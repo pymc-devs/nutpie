@@ -4,21 +4,35 @@ version = "0.1.0"
 authors = ["Adrian Seyboldt <adrian.seyboldt@gmail.com>"]
 edition = "2018"
 
+[features]
+extension-module = ["pyo3/extension-module"]
+default = ["extension-module"]
+
 [lib]
 name = "nuts_py"
 crate-type = ["cdylib"]
-
-[dependencies.pyo3]
-version = "0.12.3"
-features = ["extension-module"]
+#features = ["extension-module"]
 
 [dependencies]
+pyo3 = "0.15.1"
 nuts-rs = { path = "../nuts-rs" }
-numpy = "0.12"
-ndarray = "0.13"
-rand = "0.7"
+#tvm = { path = "../tvm/rust/tvm" }
+numpy = "0.15.0"
+ndarray = "0.15.3"
+rand = "0.8.4"
+
+[dev-dependencies]
+criterion = "0.3.3"
 
 [profile.release]
 panic = "abort"
 debug = true
 lto = "fat"
+
+[profile.bench]
+debug = true
+lto = "fat"
+
+[[bench]]
+name = "run_tvm_leapfrog"
+harness = false

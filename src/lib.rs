@@ -1,27 +1,22 @@
+use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::wrap_pyfunction;
-use pyo3::exceptions::{PyTypeError, PyValueError};
 
-use nuts_rs::cpu::{StaticIntegrator, LogpFunc, State};
-use nuts_rs::nuts::{Integrator, draw};
+use nuts_rs::cpu::{LogpFunc, State, StaticIntegrator};
+use nuts_rs::nuts::{draw, Integrator};
 
-
-type GradFunc = unsafe extern "C" fn(usize, *const f64, *mut f64, *mut f64, *const std::ffi::c_void) -> i64;
+type GradFunc =
+    unsafe extern "C" fn(usize, *const f64, *mut f64, *mut f64, *const std::ffi::c_void) -> i64;
 type UserData = *const std::ffi::c_void;
 
-
 #[pyclass]
-struct SampleInfo {
-    
-}
-
+struct SampleInfo {}
 
 struct PtrLogpFunc {
     func: GradFunc,
     user_data: UserData,
     dim: usize,
 }
-
 
 impl LogpFunc for PtrLogpFunc {
     type Err = i64;
@@ -36,9 +31,7 @@ impl LogpFunc for PtrLogpFunc {
         let mut logp = 0f64;
         let logp_ptr = (&mut logp) as *mut f64;
         let func = self.func;
-        let retcode = unsafe {
-            func(self.dim, pos, grad, logp_ptr, self.user_data)
-        };
+        let retcode = unsafe { func(self.dim, pos, grad, logp_ptr, self.user_data) };
         if retcode == 0 {
             state.potential_energy = -logp;
             return Ok(());
@@ -46,7 +39,6 @@ impl LogpFunc for PtrLogpFunc {
         Err(retcode)
     }
 }
-
 
 impl PtrLogpFunc {
     unsafe fn new(func: GradFunc, user_data: UserData, dim: usize) -> PtrLogpFunc {
@@ -58,7 +50,6 @@ impl PtrLogpFunc {
     }
 }
 
-
 #[pyclass(unsendable)]
 struct PtrIntegrator {
     integrator: StaticIntegrator<PtrLogpFunc>,
@@ -67,11 +58,17 @@ struct PtrIntegrator {
     dim: usize,
 }
 
-
 #[pymethods]
 impl PtrIntegrator {
     #[new]
-    unsafe fn new(py: Python, func: usize, user_data: usize, dim: usize, seed: u64, maxdepth: u64) -> PyResult<PtrIntegrator> {
+    unsafe fn new(
+        _py: Python,
+        func: usize,
+        user_data: usize,
+        dim: usize,
+        seed: u64,
+        maxdepth: u64,
+    ) -> PyResult<PtrIntegrator> {
         use rand::SeedableRng;
 
         let func: GradFunc = std::mem::transmute(func as *const std::ffi::c_void);
@@ -89,19 +86,20 @@ impl PtrIntegrator {
     fn draw(&mut self, init: usize, out: usize) -> PyResult<()> {
         let init: &[f64] = unsafe { std::slice::from_raw_parts(init as *const f64, self.dim) };
         let out: &mut [f64] = unsafe { std::slice::from_raw_parts_mut(out as *mut f64, self.dim) };
-        let state = self.integrator.new_state(init).map_err(|_| PyErr::new::<PyValueError, _>("Error initializing state"))?;
-        let (state, info) = draw(state, &mut self.rng, &mut self.integrator, self.maxdepth);
+        let state = self
+            .integrator
+            .new_state(init)
+            .map_err(|_| PyErr::new::<PyValueError, _>("Error initializing state"))?;
+        let (state, _info) = draw(state, &mut self.rng, &mut self.integrator, self.maxdepth);
         self.integrator.write_position(&state, out);
         Ok(())
     }
 }
 
-
 struct PyLogpFunc {
     pyfunc: PyObject,
     dim: usize,
 }
-
 
 impl LogpFunc for PyLogpFunc {
     type Err = PyErr;
@@ -123,13 +121,9 @@ impl LogpFunc for PyLogpFunc {
 
 impl PyLogpFunc {
     fn new(pyfunc: PyObject, dim: usize) -> PyLogpFunc {
-        PyLogpFunc {
-            pyfunc,
-            dim,
-        }
+        PyLogpFunc { pyfunc, dim }
     }
 }
-
 
 #[pyclass(unsendable)]
 struct PyIntegrator {
@@ -138,11 +132,16 @@ struct PyIntegrator {
     maxdepth: u64,
 }
 
-
 #[pymethods]
 impl PyIntegrator {
     #[new]
-    fn new(py: Python, pyfunc: PyObject, dim: usize, seed: u64, maxdepth: u64) -> PyResult<PyIntegrator> {
+    fn new(
+        py: Python,
+        pyfunc: PyObject,
+        dim: usize,
+        seed: u64,
+        maxdepth: u64,
+    ) -> PyResult<PyIntegrator> {
         use rand::SeedableRng;
 
         if !pyfunc.cast_as::<PyAny>(py)?.is_callable() {
@@ -156,14 +155,22 @@ impl PyIntegrator {
         })
     }
 
-    fn draw(&mut self, py: Python, init: numpy::PyReadonlyArray1<f64>, out: &numpy::PyArray1<f64>) -> PyResult<()> {
-        let state = self.integrator.new_state(&init.as_slice()?).map_err(|_| PyErr::new::<PyValueError, _>("Error initializing state"))?;
-        let (state, info) = draw(state, &mut self.rng, &mut self.integrator, self.maxdepth);
-        self.integrator.write_position(&state, unsafe { out.as_slice_mut() }?);
+    fn draw(
+        &mut self,
+        _py: Python,
+        init: numpy::PyReadonlyArray1<f64>,
+        out: &numpy::PyArray1<f64>,
+    ) -> PyResult<()> {
+        let state = self
+            .integrator
+            .new_state(&init.as_slice()?)
+            .map_err(|_| PyErr::new::<PyValueError, _>("Error initializing state"))?;
+        let (state, _info) = draw(state, &mut self.rng, &mut self.integrator, self.maxdepth);
+        self.integrator
+            .write_position(&state, unsafe { out.as_slice_mut() }?);
         Ok(())
     }
 }
-
 
 /// Formats the sum of two numbers as string.
 #[pyfunction]
@@ -173,7 +180,7 @@ fn sum_as_string(a: usize, b: usize) -> PyResult<String> {
 
 /// A Python module implemented in Rust.
 #[pymodule]
-fn nuts_py(py: Python, m: &PyModule) -> PyResult<()> {
+fn nuts_py(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(sum_as_string, m)?)?;
     m.add_class::<PyIntegrator>()?;
     m.add_class::<PtrIntegrator>()?;
