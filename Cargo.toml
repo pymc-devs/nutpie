@@ -33,6 +33,6 @@ lto = "fat"
 debug = true
 lto = "fat"
 
-[[bench]]
-name = "run_tvm_leapfrog"
-harness = false
+#[[bench]]
+#name = "run_tvm_leapfrog"
+#harness = false
