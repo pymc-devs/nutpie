@@ -1,2 +1,7 @@
 /target
 Cargo.lock
+*.ipynb
+*.so
+tvm_libs/*
+.gdb_history
+.ipynb_checkpoints

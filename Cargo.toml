@@ -2,7 +2,7 @@
 name = "nuts-py"
 version = "0.1.0"
 authors = ["Adrian Seyboldt <adrian.seyboldt@gmail.com>"]
-edition = "2018"
+edition = "2021"
 
 [features]
 extension-module = ["pyo3/extension-module"]
@@ -14,20 +14,26 @@ crate-type = ["cdylib"]
 #features = ["extension-module"]
 
 [dependencies]
-pyo3 = "0.15.1"
 nuts-rs = { path = "../nuts-rs" }
 #tvm = { path = "../tvm/rust/tvm" }
 numpy = "0.15.0"
 ndarray = "0.15.3"
 rand = "0.8.4"
+crossbeam = "0.8"
+
+[dependencies.pyo3]
+version = "0.15.1"
+features = ["extension-module", "auto-initialize"]
 
 [dev-dependencies]
 criterion = "0.3.3"
 
 [profile.release]
-panic = "abort"
-debug = true
+#panic = "abort"
+debug = 2
 lto = "fat"
+codegen-units = 1
+opt-level = 2
 
 [profile.bench]
 debug = true

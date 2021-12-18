@@ -1,6 +1,6 @@
 [build-system]
-requires = ["maturin"]
+requires = ["maturin>=0.12,<0.13"]
 build-backend = "maturin"
 
 [tool.maturin]
-bindings = "lib"
+bindings = "pyo3"

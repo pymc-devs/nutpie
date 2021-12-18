@@ -1,98 +1,185 @@
-use pyo3::exceptions::{PyTypeError, PyValueError};
-use pyo3::prelude::*;
-use pyo3::wrap_pyfunction;
+use std::thread::JoinHandle;
+use std::time::Duration;
 
-use nuts_rs::cpu::{LogpFunc, State, StaticIntegrator};
-use nuts_rs::nuts::{draw, Integrator};
+use crossbeam::channel::Receiver;
+use numpy::{PyArray1, PyReadonlyArray1, IntoPyArray};
+use nuts_rs::cpu_sampler::JitterInitFunc;
+use pyo3::exceptions::PyTypeError;
+use pyo3::exceptions::PyValueError;
+use pyo3::prelude::*;
+use pyo3::types::PyFunction;
+
+use nuts_rs::cpu_sampler::{AdaptiveSampler, CpuLogpFunc};
 
 type GradFunc =
     unsafe extern "C" fn(usize, *const f64, *mut f64, *mut f64, *const std::ffi::c_void) -> i64;
 type UserData = *const std::ffi::c_void;
 
 #[pyclass]
-struct SampleInfo {}
+struct Stats {
+    stats: nuts_rs::cpu_sampler::SampleStats,
+}
+
+#[pymethods]
+impl Stats {
+    #[getter]
+    fn mean_acceptance_rate(&self) -> f64 {
+        self.stats.mean_acceptance_rate
+    }
+
+    #[getter]
+    fn depth(&self) -> u64 {
+        self.stats.depth
+    }
+
+    #[getter]
+    fn is_diverging(&self) -> bool {
+        self.stats.divergence_info.is_some()
+    }
+    
+    #[getter]
+    fn divergence_trajectory_idx(&self) -> Option<i64> {
+        self.stats.divergence_info.as_ref()?.end_idx_in_trajectory()
+    }
+
+    #[getter]
+    fn step_size(&self) -> f64 {
+        self.stats.step_size
+    }
+
+    #[getter]
+    fn step_size_bar(&self) -> f64 {
+        self.stats.step_size_bar
+    }
+
+    #[getter]
+    fn logp(&self) -> f64 {
+        self.stats.logp
+    }
+
+    #[getter]
+    fn idx_in_trajectory(&self) -> i64 {
+        self.stats.idx_in_trajectory
+    }
+
+    #[getter]
+    fn chain(&self) -> u64 {
+        self.stats.chain
+    }
+
+    #[getter]
+    fn draw(&self) -> u64 {
+        self.stats.draw
+    }
+
+    #[getter]
+    fn tree_size(&self) -> u64 {
+        self.stats.tree_size
+    }
+
+    #[getter]
+    fn first_diag_mass_matrix(&self) -> f64 {
+        self.stats.first_diag_mass_matrix
+    }
+}
 
 struct PtrLogpFunc {
     func: GradFunc,
     user_data: UserData,
     dim: usize,
+    user_data_init_fn: Py<PyFunction>,
 }
 
-impl LogpFunc for PtrLogpFunc {
+
+unsafe impl Send for PtrLogpFunc {}
+
+impl Clone for PtrLogpFunc {
+    fn clone(&self) -> Self {
+        Python::with_gil(|py| {
+            let user_data = self.user_data_init_fn
+                    .call0(py)
+                    .expect("Calling the user data generation function failed.")
+                    .extract::<isize>(py)
+                    .expect("User data generation function returned invalid results.");
+
+            Self {
+                func: self.func,//.clone(),
+                user_data: user_data as _,
+                dim: self.dim,
+                user_data_init_fn: self.user_data_init_fn.clone(),
+            }
+        })
+    }
+}
+
+
+impl CpuLogpFunc for PtrLogpFunc {
     type Err = i64;
 
     fn dim(&self) -> usize {
         self.dim
     }
 
-    fn logp(&self, state: &mut State) -> Result<(), Self::Err> {
-        let grad = (&mut state.grad).as_mut_ptr();
-        let pos = (&state.q).as_ptr();
+    fn logp(&mut self, position: &[f64], gradient: &mut [f64]) -> Result<f64, Self::Err> {
         let mut logp = 0f64;
         let logp_ptr = (&mut logp) as *mut f64;
         let func = self.func;
-        let retcode = unsafe { func(self.dim, pos, grad, logp_ptr, self.user_data) };
+        assert!(position.len() == self.dim);
+        assert!(gradient.len() == self.dim);
+        let retcode = unsafe { func(self.dim, &position[0]as *const f64, &mut gradient[0] as *mut f64, logp_ptr, self.user_data) };
         if retcode == 0 {
-            state.potential_energy = -logp;
-            return Ok(());
+            return Ok(logp);
         }
         Err(retcode)
     }
 }
 
 impl PtrLogpFunc {
-    unsafe fn new(func: GradFunc, user_data: UserData, dim: usize) -> PtrLogpFunc {
+    unsafe fn new(func: GradFunc, user_data: UserData, dim: usize, user_data_init_fn: Py<PyFunction>) -> PtrLogpFunc {
         PtrLogpFunc {
             func,
             user_data,
             dim,
+            user_data_init_fn,
         }
     }
 }
 
 #[pyclass(unsendable)]
-struct PtrIntegrator {
-    integrator: StaticIntegrator<PtrLogpFunc>,
-    rng: rand::rngs::StdRng,
-    maxdepth: u64,
-    dim: usize,
+struct PtrSampler {
+    sampler: AdaptiveSampler<PtrLogpFunc>,
 }
 
 #[pymethods]
-impl PtrIntegrator {
+impl PtrSampler {
     #[new]
     unsafe fn new(
-        _py: Python,
+        py: Python,
         func: usize,
-        user_data: usize,
+        user_data_init_fn: Py<PyFunction>,
         dim: usize,
+        settings: SamplerArgs,
+        chain: u64,
         seed: u64,
-        maxdepth: u64,
-    ) -> PyResult<PtrIntegrator> {
-        use rand::SeedableRng;
-
+    ) -> PyResult<PtrSampler> {
         let func: GradFunc = std::mem::transmute(func as *const std::ffi::c_void);
-        let user_data = user_data as UserData;
+        let user_data: isize = user_data_init_fn.call0(py)?.extract(py)?;
 
-        let func = PtrLogpFunc::new(func, user_data, dim);
-        Ok(PtrIntegrator {
-            integrator: StaticIntegrator::new(func, dim),
-            rng: rand::rngs::StdRng::seed_from_u64(seed),
-            maxdepth,
-            dim,
+        let func = PtrLogpFunc::new(func, user_data as UserData, dim, user_data_init_fn);
+
+        Ok(PtrSampler {
+            sampler: AdaptiveSampler::new(func, settings.inner, chain, seed),
         })
     }
 
-    fn draw(&mut self, init: usize, out: usize) -> PyResult<()> {
-        let init: &[f64] = unsafe { std::slice::from_raw_parts(init as *const f64, self.dim) };
-        let out: &mut [f64] = unsafe { std::slice::from_raw_parts_mut(out as *mut f64, self.dim) };
-        let state = self
-            .integrator
-            .new_state(init)
-            .map_err(|_| PyErr::new::<PyValueError, _>("Error initializing state"))?;
-        let (state, _info) = draw(state, &mut self.rng, &mut self.integrator, self.maxdepth);
-        self.integrator.write_position(&state, out);
+    fn set_position<'py>(&mut self, _py: Python<'py>, init: PyReadonlyArray1<'py, f64>) -> PyResult<()> {
+        self.sampler.set_position(init.as_slice()?).map_err(|e| PyValueError::new_err(format!("Could not evaluate logp. Return code was {}.", e)))?;
         Ok(())
+    }
+
+    fn draw<'py>(&mut self, py: Python<'py>) -> PyResult<(&'py PyArray1<f64>, Stats)> {
+        let (out, stats) = self.sampler.draw();
+        Ok((out.into_pyarray(py), Stats { stats }))
     }
 }
 
@@ -101,20 +188,19 @@ struct PyLogpFunc {
     dim: usize,
 }
 
-impl LogpFunc for PyLogpFunc {
+impl CpuLogpFunc for PyLogpFunc {
     type Err = PyErr;
 
     fn dim(&self) -> usize {
         self.dim
     }
 
-    fn logp(&self, state: &mut State) -> Result<(), Self::Err> {
+    fn logp(&mut self, position: &[f64], gradient: &mut [f64]) -> Result<f64, Self::Err> {
         Python::with_gil(|py| {
-            let out = numpy::PyArray1::from_slice(py, &mut state.grad);
-            let pos = numpy::PyArray1::from_slice(py, &state.q);
+            let out = numpy::PyArray1::from_slice(py, gradient);
+            let pos = numpy::PyArray1::from_slice(py, position);
             let logp = self.pyfunc.call1(py, (pos, out))?;
-            state.potential_energy = -logp.extract::<f64>(py)?;
-            Ok(())
+            Ok(logp.extract::<f64>(py)?)
         })
     }
 }
@@ -126,63 +212,226 @@ impl PyLogpFunc {
 }
 
 #[pyclass(unsendable)]
-struct PyIntegrator {
-    integrator: StaticIntegrator<PyLogpFunc>,
-    rng: rand::rngs::StdRng,
-    maxdepth: u64,
+struct PySampler {
+    sampler: AdaptiveSampler<PyLogpFunc>,
 }
 
 #[pymethods]
-impl PyIntegrator {
+impl PySampler {
     #[new]
     fn new(
         py: Python,
         pyfunc: PyObject,
+        settings: SamplerArgs,
         dim: usize,
+        chain: u64,
         seed: u64,
-        maxdepth: u64,
-    ) -> PyResult<PyIntegrator> {
-        use rand::SeedableRng;
-
+    ) -> PyResult<PySampler> {
         if !pyfunc.cast_as::<PyAny>(py)?.is_callable() {
             return Err(PyErr::new::<PyTypeError, _>("func must be callable."));
         }
         let func = PyLogpFunc::new(pyfunc, dim);
-        Ok(PyIntegrator {
-            integrator: StaticIntegrator::new(func, dim),
-            rng: rand::rngs::StdRng::seed_from_u64(seed),
-            maxdepth,
+        let args = settings.inner;
+
+        Ok(PySampler {
+            sampler: AdaptiveSampler::new(func, args, chain, seed),
         })
     }
 
-    fn draw(
-        &mut self,
-        _py: Python,
-        init: numpy::PyReadonlyArray1<f64>,
-        out: &numpy::PyArray1<f64>,
+    fn set_position<'py>(
+        &mut self, _py: Python<'py>,
+        init: PyReadonlyArray1<'py, f64>
     ) -> PyResult<()> {
-        let state = self
-            .integrator
-            .new_state(&init.as_slice()?)
-            .map_err(|_| PyErr::new::<PyValueError, _>("Error initializing state"))?;
-        let (state, _info) = draw(state, &mut self.rng, &mut self.integrator, self.maxdepth);
-        self.integrator
-            .write_position(&state, unsafe { out.as_slice_mut() }?);
+        self.sampler.set_position(init.as_slice()?)?;
         Ok(())
+    }
+
+    fn draw<'py>(&mut self, py: Python<'py>) -> PyResult<(&'py PyArray1<f64>, Stats)> {
+        let (out, stats) = self.sampler.draw();
+        Ok((out.into_pyarray(py), Stats { stats }))
     }
 }
 
-/// Formats the sum of two numbers as string.
-#[pyfunction]
-fn sum_as_string(a: usize, b: usize) -> PyResult<String> {
-    Ok((a + b).to_string())
+#[pyclass]
+#[derive(Clone, Default)]
+pub struct SamplerArgs {
+    inner: nuts_rs::cpu_sampler::SamplerArgs
+}
+
+#[pymethods]
+impl SamplerArgs {
+    #[new]
+    fn new() -> SamplerArgs {
+        SamplerArgs::default()
+    }
+
+    #[getter]
+    fn num_tune(&self) -> u64 {
+        self.inner.num_tune
+    }
+
+    #[setter(num_tune)]
+    fn set_num_tune(&mut self, val: u64) {
+        self.inner.num_tune = val
+    }
+
+    #[getter]
+    fn initial_step(&self) -> f64 {
+        self.inner.initial_step
+    }
+
+    #[setter(initial_step)]
+    fn set_initial_step(&mut self, val: f64) {
+        self.inner.initial_step = val
+    }
+
+    #[getter]
+    fn maxdepth(&self) -> u64 {
+        self.inner.maxdepth
+    }
+
+    #[setter(maxdepth)]
+    fn set_maxdepth(&mut self, val: u64) {
+        self.inner.maxdepth = val
+    }
+
+    #[getter]
+    fn max_energy_error(&self) -> f64 {
+        self.inner.max_energy_error
+    }
+
+    #[setter(energy_error)]
+    fn set_max_energy_error(&mut self, val: f64) {
+        self.inner.max_energy_error = val
+    }
+
+    #[setter(target_accept)]
+    fn set_target_accept(&mut self, val: f64) {
+        self.inner.step_size_adapt.target = val;
+    }
+
+    #[getter]
+    fn target_accept(&self) -> f64 {
+        self.inner.step_size_adapt.target
+    }
+}
+
+#[pyclass]
+pub struct ParallelSampler {
+    handle: Option<JoinHandle<Result<Vec<()>, ()>>>,
+    channel: Option<Receiver<(Box<[f64]>, nuts_rs::cpu_sampler::SampleStats)>>,
+}
+
+
+#[pymethods]
+impl ParallelSampler {
+    #[new]
+    fn new<'py>(
+        py: Python<'py>,
+        func: usize,
+        user_data_init_fn: Py<PyFunction>,
+        dim: usize,
+        start_point: PyReadonlyArray1<'py, f64>,
+        settings: SamplerArgs,
+        n_chains: u64,
+        n_draws: u64,
+        seed: u64,
+        n_try_init: u64,
+    ) -> PyResult<ParallelSampler>
+    {
+        let func: GradFunc = unsafe { std::mem::transmute(func as *const std::ffi::c_void) };
+        let user_data: isize = user_data_init_fn.call0(py)?.extract(py)?;
+
+        let func = unsafe { PtrLogpFunc::new(func, user_data as UserData, dim, user_data_init_fn) };
+        let mut init_point_func = JitterInitFunc::new();  // TODO use start_point
+
+        let (handle, channel) = nuts_rs::cpu_sampler::sample_parallel(
+            func,
+            &mut init_point_func,
+            settings.inner,
+            n_chains,
+            n_draws,
+            seed,
+            n_try_init,
+        ).map_err(|e| PyValueError::new_err(format!("Logp function returned error {}", e)))?;
+
+        Ok(ParallelSampler {
+            handle: Some(handle),
+            channel: Some(channel),
+        })
+    }
+
+    fn __iter__(self_: PyRef<Self>) -> Py<ParallelSampler> {
+        self_.into()
+    }
+
+    fn __next__(mut self_: PyRefMut<Self>) -> PyResult<Option<(Py<PyArray1<f64>>, Stats)>> {
+        let channel = match self_.channel {
+            Some(ref val) => { val },
+            None => { return Ok(None) },
+        };
+        loop {
+            match channel.recv_timeout(Duration::from_millis(10)) {
+                Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
+                    Python::with_gil(|py| {
+                        py.check_signals()
+                    })?;
+                    continue;
+                },
+                Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
+                    self_.finalize()?;
+                    return Ok(None)
+                },
+                Ok((ref draw, stats)) => {
+                    let draw: PyResult<Py<PyArray1<f64>>> = Python::with_gil(|py| {
+                        py.check_signals()?;
+                        Ok(PyArray1::from_slice(py, &draw).into_py(py))
+                    });
+                    let stats = Stats { stats };
+                    return Ok(Some((draw?, stats)));
+                }
+            };
+        };
+    }
+
+    fn finalize(&mut self) -> PyResult<()> {
+        drop(self.channel.take());
+        if let Some(handle) = self.handle.take() {
+            let result = handle
+                .join()
+                .map_err(|_| PyValueError::new_err("Worker process paniced."))?;
+            result.map_err(|_| PyValueError::new_err("Worker thread failed."))?;
+        };
+
+        Ok(())
+    }
+
+    /*
+    fn __next__<'py>(mut self_: PyRefMut<Self>, py: Python<'py>) -> PyResult<Option<(&'py PyArray1<f64>, Stats)>> {
+        match self_.channel.recv() {
+            Err(_) => {
+                if let Some(handle) = self_.handle.take() {
+                    let result = handle.join();
+                    result.map_err(|_| PyValueError::new_err("Worker thread failed."))?
+                }
+                return Ok(None)
+            },
+            Ok((ref draw, stats)) => {
+                let draw = PyArray1::from_slice(py, &draw);
+                let stats = Stats { stats };
+                return Ok(Some((draw, stats)));
+            }
+        };
+    }
+    */
 }
 
 /// A Python module implemented in Rust.
 #[pymodule]
 fn nuts_py(_py: Python, m: &PyModule) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(sum_as_string, m)?)?;
-    m.add_class::<PyIntegrator>()?;
-    m.add_class::<PtrIntegrator>()?;
+    m.add_class::<PySampler>()?;
+    m.add_class::<PtrSampler>()?;
+    m.add_class::<ParallelSampler>()?;
+    m.add_class::<SamplerArgs>()?;
     Ok(())
 }
