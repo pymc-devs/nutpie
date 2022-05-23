@@ -6,94 +6,12 @@ jupyter:
       extension: .md
       format_name: markdown
       format_version: '1.3'
-      jupytext_version: 1.13.4
+      jupytext_version: 1.13.8
   kernelspec:
     display_name: pymc4-dev
     language: python
     name: pymc4-dev
 ---
-
-```python
-%env OMP_NUM_THREADS=1
-%env RAYON_NUM_THREADS=10
-```
-
-```python
-import httpstan
-```
-
-```python
-import stan
-import nest_asyncio
-nest_asyncio.apply()
-```
-
-```python
-model = stan.build(
-    """
-    parameters {
-        vector[5000] a;
-    }
-    model {
-        a ~ normal(0, 1);
-    }
-    """,
-    random_seed=6,
-)
-```
-
-```python
-import numpy as np
-```
-
-```python
-%%time
-trace = model.sample(num_samples=1000, max_depth=10, delta=0.8, num_chains=16)
-```
-
-```python
-draws = trace["a"][0, :]
-```
-
-```python
-import seaborn as sns
-```
-
-```python
-sns.displot(draws)
-```
-
-```python
-import scipy.stats
-```
-
-```python
-scipy.stats.ks_1samp(draws, scipy.stats.norm(scale=1).cdf)
-```
-
-```python
-import arviz
-```
-
-```python
-tr = arviz.from_pystan(trace)
-```
-
-```python
-(tr.posterior.diff('draw').a == 0).mean()
-```
-
-```python
-tr.sample_stats.n_steps
-```
-
-```python
-tr.sample_stats.n_steps.mean()
-```
-
-```python
-arviz.ess(trace)
-```
 
 ```python
 import aesara
@@ -106,36 +24,49 @@ from math import prod
 import fastprogress
 import arviz
 import stan
+
+import os
+
+os.getpid()
 ```
 
 ```python
 def compute_shapes(model):
     point = pm.model.make_initial_point_fn(model=model, return_transformed=True)(0)
-    
+
     value_vars = model.value_vars.copy()
-    trace_vars = {name: var for (name, var) in model.named_vars.items() if var not in model.observed_RVs + model.potentials}
+    trace_vars = {
+        name: var
+        for (name, var) in model.named_vars.items()
+        if var not in model.observed_RVs + model.potentials
+    }
 
     shape_func = aesara.function(
         inputs=[],
         outputs=[var.shape for var in trace_vars.values()],
         givens=(
             [(obs, obs.tag.observations) for obs in model.observed_RVs]
-            + [(trace_vars[name], point[name]) for name in trace_vars.keys() if name in point]
+            + [
+                (trace_vars[name], point[name])
+                for name in trace_vars.keys()
+                if name in point
+            ]
         ),
         mode=aesara.compile.mode.FAST_COMPILE,
-        on_unused_input="ignore"
+        on_unused_input="ignore",
     )
     return {name: shape for name, shape in zip(trace_vars.keys(), shape_func())}
-    
+
+
 def make_functions(model):
     shapes = compute_shapes(model)
-    
+
     # Make logp_dlogp_function
     joined = at.dvector("__joined_variables")
 
     value_vars = [model.rvs_to_values[var] for var in model.free_RVs]
 
-    logp = model.logpt
+    logp = model.logpt()
     grads = at.grad(logp, value_vars)
     grad = at.concatenate([grad.ravel() for grad in grads])
 
@@ -156,19 +87,28 @@ def make_functions(model):
         joined_slices.append(slice_val)
         symbolic_sliced.append((value_var, joined[slice_val].reshape(shape)))
         count += length
-    
+
     num_free_vars = count
 
     # We should avoid compiling the function, and optimize only
-    func = aesara.function((joined,), (logp, grad), givens=symbolic_sliced, mode=aesara.compile.NUMBA)
+    func = aesara.function(
+        (joined,), (logp, grad), givens=symbolic_sliced, mode=aesara.compile.NUMBA
+    )
     fgraph = func.maker.fgraph
     func = aesara.link.numba.dispatch.numba_funcify(fgraph)
-    logp_func = numba.njit(func)
-    
+    # logp_func = numba.njit(func)
+    logp_func = func
+
     # Make function that computes remaining variables for the trace
-    trace_vars = {name: var for (name, var) in model.named_vars.items() if var not in model.observed_RVs + model.potentials}
+    trace_vars = {
+        name: var
+        for (name, var) in model.named_vars.items()
+        if var not in model.observed_RVs + model.potentials
+    }
     remaining_names = [name for name in trace_vars if name not in joined_names]
-    remaining_rvs = [var for var in model.unobserved_value_vars if var.name not in joined_names]
+    remaining_rvs = [
+        var for var in model.unobserved_value_vars if var.name not in joined_names
+    ]
 
     all_names = joined_names + remaining_rvs
 
@@ -185,51 +125,50 @@ def make_functions(model):
         count += length
 
     allvars = at.concatenate([joined, *[var.ravel() for var in remaining_rvs]])
-    func = aesara.function((joined,), (allvars,), givens=symbolic_sliced, mode=aesara.compile.NUMBA)
+    func = aesara.function(
+        (joined,), (allvars,), givens=symbolic_sliced, mode=aesara.compile.NUMBA
+    )
     fgraph = func.maker.fgraph
     func = aesara.link.numba.dispatch.numba_funcify(fgraph)
     expanding_function = numba.njit(func, fastmath=True, error_model="numpy")
-        
-    return num_free_vars, logp_func, expanding_function, (all_names, all_slices, all_shapes)
+
+    return (
+        num_free_vars,
+        logp_func,
+        expanding_function,
+        (all_names, all_slices, all_shapes),
+    )
+
 
 def make_c_logp_func(N, logp_func):
     c_sig = numba.types.int64(
-    numba.types.uint64,
-    numba.types.CPointer(numba.types.double),
-    numba.types.CPointer(numba.types.double),
-    numba.types.CPointer(numba.types.double),
-    numba.types.voidptr,
+        numba.types.uint64,
+        numba.types.CPointer(numba.types.double),
+        numba.types.CPointer(numba.types.double),
+        numba.types.CPointer(numba.types.double),
+        numba.types.voidptr,
     )
-    
+
     def rerun_inner(x):
         try:
             logp_func(x)
         except Exception as e:
             print(e)
-    
+
     @numba.njit()
     def rerun(x):
         with numba.objmode():
             rerun_inner(x)
-            
-    @numba.cfunc(c_sig, nopython=True, fastmath=True, error_model="numpy")
+
     def logp_numba(dim, x_, out_, logp_, user_data_):
         try:
             x = numba.carray(x_, (N,))
             out = numba.carray(out_, (N,))
             logp = numba.carray(logp_, ())
-            
-            # TODO
+
             logp_val, grad = logp_func(x)
             logp[()] = logp_val
             out[...] = grad
-            
-            #logp_val = 0
-            #for i in range(N):
-            #    out[i] = -x[i]
-            #    logp_val -= x[i] * x[i] / 2
-            
-            #logp[()] = logp_val
 
             if not np.all(np.isfinite(out)):
                 return 2
@@ -237,51 +176,80 @@ def make_c_logp_func(N, logp_func):
                 return 3
             return 0
         except Exception:
-            #x = numba.carray(x_, (N,))
-            #rerun(x)
             return 1
 
-    logp_numba.compile()
-    return logp_numba
+    # logp_numba.compile()
+    return logp_numba, c_sig
 
-def sample(*, N, logp_numba, expanding_function, shape_info, n_tune, n_draws, n_chains, seed=42, max_treedepth=10, target_accept=0.8):
+
+def sample(
+    *,
+    N,
+    logp_numba,
+    expanding_function,
+    shape_info,
+    n_tune,
+    n_draws,
+    n_chains,
+    seed=42,
+    max_treedepth=10,
+    target_accept=0.8
+):
     def make_user_data():
         return 0
 
-    settings = nuts_py.lib.SamplerArgs()
+    settings = nuts_py.lib.PySamplerArgs()
     settings.num_tune = n_tune
     settings.maxdepth = max_treedepth
     settings.target_accept = target_accept
     x = np.random.randn(N)
-    sampler = nuts_py.lib.ParallelSampler(logp_numba.address, make_user_data, N, x, settings, n_chains=n_chains, n_draws=n_draws, seed=seed, n_try_init=10)
+    sampler = nuts_py.lib.PyParallelSampler(
+        logp_numba.address,
+        make_user_data,
+        N,
+        x,
+        settings,
+        n_chains=n_chains,
+        n_draws=n_draws,
+        seed=seed,
+        n_try_init=10,
+    )
 
     try:
         n_expanded = len(expanding_function(x)[0])
         draws = np.full((n_chains, n_draws + n_tune, n_expanded), np.nan)
         infos = []
-        for draw, info in fastprogress.progress_bar(sampler, total=n_chains * (n_draws + n_tune)):
+        for draw, info in fastprogress.progress_bar(
+            sampler, total=n_chains * (n_draws + n_tune)
+        ):
             infos.append(info)
             draws[info.chain, info.draw, :] = expanding_function(draw)[0]
     finally:
         sampler.finalize()
-        
+
     trace_dict = {}
     trace_dict_tune = {}
     for name, slice_, shape in zip(*shape_info):
-        trace_dict_tune[name] = draws[:, :n_tune, slice_].reshape((n_chains, n_tune) + tuple(shape))
-        trace_dict[name] = draws[:, n_tune:, slice_].reshape((n_chains, n_draws) + tuple(shape))
-    
+        trace_dict_tune[name] = draws[:, :n_tune, slice_].reshape(
+            (n_chains, n_tune) + tuple(shape)
+        )
+        trace_dict[name] = draws[:, n_tune:, slice_].reshape(
+            (n_chains, n_draws) + tuple(shape)
+        )
+
     stat_dtypes = {
-        "idx_in_trajectory": np.int64,
-        "is_diverging": bool,
-        "mean_acceptance_rate": np.float64,
+        "index_in_trajectory": np.int64,
+        "mean_tree_accept": np.float64,
         "depth": np.int64,
+        "maxdepth_reached": bool,
+        "logp": np.float64,
+        "energy": np.float64,
+        "diverging": bool,
         "step_size": np.float64,
         "step_size_bar": np.float64,
-        "tree_size": np.int64,
-        "first_diag_mass_matrix": np.float64,
+        "mean_tree_accept": np.float64,
     }
-    
+
     # This is actually relatively slow, we should be able to speed this up
     stats = {}
     stats_tune = {}
@@ -290,6 +258,7 @@ def sample(*, N, logp_numba, expanding_function, shape_info, n_tune, n_draws, n_
         stats_tune[name] = np.zeros((n_chains, n_tune), dtype=dtype)
 
     for info in infos:
+        info_dict = info.as_dict()
         if info.draw < n_tune:
             out = stats_tune
             draw = info.draw
@@ -297,8 +266,8 @@ def sample(*, N, logp_numba, expanding_function, shape_info, n_tune, n_draws, n_
             out = stats
             draw = info.draw - n_tune
         for name in stat_dtypes:
-            out[name][info.chain, draw] = getattr(info, name)
-    
+            out[name][info.chain, draw] = info_dict[name]
+
     return arviz.from_dict(
         posterior=trace_dict,
         warmup_posterior=trace_dict_tune,
@@ -311,46 +280,78 @@ def sample(*, N, logp_numba, expanding_function, shape_info, n_tune, n_draws, n_
 ```
 
 ```python
-N = 10
+N = 100
 idx = np.arange(N, dtype=int)
 np.random.shuffle(idx)
 with pm.Model() as model:
-    #a = pm.Normal("a", shape=N, sigma=1.)
+    a = pm.Normal("a", shape=N, sigma=1.)
     #b = pm.Normal("b", shape=N, sigma=2000.)
     #pm.Deterministic("b", 2 * a)
-    log_sd = pm.Gamma("sd", shape=N, sigma=1000, mu=10_000)
-    pm.Normal("a", sd=1, shape=N)
-    #pm.Gamma("a", mu=1, sd=0.1, shape=N)
+    #sd = pm.Gamma("sd", sigma=0.1, mu=1)
+    #pm.Normal("a", sigma=1, shape=N)
+    pm.Gamma("b", mu=1, sigma=0.1, shape=N)
     #pm.SkewNormal("a", alpha=np.array([3., 3.]), shape=2)
+    #pm.HalfNormal("a", shape=2)
     #pm.Mixture("a", w=[0.5, 0.5])
     #pm.Normal("y", observed=3.)
-    #pm.Normal("y", mu=a[idx][idx][idx][idx], observed=5 + np.random.randn(N))
+    #pm.Normal("y", mu=mu[idx][idx][idx], observed=5 + np.random.randn(N))
 ```
 
 ```python
-n_chains = 8
+n_chains = 200
+```
+
+```python
+import threadpoolctl
 ```
 
 ```python
 %%time
-with model:
-    trace_py = pm.sample(
-        init="jitter+adapt_diag_grad",
-        draws=1000,
-        chains=n_chains,
-        cores=10,
-        idata_kwargs={"log_likelihood": False},
-        compute_convergence_checks=False,
-        target_accept=0.8,
-        max_treedepth=10,
-        discard_tuned_samples=False,
-    )
+with threadpoolctl.threadpool_limits(1):
+    with model:
+        trace_py = pm.sample(
+            init="jitter+adapt_diag_grad",
+            draws=1000,
+            chains=n_chains,
+            cores=10,
+            idata_kwargs={"log_likelihood": False},
+            compute_convergence_checks=False,
+            target_accept=0.8,
+            #max_treedepth=10,
+            discard_tuned_samples=False,
+        )
+```
+
+```python
+from aesara import config
+```
+
+```python
+config.numba__error_model = "numpy"
+config.numba__nogil = True
+config.numba__cache = False
+config.numba__boundscheck = True
+config.numba__fastmath = True
+config.numba__parallel = False
+```
+
+```python
+kwargs = {
+    "error_model": config.numba__error_model,
+    "nogil": config.numba__nogil,
+    "boundscheck": config.numba__boundscheck,
+    "fastmath": config.numba__fastmath,
+    "parallel": config.numba__parallel,
+}
 ```
 
 ```python
 %%time
 n_dim, logp_func, expanding_function, shape_info = make_functions(model)
-logp_numba = make_c_logp_func(n_dim, logp_func)
+logp_func = numba.njit(**kwargs)(logp_func)
+logp_numba_raw, c_sig = make_c_logp_func(n_dim, logp_func)
+logp_numba = numba.cfunc(c_sig, **kwargs)(logp_numba_raw)
+#logp_numba.compile()
 ```
 
 ```python
@@ -358,40 +359,98 @@ x = np.random.randn(n_dim)
 ```
 
 ```python
-logp_func(x)
+#from numba.pycc import CC
+
+#cc = CC('logp_module')
+#cc.target_cpu = "host"
+#logp_func(np.random.randn(n_dim))
+#cc.export("logp_grad", logp_func.signatures[0])(logp_func)
+#cc.compile()
 ```
 
 ```python
-func_orig = model.logp_dlogp_function()
-func_orig.set_extra_values({})
+#func_orig = model.logp_dlogp_function()
+#func_orig.set_extra_values({})
+#%timeit func_orig._aesara_function(x)
 ```
 
 ```python
-#func_orig._aesara_function(x[shape_info[1][0]])
+n_draws = 1000
+seed = 42
 ```
 
 ```python
-#logp_func(x)
+def make_user_data():
+    return 0
+
+settings = nuts_py.lib.PySamplerArgs()
+settings.num_tune = 1000
+settings.maxdepth = 10
+settings.target_accept = 0.8
+
+x = np.random.randn(n_dim)
 ```
 
 ```python
 %%time
-trace_rust = sample(
-    N=n_dim,
-    logp_numba=logp_numba,
-    expanding_function=expanding_function,
-    shape_info=shape_info,
-    max_treedepth=100,
-    n_tune=1000,
-    n_draws=1000,
-    n_chains=n_chains,
-    seed=2,
-    target_accept=0.8,
-)
+draws = []
+for _ in range(200):
+    sampler = nuts_py.lib.PySampler(logp_numba.address, make_user_data, x, n_dim, settings, draws=n_draws + settings.num_tune, chain=0, seed=seed)
+    draws.extend(sampler)
 ```
 
 ```python
-trace_rust.sample_stats.is_diverging.sum('draw')
+len(draws)
+```
+
+```python
+import os
+os.getpid()
+```
+
+```python
+%%time
+n_chains = 200
+n_draws = 1000
+seed = 4
+
+def make_user_data():
+    return 0
+
+settings = nuts_py.lib.PySamplerArgs()
+settings.num_tune = 1000
+settings.maxdepth = 10
+settings.target_accept = 0.8
+x = np.random.randn(n_dim)
+
+sampler = nuts_py.lib.PyParallelSampler(logp_numba.address, make_user_data, n_dim, x, settings, n_chains=n_chains, n_draws=n_draws, seed=seed, n_try_init=10)
+draws = list(sampler)
+```
+
+```python
+import os
+os.getpid()
+```
+
+```python
+n_chains = 200
+```
+
+```python
+%%time
+with threadpoolctl.threadpool_limits(10):
+    trace_rust = sample(
+        N=n_dim,
+        logp_numba=logp_numba,
+        expanding_function=expanding_function,
+        shape_info=shape_info,
+        max_treedepth=10,
+        n_tune=1000,
+        n_draws=1000,
+        n_chains=n_chains,
+        seed=5,
+        target_accept=0.8,
+    )
 ```
 
 ```python
@@ -399,31 +458,7 @@ import seaborn as sns
 ```
 
 ```python
-#trace_rust.posterior["a"]
-```
-
-```python
-np.log(trace_rust.warmup_sample_stats.step_size_bar).plot(x="draw", hue="chain")
-```
-
-```python
-np.log(trace_rust.warmup_sample_stats.first_diag_mass_matrix).plot(x="draw", hue="chain")
-```
-
-```python
-1 / 1.05
-```
-
-```python
-np.log(trace_py.warmup_sample_stats.step_size_bar).plot(x="draw", hue="chain");
-```
-
-```python
-trace_py.warmup_posterior.sd.isel(sd_dim_0=0).plot.line(x="draw")
-```
-
-```python
-trace_rust.warmup_posterior.sd.isel(sd_dim_0=0).plot.line(x="draw")
+np.log(trace_rust.warmup_sample_stats.step_size_bar).plot(x="draw", hue="chain", add_legend=False);
 ```
 
 ```python
@@ -443,66 +478,15 @@ from scipy import stats
 ```
 
 ```python
-stats.ks_1samp(trace_rust.posterior["a"].values[:, :, 0].ravel(), stats.norm(scale=1).cdf)
+sns.countplot(trace_rust.sample_stats.index_in_trajectory.values.ravel())
 ```
 
 ```python
-stats.ks_1samp(trace_py.posterior["a"].values[:, :, 0].ravel(), stats.norm(scale=1).cdf)
-```
-
-```python
-sns.histplot(trace_rust.sample_stats.mean_acceptance_rate.values.ravel(), color='C0')
-sns.histplot(trace_py.sample_stats.acceptance_rate.values.ravel(), color='C1')
-```
-
-```python
-sns.kdeplot(trace_rust.sample_stats.mean_acceptance_rate.mean('draw').values.ravel(), color='C0')
-sns.kdeplot(trace_py.sample_stats.acceptance_rate.mean('draw').values.ravel(), color='C1')
-```
-
-```python
-sns.kdeplot(trace_rust.sample_stats.step_size.mean('draw').values.ravel(), color='C0')
-sns.kdeplot(trace_py.sample_stats.step_size.mean('draw').values.ravel(), color='C1')
-```
-
-```python
-sns.countplot(trace_rust.sample_stats.idx_in_trajectory.values.ravel())
-```
-
-```python
-(trace_py.posterior.diff('draw').a == 0).mean()
-```
-
-```python
-(trace_rust.posterior.diff('draw').a == 0).mean()
-```
-
-```python
-(trace_rust.sample_stats.idx_in_trajectory == 0).mean()
-```
-
-```python
-trace_rust.sample_stats.depth.mean()
-```
-
-```python
-trace_py.sample_stats.tree_depth.mean()
-```
-
-```python
-trace_rust.sample_stats.tree_size
-```
-
-```python
-trace_py.sample_stats.n_steps
+sns.countplot(trace_py.sample_stats.index_in_trajectory.values.ravel())
 ```
 
 ```python
 arviz.plot_autocorr(trace_rust.posterior.a.values[0, :, 0])
-```
-
-```python
-arviz.plot_autocorr(np.random.randn(len(trace_py.posterior.a.values[0, :, 0])))
 ```
 
 ```python
@@ -512,38 +496,4 @@ arviz.plot_autocorr(trace_py.posterior.a.values[0, :, 0])
 ```python
 ess_py = arviz.ess(trace_py)
 ess_rust = arviz.ess(trace_rust)
-```
-
-```python
-ess_rust
-```
-
-```python
-sns.kdeplot(ess_rust.a)
-sns.kdeplot(ess_py.a)
-```
-
-```python
-
-```
-
-```python
-trace_rust.sample_stats.tree_size.mean()
-```
-
-```python
-trace_py.sample_stats.n_steps.mean()
-```
-
-```python
-sns.histplot(trace_rust.sample_stats.step_size.isel(draw=0).values.ravel(), color='C0')
-sns.histplot(trace_py.sample_stats.step_size.isel(draw=0).values.ravel(), color='C1')
-```
-
-```python
-
-```
-
-```python
-
 ```

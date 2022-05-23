@@ -1,85 +1,95 @@
+use std::fmt::Display;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use crossbeam::channel::Receiver;
-use numpy::{PyArray1, PyReadonlyArray1, IntoPyArray};
-use nuts_rs::cpu_sampler::JitterInitFunc;
-use pyo3::exceptions::PyTypeError;
+use numpy::{PyArray1, PyReadonlyArray1};
+use nuts_rs::LogpError;
+use nuts_rs::{JitterInitFunc, sample_parallel, SampleStats, SamplerArgs, SampleStatValue, CpuLogpFunc, NutsError, sample_sequentially};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyFunction;
-
-use nuts_rs::cpu_sampler::{AdaptiveSampler, CpuLogpFunc};
+use pyo3::types::{PyFunction, PyDict};
+use thiserror::Error;
+use crossbeam::channel::Receiver;
 
 type GradFunc =
     unsafe extern "C" fn(usize, *const f64, *mut f64, *mut f64, *const std::ffi::c_void) -> i64;
 type UserData = *const std::ffi::c_void;
 
 #[pyclass]
-struct Stats {
-    stats: nuts_rs::cpu_sampler::SampleStats,
+struct PySampleStats {
+    stats: Box<dyn SampleStats>,
 }
 
 #[pymethods]
-impl Stats {
-    #[getter]
-    fn mean_acceptance_rate(&self) -> f64 {
-        self.stats.mean_acceptance_rate
-    }
-
+impl PySampleStats {
     #[getter]
     fn depth(&self) -> u64 {
-        self.stats.depth
+        self.stats.depth()
     }
 
     #[getter]
     fn is_diverging(&self) -> bool {
-        self.stats.divergence_info.is_some()
+        self.stats.divergence_info().is_some()
     }
-    
+
     #[getter]
     fn divergence_trajectory_idx(&self) -> Option<i64> {
-        self.stats.divergence_info.as_ref()?.end_idx_in_trajectory()
-    }
-
-    #[getter]
-    fn step_size(&self) -> f64 {
-        self.stats.step_size
-    }
-
-    #[getter]
-    fn step_size_bar(&self) -> f64 {
-        self.stats.step_size_bar
+        self.stats.divergence_info().as_ref()?.end_idx_in_trajectory()
     }
 
     #[getter]
     fn logp(&self) -> f64 {
-        self.stats.logp
+        self.stats.logp()
     }
 
     #[getter]
-    fn idx_in_trajectory(&self) -> i64 {
-        self.stats.idx_in_trajectory
+    fn index_in_trajectory(&self) -> i64 {
+        self.stats.index_in_trajectory()
     }
 
     #[getter]
     fn chain(&self) -> u64 {
-        self.stats.chain
+        self.stats.chain()
     }
 
     #[getter]
     fn draw(&self) -> u64 {
-        self.stats.draw
+        self.stats.draw()
     }
 
-    #[getter]
-    fn tree_size(&self) -> u64 {
-        self.stats.tree_size
-    }
-
-    #[getter]
-    fn first_diag_mass_matrix(&self) -> f64 {
-        self.stats.first_diag_mass_matrix
+    fn as_dict<'py>(&self, py: Python<'py>) -> PyResult<&'py PyDict> {
+        let dict = PyDict::new(py);
+        let results: Result<Vec<_>, _> = self.stats.to_vec().drain(..).map(|(key, val)| {
+            match val {
+                SampleStatValue::Array(val) => {
+                    dict.set_item(key, PyArray1::from_slice(py, &val))
+                },
+                SampleStatValue::OptionArray(val) => {
+                    match val {
+                        Some(val) => {
+                            dict.set_item(key, PyArray1::from_slice(py, &val))
+                        },
+                        None => {
+                            dict.set_item(key, py.None())
+                        }
+                    }
+                },
+                SampleStatValue::U64(val) => {
+                    dict.set_item(key, val)
+                },
+                SampleStatValue::I64(val) => {
+                    dict.set_item(key, val)
+                },
+                SampleStatValue::F64(val) => {
+                    dict.set_item(key, val)
+                },
+                SampleStatValue::Bool(val) => {
+                    dict.set_item(key, val)
+                },
+            }
+        }).collect();
+        results?;
+        Ok(dict)
     }
 }
 
@@ -112,9 +122,23 @@ impl Clone for PtrLogpFunc {
     }
 }
 
+#[derive(Error, Debug)]
+struct ErrorCode(i64);
+
+impl LogpError for ErrorCode {
+    fn is_recoverable(&self) -> bool {
+        self.0 > 0
+    }
+}
+
+impl Display for ErrorCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Logp function returned error code {}", self.0)
+    }
+}
 
 impl CpuLogpFunc for PtrLogpFunc {
-    type Err = i64;
+    type Err = ErrorCode;
 
     fn dim(&self) -> usize {
         self.dim
@@ -130,7 +154,7 @@ impl CpuLogpFunc for PtrLogpFunc {
         if retcode == 0 {
             return Ok(logp);
         }
-        Err(retcode)
+        Err(ErrorCode(retcode))
     }
 }
 
@@ -146,43 +170,78 @@ impl PtrLogpFunc {
 }
 
 #[pyclass(unsendable)]
-struct PtrSampler {
-    sampler: AdaptiveSampler<PtrLogpFunc>,
+struct PySampler {
+    sampler: Box<
+        dyn Iterator<
+            Item = Result<
+                (Box<[f64]>, Box<dyn SampleStats>),
+                NutsError
+            >
+        >
+    >,
 }
 
 #[pymethods]
-impl PtrSampler {
+impl PySampler {
     #[new]
-    unsafe fn new(
-        py: Python,
+    unsafe fn new<'py>(
+        py: Python<'py>,
         func: usize,
         user_data_init_fn: Py<PyFunction>,
+        start_point: PyReadonlyArray1<'py, f64>,
         dim: usize,
-        settings: SamplerArgs,
+        settings: PySamplerArgs,
+        draws: u64,
         chain: u64,
         seed: u64,
-    ) -> PyResult<PtrSampler> {
+    ) -> PyResult<PySampler> {
         let func: GradFunc = std::mem::transmute(func as *const std::ffi::c_void);
         let user_data: isize = user_data_init_fn.call0(py)?.extract(py)?;
 
         let func = PtrLogpFunc::new(func, user_data as UserData, dim, user_data_init_fn);
+        //let sampler = new_sampler(func, settings.inner, chain, seed);
+        //sample_sequentially start_point
 
-        Ok(PtrSampler {
-            sampler: AdaptiveSampler::new(func, settings.inner, chain, seed),
-        })
+        let draws = sample_sequentially(
+            func,
+            settings.inner,
+            start_point.as_slice()?,
+            draws,
+            chain,
+            seed
+        ).map_err(|_| PyValueError::new_err(format!("Logp failed at initial location")))?;
+        let sampler = Box::new(
+            draws.map(|draw| {
+                draw.map(|(pos, stats)| {
+                    (pos, Box::new(stats) as Box<dyn SampleStats>)
+                })
+            })
+        );
+        Ok(
+            PySampler {
+                sampler
+            }
+        )
     }
 
-    fn set_position<'py>(&mut self, _py: Python<'py>, init: PyReadonlyArray1<'py, f64>) -> PyResult<()> {
-        self.sampler.set_position(init.as_slice()?).map_err(|e| PyValueError::new_err(format!("Could not evaluate logp. Return code was {}.", e)))?;
-        Ok(())
+    fn __iter__(self_: PyRef<Self>) -> Py<PySampler> {
+        self_.into()
     }
 
-    fn draw<'py>(&mut self, py: Python<'py>) -> PyResult<(&'py PyArray1<f64>, Stats)> {
-        let (out, stats) = self.sampler.draw();
-        Ok((out.into_pyarray(py), Stats { stats }))
+    fn __next__(mut self_: PyRefMut<Self>) -> PyResult<Option<(Py<PyArray1<f64>>, PySampleStats)>> {
+        match self_.sampler.next() {
+            Some(val) => {
+                let (pos, stats) = val.map_err(|e| PyValueError::new_err(format!("Could not retrieve next draw: {}", e)))?;
+                Python::with_gil(|py| {
+                    Ok(Some((numpy::PyArray1::from_vec(py, pos.into()).into(), PySampleStats { stats })))
+                })
+            },
+            None => Ok(None),
+        }
     }
 }
 
+/*
 struct PyLogpFunc {
     pyfunc: PyObject,
     dim: usize,
@@ -210,59 +269,19 @@ impl PyLogpFunc {
         PyLogpFunc { pyfunc, dim }
     }
 }
-
-#[pyclass(unsendable)]
-struct PySampler {
-    sampler: AdaptiveSampler<PyLogpFunc>,
-}
-
-#[pymethods]
-impl PySampler {
-    #[new]
-    fn new(
-        py: Python,
-        pyfunc: PyObject,
-        settings: SamplerArgs,
-        dim: usize,
-        chain: u64,
-        seed: u64,
-    ) -> PyResult<PySampler> {
-        if !pyfunc.cast_as::<PyAny>(py)?.is_callable() {
-            return Err(PyErr::new::<PyTypeError, _>("func must be callable."));
-        }
-        let func = PyLogpFunc::new(pyfunc, dim);
-        let args = settings.inner;
-
-        Ok(PySampler {
-            sampler: AdaptiveSampler::new(func, args, chain, seed),
-        })
-    }
-
-    fn set_position<'py>(
-        &mut self, _py: Python<'py>,
-        init: PyReadonlyArray1<'py, f64>
-    ) -> PyResult<()> {
-        self.sampler.set_position(init.as_slice()?)?;
-        Ok(())
-    }
-
-    fn draw<'py>(&mut self, py: Python<'py>) -> PyResult<(&'py PyArray1<f64>, Stats)> {
-        let (out, stats) = self.sampler.draw();
-        Ok((out.into_pyarray(py), Stats { stats }))
-    }
-}
+*/
 
 #[pyclass]
 #[derive(Clone, Default)]
-pub struct SamplerArgs {
-    inner: nuts_rs::cpu_sampler::SamplerArgs
+pub struct PySamplerArgs {
+    inner: SamplerArgs
 }
 
 #[pymethods]
-impl SamplerArgs {
+impl PySamplerArgs {
     #[new]
-    fn new() -> SamplerArgs {
-        SamplerArgs::default()
+    fn new() -> PySamplerArgs {
+        PySamplerArgs { inner: SamplerArgs::default() }
     }
 
     #[getter]
@@ -277,12 +296,12 @@ impl SamplerArgs {
 
     #[getter]
     fn initial_step(&self) -> f64 {
-        self.inner.initial_step
+        self.inner.step_size_adapt.initial_step
     }
 
     #[setter(initial_step)]
     fn set_initial_step(&mut self, val: f64) {
-        self.inner.initial_step = val
+        self.inner.step_size_adapt.initial_step = val
     }
 
     #[getter]
@@ -316,36 +335,38 @@ impl SamplerArgs {
     }
 }
 
-#[pyclass]
-pub struct ParallelSampler {
-    handle: Option<JoinHandle<Result<Vec<()>, ()>>>,
-    channel: Option<Receiver<(Box<[f64]>, nuts_rs::cpu_sampler::SampleStats)>>,
+#[pyclass(unsendable)]
+struct PyParallelSampler {
+    handle: Option<JoinHandle<Vec<nuts_rs::ParallelChainResult>>>,
+    channel: Option<Receiver<(Box<[f64]>, Box<dyn nuts_rs::SampleStats>)>>,
 }
 
-
 #[pymethods]
-impl ParallelSampler {
+impl PyParallelSampler {
     #[new]
     fn new<'py>(
-        py: Python<'py>,
         func: usize,
         user_data_init_fn: Py<PyFunction>,
         dim: usize,
         start_point: PyReadonlyArray1<'py, f64>,
-        settings: SamplerArgs,
+        settings: PySamplerArgs,
         n_chains: u64,
         n_draws: u64,
         seed: u64,
         n_try_init: u64,
-    ) -> PyResult<ParallelSampler>
+    ) -> PyResult<PyParallelSampler>
     {
         let func: GradFunc = unsafe { std::mem::transmute(func as *const std::ffi::c_void) };
-        let user_data: isize = user_data_init_fn.call0(py)?.extract(py)?;
+
+
+        let user_data: isize = Python::with_gil(|py| {
+            user_data_init_fn.call0(py)?.extract(py)
+        })?;
 
         let func = unsafe { PtrLogpFunc::new(func, user_data as UserData, dim, user_data_init_fn) };
         let mut init_point_func = JitterInitFunc::new();  // TODO use start_point
 
-        let (handle, channel) = nuts_rs::cpu_sampler::sample_parallel(
+        let (handle, channel) = sample_parallel(
             func,
             &mut init_point_func,
             settings.inner,
@@ -355,52 +376,65 @@ impl ParallelSampler {
             n_try_init,
         ).map_err(|e| PyValueError::new_err(format!("Logp function returned error {}", e)))?;
 
-        Ok(ParallelSampler {
+        Ok(PyParallelSampler {
             handle: Some(handle),
             channel: Some(channel),
         })
     }
 
-    fn __iter__(self_: PyRef<Self>) -> Py<ParallelSampler> {
+    fn __iter__(self_: PyRef<Self>) -> Py<PyParallelSampler> {
         self_.into()
     }
 
-    fn __next__(mut self_: PyRefMut<Self>) -> PyResult<Option<(Py<PyArray1<f64>>, Stats)>> {
+    fn __next__(mut self_: PyRefMut<Self>, py: Python<'_>) -> PyResult<Option<(Py<PyArray1<f64>>, PySampleStats)>> {
         let channel = match self_.channel {
             Some(ref val) => { val },
             None => { return Ok(None) },
         };
-        loop {
-            match channel.recv_timeout(Duration::from_millis(10)) {
-                Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
-                    Python::with_gil(|py| {
-                        py.check_signals()
-                    })?;
-                    continue;
-                },
-                Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
-                    self_.finalize()?;
-                    return Ok(None)
-                },
-                Ok((ref draw, stats)) => {
-                    let draw: PyResult<Py<PyArray1<f64>>> = Python::with_gil(|py| {
-                        py.check_signals()?;
-                        Ok(PyArray1::from_slice(py, &draw).into_py(py))
-                    });
-                    let stats = Stats { stats };
-                    return Ok(Some((draw?, stats)));
-                }
+        let mut call_finalize = false;
+        let result = py.allow_threads(|| {
+            loop {
+                match channel.recv_timeout(Duration::from_millis(50)) {
+                    Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
+                        Python::with_gil(|py| {
+                            py.check_signals()
+                        })?;
+                        continue;
+                    },
+                    Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
+                        call_finalize = true;
+                        return Ok(None)
+                    },
+                    Ok((ref draw, stats)) => {
+                        let draw: PyResult<Py<PyArray1<f64>>> = Python::with_gil(|py| {
+                            py.check_signals()?;
+                            Ok(PyArray1::from_slice(py, &draw).into_py(py))
+                        });
+                        let stats = PySampleStats { stats };
+                        return Ok(Some((draw?, stats)));
+                    }
+                };
             };
-        };
+        });
+        if call_finalize {
+            self_.finalize(py)?;
+        }
+        result
     }
 
-    fn finalize(&mut self) -> PyResult<()> {
+    fn finalize(&mut self, py: Python<'_>) -> PyResult<()> {
         drop(self.channel.take());
         if let Some(handle) = self.handle.take() {
-            let result = handle
-                .join()
-                .map_err(|_| PyValueError::new_err("Worker process paniced."))?;
-            result.map_err(|_| PyValueError::new_err("Worker thread failed."))?;
+            let result: PyResult<_> = py.allow_threads(|| {
+                let result: Result<Vec<_>, _> = handle
+                    .join()
+                    .map_err(|_| PyValueError::new_err("Worker process paniced."))?
+                    .into_iter()
+                    .collect();
+                result.map_err(|e| PyValueError::new_err(format!("Worker thread failed: {}", e)))?;
+                Ok(())
+            });
+            result?;
         };
 
         Ok(())
@@ -426,12 +460,12 @@ impl ParallelSampler {
     */
 }
 
+
 /// A Python module implemented in Rust.
 #[pymodule]
 fn nuts_py(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<PySampler>()?;
-    m.add_class::<PtrSampler>()?;
-    m.add_class::<ParallelSampler>()?;
-    m.add_class::<SamplerArgs>()?;
+    m.add_class::<PyParallelSampler>()?;
+    m.add_class::<PySamplerArgs>()?;
     Ok(())
 }

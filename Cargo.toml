@@ -16,17 +16,18 @@ crate-type = ["cdylib"]
 [dependencies]
 nuts-rs = { path = "../nuts-rs" }
 #tvm = { path = "../tvm/rust/tvm" }
-numpy = "0.15.0"
-ndarray = "0.15.3"
-rand = "0.8.4"
-crossbeam = "0.8"
+numpy = "0.16.2"
+ndarray = "0.15.4"
+rand = "0.8.5"
+crossbeam = "0.8.1"
+thiserror = "1.0.31"
 
 [dependencies.pyo3]
-version = "0.15.1"
+version = "0.16.5"
 features = ["extension-module", "auto-initialize"]
 
 [dev-dependencies]
-criterion = "0.3.3"
+criterion = "0.3.5"
 
 [profile.release]
 #panic = "abort"
