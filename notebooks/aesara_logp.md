@@ -14,6 +14,10 @@ jupyter:
 ---
 
 ```python
+%env RAYON_NUM_THREADS=12
+```
+
+```python
 import aesara
 import aesara.tensor as at
 import pymc as pm
@@ -280,16 +284,16 @@ def sample(
 ```
 
 ```python
-N = 100
+N = 1000
 idx = np.arange(N, dtype=int)
 np.random.shuffle(idx)
 with pm.Model() as model:
-    a = pm.Normal("a", shape=N, sigma=1.)
+    mu = pm.Normal("a", shape=N, sigma=0.1)
     #b = pm.Normal("b", shape=N, sigma=2000.)
     #pm.Deterministic("b", 2 * a)
     #sd = pm.Gamma("sd", sigma=0.1, mu=1)
     #pm.Normal("a", sigma=1, shape=N)
-    pm.Gamma("b", mu=1, sigma=0.1, shape=N)
+    #pm.Gamma("b", mu=1, sigma=0.1, shape=N)
     #pm.SkewNormal("a", alpha=np.array([3., 3.]), shape=2)
     #pm.HalfNormal("a", shape=2)
     #pm.Mixture("a", w=[0.5, 0.5])
@@ -298,7 +302,7 @@ with pm.Model() as model:
 ```
 
 ```python
-n_chains = 200
+n_chains = 8
 ```
 
 ```python
@@ -376,7 +380,7 @@ x = np.random.randn(n_dim)
 
 ```python
 n_draws = 1000
-seed = 42
+seed = 40
 ```
 
 ```python
@@ -394,9 +398,29 @@ x = np.random.randn(n_dim)
 ```python
 %%time
 draws = []
-for _ in range(200):
-    sampler = nuts_py.lib.PySampler(logp_numba.address, make_user_data, x, n_dim, settings, draws=n_draws + settings.num_tune, chain=0, seed=seed)
-    draws.extend(sampler)
+tune = []
+for i in range(n_chains):
+    sampler = nuts_py.lib.PySampler(logp_numba.address, make_user_data, x, n_dim, settings, draws=n_draws + settings.num_tune, chain=0, seed=seed + i)
+    samples = list(sampler)
+    tune.extend(samples[:settings.num_tune])
+    draws.extend(samples[settings.num_tune:])
+```
+
+```python
+from scipy import stats
+import seaborn as sns
+```
+
+```python
+draws = np.array([vals for vals, _ in draws]).ravel()
+```
+
+```python
+stats.ks_1samp(draws / 2, stats.norm.cdf)
+```
+
+```python
+#sns.kdeplot(np.array(draws).ravel())
 ```
 
 ```python
@@ -410,7 +434,7 @@ os.getpid()
 
 ```python
 %%time
-n_chains = 200
+#n_chains = 200
 n_draws = 1000
 seed = 4
 
@@ -433,24 +457,25 @@ os.getpid()
 ```
 
 ```python
-n_chains = 200
+#n_chains = 200
 ```
 
 ```python
 %%time
-with threadpoolctl.threadpool_limits(10):
-    trace_rust = sample(
-        N=n_dim,
-        logp_numba=logp_numba,
-        expanding_function=expanding_function,
-        shape_info=shape_info,
-        max_treedepth=10,
-        n_tune=1000,
-        n_draws=1000,
-        n_chains=n_chains,
-        seed=5,
-        target_accept=0.8,
-    )
+for _ in range(1):
+    with threadpoolctl.threadpool_limits(1):
+        trace_rust = sample(
+            N=n_dim,
+            logp_numba=logp_numba,
+            expanding_function=expanding_function,
+            shape_info=shape_info,
+            max_treedepth=10,
+            n_tune=1000,
+            n_draws=1000,
+            n_chains=n_chains,
+            seed=6,
+            target_accept=0.8,
+        )
 ```
 
 ```python
@@ -462,9 +487,25 @@ np.log(trace_rust.warmup_sample_stats.step_size_bar).plot(x="draw", hue="chain",
 ```
 
 ```python
+sns.histplot(trace_rust.posterior["a"].values[:, :, 0].ravel())
+```
+
+```python
+
+```
+
+```python
 sns.kdeplot(trace_rust.posterior["a"].values[:, :, 0].ravel())
 sns.kdeplot(trace_py.posterior["a"].values[:, :, 0].ravel())
 #sns.kdeplot(np.random.randn(16_000))
+```
+
+```python
+stats.ks_1samp(trace_rust.posterior["a"].values[:, :, 0].ravel() / 0.1, stats.norm.cdf)
+```
+
+```python
+stats.ks_1samp(trace_py.posterior["a"].values[:, :, 0].ravel() / 0.1, stats.norm.cdf)
 ```
 
 ```python
@@ -496,4 +537,16 @@ arviz.plot_autocorr(trace_py.posterior.a.values[0, :, 0])
 ```python
 ess_py = arviz.ess(trace_py)
 ess_rust = arviz.ess(trace_rust)
+```
+
+```python
+ess_rust
+```
+
+```python
+ess_py
+```
+
+```python
+
 ```
