@@ -8,13 +8,13 @@ jupyter:
       format_version: '1.3'
       jupytext_version: 1.13.8
   kernelspec:
-    display_name: pymc4-dev
+    display_name: pymc
     language: python
-    name: pymc4-dev
+    name: pymc
 ---
 
 ```python
-%env RAYON_NUM_THREADS=12
+%env RAYON_NUM_THREADS=4
 ```
 
 ```python
@@ -27,14 +27,12 @@ import numba
 from math import prod
 import fastprogress
 import arviz
-import stan
-
 import os
-
-os.getpid()
+import threadpoolctl
 ```
 
 ```python
+# Some helper functions to compile logp functions as needed
 def compute_shapes(model):
     point = pm.model.make_initial_point_fn(model=model, return_transformed=True)(0)
 
@@ -288,7 +286,7 @@ N = 1000
 idx = np.arange(N, dtype=int)
 np.random.shuffle(idx)
 with pm.Model() as model:
-    mu = pm.Normal("a", shape=N, sigma=0.1)
+    mu = pm.Normal("a", shape=N, sigma=1e-4)
     #b = pm.Normal("b", shape=N, sigma=2000.)
     #pm.Deterministic("b", 2 * a)
     #sd = pm.Gamma("sd", sigma=0.1, mu=1)
@@ -298,16 +296,14 @@ with pm.Model() as model:
     #pm.HalfNormal("a", shape=2)
     #pm.Mixture("a", w=[0.5, 0.5])
     #pm.Normal("y", observed=3.)
-    #pm.Normal("y", mu=mu[idx][idx][idx], observed=5 + np.random.randn(N))
+    pm.Normal("y", mu=mu[idx], observed=5 + np.random.randn(N))
 ```
 
 ```python
-n_chains = 8
+n_chains = 4
 ```
 
-```python
-import threadpoolctl
-```
+## Sample using PyMC NUTS
 
 ```python
 %%time
@@ -321,10 +317,11 @@ with threadpoolctl.threadpool_limits(1):
             idata_kwargs={"log_likelihood": False},
             compute_convergence_checks=False,
             target_accept=0.8,
-            #max_treedepth=10,
             discard_tuned_samples=False,
         )
 ```
+
+## Compile functions for rust sampler
 
 ```python
 from aesara import config
@@ -355,14 +352,11 @@ n_dim, logp_func, expanding_function, shape_info = make_functions(model)
 logp_func = numba.njit(**kwargs)(logp_func)
 logp_numba_raw, c_sig = make_c_logp_func(n_dim, logp_func)
 logp_numba = numba.cfunc(c_sig, **kwargs)(logp_numba_raw)
-#logp_numba.compile()
 ```
 
 ```python
-x = np.random.randn(n_dim)
-```
+#x = np.random.randn(n_dim)
 
-```python
 #from numba.pycc import CC
 
 #cc = CC('logp_module')
@@ -370,9 +364,7 @@ x = np.random.randn(n_dim)
 #logp_func(np.random.randn(n_dim))
 #cc.export("logp_grad", logp_func.signatures[0])(logp_func)
 #cc.compile()
-```
 
-```python
 #func_orig = model.logp_dlogp_function()
 #func_orig.set_extra_values({})
 #%timeit func_orig._aesara_function(x)
@@ -395,6 +387,8 @@ settings.target_accept = 0.8
 x = np.random.randn(n_dim)
 ```
 
+## Sample using rust sampler with no parallelization
+
 ```python
 %%time
 draws = []
@@ -412,29 +406,14 @@ import seaborn as sns
 ```
 
 ```python
-draws = np.array([vals for vals, _ in draws]).ravel()
+#draws = np.array([vals for vals, _ in draws]).ravel()
+#stats.ks_1samp(draws / 2, stats.norm.cdf)
 ```
 
-```python
-stats.ks_1samp(draws / 2, stats.norm.cdf)
-```
-
-```python
-#sns.kdeplot(np.array(draws).ravel())
-```
-
-```python
-len(draws)
-```
-
-```python
-import os
-os.getpid()
-```
+## Rust sampling with raw parallelization
 
 ```python
 %%time
-#n_chains = 200
 n_draws = 1000
 seed = 4
 
@@ -447,17 +426,25 @@ settings.maxdepth = 10
 settings.target_accept = 0.8
 x = np.random.randn(n_dim)
 
-sampler = nuts_py.lib.PyParallelSampler(logp_numba.address, make_user_data, n_dim, x, settings, n_chains=n_chains, n_draws=n_draws, seed=seed, n_try_init=10)
+sampler = nuts_py.lib.PyParallelSampler(
+    logp_numba.address,
+    make_user_data,
+    n_dim,
+    x,
+    settings,
+    n_chains=n_chains,
+    n_draws=n_draws,
+    seed=seed,
+    n_try_init=10
+)
 draws = list(sampler)
 ```
+
+## Parallel rust sampling with progress and arviz export
 
 ```python
 import os
 os.getpid()
-```
-
-```python
-#n_chains = 200
 ```
 
 ```python
@@ -483,47 +470,30 @@ import seaborn as sns
 ```
 
 ```python
-np.log(trace_rust.warmup_sample_stats.step_size_bar).plot(x="draw", hue="chain", add_legend=False);
-```
-
-```python
-sns.histplot(trace_rust.posterior["a"].values[:, :, 0].ravel())
-```
-
-```python
-
-```
-
-```python
 sns.kdeplot(trace_rust.posterior["a"].values[:, :, 0].ravel())
 sns.kdeplot(trace_py.posterior["a"].values[:, :, 0].ravel())
 #sns.kdeplot(np.random.randn(16_000))
 ```
 
 ```python
-stats.ks_1samp(trace_rust.posterior["a"].values[:, :, 0].ravel() / 0.1, stats.norm.cdf)
+#stats.ks_1samp(trace_rust.posterior["a"].values[:, :, 0].ravel() / 0.1, stats.norm.cdf)
 ```
 
 ```python
-stats.ks_1samp(trace_py.posterior["a"].values[:, :, 0].ravel() / 0.1, stats.norm.cdf)
+#stats.ks_1samp(trace_py.posterior["a"].values[:, :, 0].ravel() / 0.1, stats.norm.cdf)
 ```
 
 ```python
-sns.kdeplot(np.log(trace_rust.posterior["a"].values[:, :, -1].ravel()))
-sns.kdeplot(np.log(trace_py.posterior["a"].values[:, :, -1].ravel()))
-#sns.kdeplot(2000 * np.random.randn(16_000))
+#sns.kdeplot(np.log(trace_rust.posterior["a"].values[:, :, -1].ravel()))
+#sns.kdeplot(np.log(trace_py.posterior["a"].values[:, :, -1].ravel()))
 ```
 
 ```python
-from scipy import stats
+sns.countplot(x=trace_rust.sample_stats.index_in_trajectory.values.ravel());
 ```
 
 ```python
-sns.countplot(trace_rust.sample_stats.index_in_trajectory.values.ravel())
-```
-
-```python
-sns.countplot(trace_py.sample_stats.index_in_trajectory.values.ravel())
+sns.countplot(x=trace_py.sample_stats.index_in_trajectory.values.ravel());
 ```
 
 ```python
@@ -532,21 +502,4 @@ arviz.plot_autocorr(trace_rust.posterior.a.values[0, :, 0])
 
 ```python
 arviz.plot_autocorr(trace_py.posterior.a.values[0, :, 0])
-```
-
-```python
-ess_py = arviz.ess(trace_py)
-ess_rust = arviz.ess(trace_rust)
-```
-
-```python
-ess_rust
-```
-
-```python
-ess_py
-```
-
-```python
-
 ```
