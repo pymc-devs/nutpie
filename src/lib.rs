@@ -6,7 +6,7 @@ use numpy::{PyArray1, PyReadonlyArray1};
 use nuts_rs::LogpError;
 use nuts_rs::{JitterInitFunc, sample_parallel, SampleStats, SamplerArgs, SampleStatValue, CpuLogpFunc, NutsError, sample_sequentially};
 use pyo3::exceptions::PyValueError;
-use pyo3::prelude::*;
+use pyo3::{prelude::*, intern};
 use pyo3::types::{PyFunction, PyDict};
 use thiserror::Error;
 use crossbeam::channel::Receiver;
@@ -169,6 +169,84 @@ impl PtrLogpFunc {
     }
 }
 
+#[derive(Error, Debug)]
+enum PyLogpErr {
+    #[error("Recoverable error in logp evaluation")]
+    Recoverable {
+        #[source]
+        source: PyErr,
+    },
+    #[error("Non-recoverable error in logp evaluation")]
+    NonRecoverable {
+        #[source]
+        source: PyErr,
+    },
+}
+
+impl LogpError for PyLogpErr {
+    fn is_recoverable(&self) -> bool {
+        match self {
+            PyLogpErr::Recoverable { source: _ } => { true },
+            PyLogpErr::NonRecoverable { source: _ } => { false },
+        }
+    }
+}
+
+impl From<PyErr> for PyLogpErr {
+    fn from(err: PyErr) -> Self {
+        Python::with_gil(|py| {
+            let recov: bool = match err.value(py).getattr(intern!(py, "is_recoverable")) {
+                Result::Ok(recoverable) => {
+                    match recoverable.extract::<bool>() {
+                        Result::Ok(val) => { val },
+                        Result::Err(_) => { false },
+                    }
+                },
+                Result::Err(_) => { false },  // TODO
+            };
+            if recov {
+                PyLogpErr::Recoverable { source: err }
+            }
+            else {
+                PyLogpErr::NonRecoverable { source: err }
+            }
+        })
+    }
+}
+
+#[pyclass]
+struct PyLogpFunc {
+    pyfunc: PyObject,
+    dim: usize,
+}
+
+impl CpuLogpFunc for PyLogpFunc {
+    type Err = PyLogpErr;
+
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    fn logp(&mut self, position: &[f64], gradient: &mut [f64]) -> Result<f64, Self::Err> {
+        Python::with_gil(|py| {
+            let out = numpy::PyArray1::from_slice(py, gradient);
+            let pos = numpy::PyArray1::from_slice(py, position);
+            let logp = self.pyfunc.call1(py, (pos, out))?;
+            py.check_signals().map_err(|e| PyLogpErr::NonRecoverable { source: e })?;
+            gradient.iter_mut().zip(out.to_owned_array().iter()).for_each(|(out, &val)| *out = val);
+            Ok(logp.extract::<f64>(py)?)
+        })
+    }
+}
+
+#[pymethods]
+impl PyLogpFunc {
+    #[new]
+    fn new(pyfunc: PyObject, dim: usize) -> PyLogpFunc {
+        PyLogpFunc { pyfunc, dim }
+    }
+}
+
 #[pyclass(unsendable)]
 struct PySampler {
     sampler: Box<
@@ -183,6 +261,39 @@ struct PySampler {
 
 #[pymethods]
 impl PySampler {
+    #[staticmethod]
+    fn from_pyfunc<'py>(
+        func: PyObject,
+        start_point: PyReadonlyArray1<'py, f64>,
+        dim: usize,
+        settings: PySamplerArgs,
+        draws: u64,
+        chain: u64,
+        seed: u64,
+    ) -> PyResult<PySampler> {
+        let func = PyLogpFunc::new(func, dim);
+        let draws = sample_sequentially(
+            func,
+            settings.inner,
+            start_point.as_slice()?,
+            draws,
+            chain,
+            seed
+        ).map_err(|_| PyValueError::new_err(format!("Logp failed at initial location")))?;
+        let sampler = Box::new(
+            draws.map(|draw| {
+                draw.map(|(pos, stats)| {
+                    (pos, Box::new(stats) as Box<dyn SampleStats>)
+                })
+            })
+        );
+        Ok(
+            PySampler {
+                sampler
+            }
+        )
+    }
+
     #[new]
     unsafe fn new<'py>(
         py: Python<'py>,
@@ -233,6 +344,7 @@ impl PySampler {
             Some(val) => {
                 let (pos, stats) = val.map_err(|e| PyValueError::new_err(format!("Could not retrieve next draw: {}", e)))?;
                 Python::with_gil(|py| {
+                    //py.check_signals()?;
                     Ok(Some((numpy::PyArray1::from_vec(py, pos.into()).into(), PySampleStats { stats })))
                 })
             },
@@ -240,36 +352,6 @@ impl PySampler {
         }
     }
 }
-
-/*
-struct PyLogpFunc {
-    pyfunc: PyObject,
-    dim: usize,
-}
-
-impl CpuLogpFunc for PyLogpFunc {
-    type Err = PyErr;
-
-    fn dim(&self) -> usize {
-        self.dim
-    }
-
-    fn logp(&mut self, position: &[f64], gradient: &mut [f64]) -> Result<f64, Self::Err> {
-        Python::with_gil(|py| {
-            let out = numpy::PyArray1::from_slice(py, gradient);
-            let pos = numpy::PyArray1::from_slice(py, position);
-            let logp = self.pyfunc.call1(py, (pos, out))?;
-            Ok(logp.extract::<f64>(py)?)
-        })
-    }
-}
-
-impl PyLogpFunc {
-    fn new(pyfunc: PyObject, dim: usize) -> PyLogpFunc {
-        PyLogpFunc { pyfunc, dim }
-    }
-}
-*/
 
 #[pyclass]
 #[derive(Clone, Default)]
@@ -295,6 +377,26 @@ impl PySamplerArgs {
     }
 
     #[getter]
+    fn variance_decay(&self) -> f64 {
+        self.inner.mass_matrix_adapt.variance_decay
+    }
+
+    #[setter(variance_decay)]
+    fn set_variance_decay(&mut self, val: f64) {
+        self.inner.mass_matrix_adapt.variance_decay = val;
+    }
+
+    #[getter]
+    fn window_switch_freq(&self) -> u64 {
+        self.inner.mass_matrix_adapt.window_switch_freq
+    }
+
+    #[setter(window_switch_freq)]
+    fn set_window_switch_freq(&mut self, val: u64) {
+        self.inner.mass_matrix_adapt.window_switch_freq = val;
+    }
+
+    #[getter]
     fn initial_step(&self) -> f64 {
         self.inner.step_size_adapt.initial_step
     }
@@ -315,6 +417,16 @@ impl PySamplerArgs {
     }
 
     #[getter]
+    fn discard_window(&self) -> u64 {
+        self.inner.mass_matrix_adapt.discard_window
+    }
+
+    #[setter(discard_window)]
+    fn set_discard_window(&mut self, val: u64) {
+        self.inner.mass_matrix_adapt.discard_window = val;
+    }
+
+    #[getter]
     fn max_energy_error(&self) -> f64 {
         self.inner.max_energy_error
     }
@@ -322,6 +434,16 @@ impl PySamplerArgs {
     #[setter(energy_error)]
     fn set_max_energy_error(&mut self, val: f64) {
         self.inner.max_energy_error = val
+    }
+
+    #[getter]
+    fn stop_adapt_at_draw(&self) -> u64 {
+        self.inner.mass_matrix_adapt.stop_at_draw
+    }
+
+    #[setter(stop_adapt_at_draw)]
+    fn set_stop_adapt_at_draw(&mut self, val: u64) {
+        self.inner.mass_matrix_adapt.stop_at_draw = val;
     }
 
     #[setter(target_accept)]
