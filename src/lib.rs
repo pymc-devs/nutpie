@@ -387,6 +387,16 @@ impl PySamplerArgs {
     }
 
     #[getter]
+    fn early_variance_decay(&self) -> f64 {
+        self.inner.mass_matrix_adapt.early_variance_decay
+    }
+
+    #[setter(early_variance_decay)]
+    fn set_early_variance_decay(&mut self, val: f64) {
+        self.inner.mass_matrix_adapt.early_variance_decay = val;
+    }
+
+    #[getter]
     fn window_switch_freq(&self) -> u64 {
         self.inner.mass_matrix_adapt.window_switch_freq
     }
@@ -454,6 +464,16 @@ impl PySamplerArgs {
     #[getter]
     fn target_accept(&self) -> f64 {
         self.inner.step_size_adapt.target
+    }
+
+    #[getter]
+    fn save_mass_matrix(&self) -> bool {
+        self.inner.mass_matrix_adapt.save_mass_matrix
+    }
+
+    #[setter(save_mass_matrix)]
+    fn set_save_mass_matrix(&mut self, val: bool) {
+        self.inner.mass_matrix_adapt.save_mass_matrix = val;
     }
 }
 
