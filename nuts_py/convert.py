@@ -235,6 +235,7 @@ def sample(
         "step_size": np.float64,
         "step_size_bar": np.float64,
         "mean_tree_accept": np.float64,
+        "n_steps": np.int64,
     }
 
     # This is actually relatively slow, we should be able to speed this up

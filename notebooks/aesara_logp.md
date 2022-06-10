@@ -85,7 +85,7 @@ with threadpoolctl.threadpool_limits(1):
             idata_kwargs={"log_likelihood": False},
             compute_convergence_checks=False,
             target_accept=0.8,
-            #max_treedepth=10,
+            #max_treedepth=6,
             discard_tuned_samples=False,
         )
 ```
@@ -195,9 +195,9 @@ def make_user_data():
 
 settings = nuts_py.lib.PySamplerArgs()
 settings.num_tune = 1000
-settings.maxdepth = 10
 settings.target_accept = 0.8
 settings.save_mass_matrix = True
+settings.discard_window = 100
 
 x = np.random.default_rng(42).normal(size=n_dim)
 ```
@@ -219,16 +219,8 @@ plt.plot(np.log([stat.as_dict()["step_size_bar"] for stat in stats])[:60])
 ```
 
 ```python
-mass_matrix = np.array([stat.as_dict()["current_mass_matrix_inv_diag"] for stat in stats])[:50, :]
-plt.plot(np.log(mass_matrix)[:20], color="C0");
-```
-
-```python
-plt.plot(([stat.as_dict()["index_in_trajectory"] for stat in stats])[:60])
-```
-
-```python
-plt.plot([np.log(stat.as_dict()["step_size_bar"]) for stat in stats])
+mass_matrix = np.array([stat.as_dict()["current_mass_matrix_inv_diag"] for stat in stats])[:500, :]
+plt.plot(np.log(mass_matrix)[:500]);
 ```
 
 ```python
@@ -249,14 +241,25 @@ for _ in range(1):
             n_tune=1000,
             n_draws=1000,
             n_chains=n_chains,
-            seed=8,
             target_accept=0.8,
-            discard_window=0
+            early_target_accept=0.2,
+            seed=42,
+            variance_decay=0.01,
+            #window_switch_freq=20,
+            #early_variance_decay=0.5,
         )
 ```
 
 ```python
-np.log(trace_rust.warmup_sample_stats.step_size_bar.isel(draw=slice(0, 500))).plot(x="draw", hue="chain", add_legend=False);
+trace_rust.sample_stats.diverging.sum().values
+```
+
+```python
+np.log(trace_rust.warmup_sample_stats.step_size_bar.isel(draw=slice(0, 1000))).plot(x="draw", hue="chain", add_legend=False);
+```
+
+```python
+trace_rust.warmup_sample_stats.mean_tree_accept.rolling(draw=20).mean().plot.line(x="draw", add_legend=False);
 ```
 
 ```python
@@ -264,11 +267,30 @@ trace_rust.warmup_posterior.eps.isel(draw=slice(0, 100)).plot(x="draw", hue="cha
 ```
 
 ```python
-trace_rust.warmup_sample_stats.depth.isel(draw=slice(0, 100)).plot(x="draw", hue="chain", add_legend=False);
+plt.plot((trace_rust.warmup_sample_stats.n_steps).isel(draw=slice(0, 1000)).cumsum("draw").T, trace_rust.warmup_sample_stats.energy.isel(draw=slice(0, 1000)).T);
+plt.xlim(0, 1000)
 ```
 
 ```python
-trace_rust.warmup_sample_stats.mean_tree_accept.isel(draw=slice(None, 100)).plot(x="draw", hue="chain", add_legend=False);
+plt.plot((trace_py.warmup_sample_stats.n_steps).isel(draw=slice(0, 1000)).cumsum("draw").T, trace_py.warmup_sample_stats.energy.isel(draw=slice(0, 1000)).T);
+plt.xlim(0, 1000)
+```
+
+```python
+plt.plot((trace_py2.warmup_sample_stats.n_steps).isel(draw=slice(0, 1000)).cumsum("draw").T, trace_py2.warmup_sample_stats.energy.isel(draw=slice(0, 1000)).T);
+plt.xlim(0, 1000)
+```
+
+```python
+plt.plot((2 ** trace_rust.warmup_sample_stats.depth).isel(draw=slice(0, 100)).cumsum("draw").T, np.log(trace_rust.warmup_sample_stats.step_size_bar.isel(draw=slice(0, 100))).T);
+```
+
+```python
+trace_rust.warmup_sample_stats.logp.isel(draw=slice(0, 100)).plot(x="draw", hue="chain", add_legend=False);
+```
+
+```python
+trace_rust.warmup_posterior.eps.isel(draw=slice(0, 100)).plot(x="draw", hue="chain", add_legend=False);
 ```
 
 ```python
@@ -286,15 +308,15 @@ ess_rust = arviz.ess(trace_rust)
 ```
 
 ```python
-(2 ** trace_py.warmup_sample_stats.tree_depth).sum()
+(trace_py.warmup_sample_stats.n_steps).sum() / n_chains
 ```
 
 ```python
-(2 ** trace_py2.warmup_sample_stats.tree_depth).sum()
+(trace_py2.warmup_sample_stats.n_steps).sum() / n_chains
 ```
 
 ```python
-(2 ** trace_rust.warmup_sample_stats.depth).sum()
+(trace_rust.warmup_sample_stats.n_steps).sum() / n_chains
 ```
 
 ```python
@@ -307,4 +329,8 @@ ess_py.min()
 
 ```python
 ess_py2.min()
+```
+
+```python
+
 ```

@@ -397,6 +397,16 @@ impl PySamplerArgs {
     }
 
     #[getter]
+    fn use_grad_init(&self) -> bool {
+        self.inner.mass_matrix_adapt.grad_init
+    }
+
+    #[setter(use_grad_init)]
+    fn set_use_grad_init(&mut self, val: bool) {
+        self.inner.mass_matrix_adapt.grad_init = val;
+    }
+
+    #[getter]
     fn window_switch_freq(&self) -> u64 {
         self.inner.mass_matrix_adapt.window_switch_freq
     }
@@ -408,12 +418,12 @@ impl PySamplerArgs {
 
     #[getter]
     fn initial_step(&self) -> f64 {
-        self.inner.step_size_adapt.initial_step
+        self.inner.step_size_adapt.params.initial_step
     }
 
     #[setter(initial_step)]
     fn set_initial_step(&mut self, val: f64) {
-        self.inner.step_size_adapt.initial_step = val
+        self.inner.step_size_adapt.params.initial_step = val
     }
 
     #[getter]
@@ -447,23 +457,33 @@ impl PySamplerArgs {
     }
 
     #[getter]
-    fn stop_adapt_at_draw(&self) -> u64 {
-        self.inner.mass_matrix_adapt.stop_at_draw
+    fn mass_matrix_final_window(&self) -> u64 {
+        self.inner.mass_matrix_adapt.final_window
     }
 
-    #[setter(stop_adapt_at_draw)]
-    fn set_stop_adapt_at_draw(&mut self, val: u64) {
-        self.inner.mass_matrix_adapt.stop_at_draw = val;
+    #[setter(mass_matrix_final_window)]
+    fn set_mass_matrix_final_window(&mut self, val: u64) {
+        self.inner.mass_matrix_adapt.final_window = val;
     }
 
     #[setter(target_accept)]
     fn set_target_accept(&mut self, val: f64) {
-        self.inner.step_size_adapt.target = val;
+        self.inner.step_size_adapt.target_accept = val;
     }
 
     #[getter]
     fn target_accept(&self) -> f64 {
-        self.inner.step_size_adapt.target
+        self.inner.step_size_adapt.target_accept
+    }
+
+    #[getter]
+    fn early_target_accept(&self) -> f64 {
+        self.inner.step_size_adapt.early_target_accept
+    }
+
+    #[setter(early_target_accept)]
+    fn set_early_target_accept(&mut self, val: f64) {
+        self.inner.step_size_adapt.early_target_accept = val;
     }
 
     #[getter]
