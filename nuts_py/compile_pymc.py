@@ -1,19 +1,67 @@
-import pymc as pm
+from math import prod
+
 import aesara
 import aesara.tensor as at
+import pymc as pm
 import numpy as np
-from math import prod
 import numba
-import fastprogress
-import arviz
+import aeppl
+from aeppl.logprob import CheckParameterValue
+import aesara.link.numba.dispatch
 
-from . import lib
+from .sample import CompiledModel
+
+# Provide a numba implementation for CheckParameterValue, which doesn't exist in aesara
+@aesara.link.numba.dispatch.numba_funcify.register(CheckParameterValue)
+def numba_functify_CheckParameterValue(op, **kwargs):
+    @aesara.link.numba.dispatch.basic.numba_njit
+    def check(value, *conditions):
+        return value
+    
+    return check
+
+# Overwrite the IncSubtensor op from aesara, see https://github.com/aesara-devs/aesara/issues/603
+@aesara.link.numba.dispatch.numba_funcify.register(at.subtensor.AdvancedIncSubtensor1)
+def numba_funcify_IncSubtensor(op, node, **kwargs):
+
+    def incsubtensor_fn(z, vals, idxs):
+        z = z.copy()
+        for idx, val in zip(idxs, vals):
+            z[idx] += val
+        return z
+
+    return aesara.link.numba.dispatch.basic.numba_njit(incsubtensor_fn)
 
 
-def compute_shapes(model):
+
+def compile_pymc_model(model, **kwargs):
+    n_dim, logp_func, expanding_function, shape_info = _make_functions(model)
+    logp_func = numba.njit(**kwargs)(logp_func)
+    logp_numba_raw, c_sig = _make_c_logp_func(n_dim, logp_func)
+    logp_numba = numba.cfunc(c_sig, **kwargs)(logp_numba_raw)
+
+    def expand_draw(x):
+        return expanding_function(x)[0]
+
+    def make_user_data():
+        return 0
+
+    return CompiledModel(
+        model,
+        n_dim,
+        logp_numba.address,
+        expand_draw,
+        make_user_data,
+        shape_info,
+        model.RV_dims,
+        model.coords,
+        logp_numba,
+    )
+
+
+def _compute_shapes(model):
     point = pm.model.make_initial_point_fn(model=model, return_transformed=True)(0)
 
-    value_vars = model.value_vars.copy()
     trace_vars = {
         name: var
         for (name, var) in model.named_vars.items()
@@ -37,8 +85,8 @@ def compute_shapes(model):
     return {name: shape for name, shape in zip(trace_vars.keys(), shape_func())}
 
 
-def make_functions(model):
-    shapes = compute_shapes(model)
+def _make_functions(model):
+    shapes = _compute_shapes(model)
 
     # Make logp_dlogp_function
     joined = at.dvector("__joined_variables")
@@ -119,7 +167,7 @@ def make_functions(model):
     )
 
 
-def make_c_logp_func(N, logp_func):
+def _make_c_logp_func(N, logp_func):
     c_sig = numba.types.int64(
         numba.types.uint64,
         numba.types.CPointer(numba.types.double),
@@ -159,109 +207,4 @@ def make_c_logp_func(N, logp_func):
         except Exception:
             return 1
 
-    # logp_numba.compile()
     return logp_numba, c_sig
-
-
-def sample(
-    model,
-    *,
-    N,
-    logp_numba,
-    expanding_function,
-    shape_info,
-    n_tune,
-    n_draws,
-    n_chains,
-    seed=42,
-    max_treedepth=10,
-    target_accept=0.8,
-    **kwargs,
-):
-    def make_user_data():
-        return 0
-
-    settings = lib.PySamplerArgs()
-    settings.num_tune = n_tune
-    settings.maxdepth = max_treedepth
-    settings.target_accept = target_accept
-
-    for name, val in kwargs.items():
-        setattr(settings, name, val)
-
-    x = np.random.randn(N)
-    sampler = lib.PyParallelSampler(
-        logp_numba.address,
-        make_user_data,
-        N,
-        x,
-        settings,
-        n_chains=n_chains,
-        n_draws=n_draws,
-        seed=seed,
-        n_try_init=10,
-    )
-
-    try:
-        n_expanded = len(expanding_function(x)[0])
-        draws = np.full((n_chains, n_draws + n_tune, n_expanded), np.nan)
-        infos = []
-        for draw, info in fastprogress.progress_bar(
-            sampler, total=n_chains * (n_draws + n_tune)
-        ):
-            infos.append(info)
-            draws[info.chain, info.draw, :] = expanding_function(draw)[0]
-    finally:
-        sampler.finalize()
-
-    trace_dict = {}
-    trace_dict_tune = {}
-    for name, slice_, shape in zip(*shape_info):
-        trace_dict_tune[name] = draws[:, :n_tune, slice_].reshape(
-            (n_chains, n_tune) + tuple(shape)
-        )
-        trace_dict[name] = draws[:, n_tune:, slice_].reshape(
-            (n_chains, n_draws) + tuple(shape)
-        )
-
-    stat_dtypes = {
-        "index_in_trajectory": np.int64,
-        "mean_tree_accept": np.float64,
-        "depth": np.int64,
-        "maxdepth_reached": bool,
-        "logp": np.float64,
-        "energy": np.float64,
-        "diverging": bool,
-        "step_size": np.float64,
-        "step_size_bar": np.float64,
-        "mean_tree_accept": np.float64,
-        "n_steps": np.int64,
-    }
-
-    # This is actually relatively slow, we should be able to speed this up
-    stats = {}
-    stats_tune = {}
-    for name, dtype in stat_dtypes.items():
-        stats[name] = np.zeros((n_chains, n_draws), dtype=dtype)
-        stats_tune[name] = np.zeros((n_chains, n_tune), dtype=dtype)
-
-    for info in infos:
-        info_dict = info.as_dict()
-        if info.draw < n_tune:
-            out = stats_tune
-            draw = info.draw
-        else:
-            out = stats
-            draw = info.draw - n_tune
-        for name in stat_dtypes:
-            out[name][info.chain, draw] = info_dict[name]
-
-    return arviz.from_dict(
-        posterior=trace_dict,
-        warmup_posterior=trace_dict_tune,
-        save_warmup=True,
-        coords=model.coords,
-        dims={name: list(dims) for name, dims in model._RV_dims.items()},
-        sample_stats=stats,
-        warmup_sample_stats=stats_tune,
-    )

@@ -12,7 +12,7 @@ use thiserror::Error;
 use crossbeam::channel::Receiver;
 
 type GradFunc =
-    unsafe extern "C" fn(usize, *const f64, *mut f64, *mut f64, *const std::ffi::c_void) -> i64;
+    unsafe extern "C" fn(usize, *const f64, *mut f64, *mut f64, *const std::ffi::c_void) -> std::os::raw::c_int;
 type UserData = *const std::ffi::c_void;
 
 #[pyclass]
@@ -86,6 +86,29 @@ impl PySampleStats {
                 SampleStatValue::Bool(val) => {
                     dict.set_item(key, val)
                 },
+                SampleStatValue::String(val) => {
+                    dict.set_item(key, val)
+                },
+                SampleStatValue::OptionF64(val) => {
+                    match val {
+                        Some(val) => {
+                            dict.set_item(key, val)
+                        },
+                        None => {
+                            dict.set_item(key, py.None())
+                        }
+                    }
+                }
+                SampleStatValue::OptionI64(val) => {
+                    match val {
+                        Some(val) => {
+                            dict.set_item(key, val)
+                        },
+                        None => {
+                            dict.set_item(key, py.None())
+                        }
+                    }
+                }
             }
         }).collect();
         results?;
@@ -100,8 +123,9 @@ struct PtrLogpFunc {
     user_data_init_fn: Py<PyFunction>,
 }
 
-
+// Make a better interface that defines the exact expected behavior
 unsafe impl Send for PtrLogpFunc {}
+unsafe impl Sync for PtrLogpFunc {}
 
 impl Clone for PtrLogpFunc {
     fn clone(&self) -> Self {
@@ -123,10 +147,11 @@ impl Clone for PtrLogpFunc {
 }
 
 #[derive(Error, Debug)]
-struct ErrorCode(i64);
+struct ErrorCode(std::os::raw::c_int);
 
 impl LogpError for ErrorCode {
     fn is_recoverable(&self) -> bool {
+        assert!(self.0 > 0, "{}", self.0);
         self.0 > 0
     }
 }
@@ -279,7 +304,7 @@ impl PySampler {
             draws,
             chain,
             seed
-        ).map_err(|_| PyValueError::new_err(format!("Logp failed at initial location")))?;
+        ).map_err(|e| PyValueError::new_err(format!("Logp failed at initial location. Error was {}", e)))?;
         let sampler = Box::new(
             draws.map(|draw| {
                 draw.map(|(pos, stats)| {
@@ -320,7 +345,7 @@ impl PySampler {
             draws,
             chain,
             seed
-        ).map_err(|_| PyValueError::new_err(format!("Logp failed at initial location")))?;
+        ).map_err(|e| PyValueError::new_err(format!("Logp failed at initial location. Error was {}", e)))?;
         let sampler = Box::new(
             draws.map(|draw| {
                 draw.map(|(pos, stats)| {
@@ -437,13 +462,13 @@ impl PySamplerArgs {
     }
 
     #[getter]
-    fn discard_window(&self) -> u64 {
-        self.inner.mass_matrix_adapt.discard_window
+    fn store_gradient(&self) -> bool {
+        self.inner.store_gradient
     }
 
-    #[setter(discard_window)]
-    fn set_discard_window(&mut self, val: u64) {
-        self.inner.mass_matrix_adapt.discard_window = val;
+    #[setter(store_gradient)]
+    fn set_store_gradient(&mut self, val: bool) {
+        self.inner.store_gradient = val;
     }
 
     #[getter]
@@ -464,6 +489,16 @@ impl PySamplerArgs {
     #[setter(mass_matrix_final_window)]
     fn set_mass_matrix_final_window(&mut self, val: u64) {
         self.inner.mass_matrix_adapt.final_window = val;
+    }
+
+    #[getter]
+    fn step_size_final_window_ratio(&self) -> f64 {
+        self.inner.step_size_adapt.final_window_ratio
+    }
+
+    #[setter(step_size_final_window_ratio)]
+    fn set_step_size_final_window(&mut self, val: f64) {
+        self.inner.step_size_adapt.final_window_ratio = val;
     }
 
     #[setter(target_accept)]
@@ -526,7 +561,7 @@ impl PyParallelSampler {
         })?;
 
         let func = unsafe { PtrLogpFunc::new(func, user_data as UserData, dim, user_data_init_fn) };
-        let mut init_point_func = JitterInitFunc::new();  // TODO use start_point
+        let mut init_point_func = JitterInitFunc::new_with_mean(start_point.as_slice()?.into());
 
         let (handle, channel) = sample_parallel(
             func,
