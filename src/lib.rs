@@ -526,7 +526,7 @@ impl PySamplerArgs {
         self.inner.mass_matrix_adapt.store_mass_matrix
     }
 
-    #[setter(save_mass_matrix)]
+    #[setter(store_mass_matrix)]
     fn set_store_mass_matrix(&mut self, val: bool) {
         self.inner.mass_matrix_adapt.store_mass_matrix = val;
     }
