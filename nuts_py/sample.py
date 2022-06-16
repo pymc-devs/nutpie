@@ -31,7 +31,8 @@ def sample(
     chains: int = 4,
     seed: int = 42,
     num_try_init=100,
-    save_warmup=True,
+    save_warmup: bool = True,
+    store_divergences: bool = False,
     **kwargs,
 ):
     settings = lib.PySamplerArgs()
@@ -58,11 +59,19 @@ def sample(
         draws_data = np.full((chains, draws + tune, n_expanded), np.nan)
         infos = []
         try:
-            for draw, info in fastprogress.progress_bar(
-                sampler, total=chains * (draws + tune)
-            ):
+            bar = fastprogress.progress_bar(
+                sampler,  total=chains * (draws + tune)
+            )
+            num_divs = 0
+            chains_finished = 0
+            for draw, info in bar:
                 infos.append(info)
                 draws_data[info.chain, info.draw, :] = compiled_model.expand_draw(draw)
+                if info.draw == draws + tune - 1:
+                    chains_finished += 1
+                if info.is_diverging and info.draw > tune:
+                    num_divs += 1
+                bar.comment = f" Chains finished: {chains_finished}, Divergences: {num_divs}"
         except KeyboardInterrupt:
             pass
         return draws_data, infos
@@ -99,10 +108,16 @@ def sample(
         "n_steps": ((), np.int64),
     }
 
+    # Sampler statistics that do not have extra dimensions
+    simple_stats = list(stat_dtypes.keys())
+
     if settings.save_mass_matrix:
         stat_dtypes["current_mass_matrix_inv_diag"] = (("unconstrained_parameter",), np.float64)
     if settings.store_gradient:
         stat_dtypes["gradient"] = (("unconstrained_parameter",), np.float64)
+    if store_divergences:
+        stat_dtypes["divergence_start"] = (("unconstrained_parameter",), np.float64)
+        stat_dtypes["divergence_end"] = (("unconstrained_parameter",), np.float64)
 
     dim_to_length = {
         "unconstrained_parameter": compiled_model.n_dim,
@@ -112,8 +127,12 @@ def sample(
     stats_tune = {}
     for name, (dims, dtype) in stat_dtypes.items():
         shapes = tuple(dim_to_length[name] for name in dims)
-        stats[name] = np.zeros((chains, draws) + shapes, dtype=dtype)
-        stats_tune[name] = np.zeros((chains, tune) + shapes, dtype=dtype)
+        if dtype == np.float64:
+            value = np.nan
+        else:
+            value = 0
+        stats[name] = np.full((chains, draws) + shapes, value, dtype=dtype)
+        stats_tune[name] = np.full((chains, tune) + shapes, value, dtype=dtype)
 
     for info in infos:
         info_dict = info.as_dict()
@@ -124,7 +143,8 @@ def sample(
             out = stats
             draw = info.draw - tune
         for name in stat_dtypes:
-            out[name][info.chain, draw] = info_dict[name]
+            if name in info_dict:
+                out[name][info.chain, draw] = info_dict[name]
 
     trace = arviz.from_dict(
         posterior=trace_dict,
@@ -132,8 +152,21 @@ def sample(
         save_warmup=save_warmup,
         coords=compiled_model.coords,
         dims={name: list(dim) for name, dim in compiled_model.dims.items()},
-        sample_stats=stats,
-        warmup_sample_stats=stats_tune,
+        sample_stats={name: stats[name] for name in simple_stats},
+        warmup_sample_stats={name: stats_tune[name] for name in simple_stats},
     )
+
+    for name in stats:
+        if name in simple_stats:
+            continue
+        trace.sample_stats[name] = (
+            ("chain", "draw") + stat_dtypes[name][0],
+            stats[name]
+        )
+        if save_warmup:
+            trace.warmup_sample_stats[name] = (
+                ("chain", "draw") + stat_dtypes[name][0],
+                stats_tune[name]
+            )
     
     return trace

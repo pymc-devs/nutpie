@@ -34,7 +34,7 @@ def compile_stan_model(
     if cache and not extra_compile_args:
         try:
             lib = httpstan.models.import_services_extension_module(model_id)
-        except FileNotFoundError:
+        except (FileNotFoundError, KeyError):
             pass
     if lib is None:
         output = httpstan.models.build_services_extension_module_sync(code, extra_compile_args)
@@ -76,5 +76,5 @@ def compile_stan_model(
         shape_info,
         dims,
         coords,
-        lib,
+        (lib, data),
     )
