@@ -5,7 +5,6 @@ import aesara.tensor as at
 import pymc as pm
 import numpy as np
 import numba
-import aeppl
 from aeppl.logprob import CheckParameterValue
 import aesara.link.numba.dispatch
 

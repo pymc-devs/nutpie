@@ -13,9 +13,11 @@ jupyter:
     name: pymc4-dev
 ---
 
+# Usage example of nutpie
+
 ```python
+# We can control the number cores that are used by an environment variable:
 %env RAYON_NUM_THREADS=12
-%env RUST_BACKTRACE=1
 ```
 
 ```python
@@ -23,314 +25,314 @@ import aesara
 import aesara.tensor as at
 import pymc as pm
 import numpy as np
-import nuts_py
-import numba
-from math import prod
-import fastprogress
+import nutpie
 import arviz
 import pandas as pd
-import threadpoolctl
-import nuts_py.convert
-from scipy import optimize, stats
-import matplotlib.pyplot as plt
 import seaborn as sns
+import matplotlib.pyplot as plt
 ```
+
+## The dataset
+
+We use the well known radon dataset in this notebook.
 
 ```python
 data = pd.read_csv(pm.get_data("radon.csv"))
-county_names = data.county.unique()
-
 data["log_radon"] = data["log_radon"].astype(np.float64)
 county_idx, counties = pd.factorize(data.county)
 coords = {"county": counties, "obs_id": np.arange(len(county_idx))}
 ```
 
 ```python
-with pm.Model(coords=coords, check_bounds=False) as model:
-    # Intercepts, non-centered
-    mu_a = pm.Normal("mu_a", mu=0.0, sigma=10)
-    sigma_a = pm.HalfNormal("sigma_a", 1.0)
-    a = pm.Normal("a", dims="county") * sigma_a + mu_a
+sns.catplot(
+    data=data,
+    x="floor",
+    y="log_radon",
+)
+```
 
-    # Slopes, non-centered
-    
-    mu_b = pm.Normal("mu_b", mu=0.0, sigma=2.)
-    sigma_b = pm.HalfNormal("sigma_b", 1.0)
-    b = pm.Normal("b", dims="county") * sigma_b + mu_b
+## Use as a sampler for pymc
 
-    eps = pm.HalfNormal("eps", 1.5)
+```python
+with pm.Model(coords=coords, check_bounds=False) as pymc_model:
+    intercept = pm.Normal("intercept", sigma=10)
 
-    radon_est = a[county_idx] + b[county_idx] * data.floor.values
-    #radon_est = a[0] + b[0] * data.floor.values
+    # County effects
+    # TODO should be a CenteredNormal
+    raw = pm.Normal("county_raw", dims="county")
+    sd = pm.HalfNormal("county_sd")
+    county_effect = pm.Deterministic("county_effect", raw * sd, dims="county")
 
-    radon_like = pm.Normal(
-        "radon_like", mu=radon_est, sigma=eps, observed=data.log_radon.values,
-        dims="obs_id"
+    # Global floor effect
+    floor_effect = pm.Normal("floor_effect", sigma=2)
+
+    # County:floor interaction
+    # Should also be a CenteredNormal
+    raw = pm.Normal("county_floor_raw", dims="county")
+    sd = pm.HalfNormal("county_floor_sd")
+    county_floor_effect = pm.Deterministic(
+        "county_floor_effect", raw * sd, dims="county"
+    )
+
+    mu = (
+        intercept
+        + county_effect[county_idx]
+        + floor_effect * data.floor.values
+        + county_floor_effect[county_idx] * data.floor.values
+    )
+
+    sigma = pm.HalfNormal("sigma", sigma=1.5)
+    pm.Normal(
+        "log_radon", mu=mu, sigma=sigma, observed=data.log_radon.values, dims="obs_id"
     )
 ```
 
 ```python
-n_chains = 10
+%%time
+# The compilation time is pretty bad right now, I think this can be improved a lot though
+compiled_model = nutpie.compile_pymc_model(pymc_model)
 ```
 
 ```python
 %%time
-with threadpoolctl.threadpool_limits(1):
-    with model:
-        trace_py = pm.sample(
-            init="jitter+adapt_diag_grad",
-            draws=1000,
-            chains=n_chains,
-            cores=10,
-            idata_kwargs={"log_likelihood": False},
-            compute_convergence_checks=False,
-            target_accept=0.8,
-            #max_treedepth=6,
-            discard_tuned_samples=False,
-        )
+trace_pymc = nutpie.sample(compiled_model, chains=10)
 ```
 
 ```python
-%%time
-with threadpoolctl.threadpool_limits(1):
-    with model:
-        trace_py2 = pm.sample(
-            init="jitter+adapt_diag",
-            draws=1000,
-            chains=n_chains,
-            cores=10,
-            idata_kwargs={"log_likelihood": False},
-            compute_convergence_checks=False,
-            target_accept=0.8,
-            #max_treedepth=10,
-            discard_tuned_samples=False,
-        )
+sns.catplot(
+    data=(
+        (trace_pymc.posterior.county_floor_effect + trace_pymc.posterior.floor_effect)
+        .isel(county=slice(0, 5))
+        .to_dataframe("total_county_floor_effect")
+        .reset_index()
+    ),
+    x="total_county_floor_effect",
+    y="county",
+    kind="violin",
+    orient="h",
+)
+plt.axvline(0, color="grey", alpha=0.5, zorder=-100)
 ```
 
-```python
-from aesara import config
-```
+## Use nutpie as a sampling backend for stan
 
 ```python
-config.numba__error_model = "numpy"
-config.numba__nogil = True
-config.numba__cache = False
-config.numba__boundscheck = True
-config.numba__fastmath = True
-config.numba__parallel = False
-```
+%%file radon_model.stan
+data {
+    int<lower=0> n_counties;
+    int<lower=0> n_observed; 
+    array[n_observed] int<lower=1,upper=n_counties> county_idx;
+    vector[n_observed] is_floor;
+    vector[n_observed] log_radon;
+} 
+parameters {
+    real intercept;
+    
+    vector[n_counties] county_raw;
+    real<lower=0> county_sd;
+    
+    real floor_effect;
+    
+    vector[n_counties] county_floor_raw;
+    real<lower=0> county_floor_sd;
+    
+    real<lower=0> sigma;
+} 
+transformed parameters {
+    vector[n_counties] county_effect;
+    vector[n_counties] county_floor_effect;
+    vector[n_observed] mu;
 
-```python
-kwargs = {
-    "error_model": config.numba__error_model,
-    "nogil": config.numba__nogil,
-    "boundscheck": config.numba__boundscheck,
-    "fastmath": config.numba__fastmath,
-    "parallel": config.numba__parallel,
+    county_effect = county_sd * county_raw;
+    county_floor_effect = county_floor_sd * county_floor_raw;
+
+    mu = (
+        intercept
+        + county_effect[county_idx]
+        + floor_effect * is_floor
+        + county_floor_effect[county_idx] .* is_floor
+    );
+}
+model {
+    intercept ~ normal(0, 10);
+    
+    county_raw ~ normal(0, 1);
+    county_sd ~ normal(0, 1);
+    
+    floor_effect ~ normal(0, 2);
+    
+    county_floor_raw ~ normal(0, 1);
+    county_floor_sd ~ normal(0, 1);
+    
+    sigma ~ normal(0, 1.5);
+    
+    log_radon ~ normal(mu, sigma);
 }
 ```
 
 ```python
-import aeppl
-from aeppl.logprob import CheckParameterValue
-import aesara.link.numba.dispatch
+data_stan = {
+    "n_counties": len(counties),
+    "n_observed": len(data),
+    "county_idx": county_idx + 1,
+    "is_floor": data.floor.values,
+    "log_radon": data.log_radon.values,
+}
 
-@aesara.link.numba.dispatch.numba_funcify.register(CheckParameterValue)
-def numba_functify_CheckParameterValue(op, **kwargs):
-    @aesara.link.numba.dispatch.basic.numba_njit
-    def check(value, *conditions):
-        return value
+coords_stan = {
+    "county": counties,
+}
+
+dims_stan = {
+    "county_raw": ("county",),
+    "county_floor_raw": ("county",),
+    "county_effect": ("county",),
+    "county_floor_effect": ("county",),
+    "mu": ("observation",),
+}
+```
+
+```python
+%%time
+stan_model = nutpie.compile_stan_model(
+    data_stan,
+    filename="radon_model.stan",
+    coords=coords_stan,
+    dims=dims_stan,
+    cache=False
+)
+```
+
+```python
+%%time
+trace_stan = nutpie.sample(stan_model, chains=10)
+```
+
+## Comparison with pystan
+
+```python
+import stan
+import nest_asyncio
+
+nest_asyncio.apply()
+```
+
+```python
+%%time
+with open("radon_model.stan", "r") as file:
+    model = stan.build(file.read(), data=data_stan)
+```
+
+```python
+%%time
+trace_pystan = model.sample(num_chains=10, save_warmup=True)
+```
+
+```python
+trace_pystan = arviz.from_pystan(trace_pystan, save_warmup=True)
+```
+
+## Comparison to the pymc sampler
+
+```python
+%%time
+with pymc_model:
+    trace_py = pm.sample(
+        init="jitter+adapt_diag_grad",
+        draws=1000,
+        chains=10,
+        cores=10,
+        idata_kwargs={"log_likelihood": False},
+        compute_convergence_checks=False,
+        target_accept=0.8,
+        discard_tuned_samples=False,
+    )
+```
+
+## Early convergance speed
+
+```python
+plt.plot((trace_pymc.warmup_sample_stats.n_steps).isel(draw=slice(0, 1000)).cumsum("draw").T, np.log(trace_pymc.warmup_sample_stats.energy.isel(draw=slice(0, 1000)).T));
+plt.xlim(0, 10000)
+plt.ylabel("log-energy")
+plt.xlabel("gradient evaluations");
+```
+
+```python
+trace_cmdstan = arviz.from_cmdstan("output_*.csv", save_warmup=True)
+```
+
+```python
+plt.plot((trace_cmdstan.warmup_sample_stats.n_steps).isel(draw=slice(0, 1000)).cumsum("draw").T, np.log(trace_cmdstan.warmup_sample_stats.energy.isel(draw=slice(0, 1000)).T));
+plt.xlim(0, 10000)
+plt.ylabel("log-energy")
+plt.xlabel("gradient evaluations");
+```
+
+The new implementation only use about a third of gradient evaluations during tuning
+
+```python
+trace_cmdstan.warmup_sample_stats.n_steps.sum()
+```
+
+```python
+trace_stan.warmup_sample_stats.n_steps.sum()
+```
+
+## Comparison to cmdstan
+
+
+Run on the commandline:
+```
+env STAN_THREADS=1 cmdstan_model radon_model.stan
+```
+
+```python
+import json
+```
+
+```python
+stan.common.simdjson
+```
+
+```python
+type({name: int(val) if isinstance(val, int) else list(val) for name, val in data_stan.items()}["county_idx"][0])
+```
+
+```python
+data_json = {}
+for name, val in data_stan.items():
+    if isinstance(val, int):
+        data_json[name] = int(val)
+        continue
     
-    return check
-
-@aesara.link.numba.dispatch.numba_funcify.register(aesara.tensor.subtensor.AdvancedIncSubtensor1)
-def numba_funcify_IncSubtensor(op, node, **kwargs):
-
-    def incsubtensor_fn(z, vals, idxs):
-        z = z.copy()
-        for idx, val in zip(idxs, vals):
-            z[idx] += val
-        return z
-
-    return aesara.link.numba.dispatch.basic.numba_njit(incsubtensor_fn)
+    if val.dtype == np.int64:
+        data_json[name] = list(int(x) for x in val)
+        continue
+    
+    data_json[name] = list(val)
+    
+with open("radon.json", "w") as file:
+    json.dump(data_json, file)
 ```
 
 ```python
 %%time
-n_dim, logp_func, expanding_function, shape_info = nuts_py.convert.make_functions(model)
-logp_func = numba.njit(**kwargs)(logp_func)
-logp_numba_raw, c_sig = nuts_py.convert.make_c_logp_func(n_dim, logp_func)
-logp_numba = numba.cfunc(c_sig, **kwargs)(logp_numba_raw)
+out = !./radon_model sample num_chains=10 save_warmup=1 data file=radon.json num_threads=10
 ```
 
 ```python
-x = np.random.randn(n_dim)
+trace_cmdstan = arviz.from_cmdstan("output_*.csv", save_warmup=True)
+```
+
+## Gradient evals per effective sample
+
+nutpie uses fewer gradient evaluations per effective sample in this model.
+
+```python
+trace_cmdstan.sample_stats.n_steps.sum() / arviz.ess(trace_cmdstan).min()
 ```
 
 ```python
-#from numba.pycc import CC
-
-#cc = CC('logp_module')
-#cc.target_cpu = "host"
-#logp_func(np.random.randn(n_dim))
-#cc.export("logp_grad", logp_func.signatures[0])(logp_func)
-#cc.compile()
-
-#import logp_module
-#%timeit logp_module.logp_grad(x)
-```
-
-```python
-optimize.check_grad(lambda x: logp_func(x)[0], lambda x: logp_func(x)[1], x)
-```
-
-```python
-n_draws = 1000
-seed = 40
-```
-
-```python
-def make_user_data():
-    return 0
-
-settings = nuts_py.lib.PySamplerArgs()
-settings.num_tune = 1000
-settings.target_accept = 0.8
-settings.save_mass_matrix = True
-settings.discard_window = 100
-
-x = np.random.default_rng(42).normal(size=n_dim)
-```
-
-```python
-%%time
-draws = []
-tune = []
-stats = []
-for i in range(1):
-    sampler = nuts_py.lib.PySampler(logp_numba.address, make_user_data, x, n_dim, settings, draws=n_draws + settings.num_tune, chain=0, seed=seed + i)
-    for (draw, stat) in sampler:
-        draws.append(draw)
-        stats.append(stat)
-```
-
-```python
-plt.plot(np.log([stat.as_dict()["step_size_bar"] for stat in stats])[:60])
-```
-
-```python
-mass_matrix = np.array([stat.as_dict()["current_mass_matrix_inv_diag"] for stat in stats])[:500, :]
-plt.plot(np.log(mass_matrix)[:500]);
-```
-
-```python
-n_chains = 10
-```
-
-```python
-%%time
-for _ in range(1):
-    with threadpoolctl.threadpool_limits(1):
-        trace_rust = nuts_py.convert.sample(
-            model,
-            N=n_dim,
-            logp_numba=logp_numba,
-            expanding_function=expanding_function,
-            shape_info=shape_info,
-            max_treedepth=10,
-            n_tune=1000,
-            n_draws=1000,
-            n_chains=n_chains,
-            target_accept=0.8,
-            early_target_accept=0.2,
-            seed=42,
-            variance_decay=0.01,
-            #window_switch_freq=20,
-            #early_variance_decay=0.5,
-        )
-```
-
-```python
-trace_rust.sample_stats.diverging.sum().values
-```
-
-```python
-np.log(trace_rust.warmup_sample_stats.step_size_bar.isel(draw=slice(0, 1000))).plot(x="draw", hue="chain", add_legend=False);
-```
-
-```python
-trace_rust.warmup_sample_stats.mean_tree_accept.rolling(draw=20).mean().plot.line(x="draw", add_legend=False);
-```
-
-```python
-trace_rust.warmup_posterior.eps.isel(draw=slice(0, 100)).plot(x="draw", hue="chain", add_legend=False);
-```
-
-```python
-plt.plot((trace_rust.warmup_sample_stats.n_steps).isel(draw=slice(0, 1000)).cumsum("draw").T, trace_rust.warmup_sample_stats.energy.isel(draw=slice(0, 1000)).T);
-plt.xlim(0, 1000)
-```
-
-```python
-plt.plot((trace_py.warmup_sample_stats.n_steps).isel(draw=slice(0, 1000)).cumsum("draw").T, trace_py.warmup_sample_stats.energy.isel(draw=slice(0, 1000)).T);
-plt.xlim(0, 1000)
-```
-
-```python
-plt.plot((trace_py2.warmup_sample_stats.n_steps).isel(draw=slice(0, 1000)).cumsum("draw").T, trace_py2.warmup_sample_stats.energy.isel(draw=slice(0, 1000)).T);
-plt.xlim(0, 1000)
-```
-
-```python
-plt.plot((2 ** trace_rust.warmup_sample_stats.depth).isel(draw=slice(0, 100)).cumsum("draw").T, np.log(trace_rust.warmup_sample_stats.step_size_bar.isel(draw=slice(0, 100))).T);
-```
-
-```python
-trace_rust.warmup_sample_stats.logp.isel(draw=slice(0, 100)).plot(x="draw", hue="chain", add_legend=False);
-```
-
-```python
-trace_rust.warmup_posterior.eps.isel(draw=slice(0, 100)).plot(x="draw", hue="chain", add_legend=False);
-```
-
-```python
-np.log(trace_py.warmup_sample_stats.step_size_bar).isel(draw=slice(None, 500)).plot(x="draw", hue="chain", add_legend=False);
-```
-
-```python
-np.log(trace_py2.warmup_sample_stats.step_size_bar).isel(draw=slice(None, 500)).plot(x="draw", hue="chain", add_legend=False);
-```
-
-```python
-ess_py = arviz.ess(trace_py)
-ess_py2 = arviz.ess(trace_py2)
-ess_rust = arviz.ess(trace_rust)
-```
-
-```python
-(trace_py.warmup_sample_stats.n_steps).sum() / n_chains
-```
-
-```python
-(trace_py2.warmup_sample_stats.n_steps).sum() / n_chains
-```
-
-```python
-(trace_rust.warmup_sample_stats.n_steps).sum() / n_chains
-```
-
-```python
-ess_rust.min()
-```
-
-```python
-ess_py.min()
-```
-
-```python
-ess_py2.min()
-```
-
-```python
-
+trace_stan.sample_stats.n_steps.sum() / arviz.ess(trace_stan).min()
 ```

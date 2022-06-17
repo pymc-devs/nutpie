@@ -1,5 +1,5 @@
 [package]
-name = "nuts-py"
+name = "nutpie"
 version = "0.1.0"
 authors = ["Adrian Seyboldt <adrian.seyboldt@gmail.com>"]
 edition = "2021"
@@ -10,13 +10,11 @@ default = ["extension-module"]
 simd_support = ["nuts-rs/simd_support"]
 
 [lib]
-name = "nuts_py"
+name = "nutpie"
 crate-type = ["cdylib"]
-#features = ["extension-module"]
 
 [dependencies]
-nuts-rs = { path = "../nuts-rs" }
-#tvm = { path = "../tvm/rust/tvm" }
+nuts-rs = "0.2"
 numpy = "0.16.2"
 ndarray = "0.15.4"
 rand = "0.8.5"
@@ -31,16 +29,11 @@ features = ["extension-module", "auto-initialize"]
 criterion = "0.3.5"
 
 [profile.release]
-#panic = "abort"
-debug = 2
+debug = true
 lto = "fat"
 codegen-units = 1
-opt-level = 2
+opt-level = 3
 
 [profile.bench]
 debug = true
 lto = "fat"
-
-#[[bench]]
-#name = "run_tvm_leapfrog"
-#harness = false

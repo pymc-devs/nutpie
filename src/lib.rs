@@ -660,7 +660,7 @@ impl PyParallelSampler {
 
 /// A Python module implemented in Rust.
 #[pymodule]
-fn nuts_py(_py: Python, m: &PyModule) -> PyResult<()> {
+fn nutpie(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<PySampler>()?;
     m.add_class::<PyParallelSampler>()?;
     m.add_class::<PySamplerArgs>()?;

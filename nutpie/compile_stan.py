@@ -1,7 +1,5 @@
 from math import prod
 
-import httpstan.models
-
 from .sample import CompiledModel
 
 
@@ -16,6 +14,8 @@ def compile_stan_model(
     dims=None,
     coords=None,
 ):
+    import httpstan.models
+
     if dims is None:
         dims = {}
     if coords is None:

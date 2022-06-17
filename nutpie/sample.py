@@ -63,15 +63,15 @@ def sample(
                 sampler,  total=chains * (draws + tune)
             )
             num_divs = 0
-            chains_finished = 0
+            chains_tuning = chains
             for draw, info in bar:
                 infos.append(info)
                 draws_data[info.chain, info.draw, :] = compiled_model.expand_draw(draw)
-                if info.draw == draws + tune - 1:
-                    chains_finished += 1
+                if info.draw == tune - 1:
+                    chains_tuning -= 1
                 if info.is_diverging and info.draw > tune:
                     num_divs += 1
-                bar.comment = f" Chains finished: {chains_finished}, Divergences: {num_divs}"
+                bar.comment = f" Chains in warmup: {chains_tuning}, Divergences: {num_divs}"
         except KeyboardInterrupt:
             pass
         return draws_data, infos
@@ -111,8 +111,8 @@ def sample(
     # Sampler statistics that do not have extra dimensions
     simple_stats = list(stat_dtypes.keys())
 
-    if settings.save_mass_matrix:
-        stat_dtypes["current_mass_matrix_inv_diag"] = (("unconstrained_parameter",), np.float64)
+    if settings.store_mass_matrix:
+        stat_dtypes["mass_matrix_inv"] = (("unconstrained_parameter",), np.float64)
     if settings.store_gradient:
         stat_dtypes["gradient"] = (("unconstrained_parameter",), np.float64)
     if store_divergences:
