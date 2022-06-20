@@ -4,12 +4,15 @@ on:
   push:
   pull_request:
 
+env:
+  PYTHON_VERSION: "3.9"
+
 jobs:
   macos:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v2
-      - uses: actions/setup-python@v2
+      - uses: actions/setup-python@v4
         with:
           python-version: 3.9
           architecture: x64
@@ -23,24 +26,21 @@ jobs:
         uses: messense/maturin-action@v1
         with:
           target: x86_64
-          command: develop
-          args: --release
+          args: --release --out dist --no-sdist -i python
       - name: Install built wheel - x86_64
         run: |
+          pip install dist/nutpie-*.whl --force-reinstall
           pip install pytest pymc
-          cd tests && pytest tests
+          cd tests && pytest
 
   windows:
     runs-on: windows-latest
-    strategy:
-      matrix:
-        target: [x64, x86]
     steps:
       - uses: actions/checkout@v2
-      - uses: actions/setup-python@v2
+      - uses: actions/setup-python@v4
         with:
           python-version: 3.9
-          architecture: ${{ matrix.target }}
+          architecture: x64
       - name: Install Rust toolchain
         uses: actions-rs/toolchain@v1
         with:
@@ -50,35 +50,30 @@ jobs:
       - name: Build wheels
         uses: messense/maturin-action@v1
         with:
-          command: develop
-          target: ${{ matrix.target }}
-          args: --release
+          target: x86_64
+          args: --release --out dist --no-sdist -i python
       - name: Install built wheel
         run: |
+          pip install dist\nutpie-*.whl --force-reinstall
           pip install pytest pymc
-          cd tests && pytest tests
+          cd tests && pytest
 
   linux:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        target: [x86_64, i686]
     steps:
     - uses: actions/checkout@v2
-    - uses: actions/setup-python@v2
+    - uses: actions/setup-python@v4
       with:
         python-version: 3.9
         architecture: x64
     - name: Build wheels
       uses: messense/maturin-action@v1
       with:
+        target: x86_64
         rust-toolchain: nightly
-        target: ${{ matrix.target }}
-        manylinux: auto
-        args: --release
-        command: develop
+        args: --release --out dist --no-sdist -i python
     - name: Install built wheel
-      if: matrix.target == 'x86_64'
       run: |
+        pip install dist/nutpie-*.whl --force-reinstall
         pip install pytest pymc
-        cd tests && pytest tests
+        cd tests && pytest
