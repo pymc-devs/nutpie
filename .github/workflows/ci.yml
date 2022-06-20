@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions/setup-python@v2
+        with:
+          python-version: 3.9
+          architecture: x64
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: nightly
+          profile: minimal
+          default: true
+      - name: Build wheels - x86_64
+        uses: messense/maturin-action@v1
+        with:
+          target: x86_64
+          command: develop
+          args: --release
+      - name: Install built wheel - x86_64
+        run: |
+          pip install pytest pymc
+          cd tests && pytest tests
+
+  windows:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        target: [x64, x86]
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions/setup-python@v2
+        with:
+          python-version: 3.9
+          architecture: ${{ matrix.target }}
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: nightly
+          profile: minimal
+          default: true
+      - name: Build wheels
+        uses: messense/maturin-action@v1
+        with:
+          command: develop
+          target: ${{ matrix.target }}
+          args: --release
+      - name: Install built wheel
+        run: |
+          pip install pytest pymc
+          cd tests && pytest tests
+
+  linux:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [x86_64, i686]
+    steps:
+    - uses: actions/checkout@v2
+    - uses: actions/setup-python@v2
+      with:
+        python-version: 3.9
+        architecture: x64
+    - name: Build wheels
+      uses: messense/maturin-action@v1
+      with:
+        rust-toolchain: nightly
+        target: ${{ matrix.target }}
+        manylinux: auto
+        args: --release
+        command: develop
+    - name: Install built wheel
+      if: matrix.target == 'x86_64'
+      run: |
+        pip install pytest pymc
+        cd tests && pytest tests
