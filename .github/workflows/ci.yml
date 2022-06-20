@@ -54,7 +54,7 @@ jobs:
           args: --release --out dist --no-sdist -i python
       - name: Install built wheel
         run: |
-          pip install dist\nutpie-*.whl --force-reinstall
+          pip install --no-index --find-links ./dist nutpie
           pip install pytest pymc
           cd tests && pytest
 
