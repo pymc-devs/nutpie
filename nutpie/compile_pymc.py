@@ -202,8 +202,8 @@ def _make_c_logp_func(N, logp_func):
                 return 3
             if np.any(out == 0):
                 return 4
-            return 0
         except Exception:
             return 1
+        return 0
 
     return logp_numba, c_sig
