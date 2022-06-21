@@ -14,7 +14,7 @@ name = "nutpie"
 crate-type = ["cdylib"]
 
 [dependencies]
-nuts-rs = { path = "../nuts-rs" }
+nuts-rs = "0.2"
 numpy = "0.16.2"
 ndarray = "0.15.4"
 rand = "0.8.5"
