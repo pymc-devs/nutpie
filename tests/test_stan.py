@@ -1,8 +1,10 @@
 import nutpie
 import pytest
 
-@pytest.mark.xfail
+
 def test_stan_model():
+    _ = pytest.importorskip("httpstan")
+
     model = """
     data {}
     parameters {

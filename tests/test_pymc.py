@@ -1,10 +1,10 @@
-import pymc as pm
 import nutpie
 import pytest
 
 
-@pytest.mark.xfail
 def test_pymc_model():
+    pm = pytest.importorskip("pymc")
+
     with pm.Model() as model:
         pm.Normal("a")
 
