@@ -5,6 +5,8 @@ import pytest
 def test_stan_model():
     _ = pytest.importorskip("httpstan")
 
+    import nutpie.compile_stan
+
     model = """
     data {}
     parameters {

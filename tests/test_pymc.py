@@ -5,6 +5,8 @@ import pytest
 def test_pymc_model():
     pm = pytest.importorskip("pymc")
 
+    import nutpie.compile_pymc
+
     with pm.Model() as model:
         pm.Normal("a")
 
