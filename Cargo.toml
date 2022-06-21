@@ -1,6 +1,6 @@
 [package]
 name = "nutpie"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Adrian Seyboldt <adrian.seyboldt@gmail.com>"]
 edition = "2021"
 
@@ -14,7 +14,7 @@ name = "nutpie"
 crate-type = ["cdylib"]
 
 [dependencies]
-nuts-rs = "0.2"
+nuts-rs = { path = "../nuts-rs" }
 numpy = "0.16.2"
 ndarray = "0.15.4"
 rand = "0.8.5"
