@@ -34,6 +34,7 @@ def numba_funcify_IncSubtensor(op, node, **kwargs):
 
 
 def compile_pymc_model(model, **kwargs):
+    """Compile necessary functions for sampling a pymc model."""
     n_dim, logp_func, expanding_function, shape_info = _make_functions(model)
     logp_func = numba.njit(**kwargs)(logp_func)
     logp_numba_raw, c_sig = _make_c_logp_func(n_dim, logp_func)
@@ -120,10 +121,8 @@ def _make_functions(model):
     func = aesara.function(
         (joined,), (logp, grad), givens=symbolic_sliced, mode=aesara.compile.NUMBA
     )
-    fgraph = func.maker.fgraph
-    func = aesara.link.numba.dispatch.numba_funcify(fgraph)
-    # logp_func = numba.njit(func)
-    logp_func = func
+
+    logp_func = func.vm.jit_fn.py_func
 
     # Make function that computes remaining variables for the trace
     trace_vars = {
@@ -154,9 +153,9 @@ def _make_functions(model):
     func = aesara.function(
         (joined,), (allvars,), givens=symbolic_sliced, mode=aesara.compile.NUMBA
     )
-    fgraph = func.maker.fgraph
-    func = aesara.link.numba.dispatch.numba_funcify(fgraph)
+    func = func.vm.jit_fn.py_func
     expanding_function = numba.njit(func, fastmath=True, error_model="numpy")
+    expanding_function(np.zeros(num_free_vars))
 
     return (
         num_free_vars,
@@ -174,17 +173,6 @@ def _make_c_logp_func(N, logp_func):
         numba.types.CPointer(numba.types.double),
         numba.types.voidptr,
     )
-
-    def rerun_inner(x):
-        try:
-            logp_func(x)
-        except Exception as e:
-            print(e)
-
-    @numba.njit()
-    def rerun(x):
-        with numba.objmode():
-            rerun_inner(x)
 
     def logp_numba(dim, x_, out_, logp_, user_data_):
         try:

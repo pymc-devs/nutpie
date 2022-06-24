@@ -35,6 +35,31 @@ def sample(
     store_divergences: bool = False,
     **kwargs,
 ):
+    """Sample the posterior distribution for a compiled model.
+
+    Parameters
+    ----------
+    draws: int
+        The number of draws after tuning in each chain.
+    tune: int
+        The number of tuning (warmup) draws in each chain.
+    chains: int
+        The number of chains to sample.
+    seed: int
+        Seed for the randomness in sampling.
+    num_try_init: int
+        The number if initial positions for each chain to try.
+        Fail if we can't find a valid initializion point after
+        this many tries.
+    save_warmup: bool
+        Wether to save the tuning (warmup) statistics and
+        posterior draws in the output dataset.
+    store_divergences: bool
+        If true, store the exact locations where diverging
+        transitions happend in the sampler stats.
+    **kwargs
+        Pass additional arguments to nutpie.lib.PySamplerArgs
+    """
     settings = lib.PySamplerArgs()
     settings.num_tune = tune
 
