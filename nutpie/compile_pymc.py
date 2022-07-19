@@ -55,7 +55,7 @@ def compile_pymc_model(model, **kwargs):
         shape_info,
         model.RV_dims,
         model.coords,
-        logp_numba,
+        (logp_numba, logp_func),
     )
 
 
@@ -93,7 +93,7 @@ def _make_functions(model):
 
     value_vars = [model.rvs_to_values[var] for var in model.free_RVs]
 
-    logp = model.logpt()
+    logp = model.logp()
     grads = at.grad(logp, value_vars)
     grad = at.concatenate([grad.ravel() for grad in grads])
 
