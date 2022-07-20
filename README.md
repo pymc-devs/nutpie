@@ -19,7 +19,7 @@ switch to rust nightly and then install with the `simd_support` feature in the n
 
 ```
 rustup override set nightly
-maturin develop --release --extra-cargo-args="--features=simd_support"
+maturin develop --release --features=simd_support
 ```
 
 ## Usage

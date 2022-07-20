@@ -26,7 +26,7 @@ jobs:
         uses: messense/maturin-action@v1
         with:
           target: x86_64
-          args: --release --out dist --no-sdist -i python
+          args: --release --out dist -i python
       - name: Install built wheel - x86_64
         run: |
           pip install dist/nutpie-*.whl --force-reinstall
@@ -51,7 +51,7 @@ jobs:
         uses: messense/maturin-action@v1
         with:
           target: x86_64
-          args: --release --out dist --no-sdist -i python
+          args: --release --out dist -i python
       - name: Install built wheel
         run: |
           pip install --no-index --find-links ./dist nutpie
@@ -71,7 +71,7 @@ jobs:
       with:
         target: x86_64
         rust-toolchain: nightly
-        args: --release --out dist --no-sdist -i python
+        args: --release --out dist -i python
     - name: Install built wheel
       run: |
         pip install dist/nutpie-*.whl --force-reinstall
