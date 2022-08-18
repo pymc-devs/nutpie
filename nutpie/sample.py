@@ -33,6 +33,7 @@ def sample(
     num_try_init=100,
     save_warmup: bool = True,
     store_divergences: bool = False,
+    progress_bar=True,
     **kwargs,
 ):
     """Sample the posterior distribution for a compiled model.
@@ -57,6 +58,8 @@ def sample(
     store_divergences: bool
         If true, store the exact locations where diverging
         transitions happend in the sampler stats.
+    progress_bar: bool
+        If true, display the progress bar (default)
     **kwargs
         Pass additional arguments to nutpie.lib.PySamplerArgs
     """
@@ -85,7 +88,7 @@ def sample(
         infos = []
         try:
             bar = fastprogress.progress_bar(
-                sampler,  total=chains * (draws + tune)
+                sampler,  total=chains * (draws + tune), display=progress_bar,
             )
             num_divs = 0
             chains_tuning = chains
