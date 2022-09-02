@@ -61,7 +61,7 @@ class CompiledPyMCModel(CompiledModel):
             if name not in shared_data:
                 raise KeyError(f"Unknown shared variable: {name}")
             old_val = shared_data[name]
-            new_val = np.asarray(new_val).copy()
+            new_val = np.asarray(new_val, dtype=old_val.dtype).copy()
             new_val.flags.writeable = False
             if old_val.ndim != new_val.ndim:
                 raise ValueError(
