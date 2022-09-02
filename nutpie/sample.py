@@ -1,5 +1,4 @@
-from collections import Callable
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Callable
 from dataclasses import dataclass
 
 import numpy as np
