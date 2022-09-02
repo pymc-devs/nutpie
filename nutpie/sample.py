@@ -1,26 +1,24 @@
-from collections import namedtuple
+from collections import Callable
+from typing import Dict, List, Tuple
+from dataclasses import dataclass
 
 import numpy as np
 import fastprogress
 import arviz
+from numpy.typing import DTypeLike, NDArray
+import xarray as xr
 
 from . import lib
 
 
-CompiledModel = namedtuple(
-    "CompiledModel",
-    [
-        "model",
-        "n_dim",
-        "logp_func_addr",
-        "expand_draw",
-        "make_user_data",
-        "shape_info",
-        "dims",
-        "coords",
-        "keep_alive",
-    ]
-)
+@dataclass(frozen=True)
+class CompiledModel:
+    n_dim: int
+    dims: Dict[str, Tuple[str, ...]]
+    coords: Dict[str, xr.IndexVariable]
+    shape_info: List[Tuple[str, slice, Tuple[int, ...]]]
+    logp_func_maker: lib.PtrLogpFuncMaker
+    expand_draw_fn: Callable[[NDArray], NDArray]
 
 
 def sample(
@@ -71,9 +69,7 @@ def sample(
 
     init_mean = np.zeros(compiled_model.n_dim)
     sampler = lib.PyParallelSampler(
-        compiled_model.logp_func_addr,
-        compiled_model.make_user_data,
-        compiled_model.n_dim,
+        compiled_model.logp_func_maker,
         init_mean,
         settings,
         n_chains=chains,
@@ -82,28 +78,36 @@ def sample(
         n_try_init=num_try_init,
     )
 
+    expand_draw = compiled_model.expand_draw_fn
+
     def do_sample():
-        n_expanded = len(compiled_model.expand_draw(init_mean))
+        n_expanded = len(expand_draw(init_mean))
         draws_data = np.full((chains, draws + tune, n_expanded), np.nan)
         infos = []
         try:
             bar = fastprogress.progress_bar(
-                sampler,  total=chains * (draws + tune), display=progress_bar,
+                sampler,
+                total=chains * (draws + tune),
+                display=progress_bar,
             )
             num_divs = 0
             chains_tuning = chains
             for draw, info in bar:
                 infos.append(info)
-                draws_data[info.chain, info.draw, :] = compiled_model.expand_draw(draw)
+                draws_data[info.chain, info.draw, :] = compiled_model.expand_draw_fn(
+                    draw
+                )
                 if info.draw == tune - 1:
                     chains_tuning -= 1
                 if info.is_diverging and info.draw > tune:
                     num_divs += 1
-                bar.comment = f" Chains in warmup: {chains_tuning}, Divergences: {num_divs}"
+                bar.comment = (
+                    f" Chains in warmup: {chains_tuning}, Divergences: {num_divs}"
+                )
         except KeyboardInterrupt:
             pass
         return draws_data, infos
-    
+
     try:
         draws_data, infos = do_sample()
     finally:
@@ -122,7 +126,7 @@ def sample(
             (chains, draws) + tuple(shape)
         )
 
-    stat_dtypes = {
+    stat_dtypes: Dict[str, Tuple[Tuple[str, ...], DTypeLike]] = {
         "index_in_trajectory": ((), np.int64),
         "mean_tree_accept": ((), np.float64),
         "depth": ((), np.int64),
@@ -189,12 +193,12 @@ def sample(
             continue
         trace.sample_stats[name] = (
             ("chain", "draw") + stat_dtypes[name][0],
-            stats[name]
+            stats[name],
         )
         if save_warmup:
             trace.warmup_sample_stats[name] = (
                 ("chain", "draw") + stat_dtypes[name][0],
-                stats_tune[name]
+                stats_tune[name],
             )
-    
+
     return trace
