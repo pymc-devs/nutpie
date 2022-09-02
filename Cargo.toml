@@ -1,6 +1,6 @@
 [package]
 name = "nutpie"
-version = "0.1.3"
+version = "0.2.0"
 authors = ["Adrian Seyboldt <adrian.seyboldt@gmail.com>"]
 edition = "2021"
 
@@ -14,15 +14,15 @@ name = "nutpie"
 crate-type = ["cdylib"]
 
 [dependencies]
-nuts-rs = "0.2.1"
-numpy = "0.16.2"
+nuts-rs = "0.3.0"
+numpy = "0.17.1"
 ndarray = "0.15.4"
 rand = "0.8.5"
 crossbeam = "0.8.1"
 thiserror = "1.0.31"
 
 [dependencies.pyo3]
-version = "0.16.5"
+version = "0.17.1"
 features = ["extension-module", "auto-initialize"]
 
 [dev-dependencies]
