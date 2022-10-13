@@ -61,8 +61,8 @@ def compile_stan_model(
 
     logp_maker = _make_logp_maker(stan_lib, data)
 
-    def expanding_function(x):
-        return stan_lib.write_array_ctx(ctx, x, True, True, 0)
+    def expanding_function(x, seed, chain, draw):
+        return stan_lib.write_array_ctx(ctx, x, True, True, seed + 10000 * chain + draw)
 
     return CompiledStanModel(
         n_dim,

@@ -112,7 +112,6 @@ struct ErrorCode(std::os::raw::c_int);
 
 impl LogpError for ErrorCode {
     fn is_recoverable(&self) -> bool {
-        assert!(self.0 > 0, "{}", self.0);
         self.0 > 0
     }
 }
