@@ -1,6 +1,18 @@
+from dataclasses import dataclass
 from math import prod
+from typing import Any, Dict
+
+from numpy.typing import NDArray
 
 from .sample import CompiledModel
+from . import lib
+
+
+@dataclass(frozen=True)
+class CompiledStanModel(CompiledModel):
+    code: str
+    data: Dict[str, NDArray]
+    lib: Any
 
 
 def compile_stan_model(
@@ -27,54 +39,69 @@ def compile_stan_model(
         if filename is None:
             raise ValueError("Either code or filename have to be specified")
         with open(filename, "r") as file:
-            code = file.read() 
+            code = file.read()
 
     model_id = httpstan.models.calculate_model_name(code)
-    lib = None
+    stan_lib = None
     if cache and not extra_compile_args:
         try:
-            lib = httpstan.models.import_services_extension_module(model_id)
+            stan_lib = httpstan.models.import_services_extension_module(model_id)
         except (FileNotFoundError, KeyError):
             pass
-    if lib is None:
+    if stan_lib is None:
         output = httpstan.models.build_services_extension_module_sync(code, extra_compile_args)
         if show_compiler_output:
             print(output)
-        lib = httpstan.models.import_services_extension_module(model_id)
+        stan_lib = httpstan.models.import_services_extension_module(model_id)
 
-    ctx = lib.new_logp_ctx(data)
-    n_dim = lib.num_unconstrained_parameters(ctx)
-    logp = lib.logp_func(ctx)
+    ctx = stan_lib.new_logp_ctx(data)
+    n_dim = stan_lib.num_unconstrained_parameters(ctx)
 
-    def make_shape_info(model, data):
-        slices = []
-        shapes = []
-        count = 0
-        for shape in model.get_dims(data):
-            shapes.append(shape)
-            length = prod(shape)
-            slices.append(slice(count, count + length))
-            count += length
-        
-        names = model.get_param_names(data)
-        return names, slices, shapes
-    
-    shape_info = make_shape_info(lib, data)
+    shape_info = _make_shape_info(stan_lib, data)
 
-    def make_user_data():
-        return lib.new_logp_ctx(data)
-    
+    logp_maker = _make_logp_maker(stan_lib, data)
+
     def expanding_function(x):
-        return lib.write_array_ctx(ctx, x, True, True, 0)
+        return stan_lib.write_array_ctx(ctx, x, True, True, 0)
 
-    return CompiledModel(
-        code,
+    return CompiledStanModel(
         n_dim,
-        logp,
-        expanding_function,
-        make_user_data,
-        shape_info,
         dims,
         coords,
-        (lib, data),
+        shape_info,
+        logp_maker,
+        expanding_function,
+        code,
+        data,
+        stan_lib,
     )
+
+
+def _make_shape_info(model, data):
+    slices = []
+    shapes = []
+    count = 0
+    for shape in model.get_dims(data):
+        shapes.append(shape)
+        length = prod(shape)
+        slices.append(slice(count, count + length))
+        count += length
+
+    names = model.get_param_names(data)
+    return names, slices, shapes
+
+
+def _make_logp_maker(stanlib, data):
+    ctx = stanlib.new_logp_ctx(data)
+    n_dim = stanlib.num_unconstrained_parameters(ctx)
+    stanlib.free_logp_ctx(ctx)
+
+    def make_logp_pyfn(args):
+        stanlib, data = args
+        ctx = stanlib.new_logp_ctx(data)
+        func_ptr = stanlib.logp_func(ctx)
+        return func_ptr, ctx, (stanlib, data)
+
+    return lib.PtrLogpFuncMaker(make_logp_pyfn, (stanlib, data), n_dim, (stanlib, data))
+
+
