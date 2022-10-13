@@ -17,7 +17,7 @@ class CompiledModel:
     coords: Dict[str, xr.IndexVariable]
     shape_info: List[Tuple[str, slice, Tuple[int, ...]]]
     logp_func_maker: lib.PtrLogpFuncMaker
-    expand_draw_fn: Callable[[NDArray], NDArray]
+    expand_draw_fn: Callable[[NDArray, int, int, int], NDArray]
 
 
 def sample(
@@ -27,10 +27,11 @@ def sample(
     tune: int = 1000,
     chains: int = 4,
     seed: int = 42,
-    num_try_init=100,
+    num_try_init=200,
     save_warmup: bool = True,
     store_divergences: bool = False,
     progress_bar=True,
+    init_mean=None,
     **kwargs,
 ):
     """Sample the posterior distribution for a compiled model.
@@ -66,7 +67,9 @@ def sample(
     for name, val in kwargs.items():
         setattr(settings, name, val)
 
-    init_mean = np.zeros(compiled_model.n_dim)
+    if init_mean is None:
+        init_mean = np.zeros(compiled_model.n_dim)
+
     sampler = lib.PyParallelSampler(
         compiled_model.logp_func_maker,
         init_mean,
@@ -80,7 +83,7 @@ def sample(
     expand_draw = compiled_model.expand_draw_fn
 
     def do_sample():
-        n_expanded = len(expand_draw(init_mean))
+        n_expanded = len(expand_draw(init_mean, seed, 0, 0))
         draws_data = np.full((chains, draws + tune, n_expanded), np.nan)
         infos = []
         try:
@@ -94,7 +97,10 @@ def sample(
             for draw, info in bar:
                 infos.append(info)
                 draws_data[info.chain, info.draw, :] = compiled_model.expand_draw_fn(
-                    draw
+                    draw,
+                    seed,
+                    info.chain,
+                    info.draw,
                 )
                 if info.draw == tune - 1:
                     chains_tuning -= 1

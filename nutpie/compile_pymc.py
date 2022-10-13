@@ -135,7 +135,7 @@ def compile_pymc_model(model, **kwargs):
     )
     logp_numba = numba.cfunc(c_sig, **kwargs)(logp_numba_raw)
 
-    def expand_draw(x, shared_data):
+    def expand_draw(x, seed, chain, draw, *, shared_data):
         return expand_fn(x, **{name: shared_data[name] for name in shared_expand})[0]
 
     def make_logp_pyfn(data_ptr):
@@ -260,7 +260,7 @@ def _make_functions(model):
     expand_fn = expand_fn_at.vm.jit_fn
     # expand_fn = numba.njit(expand_fn, fastmath=True, error_model="numpy")
     # Trigger a compile
-    expand_fn(np.zeros(num_free_vars))
+    expand_fn(np.zeros(num_free_vars), *[var.get_value() for var in expand_fn_at.get_shared()])
 
     return (
         num_free_vars,
