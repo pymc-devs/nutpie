@@ -100,7 +100,7 @@ evaluation, and tends to converge faster and with fewer gradient evaluation.
 From the benchmarks I did, it seems to be the fastest CPU based sampler I could
 find, outperforming cmdstan and numpyro.
 
-Unforunately performance on pymc models is currently somewhat limited by an
+Unfortunately performance on pymc models is currently somewhat limited by an
 [issue in numba](https://github.com/numba/numba/issues/8156), which hopefully
 will be fixed soon. Without the patch mentioned in the issue the model above
 samples in about 2s on my machine, with the patch it finished is about 700ms.
