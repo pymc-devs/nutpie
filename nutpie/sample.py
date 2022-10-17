@@ -32,6 +32,7 @@ def sample(
     store_divergences: bool = False,
     progress_bar=True,
     init_mean=None,
+    store_unconstrained=False,
     **kwargs,
 ):
     """Sample the posterior distribution for a compiled model.
@@ -95,7 +96,10 @@ def sample(
             num_divs = 0
             chains_tuning = chains
             for draw, info in bar:
-                infos.append(info)
+                info_dict = info.as_dict()
+                if store_unconstrained:
+                    info_dict["draw_unconstrained"] = draw
+                infos.append((info, info_dict))
                 draws_data[info.chain, info.draw, :] = compiled_model.expand_draw_fn(
                     draw,
                     seed,
@@ -155,6 +159,8 @@ def sample(
     if store_divergences:
         stat_dtypes["divergence_start"] = (("unconstrained_parameter",), np.float64)
         stat_dtypes["divergence_end"] = (("unconstrained_parameter",), np.float64)
+    if store_unconstrained:
+        stat_dtypes["draw_unconstrained"] = (("unconstrained_parameter",), np.float64)
 
     dim_to_length = {
         "unconstrained_parameter": compiled_model.n_dim,
@@ -171,8 +177,7 @@ def sample(
         stats[name] = np.full((chains, draws) + shapes, value, dtype=dtype)
         stats_tune[name] = np.full((chains, tune) + shapes, value, dtype=dtype)
 
-    for info in infos:
-        info_dict = info.as_dict()
+    for info, info_dict in infos:
         if info.draw < tune:
             out = stats_tune
             draw = info.draw
