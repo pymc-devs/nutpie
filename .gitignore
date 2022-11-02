@@ -1,6 +1,5 @@
 /target
 __pycache__
-Cargo.lock
 *.ipynb
 *.so
 tvm_libs/*
