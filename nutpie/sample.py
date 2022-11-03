@@ -59,6 +59,28 @@ def sample(
         transitions happend in the sampler stats.
     progress_bar: bool
         If true, display the progress bar (default)
+    init_mean: ndarray
+        Initialize the chains using jittered values around this
+        point on the transformed parameter space. Defaults to
+        zeros.
+    store_unconstrained: bool
+        If True, store each draw in the unconstrained (transformed)
+        space in the sample stats.
+    store_gradient: bool
+        If True, store the logp gradient of each draw in the unconstrained
+        space in the sample stats.
+    store_mass_matrix: bool
+        If True, store the current mass matrix at each draw in
+        the sample stats.
+    target_accept: float between 0 and 1, default 0.8
+        Adapt the step size of the integrator so that the average
+        acceptance probability of the draws is `target_accept`.
+        Larger values will decrease the step size of the integrator,
+        which can help when sampling models with bad geometry.
+    maxdepth: int, default=10
+        The maximum depth of the tree for each draw. The maximum
+        number of gradient evaluations for each draw will
+        be 2 ^ maxdepth.
     **kwargs
         Pass additional arguments to nutpie.lib.PySamplerArgs
     """
