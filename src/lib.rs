@@ -434,53 +434,32 @@ impl PySamplerArgs {
     }
 
     #[getter]
-    fn variance_decay(&self) -> f64 {
-        self.inner.mass_matrix_adapt.variance_decay
-    }
-
-    #[setter(variance_decay)]
-    fn set_variance_decay(&mut self, val: f64) {
-        self.inner.mass_matrix_adapt.variance_decay = val;
-    }
-
-    #[getter]
-    fn early_variance_decay(&self) -> f64 {
-        self.inner.mass_matrix_adapt.early_variance_decay
-    }
-
-    #[setter(early_variance_decay)]
-    fn set_early_variance_decay(&mut self, val: f64) {
-        self.inner.mass_matrix_adapt.early_variance_decay = val;
-    }
-
-    #[getter]
-    fn use_grad_init(&self) -> bool {
-        self.inner.mass_matrix_adapt.grad_init
-    }
-
-    #[setter(use_grad_init)]
-    fn set_use_grad_init(&mut self, val: bool) {
-        self.inner.mass_matrix_adapt.grad_init = val;
-    }
-
-    #[getter]
     fn window_switch_freq(&self) -> u64 {
-        self.inner.mass_matrix_adapt.window_switch_freq
+        self.inner.mass_matrix_adapt.mass_matrix_switch_freq
     }
 
     #[setter(window_switch_freq)]
     fn set_window_switch_freq(&mut self, val: u64) {
-        self.inner.mass_matrix_adapt.window_switch_freq = val;
+        self.inner.mass_matrix_adapt.mass_matrix_switch_freq = val;
     }
 
     #[getter]
+    fn early_window_switch_freq(&self) -> u64 {
+        self.inner.mass_matrix_adapt.early_mass_matrix_switch_freq
+    }
+
+    #[setter(window_switch_freq)]
+    fn set_early_window_switch_freq(&mut self, val: u64) {
+        self.inner.mass_matrix_adapt.early_mass_matrix_switch_freq = val;
+    }
+    #[getter]
     fn initial_step(&self) -> f64 {
-        self.inner.step_size_adapt.params.initial_step
+        self.inner.step_size_adapt.initial_step
     }
 
     #[setter(initial_step)]
     fn set_initial_step(&mut self, val: f64) {
-        self.inner.step_size_adapt.params.initial_step = val
+        self.inner.step_size_adapt.initial_step = val
     }
 
     #[getter]
@@ -513,26 +492,6 @@ impl PySamplerArgs {
         self.inner.max_energy_error = val
     }
 
-    #[getter]
-    fn mass_matrix_final_window(&self) -> u64 {
-        self.inner.mass_matrix_adapt.final_window
-    }
-
-    #[setter(mass_matrix_final_window)]
-    fn set_mass_matrix_final_window(&mut self, val: u64) {
-        self.inner.mass_matrix_adapt.final_window = val;
-    }
-
-    #[getter]
-    fn step_size_final_window_ratio(&self) -> f64 {
-        self.inner.step_size_adapt.final_window_ratio
-    }
-
-    #[setter(step_size_final_window_ratio)]
-    fn set_step_size_final_window(&mut self, val: f64) {
-        self.inner.step_size_adapt.final_window_ratio = val;
-    }
-
     #[setter(target_accept)]
     fn set_target_accept(&mut self, val: f64) {
         self.inner.step_size_adapt.target_accept = val;
@@ -544,23 +503,13 @@ impl PySamplerArgs {
     }
 
     #[getter]
-    fn early_target_accept(&self) -> f64 {
-        self.inner.step_size_adapt.early_target_accept
-    }
-
-    #[setter(early_target_accept)]
-    fn set_early_target_accept(&mut self, val: f64) {
-        self.inner.step_size_adapt.early_target_accept = val;
-    }
-
-    #[getter]
     fn store_mass_matrix(&self) -> bool {
-        self.inner.mass_matrix_adapt.store_mass_matrix
+        self.inner.mass_matrix_adapt.mass_matrix_options.store_mass_matrix
     }
 
     #[setter(store_mass_matrix)]
     fn set_store_mass_matrix(&mut self, val: bool) {
-        self.inner.mass_matrix_adapt.store_mass_matrix = val;
+        self.inner.mass_matrix_adapt.mass_matrix_options.store_mass_matrix = val;
     }
 }
 
