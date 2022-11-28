@@ -10,7 +10,7 @@ from numpy.typing import NDArray
 import pymc as pm
 import numpy as np
 import numba
-from aeppl.logprob import CheckParameterValue
+from aesara.raise_op import CheckAndRaise
 import aesara.link.numba.dispatch
 from numba import literal_unroll
 from numba.cpython.unsafe.tuple import alloca_once, tuple_setitem
@@ -21,8 +21,8 @@ from . import lib
 
 # Provide a numba implementation for CheckParameterValue,
 # which doesn't exist in aesara
-@aesara.link.numba.dispatch.basic.numba_funcify.register(CheckParameterValue)
-def numba_functify_CheckParameterValue(op, **kwargs):
+@aesara.link.numba.dispatch.basic.numba_funcify.register(CheckAndRaise)
+def numba_functify_CheckAndRaise(op, **kwargs):
     msg = f"Invalid parameter value {str(op)}"
 
     @aesara.link.numba.dispatch.basic.numba_njit
