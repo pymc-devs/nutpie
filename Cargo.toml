@@ -1,6 +1,6 @@
 [package]
 name = "nutpie"
-version = "0.3.0"
+version = "0.4.0"
 authors = ["Adrian Seyboldt <adrian.seyboldt@gmail.com>"]
 edition = "2021"
 
