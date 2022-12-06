@@ -152,8 +152,8 @@ def _compute_shapes(model):
     point = pm.model.make_initial_point_fn(model=model, return_transformed=True)(0)
 
     trace_vars = {
-        name: var
-        for (name, var) in model.named_vars.items()
+        var.name: var
+        for var in model.value_vars + model.free_RVs + model.deterministics
         if var not in model.observed_RVs + model.potentials
     }
 
