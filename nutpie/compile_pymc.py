@@ -4,35 +4,20 @@ import functools
 from math import prod
 from typing import Dict, List
 
-import aesara
-import aesara.tensor as at
+import pytensor
+import pytensor.tensor as at
 from numpy.typing import NDArray
 import pymc as pm
 import numpy as np
 import numba
-from aesara.raise_op import CheckAndRaise
-import aesara.link.numba.dispatch
+from pytensor.raise_op import CheckAndRaise
+import pytensor.link.numba.dispatch
 from numba import literal_unroll
 from numba.cpython.unsafe.tuple import alloca_once, tuple_setitem
 import numba.core.ccallback
 
 from .sample import CompiledModel
 from . import lib
-
-# Provide a numba implementation for CheckParameterValue,
-# which doesn't exist in aesara
-@aesara.link.numba.dispatch.basic.numba_funcify.register(CheckAndRaise)
-def numba_functify_CheckAndRaise(op, **kwargs):
-    msg = f"Invalid parameter value {str(op)}"
-
-    @aesara.link.numba.dispatch.basic.numba_njit
-    def check(value, *conditions):
-        for cond in literal_unroll(conditions):
-            if not cond:
-                raise ValueError(msg)
-        return value
-
-    return check
 
 
 @numba.extending.intrinsic
@@ -172,7 +157,7 @@ def _compute_shapes(model):
         if var not in model.observed_RVs + model.potentials
     }
 
-    shape_func = aesara.compile.function.function(
+    shape_func = pytensor.compile.function.function(
         inputs=[],
         outputs=[var.shape for var in trace_vars.values()],
         givens=(
@@ -183,7 +168,7 @@ def _compute_shapes(model):
                 if name in point
             ]
         ),
-        mode=aesara.compile.mode.FAST_COMPILE,
+        mode=pytensor.compile.mode.FAST_COMPILE,
         on_unused_input="ignore",
     )
     return {name: shape for name, shape in zip(trace_vars.keys(), shape_func())}
@@ -198,7 +183,7 @@ def _make_functions(model):
     value_vars = [model.rvs_to_values[var] for var in model.free_RVs]
 
     logp = model.logp()
-    grads = aesara.gradient.grad(logp, value_vars)
+    grads = pytensor.gradient.grad(logp, value_vars)
     grad = at.concatenate([grad.ravel() for grad in grads])
 
     count = 0
@@ -222,8 +207,8 @@ def _make_functions(model):
     num_free_vars = count
 
     # We should avoid compiling the function, and optimize only
-    logp_fn_at = aesara.compile.function.function(
-        (joined,), (logp, grad), givens=symbolic_sliced, mode=aesara.compile.NUMBA
+    logp_fn_at = pytensor.compile.function.function(
+        (joined,), (logp, grad), givens=symbolic_sliced, mode=pytensor.compile.NUMBA
     )
 
     logp_fn = logp_fn_at.vm.jit_fn
@@ -254,8 +239,8 @@ def _make_functions(model):
         count += length
 
     allvars = at.concatenate([joined, *[var.ravel() for var in remaining_rvs]])
-    expand_fn_at = aesara.compile.function.function(
-        (joined,), (allvars,), givens=symbolic_sliced, mode=aesara.compile.NUMBA
+    expand_fn_at = pytensor.compile.function.function(
+        (joined,), (allvars,), givens=symbolic_sliced, mode=pytensor.compile.NUMBA
     )
     expand_fn = expand_fn_at.vm.jit_fn
     # expand_fn = numba.njit(expand_fn, fastmath=True, error_model="numpy")
