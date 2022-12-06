@@ -16,6 +16,34 @@ def test_pymc_model():
     trace.posterior.a
 
 
+def test_trafo():
+    pm = pytest.importorskip("pymc")
+
+    import nutpie.compile_pymc
+
+    with pm.Model() as model:
+        pm.Uniform("a")
+
+    compiled = nutpie.compile_pymc_model(model)
+    trace = nutpie.sample(compiled, chains=1)
+    trace.posterior.a
+
+
+def test_det():
+    pm = pytest.importorskip("pymc")
+
+    import nutpie.compile_pymc
+
+    with pm.Model() as model:
+        a = pm.Uniform("a", shape=2)
+        b = pm.Deterministic("b", 2 * a)
+
+    compiled = nutpie.compile_pymc_model(model)
+    trace = nutpie.sample(compiled, chains=1)
+    assert trace.posterior.a.shape[-1] == 2
+    assert trace.posterior.b.shape[-1] == 2
+
+
 def test_pymc_model_shared():
     pm = pytest.importorskip("pymc")
 
