@@ -30,7 +30,8 @@ jobs:
       - name: Install built wheel - x86_64
         run: |
           pip install dist/nutpie-*.whl --force-reinstall
-          pip install pytest pymc numba
+          pip install numba pytest
+          pip install https://github.com/pymc-devs/pymc/archive/main.zip
           cd tests && pytest
 
   windows:
@@ -55,7 +56,8 @@ jobs:
       - name: Install built wheel
         run: |
           pip install --no-index --find-links ./dist nutpie
-          pip install pytest pymc numba
+          pip install numba pytest
+          pip install https://github.com/pymc-devs/pymc/archive/main.zip
           cd tests && pytest
 
   linux:
@@ -75,5 +77,6 @@ jobs:
     - name: Install built wheel
       run: |
         pip install dist/nutpie-*.whl --force-reinstall
-        pip install pytest pymc numba
+        pip install numba pytest
+        pip install https://github.com/pymc-devs/pymc/archive/main.zip
         cd tests && pytest
