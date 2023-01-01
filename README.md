@@ -83,7 +83,7 @@ trace_pymc = nutpie.sample(compiled_model, chains=10)
 `trace_pymc` now contains an arviz `InferenceData` object, including sampling
 statistics and the posterior of the variables defined above.
 
-For more details, see the example notebook `aesara_logp`
+For more details, see the example notebook `pytensor_logp`
 
 nutpie can also sample from stan models, it currently needs a patched version of httpstan do so so however.
 The required version can be found [here](https://github.com/stan-dev/httpstan/pull/600).

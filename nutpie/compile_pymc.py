@@ -107,11 +107,11 @@ def compile_pymc_model(model, **kwargs):
         model
     )
 
-    shared_data = {val.name: val.get_value().copy() for val in logp_fn_at.get_shared()}
+    shared_data = {val.name: val.get_value().copy() for val in logp_fn_pt.get_shared()}
     for val in shared_data.values():
         val.flags.writeable = False
 
-    shared_logp = [var.name for var in logp_fn_at.get_shared()]
+    shared_logp = [var.name for var in logp_fn_pt.get_shared()]
 
     user_data = make_user_data(logp_fn_at, shared_data)
 
@@ -178,13 +178,13 @@ def _make_functions(model):
     shapes = _compute_shapes(model)
 
     # Make logp_dlogp_function
-    joined = at.dvector("__joined_variables")
+    joined = pt.dvector("__joined_variables")
 
     value_vars = [model.rvs_to_values[var] for var in model.free_RVs]
 
     logp = model.logp()
     grads = pytensor.gradient.grad(logp, value_vars)
-    grad = at.concatenate([grad.ravel() for grad in grads])
+    grad = pt.concatenate([grad.ravel() for grad in grads])
 
     count = 0
     joined_slices = []
@@ -211,7 +211,7 @@ def _make_functions(model):
         (joined,), (logp, grad), givens=symbolic_sliced, mode=pytensor.compile.NUMBA
     )
 
-    logp_fn = logp_fn_at.vm.jit_fn
+    logp_fn = logp_fn_pt.vm.jit_fn
 
     # Make function that computes remaining variables for the trace
     trace_vars = {
@@ -238,21 +238,21 @@ def _make_functions(model):
         all_slices.append(slice(count, count + length))
         count += length
 
-    allvars = at.concatenate([joined, *[var.ravel() for var in remaining_rvs]])
+    allvars = pt.concatenate([joined, *[var.ravel() for var in remaining_rvs]])
     expand_fn_at = pytensor.compile.function.function(
         (joined,), (allvars,), givens=symbolic_sliced, mode=pytensor.compile.NUMBA
     )
-    expand_fn = expand_fn_at.vm.jit_fn
+    expand_fn = expand_fn_pt.vm.jit_fn
     # expand_fn = numba.njit(expand_fn, fastmath=True, error_model="numpy")
     # Trigger a compile
-    expand_fn(np.zeros(num_free_vars), *[var.get_value() for var in expand_fn_at.get_shared()])
+    expand_fn(np.zeros(num_free_vars), *[var.get_value() for var in expand_fn_pt.get_shared()])
 
     return (
         num_free_vars,
         logp_fn_at,
         logp_fn,
         expand_fn,
-        [var.name for var in expand_fn_at.get_shared()],
+        [var.name for var in expand_fn_pt.get_shared()],
         (all_names, all_slices, all_shapes),
     )
 

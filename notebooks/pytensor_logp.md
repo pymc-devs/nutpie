@@ -21,8 +21,8 @@ jupyter:
 ```
 
 ```python
-import aesara
-import aesara.tensor as at
+import pytensor
+import pytensor.tensor as pt
 import pymc as pm
 import numpy as np
 import nutpie
