@@ -239,7 +239,7 @@ def _make_functions(model):
         count += length
 
     allvars = pt.concatenate([joined, *[var.ravel() for var in remaining_rvs]])
-    expand_fn_at = pytensor.compile.function.function(
+    expand_fn_pt = pytensor.compile.function.function(
         (joined,), (allvars,), givens=symbolic_sliced, mode=pytensor.compile.NUMBA
     )
     expand_fn = expand_fn_pt.vm.jit_fn
