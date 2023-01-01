@@ -5,7 +5,7 @@ from math import prod
 from typing import Dict, List
 
 import pytensor
-import pytensor.tensor as at
+import pytensor.tensor as pt
 from numpy.typing import NDArray
 import pymc as pm
 import numpy as np
@@ -103,7 +103,7 @@ def make_user_data(func, shared_data):
 def compile_pymc_model(model, **kwargs):
     """Compile necessary functions for sampling a pymc model."""
 
-    n_dim, logp_fn_at, logp_fn, expand_fn, shared_expand, shape_info = _make_functions(
+    n_dim, logp_fn_pt, logp_fn, expand_fn, shared_expand, shape_info = _make_functions(
         model
     )
 
@@ -113,7 +113,7 @@ def compile_pymc_model(model, **kwargs):
 
     shared_logp = [var.name for var in logp_fn_pt.get_shared()]
 
-    user_data = make_user_data(logp_fn_at, shared_data)
+    user_data = make_user_data(logp_fn_pt, shared_data)
 
     logp_numba_raw, c_sig = _make_c_logp_func(
         n_dim, logp_fn, user_data, shared_logp, shared_data
@@ -207,7 +207,7 @@ def _make_functions(model):
     num_free_vars = count
 
     # We should avoid compiling the function, and optimize only
-    logp_fn_at = pytensor.compile.function.function(
+    logp_fn_pt = pytensor.compile.function.function(
         (joined,), (logp, grad), givens=symbolic_sliced, mode=pytensor.compile.NUMBA
     )
 
@@ -249,7 +249,7 @@ def _make_functions(model):
 
     return (
         num_free_vars,
-        logp_fn_at,
+        logp_fn_pt,
         logp_fn,
         expand_fn,
         [var.name for var in expand_fn_pt.get_shared()],
