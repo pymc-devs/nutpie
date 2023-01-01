@@ -44,8 +44,7 @@ with pm.Model(coords=coords, check_bounds=False) as pymc_model:
     intercept = pm.Normal("intercept", sigma=10)
 
     # County effects
-    # TODO should be a CenteredNormal
-    raw = pm.Normal("county_raw", dims="county")
+    raw = pm.ZeroSumNormal("county_raw", dims="county")
     sd = pm.HalfNormal("county_sd")
     county_effect = pm.Deterministic("county_effect", raw * sd, dims="county")
 
@@ -53,8 +52,7 @@ with pm.Model(coords=coords, check_bounds=False) as pymc_model:
     floor_effect = pm.Normal("floor_effect", sigma=2)
 
     # County:floor interaction
-    # Should also be a CenteredNormal
-    raw = pm.Normal("county_floor_raw", dims="county")
+    raw = pm.ZeroSumNormal("county_floor_raw", dims="county")
     sd = pm.HalfNormal("county_floor_sd")
     county_floor_effect = pm.Deterministic(
         "county_floor_effect", raw * sd, dims="county"
