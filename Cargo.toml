@@ -1,8 +1,12 @@
 [package]
 name = "nutpie"
-version = "0.4.0"
+version = "0.5.0"
 authors = ["Adrian Seyboldt <adrian.seyboldt@gmail.com>"]
-edition = "2021"
+edition = "2023"
+license = "MIT"
+repository = "https://github.com/pymc-devs/nutpie"
+keywords = ["statistics", "bayes"]
+description = "Python wrapper for nuts-rs -- a NUTS sampler written in Rust."
 
 [features]
 extension-module = ["pyo3/extension-module"]
@@ -14,7 +18,7 @@ name = "nutpie"
 crate-type = ["cdylib"]
 
 [dependencies]
-nuts-rs = "0.4.0"
+nuts-rs = "0.4.1"
 numpy = "0.17.1"
 ndarray = "0.15.4"
 rand = "0.8.5"
