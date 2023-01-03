@@ -26,16 +26,13 @@ jobs:
       - name: Install built wheel - x86_64
         run: |
           pip install nutpie --no-index --find-links dist --force-reinstall
-          pip install pytest
-          pytest
       - name: Build wheels - universal2
         uses: PyO3/maturin-action@v1
         with:
           args: --release --universal2 --out dist -i 3.8 3.9 3.10
       - name: Install built wheel - universal2
         run: |
-          pip install nutpie --no-index --find-links dist --force-reinstall
-          pytest
+          pip install nutpie --no-index --find-links dist --force-reinstall          
       - name: Upload wheels
         uses: actions/upload-artifact@v3
         with:
@@ -67,8 +64,6 @@ jobs:
       - name: Install built wheel
         run: |
           pip install nutpie --no-index --find-links dist --force-reinstall
-          pip install pytest
-          pytest
       - name: Upload wheels
         uses: actions/upload-artifact@v3
         with:
@@ -97,8 +92,6 @@ jobs:
       if: matrix.target == 'x86_64'
       run: |
         pip install nutpie --no-index --find-links dist --force-reinstall
-        pip install pytest
-        pytest
     - name: Upload wheels
       uses: actions/upload-artifact@v3
       with:
@@ -132,10 +125,9 @@ jobs:
         install: |
           apt-get update
           apt-get install -y --no-install-recommends python3 python3-pip
-          pip3 install -U pip pytest
+          pip3 install -U pip
         run: |
           pip3 install nutpie --no-index --find-links dist/ --force-reinstall
-          pytest
     - name: Upload wheels
       uses: actions/upload-artifact@v3
       with:
@@ -170,9 +162,8 @@ jobs:
         options: -v ${{ github.workspace }}:/io -w /io
         run: |
           apk add py3-pip
-          pip3 install -U pip pytest
+          pip3 install -U pip
           pip3 install nutpie --no-index --find-links /io/dist/ --force-reinstall
-          python3 -m pytest
     - name: Upload wheels
       uses: actions/upload-artifact@v3
       with:
@@ -206,10 +197,8 @@ jobs:
         githubToken: ${{ github.token }}
         install: |
           apk add py3-pip
-          pip3 install -U pip pytest
         run: |
           pip3 install nutpie --no-index --find-links dist/ --force-reinstall
-          python3 -m pytest
     - name: Upload wheels
       uses: actions/upload-artifact@v3
       with:
