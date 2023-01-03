@@ -4,3 +4,37 @@ build-backend = "maturin"
 
 [tool.maturin]
 bindings = "pyo3"
+
+[project]
+name = "nutpie"
+version = "0.5.1"
+license = {file = "LICENSE"}
+readme = "README.md"
+requires-python = ">=3.7"
+classifiers = [
+    "Topic :: Software Development :: Build Tools",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+dependencies = [
+    "numpy",
+    "python_version<'3.11'",
+    "pymc>=5.0",
+    "pytensor>=2.8.11",
+    "arviz",
+    "numba>=0.56",
+    "fastprogress",
+    "xarray"
+]
+
+dynamic = [
+    "authors",
+    "description",
+    "license",
+    "readme",
+    "version"
+]
+
+[project.urls]
+homepage = "https://github.com/pymc-devs/nutpie"
+repository = "https://github.com/pymc-devs/nutpie"
