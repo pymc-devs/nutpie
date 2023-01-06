@@ -100,8 +100,20 @@ def make_user_data(func, shared_data):
     return user_data
 
 
-def compile_pymc_model(model, **kwargs):
-    """Compile necessary functions for sampling a pymc model."""
+def compile_pymc_model(model: pm.Model, **kwargs) -> CompiledPyMCModel:
+    """Compile necessary functions for sampling a pymc model.
+    
+    Parameters
+    ----------
+    model : pymc.Model
+        The model to compile.
+
+    Returns
+    -------
+    compiled_model : CompiledPyMCModel
+        A compiled model object.
+    
+    """
 
     n_dim, logp_fn_pt, logp_fn, expand_fn, shared_expand, shape_info = _make_functions(
         model
