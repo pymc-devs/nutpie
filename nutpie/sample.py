@@ -30,11 +30,11 @@ def sample(
     num_try_init=200,
     save_warmup: bool = True,
     store_divergences: bool = False,
-    progress_bar=True,
-    init_mean=None,
-    store_unconstrained=False,
+    progress_bar: bool = True,
+    init_mean: np.ndarray = None,
+    store_unconstrained: bool = False,
     **kwargs,
-):
+) -> arviz.InferenceData:
     """Sample the posterior distribution for a compiled model.
 
     Parameters
@@ -83,6 +83,11 @@ def sample(
         be 2 ^ maxdepth.
     **kwargs
         Pass additional arguments to nutpie.lib.PySamplerArgs
+
+    Returns
+    -------
+    trace : arviz.InferenceData
+        An ArviZ ``InferenceData`` object that contains the samples.
     """
     settings = lib.PySamplerArgs()
     settings.num_tune = tune
