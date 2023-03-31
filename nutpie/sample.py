@@ -15,9 +15,6 @@ class CompiledModel:
     n_dim: int
     dims: Dict[str, Tuple[str, ...]]
     coords: Dict[str, xr.IndexVariable]
-    shape_info: List[Tuple[str, slice, Tuple[int, ...]]]
-    logp_func_maker: lib.PtrLogpFuncMaker
-    expand_draw_fn: Callable[[NDArray, int, int, int], NDArray]
 
 
 def sample(

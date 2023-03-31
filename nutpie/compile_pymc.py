@@ -2,7 +2,7 @@ from dataclasses import dataclass
 import dataclasses
 import functools
 from math import prod
-from typing import Dict, List
+from typing import Any, Dict, List
 
 import pytensor
 import pytensor.tensor as pt
@@ -36,8 +36,11 @@ def address_as_void_pointer(typingctx, src):
 @dataclass(frozen=True)
 class CompiledPyMCModel(CompiledModel):
     compiled_logp_func: numba.core.ccallback.CFunc
+    compiled_expand_func: numba.core.ccallback.CFunc
     shared_data: Dict[str, NDArray]
     user_data: NDArray
+    n_expanded: int
+    shape_info: Any
 
     def with_data(self, **updates):
         shared_data = self.shared_data.copy()
@@ -114,7 +117,7 @@ def compile_pymc_model(model: pm.Model, **kwargs) -> CompiledPyMCModel:
     
     """
 
-    n_dim, logp_fn_pt, logp_fn, expand_fn, shared_expand, shape_info = _make_functions(
+    n_dim, n_expanded, logp_fn_pt, logp_fn, expand_fn_pt, expand_fn, shared_expand, shape_info = _make_functions(
         model
     )
 
@@ -131,31 +134,36 @@ def compile_pymc_model(model: pm.Model, **kwargs) -> CompiledPyMCModel:
     )
     logp_numba = numba.cfunc(c_sig, **kwargs)(logp_numba_raw)
 
-    def expand_draw(x, seed, chain, draw, *, shared_data):
-        return expand_fn(x, **{name: shared_data[name] for name in shared_expand})[0]
-
-    def make_logp_pyfn(data_ptr):
-        return logp_numba.address, data_ptr, None
-
-    logp_func_maker = lib.PtrLogpFuncMaker(
-        make_logp_pyfn,
-        user_data.ctypes.data,
-        n_dim,
-        logp_numba,
+    expand_numba_raw, c_sig_expand = _make_c_expand_func(
+        n_dim, n_expanded, expand_fn, user_data, shared_expand, shared_data
     )
+    expand_numba = numba.cfunc(c_sig_expand, **kwargs)(expand_numba_raw)
 
-    expand_draw_fn = functools.partial(expand_draw, shared_data=shared_data)
+    #def expand_draw(x, seed, chain, draw, *, shared_data):
+    #    return expand_fn(x, **{name: shared_data[name] for name in shared_expand})[0]
+
+    #def make_logp_pyfn(data_ptr):
+    #    return logp_numba.address, data_ptr, None
+
+    #logp_func_maker = lib.PtrLogpFuncMaker(
+    #    make_logp_pyfn,
+    #    user_data.ctypes.data,
+    #    n_dim,
+    #    logp_numba,
+    #)
+
+    #expand_draw_fn = functools.partial(expand_draw, shared_data=shared_data)
 
     return CompiledPyMCModel(
         n_dim=n_dim,
-        dims=model.RV_dims,
+        dims=model.named_vars_to_dims,
         coords=model.coords,
-        shape_info=shape_info,
-        logp_func_maker=logp_func_maker,
-        expand_draw_fn=expand_draw_fn,
         compiled_logp_func=logp_numba,
+        compiled_expand_func=expand_numba,
         shared_data=shared_data,
         user_data=user_data,
+        n_expanded=n_expanded,
+        shape_info=shape_info,
     )
 
 
@@ -249,6 +257,8 @@ def _make_functions(model):
         all_slices.append(slice(count, count + length))
         count += length
 
+    num_expanded = count
+
     allvars = pt.concatenate([joined, *[var.ravel() for var in remaining_rvs]])
     expand_fn_pt = pytensor.compile.function.function(
         (joined,), (allvars,), givens=symbolic_sliced, mode=pytensor.compile.NUMBA
@@ -256,12 +266,14 @@ def _make_functions(model):
     expand_fn = expand_fn_pt.vm.jit_fn
     # expand_fn = numba.njit(expand_fn, fastmath=True, error_model="numpy")
     # Trigger a compile
-    expand_fn(np.zeros(num_free_vars), *[var.get_value() for var in expand_fn_pt.get_shared()])
+    # expand_fn(np.zeros(num_free_vars), *[var.get_value() for var in expand_fn_pt.get_shared()])
 
     return (
         num_free_vars,
+        num_expanded,
         logp_fn_pt,
         logp_fn,
+        expand_fn_pt,
         expand_fn,
         [var.name for var in expand_fn_pt.get_shared()],
         (all_names, all_slices, all_shapes),
@@ -400,3 +412,35 @@ def _make_c_logp_func(n_dim, logp_fn, user_data, shared_logp, shared_data):
         return 0
 
     return logp_numba, c_sig
+
+
+def _make_c_expand_func(n_dim, n_expanded, expand_fn, user_data, shared_vars, shared_data):
+
+    extract = make_extraction_fn(expand_fn, shared_data, shared_vars, user_data.dtype)
+
+    c_sig = numba.types.int64(
+        numba.types.uint64,
+        numba.types.uint64,
+        numba.types.CPointer(numba.types.double),
+        numba.types.CPointer(numba.types.double),
+        numba.types.voidptr,
+    )
+
+    def expand_numba(dim, expanded, x_, out_, user_data_):
+        if dim != n_dim:
+            return -1
+        if expanded != n_expanded:
+            return -1
+
+        try:
+            x = numba.carray(x_, (n_dim,))
+            out = numba.carray(out_, (n_expanded,))
+
+            (values,) = extract(x, user_data_)
+            out[...] = values
+
+        except Exception:
+            return -2
+        return 0
+
+    return expand_numba, c_sig
