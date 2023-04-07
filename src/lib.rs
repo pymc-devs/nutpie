@@ -1,4 +1,5 @@
 mod pymc;
+mod stan;
 mod sampler;
 mod wrapper;
 

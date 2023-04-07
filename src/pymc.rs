@@ -231,7 +231,7 @@ pub(crate) struct PyMcModel {
 impl PyMcModel {
     #[new]
     fn new<'py>(
-        py: Python<'py>,
+        _py: Python<'py>,
         dim: usize,
         density: LogpFunc,
         expand: ExpandFunc,
@@ -257,13 +257,14 @@ impl Model for PyMcModel {
 
     fn new_trace<'a, R: rand::Rng + ?Sized>(
         &'a self,
-        rng: &mut R,
+        _rng: &mut R,
+        _chain: u64,
         settings: &SamplerArgs,
     ) -> Result<Self::Trace<'a>> {
         Ok(PyMcTrace::new(self, settings))
     }
 
-    fn density<'a>(&'a self) -> Result<Self::Density<'a>> {
+    fn density(&self) -> Result<Self::Density<'_>> {
         Ok(&self.density)
     }
 
