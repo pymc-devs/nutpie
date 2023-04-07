@@ -2,12 +2,11 @@ use std::{sync::mpsc::RecvTimeoutError, time::Duration};
 
 use crate::{
     pymc::{ExpandFunc, LogpFunc, PyMcModel},
-    sampler::Sampler,
+    sampler::Sampler, stan::{StanModel, StanLibrary},
 };
 
 use anyhow::Result;
 use arrow2::{array::Array, datatypes::Field};
-use numpy::PyReadonlyArray1;
 use nuts_rs::{SampleStats, SamplerArgs};
 use pyo3::{
     exceptions::PyValueError,
@@ -177,12 +176,25 @@ struct PySampler {
 
 #[pymethods]
 impl PySampler {
-    #[new]
-    fn from_pymc<'py>(
+    #[staticmethod]
+    fn from_pymc(
         settings: PySamplerArgs,
         chains: u64,
         cores: usize,
         model: PyMcModel,
+        seed: Option<u64>,
+    ) -> PyResult<PySampler> {
+        Ok(PySampler {
+            sampler: Some(Sampler::new(model, settings.inner, cores, chains, seed)),
+        })
+    }
+
+    #[staticmethod]
+    fn from_stan(
+        settings: PySamplerArgs,
+        chains: u64,
+        cores: usize,
+        model: StanModel,
         seed: Option<u64>,
     ) -> PyResult<PySampler> {
         Ok(PySampler {
@@ -276,5 +288,7 @@ pub fn nutpie(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<PyMcModel>()?;
     m.add_class::<LogpFunc>()?;
     m.add_class::<ExpandFunc>()?;
+    m.add_class::<StanLibrary>()?;
+    m.add_class::<StanModel>()?;
     Ok(())
 }

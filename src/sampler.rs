@@ -5,13 +5,13 @@ use std::{
         Arc,
     },
     thread,
-    time::Duration, collections::HashMap,
+    time::Duration,
 };
 
 use anyhow::Result;
 use arrow2::array::Array;
 use itertools::Itertools;
-use nuts_rs::{new_sampler, ArrowBuilder, ArrowRow, Chain, CpuLogpFunc, SampleStats, SamplerArgs};
+use nuts_rs::{new_sampler, ArrowBuilder, Chain, CpuLogpFunc, SampleStats, SamplerArgs};
 use rand::{thread_rng, Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
@@ -31,9 +31,10 @@ pub(crate) trait Model: Send + Sync + 'static {
     fn new_trace<'a, R: Rng + ?Sized>(
         &'a self,
         rng: &mut R,
+        chain_id: u64,
         settings: &SamplerArgs,
     ) -> Result<Self::Trace<'a>>;
-    fn density<'a>(&'a self) -> Result<Self::Density<'a>>;
+    fn density(&self) -> Result<Self::Density<'_>>;
     fn init_position<R: Rng + ?Sized>(&self, rng: &mut R, position: &mut [f64]) -> Result<()>;
 }
 
@@ -68,14 +69,14 @@ impl Sampler {
         // so that the sampler can inspect the trace and ask
         // for partial results.
         let mut stats = sampler.stats_builder(dim, &settings);
-        let mut trace = model.new_trace(&mut rng, &settings)?;
+        let mut trace = model.new_trace(&mut rng, chain, &settings)?;
 
         let mut initval = vec![0f64; dim];
         // TODO maxtries
         let mut error = None;
         for _ in 0..100 {
             model.init_position(&mut rng, &mut initval)?;
-            if let Err(err) = sampler.set_position(&mut initval) {
+            if let Err(err) = sampler.set_position(&initval) {
                 error = Some(err);
                 continue;
             }
@@ -116,8 +117,6 @@ impl Sampler {
                 .thread_name(|i| format!("nutpie-chain-{}", i))
                 .build()
                 .unwrap();
-
-            let model = model.clone();
 
             let (tx, rx) = channel();
 
