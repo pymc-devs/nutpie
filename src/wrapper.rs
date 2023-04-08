@@ -2,7 +2,8 @@ use std::{sync::mpsc::RecvTimeoutError, time::Duration};
 
 use crate::{
     pymc::{ExpandFunc, LogpFunc, PyMcModel},
-    sampler::Sampler, stan::{StanModel, StanLibrary},
+    sampler::Sampler,
+    stan::{StanLibrary, StanModel},
 };
 
 use anyhow::Result;

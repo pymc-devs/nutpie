@@ -1,4 +1,4 @@
-use std::{fmt::Display, ffi::c_void};
+use std::{ffi::c_void, fmt::Display};
 
 use anyhow::{Context, Result};
 use arrow2::{
@@ -49,7 +49,8 @@ unsafe impl Sync for LogpFunc {}
 impl LogpFunc {
     #[new]
     fn new(dim: usize, ptr: usize, user_data_ptr: usize, keep_alive: PyObject) -> Self {
-        let func = unsafe { std::mem::transmute::<*const c_void, RawLogpFunc>(ptr as *const c_void)};
+        let func =
+            unsafe { std::mem::transmute::<*const c_void, RawLogpFunc>(ptr as *const c_void) };
         Self {
             func,
             _keep_alive: keep_alive,
@@ -79,7 +80,8 @@ impl ExpandFunc {
         user_data_ptr: usize,
         keep_alive: PyObject,
     ) -> Self {
-        let func = unsafe { std::mem::transmute::<*const c_void, RawExpandFunc>(ptr as *const c_void)};
+        let func =
+            unsafe { std::mem::transmute::<*const c_void, RawExpandFunc>(ptr as *const c_void) };
         Self {
             dim,
             expanded_dim,
