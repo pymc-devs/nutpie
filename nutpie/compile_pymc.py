@@ -2,15 +2,14 @@ from dataclasses import dataclass
 import dataclasses
 import functools
 from math import prod
-from typing import Any, Dict, List
+from typing import Any, Dict
 
+from numpy.typing import NDArray
 import pytensor
 import pytensor.tensor as pt
-from numpy.typing import NDArray
 import pymc as pm
 import numpy as np
 import numba
-from pytensor.raise_op import CheckAndRaise
 import pytensor.link.numba.dispatch
 from numba import literal_unroll
 from numba.cpython.unsafe.tuple import alloca_once, tuple_setitem
@@ -70,6 +69,33 @@ class CompiledPyMCModel(CompiledModel):
             expand_draw_fn=expand_draw_fn,
         )
 
+    def _make_sampler(self, settings, init_mean, chains, cores, seed):
+        expand_fn = lib.ExpandFunc(
+            self.n_dim,
+            self.n_expanded,
+            self.compiled_expand_func.address,
+            self.user_data.ctypes.data,
+            self
+        )
+        logp_fn = lib.LogpFunc(
+            self.n_dim,
+            self.compiled_logp_func.address,
+            self.user_data.ctypes.data,
+            self,
+        )
+
+        var_sizes = [prod(shape) for shape in self.shape_info[2]]
+
+        model = lib.PyMcModel(
+            self.n_dim,
+            logp_fn,
+            expand_fn,
+            var_sizes,
+            self.shape_info[0],
+            init_mean,
+        )
+        return lib.PySampler.from_pymc(settings, chains, cores, model, seed)
+
 
 def update_user_data(user_data, user_data_storage):
     user_data = user_data[()]
@@ -104,7 +130,7 @@ def make_user_data(func, shared_data):
 
 def compile_pymc_model(model: pm.Model, **kwargs) -> CompiledPyMCModel:
     """Compile necessary functions for sampling a pymc model.
-    
+
     Parameters
     ----------
     model : pymc.Model
@@ -114,7 +140,7 @@ def compile_pymc_model(model: pm.Model, **kwargs) -> CompiledPyMCModel:
     -------
     compiled_model : CompiledPyMCModel
         A compiled model object.
-    
+
     """
 
     n_dim, n_expanded, logp_fn_pt, logp_fn, expand_fn_pt, expand_fn, shared_expand, shape_info = _make_functions(
@@ -158,6 +184,7 @@ def compile_pymc_model(model: pm.Model, **kwargs) -> CompiledPyMCModel:
         n_dim=n_dim,
         dims=model.named_vars_to_dims,
         coords=model.coords,
+        shapes={name: tuple(shape) for name, _, shape in zip(*shape_info)},
         compiled_logp_func=logp_numba,
         compiled_expand_func=expand_numba,
         shared_data=shared_data,

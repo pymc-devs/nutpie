@@ -85,6 +85,16 @@ impl PySamplerArgs {
     }
 
     #[getter]
+    fn num_draws(&self) -> u64 {
+        self.inner.num_draws
+    }
+
+    #[setter(num_draws)]
+    fn set_num_draws(&mut self, val: u64) {
+        self.inner.num_draws = val;
+    }
+
+    #[getter]
     fn window_switch_freq(&self) -> u64 {
         self.inner.mass_matrix_adapt.mass_matrix_switch_freq
     }
@@ -134,6 +144,26 @@ impl PySamplerArgs {
     }
 
     #[getter]
+    fn store_unconstrained(&self) -> bool {
+        self.inner.store_unconstrained
+    }
+
+    #[setter(store_unconstrained)]
+    fn set_store_unconstrained(&mut self, val: bool) {
+        self.inner.store_unconstrained = val;
+    }
+
+    #[getter]
+    fn store_divergences(&self) -> bool {
+        self.inner.store_divergences
+    }
+
+    #[setter(store_divergences)]
+    fn set_store_divergences(&mut self, val: bool) {
+        self.inner.store_divergences = val;
+    }
+
+    #[getter]
     fn max_energy_error(&self) -> f64 {
         self.inner.max_energy_error
     }
@@ -174,6 +204,7 @@ impl PySamplerArgs {
 struct PySampler {
     sampler: Option<Sampler>,
 }
+
 
 #[pymethods]
 impl PySampler {
