@@ -36,7 +36,7 @@ version = "1.0.2"
 path = "../bridgestan/rust/"
 
 [dependencies.pyo3]
-version = "0.18.2"
+version = "0.18.3"
 features = ["extension-module", "auto-initialize", "anyhow"]
 
 [dev-dependencies]

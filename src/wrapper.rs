@@ -205,7 +205,6 @@ struct PySampler {
     sampler: Option<Sampler>,
 }
 
-
 #[pymethods]
 impl PySampler {
     #[staticmethod]
