@@ -281,7 +281,10 @@ impl PySampler {
                         py,
                         [
                             export_array(py, "sampler_stats".into(), stats)?,
-                            export_array(py, "draws".into(), draws)?,
+                            draws
+                                .map(|draws| export_array(py, "draws".into(), draws))
+                                .transpose()?
+                                .into_py(py),
                         ]
                         .into_iter(),
                     ))

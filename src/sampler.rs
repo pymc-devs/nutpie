@@ -40,7 +40,7 @@ pub(crate) trait Model: Send + Sync + 'static {
 
 pub(crate) struct Sampler {
     /// For each thread we return the chain id, the draws and the stats
-    main_thread: thread::JoinHandle<Result<Vec<(u64, Box<dyn Array>, Box<dyn Array>)>>>,
+    main_thread: thread::JoinHandle<Result<Vec<(u64, Box<dyn Array>, Option<Box<dyn Array>>)>>>,
     updates: sync::mpsc::Receiver<Box<dyn SampleStats>>,
 }
 
@@ -51,7 +51,7 @@ impl Sampler {
         model: Arc<M>,
         settings: SamplerArgs,
         updates: Sender<Box<dyn SampleStats>>,
-    ) -> Result<(u64, Box<dyn Array>, Box<dyn Array>)> {
+    ) -> Result<(u64, Box<dyn Array>, Option<Box<dyn Array>>)> {
         let mut rng = if let Some(seed) = seed {
             ChaCha8Rng::seed_from_u64(seed)
         } else {
@@ -98,7 +98,11 @@ impl Sampler {
                 .map_err(|_| anyhow::Error::msg("Could not send updates to main thread."))?
         }
 
-        Ok((chain, trace.finalize()?, stats.finalize().boxed()))
+        Ok((
+            chain,
+            trace.finalize()?,
+            stats.finalize().map(|x| x.boxed()),
+        ))
     }
 
     pub(crate) fn new<M: Model>(
@@ -157,7 +161,7 @@ impl Sampler {
         self.updates.recv_timeout(timeout)
     }
 
-    pub fn finalize(self) -> Result<Vec<(Box<dyn Array>, Box<dyn Array>)>> {
+    pub fn finalize(self) -> Result<Vec<(Box<dyn Array>, Option<Box<dyn Array>>)>> {
         drop(self.updates);
         let vals = self.main_thread.join().unwrap();
         vals.map(|vals| {
