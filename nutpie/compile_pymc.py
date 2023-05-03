@@ -93,7 +93,6 @@ def make_user_data(func, shared_data):
                 ],
             )
         ],
-        align=True,
     )
     user_data = np.zeros((), dtype=record_dtype)
     update_user_data(user_data, shared_data)
