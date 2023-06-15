@@ -109,18 +109,18 @@ impl PySamplerArgs {
         self.inner.mass_matrix_adapt.early_mass_matrix_switch_freq
     }
 
-    #[setter(window_switch_freq)]
+    #[setter(early_window_switch_freq)]
     fn set_early_window_switch_freq(&mut self, val: u64) {
         self.inner.mass_matrix_adapt.early_mass_matrix_switch_freq = val;
     }
     #[getter]
     fn initial_step(&self) -> f64 {
-        self.inner.step_size_adapt.initial_step
+        self.inner.mass_matrix_adapt.dual_average_options.initial_step
     }
 
     #[setter(initial_step)]
     fn set_initial_step(&mut self, val: f64) {
-        self.inner.step_size_adapt.initial_step = val
+        self.inner.mass_matrix_adapt.dual_average_options.initial_step = val
     }
 
     #[getter]
@@ -175,12 +175,12 @@ impl PySamplerArgs {
 
     #[setter(target_accept)]
     fn set_target_accept(&mut self, val: f64) {
-        self.inner.step_size_adapt.target_accept = val;
+        self.inner.mass_matrix_adapt.dual_average_options.target_accept = val;
     }
 
     #[getter]
     fn target_accept(&self) -> f64 {
-        self.inner.step_size_adapt.target_accept
+        self.inner.mass_matrix_adapt.dual_average_options.target_accept
     }
 
     #[getter]
