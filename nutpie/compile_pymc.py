@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 import dataclasses
 import functools
+import itertools
 from math import prod
 from typing import Any, Dict
 
@@ -8,6 +9,7 @@ from numpy.typing import NDArray
 import pytensor
 import pytensor.tensor as pt
 import pymc as pm
+import pandas as pd
 import numpy as np
 import numba
 import pytensor.link.numba.dispatch
@@ -165,20 +167,20 @@ def compile_pymc_model(model: pm.Model, **kwargs) -> CompiledPyMCModel:
     )
     expand_numba = numba.cfunc(c_sig_expand, **kwargs)(expand_numba_raw)
 
-    #def expand_draw(x, seed, chain, draw, *, shared_data):
-    #    return expand_fn(x, **{name: shared_data[name] for name in shared_expand})[0]
+    coords = {name: pd.Index(vals) for name, vals in model.coords.items()}
+    if "unconstrained_parameter" in coords:
+        raise ValueError("Model contains invalid name 'unconstrained_parameter'.")
 
-    #def make_logp_pyfn(data_ptr):
-    #    return logp_numba.address, data_ptr, None
-
-    #logp_func_maker = lib.PtrLogpFuncMaker(
-    #    make_logp_pyfn,
-    #    user_data.ctypes.data,
-    #    n_dim,
-    #    logp_numba,
-    #)
-
-    #expand_draw_fn = functools.partial(expand_draw, shared_data=shared_data)
+    names = []
+    for base, _, shape in zip(*shape_info):
+        if base not in [var.name for var in model.value_vars]:
+            continue
+        for idx in itertools.product(*[range(length) for length in shape]):
+            if len(idx) == 0:
+                names.append(base)
+            else:
+                names.append(f"{base}_{'_'.join(str(i) for i in idx)}")
+    coords["unconstrained_parameter"] = pd.Index(names)
 
     return CompiledPyMCModel(
         n_dim=n_dim,
