@@ -1,11 +1,10 @@
-from typing import Dict, List, Tuple, Callable, Optional
+from typing import Dict, Tuple, Optional
 from dataclasses import dataclass
 
 import numpy as np
 import fastprogress
 import arviz
 import pyarrow
-from numpy.typing import DTypeLike, NDArray
 import xarray as xr
 import pandas as pd
 
@@ -77,7 +76,6 @@ def sample(
     chains: int = 6,
     cores: int = 6,
     seed: Optional[int] = None,
-    num_try_init=200,
     save_warmup: bool = True,
     progress_bar: bool = True,
     init_mean: Optional[np.ndarray] = None,
@@ -173,11 +171,16 @@ def sample(
     finally:
         results = sampler.finalize()
 
+    dims = {name: list(dim) for name, dim in compiled_model.dims.items()}
+    dims["mass_matrix_inv"] = ["unconstrained_parameter"]
+    dims["gradient"] = ["unconstrained_parameter"]
+    dims["unconstrained"] = ["unconstrained_parameter"]
+
     return _trace_to_arviz(
         results,
         tune,
         compiled_model.shapes,
-        dims={name: list(dim) for name, dim in compiled_model.dims.items()},
+        dims=dims,
         coords={name: pd.Index(vals) for name, vals in compiled_model.coords.items()},
         save_warmup=save_warmup
     )
