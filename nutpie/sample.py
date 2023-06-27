@@ -40,24 +40,41 @@ def _trace_to_arviz(traces, n_tune, shapes, **kwargs):
     table = pyarrow.Table.from_batches(draw_batches)
     table_stats = pyarrow.Table.from_batches(stats_batches)
     for name, col in zip(table.column_names, table.columns):
-        data = col.combine_chunks().values.to_numpy()
-        data = data.reshape((n_chains, n_draws) + tuple(shapes[name]))
+        lengths = [len(chunk) for chunk in col.chunks]
+        length = max(lengths)
+        dtype = col.chunks[0].values.to_numpy().dtype
+        data = np.full((n_chains, length) + tuple(shapes[name]), np.nan, dtype=dtype)
+        for i, chunk in enumerate(col.chunks):
+            data[i, :len(chunk)] = chunk.values.to_numpy().reshape((len(chunk),) + shapes[name])
+
+        #data = col.combine_chunks().values.to_numpy()
+        #data = data.reshape((n_chains, n_draws_col) + tuple(shapes[name]))
         data_dict[name] = data[:, n_tune:]
         data_dict_tune[name] = data[:, :n_tune]
 
     for name, col in zip(table_stats.column_names, table_stats.columns):
         if name in ["chain", "draw"]:
             continue
-        col = col.combine_chunks()
-        if hasattr(col, "values"):
-            data = col.values.to_numpy(False)
-            last_shape = (-1,)
+        col_type = col.type
+        if hasattr(col_type, "list_size"):
+            last_shape = (col_type.list_size,)
+            dtype = col_type.field(0).type.to_pandas_dtype()
         else:
-            data = col.to_numpy(False)
+            dtype = col_type.to_pandas_dtype()
             last_shape = ()
-        data = data.reshape((n_chains, n_draws) + last_shape)
-        stats_dict[name] = data[:, n_tune:]
-        stats_dict_tune[name] = data[:, :n_tune]
+
+        lengths = [len(chunk) for chunk in col.chunks]
+        length = max(lengths)
+
+        data = np.full((n_chains, length) + last_shape, np.nan, dtype=dtype)
+        for i, chunk in enumerate(col.chunks):
+            if hasattr(chunk, "values"):
+                values = chunk.values.to_numpy(False)
+            else:
+                values = chunk.to_numpy(False)
+            data[i, :len(chunk)] = values.reshape((len(chunk),) + last_shape)
+            stats_dict[name] = data[:, n_tune:]
+            stats_dict_tune[name] = data[:, :n_tune]
 
     return arviz.from_dict(
         data_dict,
@@ -79,6 +96,7 @@ def sample(
     save_warmup: bool = True,
     progress_bar: bool = True,
     init_mean: Optional[np.ndarray] = None,
+    return_raw_trace = False,
     **kwargs,
 ) -> arviz.InferenceData:
     """Sample the posterior distribution for a compiled model.
@@ -129,6 +147,9 @@ def sample(
         The maximum depth of the tree for each draw. The maximum
         number of gradient evaluations for each draw will
         be 2 ^ maxdepth.
+    return_raw_trace: bool, default=False
+        Return the raw trace object (an apache arrow structure)
+        instead of converting to arviz.
     **kwargs
         Pass additional arguments to nutpie.lib.PySamplerArgs
 
@@ -176,11 +197,14 @@ def sample(
     dims["gradient"] = ["unconstrained_parameter"]
     dims["unconstrained"] = ["unconstrained_parameter"]
 
-    return _trace_to_arviz(
-        results,
-        tune,
-        compiled_model.shapes,
-        dims=dims,
-        coords={name: pd.Index(vals) for name, vals in compiled_model.coords.items()},
-        save_warmup=save_warmup
-    )
+    if return_raw_trace:
+        return results
+    else:
+        return _trace_to_arviz(
+            results,
+            tune,
+            compiled_model.shapes,
+            dims=dims,
+            coords={name: pd.Index(vals) for name, vals in compiled_model.coords.items()},
+            save_warmup=save_warmup
+        )

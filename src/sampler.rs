@@ -74,7 +74,7 @@ impl Sampler {
         let mut initval = vec![0f64; dim];
         // TODO maxtries
         let mut error = None;
-        for _ in 0..100 {
+        for _ in 0..500 {
             model.init_position(&mut rng, &mut initval)?;
             if let Err(err) = sampler.set_position(&initval) {
                 error = Some(err);
@@ -93,9 +93,14 @@ impl Sampler {
             let (point, info) = sampler.draw().unwrap();
             stats.append_value(&info);
             trace.append_value(&point)?;
-            updates
-                .send(Box::new(info) as Box<dyn SampleStats>)
-                .map_err(|_| anyhow::Error::msg("Could not send updates to main thread."))?
+            // We do not handle this error. If the draws can not be send, this
+            // could for instance be because the main thread was interrupted.
+            // In this case we just want to return the draws we have so far.
+            let result = updates
+                .send(Box::new(info) as Box<dyn SampleStats>);
+            if let Err(_) = result {
+                break;
+            }
         }
 
         Ok((
