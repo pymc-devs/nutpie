@@ -29,7 +29,7 @@ rand_chacha = "0.3.1"
 rayon = "1.7.0"
 arrow2 = "0.17.2"
 anyhow = "1.0.71"
-itertools = "0.10.5"
+itertools = "0.11.0"
 
 [dependencies.bridgestan]
 version = "2.0.0"
