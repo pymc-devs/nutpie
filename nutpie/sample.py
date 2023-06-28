@@ -43,12 +43,13 @@ def _trace_to_arviz(traces, n_tune, shapes, **kwargs):
         lengths = [len(chunk) for chunk in col.chunks]
         length = max(lengths)
         dtype = col.chunks[0].values.to_numpy().dtype
-        data = np.full((n_chains, length) + tuple(shapes[name]), np.nan, dtype=dtype)
+        if dtype in [np.float64, np.float32]:
+            data = np.full((n_chains, length) + tuple(shapes[name]), np.nan, dtype=dtype)
+        else:
+            data = np.zeros((n_chains, length) + tuple(shapes[name]), dtype=dtype)
         for i, chunk in enumerate(col.chunks):
             data[i, :len(chunk)] = chunk.values.to_numpy().reshape((len(chunk),) + shapes[name])
 
-        #data = col.combine_chunks().values.to_numpy()
-        #data = data.reshape((n_chains, n_draws_col) + tuple(shapes[name]))
         data_dict[name] = data[:, n_tune:]
         data_dict_tune[name] = data[:, :n_tune]
 
@@ -66,7 +67,11 @@ def _trace_to_arviz(traces, n_tune, shapes, **kwargs):
         lengths = [len(chunk) for chunk in col.chunks]
         length = max(lengths)
 
-        data = np.full((n_chains, length) + last_shape, np.nan, dtype=dtype)
+        if dtype in [np.float64, np.float32]:
+            data = np.full((n_chains, length) + last_shape, np.nan, dtype=dtype)
+        else:
+            data = np.zeros((n_chains, length) + last_shape, dtype=dtype)
+
         for i, chunk in enumerate(col.chunks):
             if hasattr(chunk, "values"):
                 values = chunk.values.to_numpy(False)
@@ -195,7 +200,7 @@ def sample(
     dims = {name: list(dim) for name, dim in compiled_model.dims.items()}
     dims["mass_matrix_inv"] = ["unconstrained_parameter"]
     dims["gradient"] = ["unconstrained_parameter"]
-    dims["unconstrained"] = ["unconstrained_parameter"]
+    dims["unconstrained_draw"] = ["unconstrained_parameter"]
 
     if return_raw_trace:
         return results
