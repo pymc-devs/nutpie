@@ -96,8 +96,7 @@ impl Sampler {
             // We do not handle this error. If the draws can not be send, this
             // could for instance be because the main thread was interrupted.
             // In this case we just want to return the draws we have so far.
-            let result = updates
-                .send(Box::new(info) as Box<dyn SampleStats>);
+            let result = updates.send(Box::new(info) as Box<dyn SampleStats>);
             if let Err(_) = result {
                 break;
             }
