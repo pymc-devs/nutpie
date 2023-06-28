@@ -33,7 +33,7 @@ def _trace_to_arviz(traces, n_tune, shapes, **kwargs):
 
     draw_batches = []
     stats_batches = []
-    for (draws, stats) in traces:
+    for draws, stats in traces:
         draw_batches.append(pyarrow.RecordBatch.from_struct_array(draws))
         stats_batches.append(pyarrow.RecordBatch.from_struct_array(stats))
 
@@ -44,11 +44,15 @@ def _trace_to_arviz(traces, n_tune, shapes, **kwargs):
         length = max(lengths)
         dtype = col.chunks[0].values.to_numpy().dtype
         if dtype in [np.float64, np.float32]:
-            data = np.full((n_chains, length) + tuple(shapes[name]), np.nan, dtype=dtype)
+            data = np.full(
+                (n_chains, length) + tuple(shapes[name]), np.nan, dtype=dtype
+            )
         else:
             data = np.zeros((n_chains, length) + tuple(shapes[name]), dtype=dtype)
         for i, chunk in enumerate(col.chunks):
-            data[i, :len(chunk)] = chunk.values.to_numpy().reshape((len(chunk),) + shapes[name])
+            data[i, : len(chunk)] = chunk.values.to_numpy().reshape(
+                (len(chunk),) + shapes[name]
+            )
 
         data_dict[name] = data[:, n_tune:]
         data_dict_tune[name] = data[:, :n_tune]
@@ -77,7 +81,7 @@ def _trace_to_arviz(traces, n_tune, shapes, **kwargs):
                 values = chunk.values.to_numpy(False)
             else:
                 values = chunk.to_numpy(False)
-            data[i, :len(chunk)] = values.reshape((len(chunk),) + last_shape)
+            data[i, : len(chunk)] = values.reshape((len(chunk),) + last_shape)
             stats_dict[name] = data[:, n_tune:]
             stats_dict_tune[name] = data[:, :n_tune]
 
@@ -101,7 +105,7 @@ def sample(
     save_warmup: bool = True,
     progress_bar: bool = True,
     init_mean: Optional[np.ndarray] = None,
-    return_raw_trace = False,
+    return_raw_trace=False,
     **kwargs,
 ) -> arviz.InferenceData:
     """Sample the posterior distribution for a compiled model.
@@ -210,6 +214,8 @@ def sample(
             tune,
             compiled_model.shapes,
             dims=dims,
-            coords={name: pd.Index(vals) for name, vals in compiled_model.coords.items()},
-            save_warmup=save_warmup
+            coords={
+                name: pd.Index(vals) for name, vals in compiled_model.coords.items()
+            },
+            save_warmup=save_warmup,
         )
