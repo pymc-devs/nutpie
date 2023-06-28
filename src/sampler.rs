@@ -1,7 +1,7 @@
 use std::{
     sync::{
         self,
-        mpsc::{channel, RecvTimeoutError, Sender},
+        mpsc::{channel, sync_channel, RecvTimeoutError, SyncSender},
         Arc,
     },
     thread,
@@ -50,7 +50,7 @@ impl Sampler {
         chain: u64,
         model: Arc<M>,
         settings: SamplerArgs,
-        updates: Sender<Box<dyn SampleStats>>,
+        updates: SyncSender<Box<dyn SampleStats>>,
     ) -> Result<(u64, Box<dyn Array>, Option<Box<dyn Array>>)> {
         let mut rng = if let Some(seed) = seed {
             ChaCha8Rng::seed_from_u64(seed)
@@ -117,7 +117,13 @@ impl Sampler {
         seed: Option<u64>,
     ) -> Self {
         let model = Arc::new(model);
-        let (send_updates, updates) = channel();
+        let (send_updates, updates) = sync_channel(
+            chains
+                .checked_mul(4)
+                .expect("Invalid number of chains")
+                .try_into()
+                .expect("Invalid number of chains"),
+        );
 
         let thread = thread::spawn(move || {
             let pool = rayon::ThreadPoolBuilder::new()

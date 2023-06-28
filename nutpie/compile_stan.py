@@ -49,7 +49,9 @@ def compile_stan_model(
         except (FileNotFoundError, KeyError):
             pass
     if stan_lib is None:
-        output = httpstan.models.build_services_extension_module_sync(code, extra_compile_args)
+        output = httpstan.models.build_services_extension_module_sync(
+            code, extra_compile_args
+        )
         if show_compiler_output:
             print(output)
         stan_lib = httpstan.models.import_services_extension_module(model_id)
@@ -103,5 +105,3 @@ def _make_logp_maker(stanlib, data):
         return func_ptr, ctx, (stanlib, data)
 
     return lib.PtrLogpFuncMaker(make_logp_pyfn, (stanlib, data), n_dim, (stanlib, data))
-
-

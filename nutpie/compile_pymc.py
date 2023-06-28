@@ -77,7 +77,7 @@ class CompiledPyMCModel(CompiledModel):
             self.n_expanded,
             self.compiled_expand_func.address,
             self.user_data.ctypes.data,
-            self
+            self,
         )
         logp_fn = lib.LogpFunc(
             self.n_dim,
@@ -145,9 +145,16 @@ def compile_pymc_model(model: pm.Model, **kwargs) -> CompiledPyMCModel:
 
     """
 
-    n_dim, n_expanded, logp_fn_pt, logp_fn, expand_fn_pt, expand_fn, shared_expand, shape_info = _make_functions(
-        model
-    )
+    (
+        n_dim,
+        n_expanded,
+        logp_fn_pt,
+        logp_fn,
+        expand_fn_pt,
+        expand_fn,
+        shared_expand,
+        shape_info,
+    ) = _make_functions(model)
 
     shared_data = {val.name: val.get_value().copy() for val in logp_fn_pt.get_shared()}
     for val in shared_data.values():
@@ -334,8 +341,7 @@ def make_extraction_fn(inner, shared_data, shared_vars, record_dtype):
 
     @numba.extending.intrinsic
     def tuple_setitem_literal(typingctx, tup, idx, val):
-        """Return a copy of the tuple with item at *idx* replaced with *val*.
-        """
+        """Return a copy of the tuple with item at *idx* replaced with *val*."""
         if not isinstance(idx, numba.types.IntegerLiteral):
             return
 
@@ -406,7 +412,6 @@ def make_extraction_fn(inner, shared_data, shared_vars, record_dtype):
 
 
 def _make_c_logp_func(n_dim, logp_fn, user_data, shared_logp, shared_data):
-
     extract = make_extraction_fn(logp_fn, shared_data, shared_logp, user_data.dtype)
 
     c_sig = numba.types.int64(
@@ -443,8 +448,9 @@ def _make_c_logp_func(n_dim, logp_fn, user_data, shared_logp, shared_data):
     return logp_numba, c_sig
 
 
-def _make_c_expand_func(n_dim, n_expanded, expand_fn, user_data, shared_vars, shared_data):
-
+def _make_c_expand_func(
+    n_dim, n_expanded, expand_fn, user_data, shared_vars, shared_data
+):
     extract = make_extraction_fn(expand_fn, shared_data, shared_vars, user_data.dtype)
 
     c_sig = numba.types.int64(
