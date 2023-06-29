@@ -72,6 +72,10 @@ class CompiledPyMCModel(CompiledModel):
         )
 
     def _make_sampler(self, settings, init_mean, chains, cores, seed):
+        model = self._make_model(init_mean)
+        return lib.PySampler.from_pymc(settings, chains, cores, model, seed)
+
+    def _make_model(self, init_mean):
         expand_fn = lib.ExpandFunc(
             self.n_dim,
             self.n_expanded,
@@ -88,7 +92,7 @@ class CompiledPyMCModel(CompiledModel):
 
         var_sizes = [prod(shape) for shape in self.shape_info[2]]
 
-        model = lib.PyMcModel(
+        return lib.PyMcModel(
             self.n_dim,
             logp_fn,
             expand_fn,
@@ -96,7 +100,6 @@ class CompiledPyMCModel(CompiledModel):
             self.shape_info[0],
             init_mean,
         )
-        return lib.PySampler.from_pymc(settings, chains, cores, model, seed)
 
 
 def update_user_data(user_data, user_data_storage):
