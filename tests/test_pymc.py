@@ -1,13 +1,11 @@
 import nutpie
 import pytest
 import numpy as np
+import pymc as pm
+import nutpie.compile_pymc
 
 
 def test_pymc_model():
-    pm = pytest.importorskip("pymc")
-
-    import nutpie.compile_pymc
-
     with pm.Model() as model:
         pm.Normal("a")
 
@@ -17,10 +15,6 @@ def test_pymc_model():
 
 
 def test_trafo():
-    pm = pytest.importorskip("pymc")
-
-    import nutpie.compile_pymc
-
     with pm.Model() as model:
         pm.Uniform("a")
 
@@ -30,10 +24,6 @@ def test_trafo():
 
 
 def test_det():
-    pm = pytest.importorskip("pymc")
-
-    import nutpie.compile_pymc
-
     with pm.Model() as model:
         a = pm.Uniform("a", shape=2)
         b = pm.Deterministic("b", 2 * a)
@@ -45,10 +35,6 @@ def test_det():
 
 
 def test_pymc_model_shared():
-    pm = pytest.importorskip("pymc")
-
-    import nutpie.compile_pymc
-
     with pm.Model() as model:
         mu = pm.MutableData("mu", 0.1)
         sigma = pm.MutableData("sigma", np.ones(3))

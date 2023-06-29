@@ -6,7 +6,7 @@ except ImportError:
 
     def compile_pymc_model(*args, **kwargs):
         raise ValueError(
-            "Missing dependencies for pymc. `import nutpie.compile_pymc` to see error."
+            "Missing dependencies for pymc models. Install pymc."
         )
 
 
@@ -16,7 +16,7 @@ except ImportError:
 
     def compile_stan_model(*args, **kwargs):
         raise ImportError(
-            "Missing dependencies for stan. `import nutpie.compile_stan` to see error."
+            "Missing dependencies for stan models. Install bridgestan."
         )
 
 
