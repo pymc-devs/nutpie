@@ -6,6 +6,7 @@ import numpy as np
 import json
 
 from numpy.typing import NDArray
+import pandas as pd
 
 from nutpie.sample import CompiledModel
 from nutpie import lib
@@ -20,30 +21,46 @@ class _NumpyArrayEncoder(json.JSONEncoder):
 
 @dataclass(frozen=True)
 class CompiledStanModel(CompiledModel):
+    _coords: Dict[str, Any] | None
     code: str
     data: Dict[str, NDArray] | None
     library: Any
     model: Any | None
     model_name: str | None = None
 
-    def with_data(self, data, *, seed=None):
+    def with_data(self, *, seed=None, **updates):
+        if self.data is None:
+            data = {}
+        else:
+            data = self.data.copy()
+
+        data.update(updates)
+
         if data is not None:
             data_json = json.dumps(data, cls=_NumpyArrayEncoder)
         else:
             data_json = None
+
         model = lib.StanModel(self.library, seed, data_json)
+        coords = self._coords
+        if coords is None:
+            coords = {}
+        else:
+            coords = coords.copy()
+        coords["unconstrained_parameter"] = pd.Index(model.param_unc_names())
+
         return CompiledStanModel(
+            _coords=coords,
             data=data,
             code=self.code,
             library=self.library,
-            coords=self.coords,
             dims=self.dims,
             model=model,
         )
 
     def _make_model(self, init_mean):
         if self.model is None:
-            return self.with_data(None).model
+            return self.with_data().model
         return self.model
 
     def _make_sampler(self, settings, init_mean, chains, cores, seed):
@@ -53,14 +70,20 @@ class CompiledStanModel(CompiledModel):
     @property
     def n_dim(self):
         if self.model is None:
-            return self.with_data(None).n_dim
+            return self.with_data().n_dim
         return self.model.ndim()
 
     @property
     def shapes(self):
         if self.model is None:
-            return self.with_data(None).shapes
+            return self.with_data().shapes
         return {name: var.shape for name, var in self.model.variables().items()}
+
+    @property
+    def coords(self):
+        if self.model is None:
+            return self.with_data().coords
+        return self._coords
 
 
 def compile_stan_model(
@@ -110,7 +133,7 @@ def compile_stan_model(
         code=code,
         library=library,
         dims=dims,
-        coords=coords,
+        _coords=coords,
         model_name=model_name,
         model=None,
         data=None,
