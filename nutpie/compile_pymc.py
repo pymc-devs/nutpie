@@ -44,6 +44,16 @@ class CompiledPyMCModel(CompiledModel):
     shape_info: Any
     logp_func: Any
     expand_func: Any
+    _n_dim: int
+    _shapes: Dict[str, Tuple[int, ...]]
+
+    @property
+    def n_dim(self):
+        return self._n_dim
+
+    @property
+    def shapes(self):
+        return self._shapes
 
     def with_data(self, **updates):
         shared_data = self.shared_data.copy()
@@ -61,16 +71,10 @@ class CompiledPyMCModel(CompiledModel):
             shared_data[name] = new_val
         user_data = update_user_data(user_data, shared_data)
 
-        logp_func_maker = self.logp_func_maker.with_arg(user_data.ctypes.data)
-        expand_draw_fn = functools.partial(
-            self.expand_draw_fn.func, shared_data=shared_data
-        )
         return dataclasses.replace(
             self,
             shared_data=shared_data,
             user_data=user_data,
-            logp_func_maker=logp_func_maker,
-            expand_draw_fn=expand_draw_fn,
         )
 
     def _make_sampler(self, settings, init_mean, chains, cores, seed):
@@ -195,10 +199,10 @@ def compile_pymc_model(model: pm.Model, **kwargs) -> CompiledPyMCModel:
     coords["unconstrained_parameter"] = pd.Index(names)
 
     return CompiledPyMCModel(
-        n_dim=n_dim,
+        _n_dim=n_dim,
         dims=model.named_vars_to_dims,
         coords=model.coords,
-        shapes={name: tuple(shape) for name, _, shape in zip(*shape_info)},
+        _shapes={name: tuple(shape) for name, _, shape in zip(*shape_info)},
         compiled_logp_func=logp_numba,
         compiled_expand_func=expand_numba,
         shared_data=shared_data,

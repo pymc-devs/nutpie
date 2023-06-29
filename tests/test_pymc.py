@@ -55,10 +55,12 @@ def test_pymc_model_shared():
         pm.Normal("a", mu=mu, sigma=sigma, shape=3)
 
     compiled = nutpie.compile_pymc_model(model)
-    trace = nutpie.sample(compiled, chains=1)
+    trace = nutpie.sample(compiled, chains=1, seed=1)
+    np.testing.assert_allclose(trace.posterior.a.mean().values, 0.1, atol=0.05)
 
-    compiled2 = compiled.with_data(mu=0.5, sigma=3 * np.ones(3))
-    trace2 = nutpie.sample(compiled2, chains=1)
+    compiled2 = compiled.with_data(mu=10., sigma=3 * np.ones(3))
+    trace2 = nutpie.sample(compiled2, chains=1, seed=1)
+    np.testing.assert_allclose(trace2.posterior.a.mean().values, 10., atol=0.5)
 
     compiled3 = compiled.with_data(mu=0.5, sigma=3 * np.ones(4))
     with pytest.raises(ValueError):

@@ -1,32 +1,78 @@
 from dataclasses import dataclass
-from math import prod
 from typing import Any, Dict
+import tempfile
+import pathlib
+import numpy as np
+import json
 
 from numpy.typing import NDArray
 
-from .sample import CompiledModel
-from . import lib
+from nutpie.sample import CompiledModel
+from nutpie import lib
+
+
+class _NumpyArrayEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return json.JSONEncoder.default(self, obj)
 
 
 @dataclass(frozen=True)
 class CompiledStanModel(CompiledModel):
     code: str
-    data: Dict[str, NDArray]
-    lib: Any
+    data: Dict[str, NDArray] | None
+    library: Any
+    model: Any | None
+    model_name: str | None = None
+
+    def with_data(self, data, *, seed=None):
+        if data is not None:
+            data_json = json.dumps(data, cls=_NumpyArrayEncoder)
+        else:
+            data_json = None
+        model = lib.StanModel(self.library, seed, data_json)
+        return CompiledStanModel(
+            data=data,
+            code=self.code,
+            library=self.library,
+            coords=self.coords,
+            dims=self.dims,
+            model=model,
+        )
+
+    def _make_model(self, init_mean):
+        if self.model is None:
+            return self.with_data(None).model
+        return self.model
+
+    def _make_sampler(self, settings, init_mean, chains, cores, seed):
+        model = self._make_model(init_mean)
+        return lib.PySampler.from_stan(settings, chains, cores, model, seed)
+
+    @property
+    def n_dim(self):
+        if self.model is None:
+            return self.with_data(None).n_dim
+        return self.model.ndim()
+
+    @property
+    def shapes(self):
+        if self.model is None:
+            return self.with_data(None).shapes
+        return {name: var.shape for name, var in self.model.variables().items()}
 
 
 def compile_stan_model(
-    data,
     *,
     code=None,
     filename=None,
-    cache=True,
     extra_compile_args=None,
-    show_compiler_output=False,
     dims=None,
     coords=None,
+    model_name=None,
 ):
-    import httpstan.models
+    import bridgestan
 
     if dims is None:
         dims = {}
@@ -41,67 +87,31 @@ def compile_stan_model(
         with open(filename, "r") as file:
             code = file.read()
 
-    model_id = httpstan.models.calculate_model_name(code)
-    stan_lib = None
-    if cache and not extra_compile_args:
-        try:
-            stan_lib = httpstan.models.import_services_extension_module(model_id)
-        except (FileNotFoundError, KeyError):
-            pass
-    if stan_lib is None:
-        output = httpstan.models.build_services_extension_module_sync(
-            code, extra_compile_args
+    if model_name is None:
+        model_name = "model"
+
+    with tempfile.TemporaryDirectory() as basedir:
+        model_path = (
+            pathlib.Path(basedir)
+            .joinpath("name")
+            .with_name(model_name)  # This verifies that it is a valid filename
+            .with_suffix(".stan")
         )
-        if show_compiler_output:
-            print(output)
-        stan_lib = httpstan.models.import_services_extension_module(model_id)
+        model_path.write_text(code)
+        make_args = ["STAN_THREADS=true"]
+        if extra_compile_args:
+            make_args.extend(extra_compile_args)
+        so_path = bridgestan.compile_model(model_path, make_args=make_args)
+        library = lib.StanLibrary(so_path)
 
-    ctx = stan_lib.new_logp_ctx(data)
-    n_dim = stan_lib.num_unconstrained_parameters(ctx)
-
-    shape_info = _make_shape_info(stan_lib, data)
-
-    logp_maker = _make_logp_maker(stan_lib, data)
-
-    def expanding_function(x, seed, chain, draw):
-        return stan_lib.write_array_ctx(ctx, x, True, True, seed + 10000 * chain + draw)
-
+    # One the library is loaded we can delete the temporary dir
+    # TODO: Is this also true on Windows?
     return CompiledStanModel(
-        n_dim,
-        dims,
-        coords,
-        shape_info,
-        logp_maker,
-        expanding_function,
-        code,
-        data,
-        stan_lib,
+        code=code,
+        library=library,
+        dims=dims,
+        coords=coords,
+        model_name=model_name,
+        model=None,
+        data=None,
     )
-
-
-def _make_shape_info(model, data):
-    slices = []
-    shapes = []
-    count = 0
-    for shape in model.get_dims(data):
-        shapes.append(shape)
-        length = prod(shape)
-        slices.append(slice(count, count + length))
-        count += length
-
-    names = model.get_param_names(data)
-    return names, slices, shapes
-
-
-def _make_logp_maker(stanlib, data):
-    ctx = stanlib.new_logp_ctx(data)
-    n_dim = stanlib.num_unconstrained_parameters(ctx)
-    stanlib.free_logp_ctx(ctx)
-
-    def make_logp_pyfn(args):
-        stanlib, data = args
-        ctx = stanlib.new_logp_ctx(data)
-        func_ptr = stanlib.logp_func(ctx)
-        return func_ptr, ctx, (stanlib, data)
-
-    return lib.PtrLogpFuncMaker(make_logp_pyfn, (stanlib, data), n_dim, (stanlib, data))
