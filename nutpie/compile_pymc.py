@@ -1,30 +1,30 @@
-from dataclasses import dataclass
 import dataclasses
 import functools
 import itertools
+from dataclasses import dataclass
 from math import prod
 from typing import Any, Dict, Tuple
 
-from numpy.typing import NDArray
-import pytensor
-import pytensor.tensor as pt
-import pymc as pm
-import pandas as pd
-import numpy as np
 import numba
+import numba.core.ccallback
+import numpy as np
+import pandas as pd
+import pymc as pm
+import pytensor
 import pytensor.link.numba.dispatch
+import pytensor.tensor as pt
 from numba import literal_unroll
 from numba.cpython.unsafe.tuple import alloca_once, tuple_setitem
-import numba.core.ccallback
+from numpy.typing import NDArray
 
-from .sample import CompiledModel
 from . import lib
+from .sample import CompiledModel
 
 
 @numba.extending.intrinsic
 def address_as_void_pointer(typingctx, src):
     """returns a void pointer from a given memory address"""
-    from numba.core import types, cgutils
+    from numba.core import cgutils, types
 
     sig = types.voidptr(src)
 
@@ -284,7 +284,9 @@ def _make_functions(model):
 
     num_free_vars = count
 
-    joined = pt.TensorType("float64", shape=(num_free_vars,))(name="_unconstrained_point")
+    joined = pt.TensorType("float64", shape=(num_free_vars,))(
+        name="_unconstrained_point"
+    )
 
     use_split = False
     if use_split:
@@ -304,10 +306,9 @@ def _make_functions(model):
         )
     }
 
-
     (logp, grad) = pytensor.graph_replace([logp, grad], replacements)
-    #(logp, grad) = pytensor.graph.rewrite_graph(logp, include=["canonicalize", "stabilize"])
-    #grad = pytensor.gradient.grad(logp, joined)
+    # (logp, grad) = pytensor.graph.rewrite_graph(logp, include=["canonicalize", "stabilize"])
+    # grad = pytensor.gradient.grad(logp, joined)
 
     # We should avoid compiling the function, and optimize only
     logp_fn_pt = pytensor.compile.function.function(
@@ -345,7 +346,10 @@ def _make_functions(model):
 
     allvars = pt.concatenate([joined, *[var.ravel() for var in remaining_rvs]])
     expand_fn_pt = pytensor.compile.function.function(
-        (joined,), (allvars,), givens=list(replacements.items()), mode=pytensor.compile.NUMBA
+        (joined,),
+        (allvars,),
+        givens=list(replacements.items()),
+        mode=pytensor.compile.NUMBA,
     )
     expand_fn = expand_fn_pt.vm.jit_fn
     # expand_fn = numba.njit(expand_fn, fastmath=True, error_model="numpy")

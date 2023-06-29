@@ -5,9 +5,7 @@ try:
 except ImportError:
 
     def compile_pymc_model(*args, **kwargs):
-        raise ValueError(
-            "Missing dependencies for pymc models. Install pymc."
-        )
+        raise ValueError("Missing dependencies for pymc models. Install pymc.")
 
 
 try:
@@ -15,9 +13,7 @@ try:
 except ImportError:
 
     def compile_stan_model(*args, **kwargs):
-        raise ImportError(
-            "Missing dependencies for stan models. Install bridgestan."
-        )
+        raise ImportError("Missing dependencies for stan models. Install bridgestan.")
 
 
 from .sample import sample

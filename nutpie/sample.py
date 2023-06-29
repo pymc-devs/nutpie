@@ -1,12 +1,12 @@
-from typing import Dict, Tuple, Optional
 from dataclasses import dataclass
+from typing import Dict, Optional, Tuple
 
-import numpy as np
-import fastprogress
 import arviz
+import fastprogress
+import numpy as np
+import pandas as pd
 import pyarrow
 import xarray as xr
-import pandas as pd
 
 from . import lib
 
