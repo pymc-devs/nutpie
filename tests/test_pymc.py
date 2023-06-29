@@ -1,7 +1,8 @@
-import nutpie
-import pytest
 import numpy as np
 import pymc as pm
+import pytest
+
+import nutpie
 import nutpie.compile_pymc
 
 
@@ -44,11 +45,10 @@ def test_pymc_model_shared():
     trace = nutpie.sample(compiled, chains=1, seed=1)
     np.testing.assert_allclose(trace.posterior.a.mean().values, 0.1, atol=0.05)
 
-    compiled2 = compiled.with_data(mu=10., sigma=3 * np.ones(3))
+    compiled2 = compiled.with_data(mu=10.0, sigma=3 * np.ones(3))
     trace2 = nutpie.sample(compiled2, chains=1, seed=1)
-    np.testing.assert_allclose(trace2.posterior.a.mean().values, 10., atol=0.5)
+    np.testing.assert_allclose(trace2.posterior.a.mean().values, 10.0, atol=0.5)
 
     compiled3 = compiled.with_data(mu=0.5, sigma=3 * np.ones(4))
     with pytest.raises(ValueError):
         trace3 = nutpie.sample(compiled3, chains=1)
-

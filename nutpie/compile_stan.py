@@ -1,15 +1,15 @@
+import json
+import pathlib
+import tempfile
 from dataclasses import dataclass
 from typing import Any, Dict
-import tempfile
-import pathlib
+
 import numpy as np
-import json
-
-from numpy.typing import NDArray
 import pandas as pd
+from numpy.typing import NDArray
 
-from nutpie.sample import CompiledModel
 from nutpie import lib
+from nutpie.sample import CompiledModel
 
 
 class _NumpyArrayEncoder(json.JSONEncoder):
