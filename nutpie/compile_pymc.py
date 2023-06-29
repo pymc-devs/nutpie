@@ -3,7 +3,7 @@ import dataclasses
 import functools
 import itertools
 from math import prod
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 from numpy.typing import NDArray
 import pytensor
