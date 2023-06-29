@@ -42,6 +42,8 @@ class CompiledPyMCModel(CompiledModel):
     user_data: NDArray
     n_expanded: int
     shape_info: Any
+    logp_func: Any
+    expand_func: Any
 
     def with_data(self, **updates):
         shared_data = self.shared_data.copy()
@@ -203,6 +205,8 @@ def compile_pymc_model(model: pm.Model, **kwargs) -> CompiledPyMCModel:
         user_data=user_data,
         n_expanded=n_expanded,
         shape_info=shape_info,
+        logp_func=logp_fn_pt,
+        expand_func=expand_fn_pt,
     )
 
 
