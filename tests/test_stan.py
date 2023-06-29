@@ -4,10 +4,6 @@ import numpy as np
 
 
 def test_stan_model():
-    _ = pytest.importorskip("bridgestan")
-
-    import nutpie.compile_stan
-
     model = """
     data {}
     parameters {
@@ -24,10 +20,6 @@ def test_stan_model():
 
 
 def test_stan_model_data():
-    _ = pytest.importorskip("bridgestan")
-
-    import nutpie.compile_stan
-
     model = """
     data {
         real x;
