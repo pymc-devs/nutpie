@@ -13,10 +13,16 @@ from . import lib
 
 @dataclass(frozen=True)
 class CompiledModel:
-    n_dim: int
-    dims: Dict[str, Tuple[str, ...]]
-    coords: Dict[str, xr.IndexVariable]
-    shapes: Dict[str, Tuple[int, ...]]
+    dims: Dict[str, Tuple[str, ...]] | None
+    coords: Dict[str, xr.IndexVariable] | None
+
+    @property
+    def n_dim(self) -> int:
+        raise NotImplementedError()
+
+    @property
+    def shapes(self) -> Dict[str, Tuple[int, ...]] | None:
+        raise NotImplementedError()
 
     def _make_sampler(self, *args, **kwargs):
         raise NotImplementedError()
@@ -48,7 +54,6 @@ class CompiledModel:
 
 
 def _trace_to_arviz(traces, n_tune, shapes, **kwargs):
-    n_draws = len(traces[0][0])
     n_chains = len(traces)
 
     data_dict = {}
