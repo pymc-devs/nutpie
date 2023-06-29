@@ -5,7 +5,7 @@ use std::{
         Arc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::Result;
@@ -36,6 +36,48 @@ pub(crate) trait Model: Send + Sync + 'static {
     ) -> Result<Self::Trace<'a>>;
     fn density(&self) -> Result<Self::Density<'_>>;
     fn init_position<R: Rng + ?Sized>(&self, rng: &mut R, position: &mut [f64]) -> Result<()>;
+
+    fn benchmark_logp(
+        &self,
+        point: &[f64],
+        cores: usize,
+        evals: usize,
+    ) -> Result<Vec<Vec<Duration>>> {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(cores)
+            .thread_name(|idx| format!("benchmark-logp-{}", idx))
+            .build()?;
+
+        let (tx, rx) = channel();
+
+        pool.scope(move |s| {
+            for _ in 0..cores {
+                let tx = tx.clone();
+
+                s.spawn(move |_| {
+                    let run = || {
+                        let mut density = self.density()?;
+                        let mut grad = vec![0f64; density.dim()];
+                        let mut durations = Vec::with_capacity(evals);
+
+                        for _ in 0..evals {
+                            let start = Instant::now();
+                            density.logp(point, &mut grad[..])?;
+                            durations.push(start.elapsed())
+                        }
+
+                        Ok(durations)
+                    };
+
+                    tx.send(run())
+                        .expect("Could not send results to main thread");
+                });
+            }
+        });
+
+        let results: Result<Vec<_>> = rx.into_iter().collect_vec().into_iter().collect();
+        results
+    }
 }
 
 pub(crate) struct Sampler {

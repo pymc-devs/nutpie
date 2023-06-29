@@ -250,6 +250,24 @@ impl PyMcModel {
             var_sizes: var_sizes.extract()?,
         })
     }
+
+    fn benchmark_logp<'py>(
+        &self,
+        py: Python<'py>,
+        point: PyReadonlyArray1<'py, f64>,
+        cores: usize,
+        evals: usize,
+    ) -> PyResult<&'py PyList> {
+        let point = point.to_vec()?;
+        let durations = py.allow_threads(|| Model::benchmark_logp(self, &point, cores, evals))?;
+        let out = PyList::new(
+            py,
+            durations
+                .into_iter()
+                .map(|inner| PyList::new(py, inner.into_iter().map(|d| d.as_secs_f64()))),
+        );
+        Ok(out)
+    }
 }
 
 impl Model for PyMcModel {
