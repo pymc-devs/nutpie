@@ -35,5 +35,5 @@ def test_stan_model_data():
     compiled_model = nutpie.compile_stan_model(code=model)
     with pytest.raises(RuntimeError):
         trace = nutpie.sample(compiled_model)
-    trace = nutpie.sample(compiled_model.with_data({"x": np.array(3.)}))
+    trace = nutpie.sample(compiled_model.with_data(x=np.array(3.)))
     trace.posterior.a

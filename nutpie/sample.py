@@ -14,7 +14,6 @@ from . import lib
 @dataclass(frozen=True)
 class CompiledModel:
     dims: Dict[str, Tuple[str, ...]] | None
-    coords: Dict[str, xr.IndexVariable] | None
 
     @property
     def n_dim(self) -> int:
@@ -22,6 +21,10 @@ class CompiledModel:
 
     @property
     def shapes(self) -> Dict[str, Tuple[int, ...]] | None:
+        raise NotImplementedError()
+
+    @property
+    def coords(self):
         raise NotImplementedError()
 
     def _make_sampler(self, *args, **kwargs):

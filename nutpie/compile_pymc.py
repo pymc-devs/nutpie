@@ -46,6 +46,7 @@ class CompiledPyMCModel(CompiledModel):
     expand_func: Any
     _n_dim: int
     _shapes: Dict[str, Tuple[int, ...]]
+    _coords: Dict[str, Any] | None
 
     @property
     def n_dim(self):
@@ -54,6 +55,10 @@ class CompiledPyMCModel(CompiledModel):
     @property
     def shapes(self):
         return self._shapes
+
+    @property
+    def coords(self):
+        return self._coords
 
     def with_data(self, **updates):
         shared_data = self.shared_data.copy()
@@ -201,7 +206,7 @@ def compile_pymc_model(model: pm.Model, **kwargs) -> CompiledPyMCModel:
     return CompiledPyMCModel(
         _n_dim=n_dim,
         dims=model.named_vars_to_dims,
-        coords=model.coords,
+        _coords=model.coords,
         _shapes={name: tuple(shape) for name, _, shape in zip(*shape_info)},
         compiled_logp_func=logp_numba,
         compiled_expand_func=expand_numba,
