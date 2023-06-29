@@ -3,7 +3,7 @@ import functools
 import itertools
 from dataclasses import dataclass
 from math import prod
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import numba
 import numba.core.ccallback
@@ -46,7 +46,7 @@ class CompiledPyMCModel(CompiledModel):
     expand_func: Any
     _n_dim: int
     _shapes: Dict[str, Tuple[int, ...]]
-    _coords: Dict[str, Any] | None
+    _coords: Optional[Dict[str, Any]]
 
     @property
     def n_dim(self):

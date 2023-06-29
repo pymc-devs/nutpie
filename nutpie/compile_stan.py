@@ -2,7 +2,7 @@ import json
 import pathlib
 import tempfile
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import numpy as np
 import pandas as pd
@@ -21,12 +21,12 @@ class _NumpyArrayEncoder(json.JSONEncoder):
 
 @dataclass(frozen=True)
 class CompiledStanModel(CompiledModel):
-    _coords: Dict[str, Any] | None
+    _coords: Optional[Dict[str, Any]]
     code: str
-    data: Dict[str, NDArray] | None
+    data: Optional[Dict[str, NDArray]]
     library: Any
-    model: Any | None
-    model_name: str | None = None
+    model: Any
+    model_name: Optional[str] = None
 
     def with_data(self, *, seed=None, **updates):
         if self.data is None:

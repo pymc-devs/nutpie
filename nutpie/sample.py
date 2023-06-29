@@ -13,14 +13,14 @@ from . import lib
 
 @dataclass(frozen=True)
 class CompiledModel:
-    dims: Dict[str, Tuple[str, ...]] | None
+    dims: Optional[Dict[str, Tuple[str, ...]]]
 
     @property
     def n_dim(self) -> int:
         raise NotImplementedError()
 
     @property
-    def shapes(self) -> Dict[str, Tuple[int, ...]] | None:
+    def shapes(self) -> Optional[Dict[str, Tuple[int, ...]]]:
         raise NotImplementedError()
 
     @property
