@@ -18,7 +18,7 @@ name = "nutpie"
 crate-type = ["cdylib"]
 
 [dependencies]
-nuts-rs = "0.4.1"
+nuts-rs = "0.5.0"
 numpy = "0.19.0"
 ndarray = "0.15.6"
 rand = "0.8.5"

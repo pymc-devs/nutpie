@@ -691,7 +691,9 @@ dependencies = [
 
 [[package]]
 name = "nuts-rs"
-version = "0.4.1"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be034c0dcb9445f6bc61caab9cd7085a76efa8b5926bce40210aa0425413b4c7"
 dependencies = [
  "anyhow",
  "arrow2",
