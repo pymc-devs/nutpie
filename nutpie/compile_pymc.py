@@ -245,6 +245,12 @@ def _make_functions(model):
     value_vars = [model.rvs_to_values[var] for var in model.free_RVs]
 
     logp = model.logp()
+
+    rewrites = ["canonicalize", "stabilize"]
+    if not model.check_bounds:
+        rewrites.append("local_remove_check_parameter")
+
+    logp = pytensor.graph.rewrite_graph(logp, include=rewrites)
     grads = pytensor.gradient.grad(logp, value_vars)
     grad = pt.concatenate([grad.ravel() for grad in grads])
 
@@ -253,24 +259,50 @@ def _make_functions(model):
     joined_shapes = []
     joined_names = []
 
-    symbolic_sliced = []
+    splits = []
+
     for var in model.free_RVs:
         value_var = model.rvs_to_values[var]
-
         joined_names.append(value_var.name)
         shape = shapes[value_var.name]
         joined_shapes.append(shape)
         length = prod(shape)
         slice_val = slice(count, count + length)
         joined_slices.append(slice_val)
-        symbolic_sliced.append((value_var, joined[slice_val].reshape(shape)))
         count += length
+
+        splits.append(length)
 
     num_free_vars = count
 
+    joined = pt.TensorType("float64", shape=(num_free_vars,))(name="_unconstrained_point")
+
+    use_split = False
+    if use_split:
+        variables = pt.split(joined, splits, len(splits))
+    else:
+        variables = [
+            joined[slice_val].reshape(shape)
+            for slice_val, shape in zip(joined_slices, joined_shapes)
+        ]
+
+    replacements = {
+        model.rvs_to_values[var]: value.reshape(shape) if len(shape) != 1 else value
+        for var, shape, value in zip(
+            model.free_RVs,
+            joined_shapes,
+            variables,
+        )
+    }
+
+
+    (logp, grad) = pytensor.graph_replace([logp, grad], replacements)
+    #(logp, grad) = pytensor.graph.rewrite_graph(logp, include=["canonicalize", "stabilize"])
+    #grad = pytensor.gradient.grad(logp, joined)
+
     # We should avoid compiling the function, and optimize only
     logp_fn_pt = pytensor.compile.function.function(
-        (joined,), (logp, grad), givens=symbolic_sliced, mode=pytensor.compile.NUMBA
+        (joined,), (logp, grad), mode=pytensor.compile.NUMBA
     )
 
     logp_fn = logp_fn_pt.vm.jit_fn
@@ -304,7 +336,7 @@ def _make_functions(model):
 
     allvars = pt.concatenate([joined, *[var.ravel() for var in remaining_rvs]])
     expand_fn_pt = pytensor.compile.function.function(
-        (joined,), (allvars,), givens=symbolic_sliced, mode=pytensor.compile.NUMBA
+        (joined,), (allvars,), givens=list(replacements.items()), mode=pytensor.compile.NUMBA
     )
     expand_fn = expand_fn_pt.vm.jit_fn
     # expand_fn = numba.njit(expand_fn, fastmath=True, error_model="numpy")
