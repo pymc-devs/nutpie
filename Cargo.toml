@@ -32,7 +32,7 @@ bridgestan = "2.1.0"
 
 [dependencies.pyo3]
 version = "0.19.0"
-features = ["extension-module", "auto-initialize", "anyhow"]
+features = ["extension-module", "anyhow"]
 
 [dev-dependencies]
 criterion = "0.5.1"
