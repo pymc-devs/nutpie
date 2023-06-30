@@ -15,12 +15,18 @@ license = { text = "MIT" }
 version = "0.6.0"
 
 dependencies = [
-    "pyarrow >= 12.0",
+    "pyarrow >= 12.0.0",
     "pandas >= 2.0",
     "xarray >= 2023.06.0",
     "arviz >= 0.15.0",
+    "fastprogress >= 1.0.3",
 ]
 
 [project.optional-dependencies]
 stan = ["bridgestan == 2.1.0"]
-pymc = ["pymc >= 5.5.0"]
+pymc = ["pymc >= 5.5.0", "numba >= 0.57.1"]
+all = [
+    "bridgestan == 2.1.0",
+    "pymc >= 5.5.0",
+    "numba >= 0.57.1",
+]
