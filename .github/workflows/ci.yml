@@ -109,17 +109,7 @@ jobs:
         shell: bash
         run: |
           set -e
-          pushd ../..
-          git clone --recursive "https://github.com/roualdes/bridgestan"
-          pushd bridgestan
-          git fetch origin pull/149/head:fix
-          git checkout fix
-          pushd python
-          pip install -e .
-          popd
-          popd
-          popd
-          pip install "nutpie[all]" --find-links dist  # --force-reinstall
+          pip install "nutpie[all]" --find-links dist --force-reinstall
           pip install pytest
           pytest
 

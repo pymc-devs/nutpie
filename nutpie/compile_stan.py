@@ -125,6 +125,8 @@ def compile_stan_model(
         if extra_compile_args:
             make_args.extend(extra_compile_args)
         so_path = bridgestan.compile_model(model_path, make_args=make_args)
+        # Set necessary library loading paths
+        bridgestan.compile.windows_dll_path_setup()
         library = lib.StanLibrary(so_path)
 
     # One the library is loaded we can delete the temporary dir
