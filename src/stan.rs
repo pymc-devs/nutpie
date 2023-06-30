@@ -104,7 +104,7 @@ fn params(
     let mut variables = Vec::new();
     let mut start_idx = 0;
     for (name, idxs) in &name_idxs?.iter().group_by(|(name, _)| name) {
-        let shape: Vec<usize> = idxs
+        let mut shape: Vec<usize> = idxs
             .map(|(_name, idx)| idx)
             .fold(None, |acc, elem| {
                 let mut shape = acc.unwrap_or(elem.clone());
@@ -117,6 +117,7 @@ fn params(
                 Some(shape)
             })
             .unwrap_or(vec![]);
+        shape.iter_mut().for_each(|max_idx| *max_idx = (*max_idx) + 1);
         let size = shape.iter().product();
         let end_idx = start_idx + size;
         variables.push(Parameter {
