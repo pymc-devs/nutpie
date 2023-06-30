@@ -94,6 +94,7 @@ def compile_stan_model(
     dims=None,
     coords=None,
     model_name=None,
+    cleanup=True,
 ):
     import bridgestan
 
@@ -113,9 +114,10 @@ def compile_stan_model(
     if model_name is None:
         model_name = "model"
 
-    with tempfile.TemporaryDirectory() as basedir:
+    basedir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+    try:
         model_path = (
-            pathlib.Path(basedir)
+            pathlib.Path(basedir.name)
             .joinpath("name")
             .with_name(model_name)  # This verifies that it is a valid filename
             .with_suffix(".stan")
@@ -128,9 +130,13 @@ def compile_stan_model(
         # Set necessary library loading paths
         bridgestan.compile.windows_dll_path_setup()
         library = lib.StanLibrary(so_path)
+    finally:
+        try:
+            if cleanup:
+                basedir.cleanup()
+        except Exception:
+            pass
 
-    # One the library is loaded we can delete the temporary dir
-    # TODO: Is this also true on Windows?
     return CompiledStanModel(
         code=code,
         library=library,
