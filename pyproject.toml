@@ -1,9 +1,9 @@
 [build-system]
-requires = ["maturin>=0.14,<0.15"]
+requires = ["maturin>=1.1,<2.0"]
 build-backend = "maturin"
 
 [tool.maturin]
-bindings = "pyo3"
+features = ["pyo3/extension-module"]
 
 [project]
 name = "nutpie"
@@ -12,7 +12,11 @@ authors = [{name = "PyMC Developers", email = "pymc.devs@gmail.com"}]
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
-version = "0.6.0"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: Implementation :: PyPy",
+]
 
 dependencies = [
     "pyarrow >= 12.0.0",
@@ -30,3 +34,4 @@ all = [
     "pymc >= 5.5.0",
     "numba >= 0.57.1",
 ]
+
