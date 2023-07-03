@@ -6,9 +6,8 @@ import fastprogress
 import numpy as np
 import pandas as pd
 import pyarrow
-import xarray as xr
 
-from . import lib
+from nutpie import _lib
 
 
 @dataclass(frozen=True)
@@ -193,14 +192,14 @@ def sample(
         Return the raw trace object (an apache arrow structure)
         instead of converting to arviz.
     **kwargs
-        Pass additional arguments to nutpie.lib.PySamplerArgs
+        Pass additional arguments to nutpie._lib.PySamplerArgs
 
     Returns
     -------
     trace : arviz.InferenceData
         An ArviZ ``InferenceData`` object that contains the samples.
     """
-    settings = lib.PySamplerArgs()
+    settings = _lib.PySamplerArgs()
     settings.num_tune = tune
     settings.num_draws = draws
 

@@ -27,7 +27,7 @@ def test_trafo():
 def test_det():
     with pm.Model() as model:
         a = pm.Uniform("a", shape=2)
-        b = pm.Deterministic("b", 2 * a)
+        pm.Deterministic("b", 2 * a)
 
     compiled = nutpie.compile_pymc_model(model)
     trace = nutpie.sample(compiled, chains=1)
@@ -51,4 +51,4 @@ def test_pymc_model_shared():
 
     compiled3 = compiled.with_data(mu=0.5, sigma=3 * np.ones(4))
     with pytest.raises(ValueError):
-        trace3 = nutpie.sample(compiled3, chains=1)
+        nutpie.sample(compiled3, chains=1)

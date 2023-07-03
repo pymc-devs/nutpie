@@ -3,6 +3,8 @@ requires = ["maturin>=1.1,<2.0"]
 build-backend = "maturin"
 
 [tool.maturin]
+module-name = "nutpie._lib"
+python-source = "python"
 features = ["pyo3/extension-module"]
 
 [project]
