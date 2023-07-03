@@ -1,7 +1,7 @@
 import json
 import pathlib
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, Optional
 
 import numpy as np
@@ -57,6 +57,22 @@ class CompiledStanModel(CompiledModel):
             dims=self.dims,
             model=model,
         )
+
+    def with_coords(self, **coords):
+        if self.coords is None:
+            coords_new = {}
+        else:
+            coords_new = self.coords.copy()
+        coords_new.update(coords)
+        return replace(self, coords=coords_new)
+
+    def with_dims(self, **dims):
+        if self.dims is None:
+            dims_new = {}
+        else:
+            dims_new = self.dims.copy()
+        dims_new.update(dims)
+        return replace(self, dims=dims_new)
 
     def _make_model(self, init_mean):
         if self.model is None:
