@@ -327,7 +327,7 @@ fn export_array(py: Python<'_>, name: String, data: Box<dyn Array>) -> PyResult<
 
 /// A Python module implemented in Rust.
 #[pymodule]
-pub fn nutpie(_py: Python, m: &PyModule) -> PyResult<()> {
+pub fn _lib(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<PySamplerArgs>()?;
     m.add_class::<PySampleStats>()?;
     m.add_class::<PySampler>()?;
@@ -336,5 +336,6 @@ pub fn nutpie(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<ExpandFunc>()?;
     m.add_class::<StanLibrary>()?;
     m.add_class::<StanModel>()?;
+    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

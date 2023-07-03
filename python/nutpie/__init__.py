@@ -1,4 +1,5 @@
-from . import nutpie as lib
+from nutpie import _lib
+from nutpie.sample import sample
 
 try:
     from .compile_pymc import compile_pymc_model
@@ -16,4 +17,7 @@ except ImportError:
         raise ImportError("Missing dependencies for stan models. Install bridgestan.")
 
 
-from .sample import sample
+__version__ = _lib.__version__
+
+
+__all__ = ["sample", "compile_pymc_model", "compile_stan_model"]

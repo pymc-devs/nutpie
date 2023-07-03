@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 from numpy.typing import NDArray
 
-from nutpie import lib
+from nutpie import _lib
 from nutpie.sample import CompiledModel
 
 
@@ -41,7 +41,7 @@ class CompiledStanModel(CompiledModel):
         else:
             data_json = None
 
-        model = lib.StanModel(self.library, seed, data_json)
+        model = _lib.StanModel(self.library, seed, data_json)
         coords = self._coords
         if coords is None:
             coords = {}
@@ -81,7 +81,7 @@ class CompiledStanModel(CompiledModel):
 
     def _make_sampler(self, settings, init_mean, chains, cores, seed):
         model = self._make_model(init_mean)
-        return lib.PySampler.from_stan(settings, chains, cores, model, seed)
+        return _lib.PySampler.from_stan(settings, chains, cores, model, seed)
 
     @property
     def n_dim(self):
@@ -145,7 +145,7 @@ def compile_stan_model(
         so_path = bridgestan.compile_model(model_path, make_args=make_args)
         # Set necessary library loading paths
         bridgestan.compile.windows_dll_path_setup()
-        library = lib.StanLibrary(so_path)
+        library = _lib.StanLibrary(so_path)
     finally:
         try:
             if cleanup:

@@ -3,4 +3,4 @@ mod sampler;
 mod stan;
 mod wrapper;
 
-pub use wrapper::nutpie;
+pub use wrapper::_lib;

@@ -17,7 +17,7 @@ default = ["extension-module"]
 simd_support = ["nuts-rs/simd_support"]
 
 [lib]
-name = "nutpie"
+name = "_lib"
 crate-type = ["cdylib"]
 
 [dependencies]

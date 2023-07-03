@@ -1,5 +1,4 @@
 import dataclasses
-import functools
 import itertools
 from dataclasses import dataclass
 from math import prod
@@ -17,8 +16,8 @@ from numba import literal_unroll
 from numba.cpython.unsafe.tuple import alloca_once, tuple_setitem
 from numpy.typing import NDArray
 
-from . import lib
-from .sample import CompiledModel
+from nutpie import _lib
+from nutpie.sample import CompiledModel
 
 
 @numba.extending.intrinsic
@@ -84,17 +83,17 @@ class CompiledPyMCModel(CompiledModel):
 
     def _make_sampler(self, settings, init_mean, chains, cores, seed):
         model = self._make_model(init_mean)
-        return lib.PySampler.from_pymc(settings, chains, cores, model, seed)
+        return _lib.PySampler.from_pymc(settings, chains, cores, model, seed)
 
     def _make_model(self, init_mean):
-        expand_fn = lib.ExpandFunc(
+        expand_fn = _lib.ExpandFunc(
             self.n_dim,
             self.n_expanded,
             self.compiled_expand_func.address,
             self.user_data.ctypes.data,
             self,
         )
-        logp_fn = lib.LogpFunc(
+        logp_fn = _lib.LogpFunc(
             self.n_dim,
             self.compiled_logp_func.address,
             self.user_data.ctypes.data,
@@ -103,7 +102,7 @@ class CompiledPyMCModel(CompiledModel):
 
         var_sizes = [prod(shape) for shape in self.shape_info[2]]
 
-        return lib.PyMcModel(
+        return _lib.PyMcModel(
             self.n_dim,
             logp_fn,
             expand_fn,
@@ -307,8 +306,6 @@ def _make_functions(model):
     }
 
     (logp, grad) = pytensor.graph_replace([logp, grad], replacements)
-    # (logp, grad) = pytensor.graph.rewrite_graph(logp, include=["canonicalize", "stabilize"])
-    # grad = pytensor.gradient.grad(logp, joined)
 
     # We should avoid compiling the function, and optimize only
     logp_fn_pt = pytensor.compile.function.function(
@@ -318,12 +315,6 @@ def _make_functions(model):
     logp_fn = logp_fn_pt.vm.jit_fn
 
     # Make function that computes remaining variables for the trace
-    trace_vars = {
-        name: var
-        for (name, var) in model.named_vars.items()
-        if var not in model.observed_RVs + model.potentials
-    }
-    remaining_names = [name for name in trace_vars if name not in joined_names]
     remaining_rvs = [
         var for var in model.unobserved_value_vars if var.name not in joined_names
     ]
@@ -352,9 +343,6 @@ def _make_functions(model):
         mode=pytensor.compile.NUMBA,
     )
     expand_fn = expand_fn_pt.vm.jit_fn
-    # expand_fn = numba.njit(expand_fn, fastmath=True, error_model="numpy")
-    # Trigger a compile
-    # expand_fn(np.zeros(num_free_vars), *[var.get_value() for var in expand_fn_pt.get_shared()])
 
     return (
         num_free_vars,
@@ -427,8 +415,6 @@ def make_extraction_fn(inner, shared_data, shared_vars, record_dtype):
         index = index.literal_value
 
         name, ndim, base_shape, dtype = shared_metadata[index]
-
-        ndim_range = tuple(range(ndim))
 
         def impl(user_data, index):
             data_ptr = address_as_void_pointer(user_data["data"][name][()])
