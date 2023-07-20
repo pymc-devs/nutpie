@@ -2,7 +2,7 @@ import json
 import pathlib
 import tempfile
 from dataclasses import dataclass, replace
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -104,14 +104,15 @@ class CompiledStanModel(CompiledModel):
 
 def compile_stan_model(
     *,
-    code=None,
-    filename=None,
-    extra_compile_args=None,
-    dims=None,
-    coords=None,
-    model_name=None,
-    cleanup=True,
-):
+    code: Optional[str] = None,
+    filename: Optional[str] = None,
+    extra_compile_args: Optional[List[str]] = None,
+    extra_stanc_args: Optional[List[str]] = None,
+    dims: Optional[Dict[str, int]] = None,
+    coords: Optional[Dict[str, Any]] = None,
+    model_name: Optional[str] = None,
+    cleanup: bool = True,
+) -> CompiledStanModel:
     import bridgestan
 
     if dims is None:
@@ -142,7 +143,12 @@ def compile_stan_model(
         make_args = ["STAN_THREADS=true"]
         if extra_compile_args:
             make_args.extend(extra_compile_args)
-        so_path = bridgestan.compile_model(model_path, make_args=make_args)
+        stanc_args = []
+        if extra_stanc_args:
+            stanc_args.extend(extra_stanc_args)
+        so_path = bridgestan.compile_model(
+            model_path, make_args=make_args, stanc_args=stanc_args
+        )
         # Set necessary library loading paths
         bridgestan.compile.windows_dll_path_setup()
         library = _lib.StanLibrary(so_path)
