@@ -1,29 +1,29 @@
-from dataclasses import dataclass
 import dataclasses
-import functools
+import itertools
+from dataclasses import dataclass
 from math import prod
-from typing import Dict, List
+from typing import Any, Dict, Optional, Tuple
 
-import pytensor
-import pytensor.tensor as pt
-from numpy.typing import NDArray
-import pymc as pm
-import numpy as np
 import numba
-from pytensor.raise_op import CheckAndRaise
+import numba.core.ccallback
+import numpy as np
+import pandas as pd
+import pymc as pm
+import pytensor
 import pytensor.link.numba.dispatch
+import pytensor.tensor as pt
 from numba import literal_unroll
 from numba.cpython.unsafe.tuple import alloca_once, tuple_setitem
-import numba.core.ccallback
+from numpy.typing import NDArray
 
-from .sample import CompiledModel
-from . import lib
+from nutpie import _lib
+from nutpie.sample import CompiledModel
 
 
 @numba.extending.intrinsic
 def address_as_void_pointer(typingctx, src):
     """returns a void pointer from a given memory address"""
-    from numba.core import types, cgutils
+    from numba.core import cgutils, types
 
     sig = types.voidptr(src)
 
@@ -36,8 +36,28 @@ def address_as_void_pointer(typingctx, src):
 @dataclass(frozen=True)
 class CompiledPyMCModel(CompiledModel):
     compiled_logp_func: numba.core.ccallback.CFunc
+    compiled_expand_func: numba.core.ccallback.CFunc
     shared_data: Dict[str, NDArray]
     user_data: NDArray
+    n_expanded: int
+    shape_info: Any
+    logp_func: Any
+    expand_func: Any
+    _n_dim: int
+    _shapes: Dict[str, Tuple[int, ...]]
+    _coords: Optional[Dict[str, Any]]
+
+    @property
+    def n_dim(self):
+        return self._n_dim
+
+    @property
+    def shapes(self):
+        return self._shapes
+
+    @property
+    def coords(self):
+        return self._coords
 
     def with_data(self, **updates):
         shared_data = self.shared_data.copy()
@@ -55,16 +75,40 @@ class CompiledPyMCModel(CompiledModel):
             shared_data[name] = new_val
         user_data = update_user_data(user_data, shared_data)
 
-        logp_func_maker = self.logp_func_maker.with_arg(user_data.ctypes.data)
-        expand_draw_fn = functools.partial(
-            self.expand_draw_fn.func, shared_data=shared_data
-        )
         return dataclasses.replace(
             self,
             shared_data=shared_data,
             user_data=user_data,
-            logp_func_maker=logp_func_maker,
-            expand_draw_fn=expand_draw_fn,
+        )
+
+    def _make_sampler(self, settings, init_mean, chains, cores, seed):
+        model = self._make_model(init_mean)
+        return _lib.PySampler.from_pymc(settings, chains, cores, model, seed)
+
+    def _make_model(self, init_mean):
+        expand_fn = _lib.ExpandFunc(
+            self.n_dim,
+            self.n_expanded,
+            self.compiled_expand_func.address,
+            self.user_data.ctypes.data,
+            self,
+        )
+        logp_fn = _lib.LogpFunc(
+            self.n_dim,
+            self.compiled_logp_func.address,
+            self.user_data.ctypes.data,
+            self,
+        )
+
+        var_sizes = [prod(shape) for shape in self.shape_info[2]]
+
+        return _lib.PyMcModel(
+            self.n_dim,
+            logp_fn,
+            expand_fn,
+            var_sizes,
+            self.shape_info[0],
+            init_mean,
         )
 
 
@@ -101,7 +145,7 @@ def make_user_data(func, shared_data):
 
 def compile_pymc_model(model: pm.Model, **kwargs) -> CompiledPyMCModel:
     """Compile necessary functions for sampling a pymc model.
-    
+
     Parameters
     ----------
     model : pymc.Model
@@ -111,12 +155,19 @@ def compile_pymc_model(model: pm.Model, **kwargs) -> CompiledPyMCModel:
     -------
     compiled_model : CompiledPyMCModel
         A compiled model object.
-    
+
     """
 
-    n_dim, logp_fn_pt, logp_fn, expand_fn, shared_expand, shape_info = _make_functions(
-        model
-    )
+    (
+        n_dim,
+        n_expanded,
+        logp_fn_pt,
+        logp_fn,
+        expand_fn_pt,
+        expand_fn,
+        shared_expand,
+        shape_info,
+    ) = _make_functions(model)
 
     shared_data = {val.name: val.get_value().copy() for val in logp_fn_pt.get_shared()}
     for val in shared_data.values():
@@ -131,31 +182,39 @@ def compile_pymc_model(model: pm.Model, **kwargs) -> CompiledPyMCModel:
     )
     logp_numba = numba.cfunc(c_sig, **kwargs)(logp_numba_raw)
 
-    def expand_draw(x, seed, chain, draw, *, shared_data):
-        return expand_fn(x, **{name: shared_data[name] for name in shared_expand})[0]
-
-    def make_logp_pyfn(data_ptr):
-        return logp_numba.address, data_ptr, None
-
-    logp_func_maker = lib.PtrLogpFuncMaker(
-        make_logp_pyfn,
-        user_data.ctypes.data,
-        n_dim,
-        logp_numba,
+    expand_numba_raw, c_sig_expand = _make_c_expand_func(
+        n_dim, n_expanded, expand_fn, user_data, shared_expand, shared_data
     )
+    expand_numba = numba.cfunc(c_sig_expand, **kwargs)(expand_numba_raw)
 
-    expand_draw_fn = functools.partial(expand_draw, shared_data=shared_data)
+    coords = {name: pd.Index(vals) for name, vals in model.coords.items()}
+    if "unconstrained_parameter" in coords:
+        raise ValueError("Model contains invalid name 'unconstrained_parameter'.")
+
+    names = []
+    for base, _, shape in zip(*shape_info):
+        if base not in [var.name for var in model.value_vars]:
+            continue
+        for idx in itertools.product(*[range(length) for length in shape]):
+            if len(idx) == 0:
+                names.append(base)
+            else:
+                names.append(f"{base}_{'_'.join(str(i) for i in idx)}")
+    coords["unconstrained_parameter"] = pd.Index(names)
 
     return CompiledPyMCModel(
-        n_dim=n_dim,
-        dims=model.RV_dims,
-        coords=model.coords,
-        shape_info=shape_info,
-        logp_func_maker=logp_func_maker,
-        expand_draw_fn=expand_draw_fn,
+        _n_dim=n_dim,
+        dims=model.named_vars_to_dims,
+        _coords=model.coords,
+        _shapes={name: tuple(shape) for name, _, shape in zip(*shape_info)},
         compiled_logp_func=logp_numba,
+        compiled_expand_func=expand_numba,
         shared_data=shared_data,
         user_data=user_data,
+        n_expanded=n_expanded,
+        shape_info=shape_info,
+        logp_func=logp_fn_pt,
+        expand_func=expand_fn_pt,
     )
 
 
@@ -194,6 +253,12 @@ def _make_functions(model):
     value_vars = [model.rvs_to_values[var] for var in model.free_RVs]
 
     logp = model.logp()
+
+    rewrites = ["canonicalize", "stabilize"]
+    if not model.check_bounds:
+        rewrites.append("local_remove_check_parameter")
+
+    logp = pytensor.graph.rewrite_graph(logp, include=rewrites)
     grads = pytensor.gradient.grad(logp, value_vars)
     grad = pt.concatenate([grad.ravel() for grad in grads])
 
@@ -202,35 +267,54 @@ def _make_functions(model):
     joined_shapes = []
     joined_names = []
 
-    symbolic_sliced = []
+    splits = []
+
     for var in model.free_RVs:
         value_var = model.rvs_to_values[var]
-
         joined_names.append(value_var.name)
         shape = shapes[value_var.name]
         joined_shapes.append(shape)
         length = prod(shape)
         slice_val = slice(count, count + length)
         joined_slices.append(slice_val)
-        symbolic_sliced.append((value_var, joined[slice_val].reshape(shape)))
         count += length
+
+        splits.append(length)
 
     num_free_vars = count
 
+    joined = pt.TensorType("float64", shape=(num_free_vars,))(
+        name="_unconstrained_point"
+    )
+
+    use_split = False
+    if use_split:
+        variables = pt.split(joined, splits, len(splits))
+    else:
+        variables = [
+            joined[slice_val].reshape(shape)
+            for slice_val, shape in zip(joined_slices, joined_shapes)
+        ]
+
+    replacements = {
+        model.rvs_to_values[var]: value.reshape(shape) if len(shape) != 1 else value
+        for var, shape, value in zip(
+            model.free_RVs,
+            joined_shapes,
+            variables,
+        )
+    }
+
+    (logp, grad) = pytensor.graph_replace([logp, grad], replacements)
+
     # We should avoid compiling the function, and optimize only
     logp_fn_pt = pytensor.compile.function.function(
-        (joined,), (logp, grad), givens=symbolic_sliced, mode=pytensor.compile.NUMBA
+        (joined,), (logp, grad), mode=pytensor.compile.NUMBA
     )
 
     logp_fn = logp_fn_pt.vm.jit_fn
 
     # Make function that computes remaining variables for the trace
-    trace_vars = {
-        name: var
-        for (name, var) in model.named_vars.items()
-        if var not in model.observed_RVs + model.potentials
-    }
-    remaining_names = [name for name in trace_vars if name not in joined_names]
     remaining_rvs = [
         var for var in model.unobserved_value_vars if var.name not in joined_names
     ]
@@ -249,19 +333,23 @@ def _make_functions(model):
         all_slices.append(slice(count, count + length))
         count += length
 
+    num_expanded = count
+
     allvars = pt.concatenate([joined, *[var.ravel() for var in remaining_rvs]])
     expand_fn_pt = pytensor.compile.function.function(
-        (joined,), (allvars,), givens=symbolic_sliced, mode=pytensor.compile.NUMBA
+        (joined,),
+        (allvars,),
+        givens=list(replacements.items()),
+        mode=pytensor.compile.NUMBA,
     )
     expand_fn = expand_fn_pt.vm.jit_fn
-    # expand_fn = numba.njit(expand_fn, fastmath=True, error_model="numpy")
-    # Trigger a compile
-    expand_fn(np.zeros(num_free_vars), *[var.get_value() for var in expand_fn_pt.get_shared()])
 
     return (
         num_free_vars,
+        num_expanded,
         logp_fn_pt,
         logp_fn,
+        expand_fn_pt,
         expand_fn,
         [var.name for var in expand_fn_pt.get_shared()],
         (all_names, all_slices, all_shapes),
@@ -293,8 +381,7 @@ def make_extraction_fn(inner, shared_data, shared_vars, record_dtype):
 
     @numba.extending.intrinsic
     def tuple_setitem_literal(typingctx, tup, idx, val):
-        """Return a copy of the tuple with item at *idx* replaced with *val*.
-        """
+        """Return a copy of the tuple with item at *idx* replaced with *val*."""
         if not isinstance(idx, numba.types.IntegerLiteral):
             return
 
@@ -328,8 +415,6 @@ def make_extraction_fn(inner, shared_data, shared_vars, record_dtype):
         index = index.literal_value
 
         name, ndim, base_shape, dtype = shared_metadata[index]
-
-        ndim_range = tuple(range(ndim))
 
         def impl(user_data, index):
             data_ptr = address_as_void_pointer(user_data["data"][name][()])
@@ -365,7 +450,6 @@ def make_extraction_fn(inner, shared_data, shared_vars, record_dtype):
 
 
 def _make_c_logp_func(n_dim, logp_fn, user_data, shared_logp, shared_data):
-
     extract = make_extraction_fn(logp_fn, shared_data, shared_logp, user_data.dtype)
 
     c_sig = numba.types.int64(
@@ -400,3 +484,36 @@ def _make_c_logp_func(n_dim, logp_fn, user_data, shared_logp, shared_data):
         return 0
 
     return logp_numba, c_sig
+
+
+def _make_c_expand_func(
+    n_dim, n_expanded, expand_fn, user_data, shared_vars, shared_data
+):
+    extract = make_extraction_fn(expand_fn, shared_data, shared_vars, user_data.dtype)
+
+    c_sig = numba.types.int64(
+        numba.types.uint64,
+        numba.types.uint64,
+        numba.types.CPointer(numba.types.double),
+        numba.types.CPointer(numba.types.double),
+        numba.types.voidptr,
+    )
+
+    def expand_numba(dim, expanded, x_, out_, user_data_):
+        if dim != n_dim:
+            return -1
+        if expanded != n_expanded:
+            return -1
+
+        try:
+            x = numba.carray(x_, (n_dim,))
+            out = numba.carray(out_, (n_expanded,))
+
+            (values,) = extract(x, user_data_)
+            out[...] = values
+
+        except Exception:
+            return -2
+        return 0
+
+    return expand_numba, c_sig

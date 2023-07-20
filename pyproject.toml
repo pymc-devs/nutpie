@@ -1,6 +1,39 @@
 [build-system]
-requires = ["maturin>=0.14,<0.15"]
+requires = ["maturin>=1.1,<2.0"]
 build-backend = "maturin"
 
 [tool.maturin]
-bindings = "pyo3"
+module-name = "nutpie._lib"
+python-source = "python"
+features = ["pyo3/extension-module"]
+
+[project]
+name = "nutpie"
+description = "Sample Stan or PyMC models"
+authors = [{name = "PyMC Developers", email = "pymc.devs@gmail.com"}]
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: Implementation :: PyPy",
+]
+
+dependencies = [
+    "pyarrow >= 12.0.0",
+    "pandas >= 2.0",
+    "xarray >= 2023.06.0",
+    "arviz >= 0.15.0",
+    "fastprogress >= 1.0.3",
+]
+
+[project.optional-dependencies]
+stan = ["bridgestan == 2.1.1"]
+pymc = ["pymc >= 5.5.0", "numba >= 0.57.1"]
+all = [
+    "bridgestan == 2.1.1",
+    "pymc >= 5.5.0",
+    "numba >= 0.57.1",
+]
+
