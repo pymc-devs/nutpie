@@ -29,10 +29,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-stan = ["bridgestan == 2.1.1"]
+stan = ["bridgestan >= 2.1.2"]
 pymc = ["pymc >= 5.5.0", "numba >= 0.57.1"]
 all = [
-    "bridgestan == 2.1.1",
+    "bridgestan >= 2.1.2",
     "pymc >= 5.5.0",
     "numba >= 0.57.1",
 ]
