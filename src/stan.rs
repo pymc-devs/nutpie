@@ -196,8 +196,12 @@ impl StanModel {
 pub struct StanDensity<'model>(&'model InnerModel);
 
 #[derive(Debug, Error)]
-#[error("Error during logp evaluation: {0}")]
-pub struct StanLogpError(#[from] bridgestan::BridgeStanError);
+pub enum StanLogpError {
+    #[error("Error during logp evaluation: {0}")]
+    BridgeStan(#[from] bridgestan::BridgeStanError),
+    #[error("Bad logp value: {0}")]
+    BadLogp(f64),
+}
 
 impl LogpError for StanLogpError {
     fn is_recoverable(&self) -> bool {
@@ -209,7 +213,11 @@ impl<'model> CpuLogpFunc for StanDensity<'model> {
     type Err = StanLogpError;
 
     fn logp(&mut self, position: &[f64], grad: &mut [f64]) -> Result<f64, Self::Err> {
-        Ok(self.0.log_density_gradient(position, true, true, grad)?)
+        let logp = self.0.log_density_gradient(position, true, true, grad)?;
+        if !logp.is_finite() {
+            return Err(StanLogpError::BadLogp(logp));
+        }
+        Ok(logp)
     }
 
     fn dim(&self) -> usize {
