@@ -199,13 +199,13 @@ def compile_pymc_model(model: pm.Model, **kwargs) -> CompiledPyMCModel:
             if len(idx) == 0:
                 names.append(base)
             else:
-                names.append(f"{base}_{'_'.join(str(i) for i in idx)}")
+                names.append(f"{base}_{'.'.join(str(i) for i in idx)}")
     coords["unconstrained_parameter"] = pd.Index(names)
 
     return CompiledPyMCModel(
         _n_dim=n_dim,
         dims=model.named_vars_to_dims,
-        _coords=model.coords,
+        _coords=coords,
         _shapes={name: tuple(shape) for name, _, shape in zip(*shape_info)},
         compiled_logp_func=logp_numba,
         compiled_expand_func=expand_numba,
