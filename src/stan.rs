@@ -306,7 +306,7 @@ impl Model for StanModel {
         rng: &mut R,
         position: &mut [f64],
     ) -> anyhow::Result<()> {
-        let dist = Uniform::new(-1f64, 1f64);
+        let dist = Uniform::new(-2f64, 2f64);
         dist.sample_iter(rng)
             .zip(position.iter_mut())
             .for_each(|(val, pos)| *pos = val);

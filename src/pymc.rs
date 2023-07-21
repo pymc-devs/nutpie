@@ -293,7 +293,7 @@ impl Model for PyMcModel {
         rng: &mut R,
         position: &mut [f64],
     ) -> Result<()> {
-        let dist = Uniform::new(-1f64, 1f64);
+        let dist = Uniform::new(-2f64, 2f64);
         position
             .iter_mut()
             .zip_eq(self.mu.iter())
