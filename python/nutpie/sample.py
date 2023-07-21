@@ -45,11 +45,14 @@ class CompiledModel:
             if num_cores == 0:
                 continue
             flat = model.benchmark_logp(point, num_cores, num_evals)
+            data = pd.DataFrame(flat)
+            data.index = pd.MultiIndex.from_product(
+                [range(num_cores), [num_cores]],
+                names=["thread", "concurrent_cores"]
+            )
             data = (
-                pd.DataFrame(flat)
-                .rename_axis(index="concurrent_cores", columns="evaluation")
-                .unstack()
-                .rename("seconds")
+                data
+                .rename_axis(columns="evaluation")
             )
             times.append(data)
         return pd.concat(times)
