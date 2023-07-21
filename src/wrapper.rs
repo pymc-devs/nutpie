@@ -174,7 +174,7 @@ impl PySamplerArgs {
         self.inner.max_energy_error
     }
 
-    #[setter(energy_error)]
+    #[setter(max_energy_error)]
     fn set_max_energy_error(&mut self, val: f64) {
         self.inner.max_energy_error = val
     }
