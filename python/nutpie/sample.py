@@ -93,7 +93,7 @@ def _trace_to_arviz(traces, n_tune, shapes, **kwargs):
         data_dict_tune[name] = data[:, :n_tune]
 
     for name, col in zip(table_stats.column_names, table_stats.columns):
-        if name in ["chain", "draw"]:
+        if name in ["chain", "draw", "divergence_message"]:
             continue
         col_type = col.type
         if hasattr(col_type, "list_size"):
@@ -166,7 +166,10 @@ def sample(
         posterior draws in the output dataset.
     store_divergences: bool
         If true, store the exact locations where diverging
-        transitions happend in the sampler stats.
+        transitions happend in the sampler stats. This is currently
+        experimental, as the implementation is very wastefull
+        with memory, and a better interface will need breaking
+        changes.
     progress_bar: bool
         If true, display the progress bar (default)
     init_mean: ndarray
@@ -240,6 +243,10 @@ def sample(
     dims["mass_matrix_inv"] = ["unconstrained_parameter"]
     dims["gradient"] = ["unconstrained_parameter"]
     dims["unconstrained_draw"] = ["unconstrained_parameter"]
+    dims["divergence_start"] = ["unconstrained_parameter"]
+    dims["divergence_start_gradient"] = ["unconstrained_parameter"]
+    dims["divergence_end"] = ["unconstrained_parameter"]
+    dims["divergence_momentum"] = ["unconstrained_parameter"]
 
     if return_raw_trace:
         return results
