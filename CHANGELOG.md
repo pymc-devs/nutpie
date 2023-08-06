@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.0] - 2023-08-06
+
+### Bug Fixes
+
+- Initialize points in uniform(-2, 2) (Adrian Seyboldt)
+
+
+### Miscellaneous Tasks
+
+- Update deps (Adrian Seyboldt)
+
+
 ## [0.7.0] - 2023-07-21
 
 ### Bug Fixes
