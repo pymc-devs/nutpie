@@ -64,7 +64,7 @@ class CompiledStanModel(CompiledModel):
         else:
             coords_new = self.coords.copy()
         coords_new.update(coords)
-        return replace(self, coords=coords_new)
+        return replace(self, _coords=coords_new)
 
     def with_dims(self, **dims):
         if self.dims is None:
