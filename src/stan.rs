@@ -7,11 +7,12 @@ use itertools::{izip, Itertools};
 use numpy::PyReadonlyArray1;
 use nuts_rs::{CpuLogpFunc, LogpError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyTuple, PyList};
+use pyo3::types::{PyDict, PyList, PyTuple};
 use pyo3::{exceptions::PyValueError, pyclass, pymethods, PyResult};
-use rand::distributions::Uniform;
 use rand::prelude::Distribution;
 use rand::{thread_rng, RngCore};
+use rand_distr::Uniform;
+use smallvec::{SmallVec, ToSmallVec};
 
 use crate::sampler::{Model, Trace};
 use thiserror::Error;
@@ -117,7 +118,9 @@ fn params(
                 Some(shape)
             })
             .unwrap_or(vec![]);
-        shape.iter_mut().for_each(|max_idx| *max_idx = (*max_idx) + 1);
+        shape
+            .iter_mut()
+            .for_each(|max_idx| *max_idx = (*max_idx) + 1);
         let size = shape.iter().product();
         let end_idx = start_idx + size;
         variables.push(Parameter {
@@ -137,8 +140,8 @@ impl StanModel {
     #[new]
     pub fn new(lib: StanLibrary, seed: Option<u32>, data: Option<String>) -> anyhow::Result<Self> {
         let seed = match seed {
-            Some(seed) => { seed },
-            None => { thread_rng().next_u32() },
+            Some(seed) => seed,
+            None => thread_rng().next_u32(),
         };
         let data: Option<CString> = data.map(CString::new).transpose()?;
         let model = Arc::new(
@@ -164,14 +167,12 @@ impl StanModel {
     }
 
     pub fn param_unc_names(&mut self) -> anyhow::Result<Vec<String>> {
-        Ok(
-            Arc::get_mut(&mut self.model)
+        Ok(Arc::get_mut(&mut self.model)
             .ok_or_else(|| anyhow::format_err!("Model is currently in use"))?
             .param_unc_names()
             .split(",")
             .map(|name| name.to_string())
-            .collect()
-        )
+            .collect())
     }
 
     fn benchmark_logp<'py>(
@@ -225,6 +226,48 @@ impl<'model> CpuLogpFunc for StanDensity<'model> {
     }
 }
 
+fn transpose_slice(data: &[f64], shape: &[usize], out: &mut Vec<f64>) {
+    let rank = shape.len();
+    let strides = {
+        let mut strides: SmallVec<[usize; 8]> = SmallVec::with_capacity(rank);
+        let mut current: usize = 1;
+        for &length in shape.iter() {
+            strides.push(current);
+            current = current
+                .checked_mul(length)
+                .expect("Overflow in stride computation");
+        }
+        strides.reverse();
+        strides
+    };
+
+    let mut shape: SmallVec<[usize; 8]> = shape.to_smallvec();
+    shape.reverse();
+
+    let mut idx: SmallVec<[usize; 8]> = shape.iter().map(|_| 0usize).collect();
+    let mut position: usize = 0;
+    'iterate: loop {
+        out.push(data[position]);
+
+        let mut axis: usize = 0;
+        'nextidx: loop {
+            idx[axis] += 1;
+            position += strides[axis];
+
+            if idx[axis] < shape[axis] {
+                break 'nextidx;
+            }
+
+            idx[axis] = 0;
+            position = position - shape[axis] * strides[axis];
+            axis = axis + 1;
+            if axis == rank {
+                break 'iterate;
+            }
+        }
+    }
+}
+
 pub struct StanTrace<'model> {
     inner: &'model InnerModel,
     model: &'model StanModel,
@@ -245,7 +288,19 @@ impl<'model> Trace for StanTrace<'model> {
         for (var, trace) in self.model.variables.iter().zip_eq(self.trace.iter_mut()) {
             let slice = &self.expanded_buffer[var.start_idx..var.end_idx];
             assert!(slice.len() == var.size);
-            trace.extend_from_slice(slice);
+
+            if var.size == 0 {
+                continue;
+            }
+
+            // The slice is in fortran order. This doesn't matter if it low dim
+            if var.shape.len() < 2 {
+                trace.extend_from_slice(slice);
+                continue;
+            }
+
+            // We need to transpose
+            transpose_slice(slice, &var.shape, trace);
         }
         Ok(())
     }
@@ -311,5 +366,69 @@ impl Model for StanModel {
             .zip(position.iter_mut())
             .for_each(|(val, pos)| *pos = val);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use itertools::Itertools;
+
+    use super::transpose_slice;
+
+    #[test]
+    fn transpose() {
+        // Generate the expected values using code like
+        // np.arange(2 * 3 * 5, dtype=float).reshape((2, 3, 5), order="F").ravel()
+
+        let data = vec![0., 1., 2., 3., 4., 5.];
+        let mut out = vec![];
+        transpose_slice(&data, &[2, 3], &mut out);
+        let expect = vec![0., 2., 4., 1., 3., 5.];
+        assert!(expect.iter().zip_eq(out.iter()).all(|(a, b)| a == b));
+
+        let data = vec![0., 1., 2., 3., 4., 5.];
+        let mut out = vec![];
+        transpose_slice(&data, &[3, 2], &mut out);
+        let expect = vec![0., 3., 1., 4., 2., 5.];
+        assert!(expect.iter().zip_eq(out.iter()).all(|(a, b)| a == b));
+
+        let data = vec![
+            0., 1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12., 13., 14., 15., 16., 17., 18.,
+            19., 20., 21., 22., 23., 24., 25., 26., 27., 28., 29.,
+        ];
+        let mut out = vec![];
+        transpose_slice(&data, &[2, 3, 5], &mut out);
+        let expect = vec![
+            0., 6., 12., 18., 24., 2., 8., 14., 20., 26., 4., 10., 16., 22., 28., 1., 7., 13., 19.,
+            25., 3., 9., 15., 21., 27., 5., 11., 17., 23., 29.,
+        ];
+        dbg!(&out);
+        assert!(expect.iter().zip_eq(out.iter()).all(|(a, b)| a == b));
+
+        let data = vec![
+            0., 1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12., 13., 14., 15., 16., 17., 18.,
+            19., 20., 21., 22., 23., 24., 25., 26., 27., 28., 29.,
+        ];
+        let mut out = vec![];
+        transpose_slice(&data, &[2, 3, 5], &mut out);
+        let expect = vec![
+            0., 6., 12., 18., 24., 2., 8., 14., 20., 26., 4., 10., 16., 22., 28., 1., 7., 13., 19.,
+            25., 3., 9., 15., 21., 27., 5., 11., 17., 23., 29.,
+        ];
+        dbg!(&out);
+        assert!(expect.iter().zip_eq(out.iter()).all(|(a, b)| a == b));
+
+        let data = vec![
+            0., 1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12., 13., 14., 15., 16., 17., 18.,
+            19., 20., 21., 22., 23., 24., 25., 26., 27., 28., 29.,
+        ];
+        let mut out = vec![];
+        transpose_slice(&data, &[5, 3, 2], &mut out);
+        let expect = vec![
+            0., 15., 5., 20., 10., 25., 1., 16., 6., 21., 11., 26., 2., 17., 7., 22., 12., 27., 3.,
+            18., 8., 23., 13., 28., 4., 19., 9., 24., 14., 29.,
+        ];
+        dbg!(&out);
+        assert!(expect.iter().zip_eq(out.iter()).all(|(a, b)| a == b));
     }
 }

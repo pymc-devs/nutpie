@@ -694,7 +694,9 @@ dependencies = [
  "pyo3",
  "rand",
  "rand_chacha",
+ "rand_distr",
  "rayon",
+ "smallvec",
  "thiserror",
 ]
 
