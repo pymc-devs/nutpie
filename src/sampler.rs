@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::Result;
+use anyhow::{Result, Context};
 use arrow2::array::Array;
 use itertools::Itertools;
 use nuts_rs::{new_sampler, ArrowBuilder, Chain, CpuLogpFunc, SampleStats, SamplerArgs};
@@ -101,7 +101,7 @@ impl Sampler {
         };
         rng.set_stream(chain);
 
-        let logp = model.density()?;
+        let logp = model.density().context("Failed to create model density")?;
         let dim = logp.dim();
 
         let mut sampler = new_sampler(logp, settings, chain, &mut rng);
@@ -111,13 +111,17 @@ impl Sampler {
         // so that the sampler can inspect the trace and ask
         // for partial results.
         let mut stats = sampler.stats_builder(dim, &settings);
-        let mut trace = model.new_trace(&mut rng, chain, &settings)?;
+        let mut trace = model
+            .new_trace(&mut rng, chain, &settings)
+            .context("Failed to create trace object")?;
 
         let mut initval = vec![0f64; dim];
         // TODO maxtries
         let mut error = None;
         for _ in 0..500 {
-            model.init_position(&mut rng, &mut initval)?;
+            model
+                .init_position(&mut rng, &mut initval)
+                .context("Failed to initialize the initial position of the sampler")?;
             if let Err(err) = sampler.set_position(&initval) {
                 error = Some(err);
                 continue;
@@ -146,7 +150,7 @@ impl Sampler {
 
         Ok((
             chain,
-            trace.finalize()?,
+            trace.finalize().context("Failed to finalize the trace object")?,
             stats.finalize().map(|x| x.boxed()),
         ))
     }
