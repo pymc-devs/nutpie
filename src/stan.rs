@@ -1,5 +1,6 @@
 use std::{ffi::CString, path::PathBuf, sync::Arc};
 
+use anyhow::Context;
 use arrow2::array::{FixedSizeListArray, Float64Array, StructArray};
 use arrow2::datatypes::{DataType, Field};
 use bridgestan::open_library;
@@ -11,7 +12,7 @@ use pyo3::types::{PyDict, PyList, PyTuple};
 use pyo3::{exceptions::PyValueError, pyclass, pymethods, PyResult};
 use rand::prelude::Distribution;
 use rand::{thread_rng, RngCore};
-use rand_distr::Uniform;
+use rand_distr::StandardNormal;
 use smallvec::{SmallVec, ToSmallVec};
 
 use crate::sampler::{Model, Trace};
@@ -168,7 +169,8 @@ impl StanModel {
 
     pub fn param_unc_names(&mut self) -> anyhow::Result<Vec<String>> {
         Ok(Arc::get_mut(&mut self.model)
-            .ok_or_else(|| anyhow::format_err!("Model is currently in use"))?
+            .ok_or_else(|| anyhow::format_err!("Model is currently in use"))
+            .context("Failed to access the names of unconstrained parameters")?
             .param_unc_names()
             .split(",")
             .map(|name| name.to_string())
@@ -284,7 +286,7 @@ impl<'model> Trace for StanTrace<'model> {
             true,
             &mut self.expanded_buffer,
             Some(&mut self.rng),
-        )?;
+        ).context("Failed to constrain the parameters of the draw")?;
         for (var, trace) in self.model.variables.iter().zip_eq(self.trace.iter_mut()) {
             let slice = &self.expanded_buffer[var.start_idx..var.end_idx];
             assert!(slice.len() == var.size);
