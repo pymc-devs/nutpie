@@ -228,7 +228,7 @@ impl<'model> CpuLogpFunc for StanDensity<'model> {
     }
 }
 
-fn transpose_slice(data: &[f64], shape: &[usize], out: &mut Vec<f64>) {
+fn fortran_to_c_order(data: &[f64], shape: &[usize], out: &mut Vec<f64>) {
     let rank = shape.len();
     let strides = {
         let mut strides: SmallVec<[usize; 8]> = SmallVec::with_capacity(rank);
@@ -302,7 +302,7 @@ impl<'model> Trace for StanTrace<'model> {
             }
 
             // We need to transpose
-            transpose_slice(slice, &var.shape, trace);
+            fortran_to_c_order(slice, &var.shape, trace);
         }
         Ok(())
     }
@@ -375,7 +375,7 @@ impl Model for StanModel {
 mod tests {
     use itertools::Itertools;
 
-    use super::transpose_slice;
+    use super::fortran_to_c_order;
 
     #[test]
     fn transpose() {
@@ -384,13 +384,13 @@ mod tests {
 
         let data = vec![0., 1., 2., 3., 4., 5.];
         let mut out = vec![];
-        transpose_slice(&data, &[2, 3], &mut out);
+        fortran_to_c_order(&data, &[2, 3], &mut out);
         let expect = vec![0., 2., 4., 1., 3., 5.];
         assert!(expect.iter().zip_eq(out.iter()).all(|(a, b)| a == b));
 
         let data = vec![0., 1., 2., 3., 4., 5.];
         let mut out = vec![];
-        transpose_slice(&data, &[3, 2], &mut out);
+        fortran_to_c_order(&data, &[3, 2], &mut out);
         let expect = vec![0., 3., 1., 4., 2., 5.];
         assert!(expect.iter().zip_eq(out.iter()).all(|(a, b)| a == b));
 
@@ -399,7 +399,7 @@ mod tests {
             19., 20., 21., 22., 23., 24., 25., 26., 27., 28., 29.,
         ];
         let mut out = vec![];
-        transpose_slice(&data, &[2, 3, 5], &mut out);
+        fortran_to_c_order(&data, &[2, 3, 5], &mut out);
         let expect = vec![
             0., 6., 12., 18., 24., 2., 8., 14., 20., 26., 4., 10., 16., 22., 28., 1., 7., 13., 19.,
             25., 3., 9., 15., 21., 27., 5., 11., 17., 23., 29.,
@@ -412,7 +412,7 @@ mod tests {
             19., 20., 21., 22., 23., 24., 25., 26., 27., 28., 29.,
         ];
         let mut out = vec![];
-        transpose_slice(&data, &[2, 3, 5], &mut out);
+        fortran_to_c_order(&data, &[2, 3, 5], &mut out);
         let expect = vec![
             0., 6., 12., 18., 24., 2., 8., 14., 20., 26., 4., 10., 16., 22., 28., 1., 7., 13., 19.,
             25., 3., 9., 15., 21., 27., 5., 11., 17., 23., 29.,
@@ -425,7 +425,7 @@ mod tests {
             19., 20., 21., 22., 23., 24., 25., 26., 27., 28., 29.,
         ];
         let mut out = vec![];
-        transpose_slice(&data, &[5, 3, 2], &mut out);
+        fortran_to_c_order(&data, &[5, 3, 2], &mut out);
         let expect = vec![
             0., 15., 5., 20., 10., 25., 1., 16., 6., 21., 11., 26., 2., 17., 7., 22., 12., 27., 3.,
             18., 8., 23., 13., 28., 4., 19., 9., 24., 14., 29.,
