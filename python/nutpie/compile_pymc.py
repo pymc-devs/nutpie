@@ -231,7 +231,7 @@ def _compute_shapes(model):
         inputs=[],
         outputs=[var.shape for var in trace_vars.values()],
         givens=(
-            [(obs, obs.tag.observations) for obs in model.observed_RVs]
+            [(obs, model.rvs_to_values[obs]) for obs in model.observed_RVs]
             + [
                 (trace_vars[name], point[name])
                 for name in trace_vars.keys()
