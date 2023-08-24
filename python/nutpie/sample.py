@@ -47,13 +47,9 @@ class CompiledModel:
             flat = model.benchmark_logp(point, num_cores, num_evals)
             data = pd.DataFrame(flat)
             data.index = pd.MultiIndex.from_product(
-                [range(num_cores), [num_cores]],
-                names=["thread", "concurrent_cores"]
+                [range(num_cores), [num_cores]], names=["thread", "concurrent_cores"]
             )
-            data = (
-                data
-                .rename_axis(columns="evaluation")
-            )
+            data = data.rename_axis(columns="evaluation")
             times.append(data)
         return pd.concat(times)
 
