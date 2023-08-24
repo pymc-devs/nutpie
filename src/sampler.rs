@@ -121,7 +121,7 @@ impl Sampler {
         for _ in 0..500 {
             model
                 .init_position(&mut rng, &mut initval)
-                .context("Failed to initialize the initial position of the sampler")?;
+                .context("Failed to generate a new initial position")?;
             if let Err(err) = sampler.set_position(&initval) {
                 error = Some(err);
                 continue;
@@ -131,7 +131,8 @@ impl Sampler {
         }
 
         if let Some(error) = error {
-            return Err(error.into());
+            let error: anyhow::Error = error.into();
+            return Err(error.context("All initialization points failed"));
         }
 
         let draws = settings.num_tune + settings.num_draws;
