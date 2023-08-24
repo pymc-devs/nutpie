@@ -10,3 +10,4 @@ notebooks/*.csv
 notebooks/*.hpp
 perf.data*
 wheels
+.vscode/
