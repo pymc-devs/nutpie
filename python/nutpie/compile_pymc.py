@@ -15,6 +15,7 @@ import pytensor.tensor as pt
 from numba import literal_unroll
 from numba.cpython.unsafe.tuple import alloca_once, tuple_setitem
 from numpy.typing import NDArray
+from pymc.initial_point import make_initial_point_fn
 
 from nutpie import _lib
 from nutpie.sample import CompiledModel
@@ -219,7 +220,7 @@ def compile_pymc_model(model: pm.Model, **kwargs) -> CompiledPyMCModel:
 
 
 def _compute_shapes(model):
-    point = pm.model.make_initial_point_fn(model=model, return_transformed=True)(0)
+    point = make_initial_point_fn(model=model, return_transformed=True)(0)
 
     trace_vars = {
         var.name: var
