@@ -207,7 +207,12 @@ def compile_pymc_model(model: "pm.Model", **kwargs) -> CompiledPyMCModel:
     )
     expand_numba = numba.cfunc(c_sig_expand, **kwargs)(expand_numba_raw)
 
-    coords = {name: pd.Index(vals) for name, vals in model.coords.items()}
+    coords = {}
+    for name, vals in model.coords.items():
+        if vals is None:
+            vals = pd.RangeIndex(int(model.dim_lengths[name].eval()))
+        coords[name] = pd.Index(vals)
+
     if "unconstrained_parameter" in coords:
         raise ValueError("Model contains invalid name 'unconstrained_parameter'.")
 
