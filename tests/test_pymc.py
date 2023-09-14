@@ -15,6 +15,16 @@ def test_pymc_model():
     trace.posterior.a
 
 
+def test_pymc_model():
+    with pm.Model() as model:
+        model.add_coord("foo", length=5)
+        pm.Normal("a", dims="foo")
+
+    compiled = nutpie.compile_pymc_model(model)
+    trace = nutpie.sample(compiled, chains=1)
+    trace.posterior.a
+
+
 def test_trafo():
     with pm.Model() as model:
         pm.Uniform("a")
