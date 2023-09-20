@@ -138,7 +138,7 @@ trace = nutpie.sample(compiled)
 
 ## Advantages
 
-nutpie uses `nuts-rs`, a library written in rust, that implements NUTS as in
+nutpie uses [`nuts-rs`](https://github.com/pymc-devs/nuts-rs), a library written in rust, that implements NUTS as in
 pymc and stan, but with a slightly different mass matrix tuning method as
 those. It often produces a higher effective sample size per gradient
 evaluation, and tends to converge faster and with fewer gradient evaluation.
