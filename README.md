@@ -106,8 +106,8 @@ pip install bridgestan
 When we install nutpie with pip, we can also specify that we want optional
 dependencies for Stan models using
 
-```bash
-pip install 'bridgestan[stan]'
+```
+pip install 'nutpie[stan]'
 ```
 
 In addition, a C++ compiler needs to be available. For details see
