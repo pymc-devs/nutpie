@@ -5,7 +5,7 @@
 nutpie can be installed using Conda or Mamba from conda-forge with
 
 ```bash
-mamba install -c conda-forge nutpie pymc
+mamba install -c conda-forge nutpie
 ```
 
 Or using pip:
@@ -34,7 +34,7 @@ maturin develop --release --features=simd_support
 First, PyMC and Numba need to be installed, for example using
 
 ```bash
-mamba install pymc numba
+mamba install -c conda-forge pymc numba
 ```
 
 We need to create a model:
