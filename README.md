@@ -1,30 +1,30 @@
-# nutpie: A fast sampler for bayesian posteriors
+# nutpie: A fast sampler for Bayesian posteriors
 
 ## Installation
 
-nutpie can be installed using conda or mamba from conda-forge with
+nutpie can be installed using Conda or Mamba from conda-forge with
 
-```
+```bash
 mamba install -c conda-forge nutpie
 ```
 
 Or using pip:
 
-```
+```bash
 pip install nutpie
 ```
 
-To install it from source, install a rust compiler and maturin and then
+To install it from source, install a Rust compiler and maturin and then
 
-```
+```bash
 maturin develop --release
 ```
 
-If you want to use the nightly simd implementation for some of the math functions,
-switch to rust nightly and then install with the `simd_support` feature in then
+If you want to use the nightly SIMD implementation for some of the math functions,
+switch to Rust nightly and then install with the `simd_support` feature in then
 nutpie directory:
 
-```
+```bash
 rustup override set nightly
 maturin develop --release --features=simd_support
 ```
@@ -33,7 +33,7 @@ maturin develop --release --features=simd_support
 
 First, PyMC and Numba need to be installed, for example using
 
-```
+```bash
 mamba install -c conda-forge pymc numba
 ```
 
@@ -91,31 +91,31 @@ compiled_model = nutpie.compile_pymc_model(pymc_model)
 trace_pymc = nutpie.sample(compiled_model)
 ```
 
-`trace_pymc` now contains an arviz `InferenceData` object, including sampling
+`trace_pymc` now contains an ArviZ `InferenceData` object, including sampling
 statistics and the posterior of the variables defined above.
 
 ## Usage with Stan
 
-In order to sample from stan model, `bridgestan` needs to be installed.
-A pip package is available, but right now this can not be installed using conda.
+In order to sample from Stan model, `bridgestan` needs to be installed.
+A pip package is available, but right now this can not be installed using Conda.
 
-```
+```bash
 pip install bridgestan
 ```
 
 When we install nutpie with pip, we can also specify that we want optional
 dependencies for Stan models using
 
-```
+```bash
 pip install 'bridgestan[stan]'
 ```
 
 In addition, a C++ compiler needs to be available. For details see
-[the stan docs](https://mc-stan.org/docs/cmdstan-guide/cmdstan-installation.html#cpp-toolchain).
+[the Stan docs](https://mc-stan.org/docs/cmdstan-guide/cmdstan-installation.html#cpp-toolchain).
 
 We can then compile a Stan model, and sample using nutpie:
 
-```
+```python
 import nutpie
 
 code = """
@@ -138,7 +138,7 @@ trace = nutpie.sample(compiled)
 
 ## Advantages
 
-nutpie uses [`nuts-rs`](https://github.com/pymc-devs/nuts-rs), a library written in rust, that implements NUTS as in
-pymc and stan, but with a slightly different mass matrix tuning method as
+nutpie uses [`nuts-rs`](https://github.com/pymc-devs/nuts-rs), a library written in Rust, that implements NUTS as in
+PyMC and Stan, but with a slightly different mass matrix tuning method as
 those. It often produces a higher effective sample size per gradient
 evaluation, and tends to converge faster and with fewer gradient evaluation.
