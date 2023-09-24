@@ -2,6 +2,7 @@ import json
 import pathlib
 import tempfile
 from dataclasses import dataclass, replace
+from importlib.util import find_spec
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -113,6 +114,13 @@ def compile_stan_model(
     model_name: Optional[str] = None,
     cleanup: bool = True,
 ) -> CompiledStanModel:
+    if find_spec("bridgestan") is None:
+        raise ImportError(
+            "BridgeStan is not installed in the current environment. "
+            "Please install it with something like "
+            "'pip install bridgestan'."
+        )
+
     import bridgestan
 
     if dims is None:
