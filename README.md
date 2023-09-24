@@ -4,19 +4,19 @@
 
 nutpie can be installed using conda or mamba from conda-forge with
 
-```
+```bash
 mamba install -c conda-forge nutpie pymc
 ```
 
 Or using pip:
 
-```
+```bash
 pip install nutpie
 ```
 
 To install it from source, install a rust compiler and maturin and then
 
-```
+```bash
 maturin develop --release
 ```
 
@@ -24,7 +24,7 @@ If you want to use the nightly simd implementation for some of the math function
 switch to rust nightly and then install with the `simd_support` feature in then
 nutpie directory:
 
-```
+```bash
 rustup override set nightly
 maturin develop --release --features=simd_support
 ```
@@ -33,7 +33,7 @@ maturin develop --release --features=simd_support
 
 First, PyMC and numba need to be installed, for example using
 
-```
+```bash
 mamba install pymc numba
 ```
 
@@ -99,14 +99,14 @@ statistics and the posterior of the variables defined above.
 In order to sample from stan model, `bridgestan` needs to be installed.
 A pip package is available, but right now this can not be installed using conda.
 
-```
+```bash
 pip install bridgestan
 ```
 
 When we install nutpie with pip, we can also specify that we want optional
 dependencies for Stan models using
 
-```
+```bash
 pip install 'bridgestan[stan]'
 ```
 
@@ -115,7 +115,7 @@ In addition, a C++ compiler needs to be available. For details see
 
 We can then compile a Stan model, and sample using nutpie:
 
-```
+```python
 import nutpie
 
 code = """
