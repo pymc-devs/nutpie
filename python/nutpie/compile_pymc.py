@@ -385,6 +385,7 @@ def _make_functions(model):
 
 def make_extraction_fn(inner, shared_data, shared_vars, record_dtype):
     import numba
+    from numba import literal_unroll
     from numba.cpython.unsafe.tuple import alloca_once, tuple_setitem
 
     if not shared_vars:
@@ -470,7 +471,7 @@ def make_extraction_fn(inner, shared_data, shared_vars, record_dtype):
         user_data = numba.carray(user_data_, (), record_dtype)
 
         _shared_tuple = shared_tuple
-        for index in numba.literal_unroll(indices):
+        for index in literal_unroll(indices):
             dat = extract_array(user_data["shared"], index)
             _shared_tuple = tuple_setitem_literal(_shared_tuple, index, dat)
 
