@@ -95,6 +95,8 @@ jobs:
         uses: PyO3/maturin-action@v1
         env:
           LIBCLANG_PATH: ${{ runner.temp }}/llvm/lib
+          # <https://discourse.mc-stan.org/t/problem-with-cmdstan-unpacking/29041/5>
+          CXXFLAGS: "-Wno-nonnull -U__MSVCRT_VERSION__ -D__MSVCRT_VERSION__=0x0E00"
         with:
           target: ${{ matrix.target }}
           args: --release --out dist --find-interpreter
