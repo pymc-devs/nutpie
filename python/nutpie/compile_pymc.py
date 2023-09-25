@@ -1,27 +1,31 @@
 import dataclasses
 import itertools
 from dataclasses import dataclass
+from importlib.util import find_spec
 from math import prod
-from typing import Any, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
-import numba
-import numba.core.ccallback
 import numpy as np
 import pandas as pd
-import pymc as pm
-import pytensor
-import pytensor.link.numba.dispatch
-import pytensor.tensor as pt
-from numba import literal_unroll
-from numba.cpython.unsafe.tuple import alloca_once, tuple_setitem
 from numpy.typing import NDArray
-from pymc.initial_point import make_initial_point_fn
 
 from nutpie import _lib
 from nutpie.sample import CompiledModel
 
+try:
+    from numba.extending import intrinsic
+except ImportError:
 
-@numba.extending.intrinsic
+    def intrinsic(f):
+        return f
+
+
+if TYPE_CHECKING:
+    import numba.core.ccallback
+    import pymc as pm
+
+
+@intrinsic
 def address_as_void_pointer(typingctx, src):
     """returns a void pointer from a given memory address"""
     from numba.core import cgutils, types
@@ -36,8 +40,8 @@ def address_as_void_pointer(typingctx, src):
 
 @dataclass(frozen=True)
 class CompiledPyMCModel(CompiledModel):
-    compiled_logp_func: numba.core.ccallback.CFunc
-    compiled_expand_func: numba.core.ccallback.CFunc
+    compiled_logp_func: "numba.core.ccallback.CFunc"
+    compiled_expand_func: "numba.core.ccallback.CFunc"
     shared_data: Dict[str, NDArray]
     user_data: NDArray
     n_expanded: int
@@ -144,7 +148,7 @@ def make_user_data(func, shared_data):
     return user_data
 
 
-def compile_pymc_model(model: pm.Model, **kwargs) -> CompiledPyMCModel:
+def compile_pymc_model(model: "pm.Model", **kwargs) -> CompiledPyMCModel:
     """Compile necessary functions for sampling a pymc model.
 
     Parameters
@@ -158,6 +162,21 @@ def compile_pymc_model(model: pm.Model, **kwargs) -> CompiledPyMCModel:
         A compiled model object.
 
     """
+    if find_spec("pymc") is None:
+        raise ImportError(
+            "PyMC is not installed in the current environment. "
+            "Please install it with something like "
+            "'mamba install -c conda-forge pymc numba' "
+            "and restart your kernel in case you are in an interactive session."
+        )
+    if find_spec("numba") is None:
+        raise ImportError(
+            "Numba is not installed in the current environment. "
+            "Please install it with something like "
+            "'mamba install -c conda-forge numba' "
+            "and restart your kernel in case you are in an interactive session."
+        )
+    import numba
 
     (
         n_dim,
@@ -220,6 +239,9 @@ def compile_pymc_model(model: pm.Model, **kwargs) -> CompiledPyMCModel:
 
 
 def _compute_shapes(model):
+    import pytensor
+    from pymc.initial_point import make_initial_point_fn
+
     point = make_initial_point_fn(model=model, return_transformed=True)(0)
 
     trace_vars = {
@@ -246,6 +268,10 @@ def _compute_shapes(model):
 
 
 def _make_functions(model):
+    import pytensor
+    import pytensor.link.numba.dispatch
+    import pytensor.tensor as pt
+
     shapes = _compute_shapes(model)
 
     # Make logp_dlogp_function
@@ -358,6 +384,10 @@ def _make_functions(model):
 
 
 def make_extraction_fn(inner, shared_data, shared_vars, record_dtype):
+    import numba
+    from numba import literal_unroll
+    from numba.cpython.unsafe.tuple import alloca_once, tuple_setitem
+
     if not shared_vars:
 
         @numba.njit(inline="always")
@@ -380,7 +410,7 @@ def make_extraction_fn(inner, shared_data, shared_vars, record_dtype):
     indices = tuple(range(len(names)))
     shared_tuple = tuple(shared_data[name] for name in shared_vars)
 
-    @numba.extending.intrinsic
+    @intrinsic
     def tuple_setitem_literal(typingctx, tup, idx, val):
         """Return a copy of the tuple with item at *idx* replaced with *val*."""
         if not isinstance(idx, numba.types.IntegerLiteral):
@@ -451,6 +481,8 @@ def make_extraction_fn(inner, shared_data, shared_vars, record_dtype):
 
 
 def _make_c_logp_func(n_dim, logp_fn, user_data, shared_logp, shared_data):
+    import numba
+
     extract = make_extraction_fn(logp_fn, shared_data, shared_logp, user_data.dtype)
 
     c_sig = numba.types.int64(
@@ -490,6 +522,8 @@ def _make_c_logp_func(n_dim, logp_fn, user_data, shared_logp, shared_data):
 def _make_c_expand_func(
     n_dim, n_expanded, expand_fn, user_data, shared_vars, shared_data
 ):
+    import numba
+
     extract = make_extraction_fn(expand_fn, shared_data, shared_vars, user_data.dtype)
 
     c_sig = numba.types.int64(
