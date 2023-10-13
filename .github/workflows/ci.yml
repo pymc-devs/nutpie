@@ -111,6 +111,7 @@ jobs:
         run: |
           set -e
           pip install "nutpie[all]" --find-links dist --force-reinstall
+          pip install --find-links dist --force-reinstall --no-deps --no-index 'nutpie[all]'
           pip install pytest
           pytest
 
@@ -145,6 +146,7 @@ jobs:
         run: |
           set -e
           pip install 'nutpie[all]' --find-links dist --force-reinstall
+          pip install --find-links dist --force-reinstall --no-deps --no-index 'nutpie[all]'
           pip install pytest
           pytest
 
