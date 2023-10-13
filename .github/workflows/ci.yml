@@ -52,7 +52,7 @@ jobs:
         run: |
           set -e
           pip install --find-links dist --force-reinstall 'nutpie[all]'
-          pip install --find-links dist --force-reinstall --no-index 'nutpie[all]'
+          pip install --find-links dist --force-reinstall --no-deps --no-index 'nutpie[all]'
           pip install pytest
           pytest
       - name: pytest
