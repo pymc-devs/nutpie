@@ -3,7 +3,7 @@ import itertools
 from dataclasses import dataclass
 from importlib.util import find_spec
 from math import prod
-from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
 import pandas as pd
@@ -42,15 +42,15 @@ def address_as_void_pointer(typingctx, src):
 class CompiledPyMCModel(CompiledModel):
     compiled_logp_func: "numba.core.ccallback.CFunc"
     compiled_expand_func: "numba.core.ccallback.CFunc"
-    shared_data: Dict[str, NDArray]
+    shared_data: dict[str, NDArray]
     user_data: NDArray
     n_expanded: int
     shape_info: Any
     logp_func: Any
     expand_func: Any
     _n_dim: int
-    _shapes: Dict[str, Tuple[int, ...]]
-    _coords: Optional[Dict[str, Any]]
+    _shapes: dict[str, tuple[int, ...]]
+    _coords: Optional[dict[str, Any]]
 
     @property
     def n_dim(self):
@@ -269,7 +269,7 @@ def _compute_shapes(model):
         mode=pytensor.compile.mode.FAST_COMPILE,
         on_unused_input="ignore",
     )
-    return {name: shape for name, shape in zip(trace_vars.keys(), shape_func())}
+    return dict(zip(trace_vars.keys(), shape_func()))
 
 
 def _make_functions(model):
@@ -517,7 +517,7 @@ def _make_c_logp_func(n_dim, logp_fn, user_data, shared_logp, shared_data):
                 return 4
             # if np.any(out == 0):
             #    return 4
-        except Exception:
+        except Exception:  # noqa: BLE001
             return 1
         return 0
 
@@ -552,7 +552,7 @@ def _make_c_expand_func(
             (values,) = extract(x, user_data_)
             out[...] = values
 
-        except Exception:
+        except Exception:  # noqa: BLE001
             return -2
         return 0
 

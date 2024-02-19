@@ -1,9 +1,9 @@
 import json
-import pathlib
 import tempfile
 from dataclasses import dataclass, replace
 from importlib.util import find_spec
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
@@ -22,9 +22,9 @@ class _NumpyArrayEncoder(json.JSONEncoder):
 
 @dataclass(frozen=True)
 class CompiledStanModel(CompiledModel):
-    _coords: Optional[Dict[str, Any]]
+    _coords: Optional[dict[str, Any]]
     code: str
-    data: Optional[Dict[str, NDArray]]
+    data: Optional[dict[str, NDArray]]
     library: Any
     model: Any
     model_name: Optional[str] = None
@@ -107,10 +107,10 @@ def compile_stan_model(
     *,
     code: Optional[str] = None,
     filename: Optional[str] = None,
-    extra_compile_args: Optional[List[str]] = None,
-    extra_stanc_args: Optional[List[str]] = None,
-    dims: Optional[Dict[str, int]] = None,
-    coords: Optional[Dict[str, Any]] = None,
+    extra_compile_args: Optional[list[str]] = None,
+    extra_stanc_args: Optional[list[str]] = None,
+    dims: Optional[dict[str, int]] = None,
+    coords: Optional[dict[str, Any]] = None,
     model_name: Optional[str] = None,
     cleanup: bool = True,
 ) -> CompiledStanModel:
@@ -133,7 +133,7 @@ def compile_stan_model(
     if code is None:
         if filename is None:
             raise ValueError("Either code or filename have to be specified")
-        with open(filename, "r") as file:
+        with Path(filename).open() as file:
             code = file.read()
 
     if model_name is None:
@@ -142,7 +142,7 @@ def compile_stan_model(
     basedir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
     try:
         model_path = (
-            pathlib.Path(basedir.name)
+            Path(basedir.name)
             .joinpath("name")
             .with_name(model_name)  # This verifies that it is a valid filename
             .with_suffix(".stan")
@@ -164,7 +164,7 @@ def compile_stan_model(
         try:
             if cleanup:
                 basedir.cleanup()
-        except Exception:
+        except Exception:  # noqa: BLE001
             pass
 
     return CompiledStanModel(

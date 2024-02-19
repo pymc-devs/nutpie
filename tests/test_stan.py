@@ -17,7 +17,7 @@ def test_stan_model():
 
     compiled_model = nutpie.compile_stan_model(code=model)
     trace = nutpie.sample(compiled_model)
-    trace.posterior.a
+    trace.posterior.a  # noqa: B018
 
 
 def test_stan_model_data():
@@ -37,4 +37,4 @@ def test_stan_model_data():
     with pytest.raises(RuntimeError):
         trace = nutpie.sample(compiled_model)
     trace = nutpie.sample(compiled_model.with_data(x=np.array(3.0)))
-    trace.posterior.a
+    trace.posterior.a  # noqa: B018

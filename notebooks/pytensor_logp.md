@@ -120,24 +120,24 @@ plt.axvline(0, color="grey", alpha=0.5, zorder=-100)
 %%file radon_model.stan
 data {
     int<lower=0> n_counties;
-    int<lower=0> n_observed; 
+    int<lower=0> n_observed;
     array[n_observed] int<lower=1,upper=n_counties> county_idx;
     vector[n_observed] is_floor;
     vector[n_observed] log_radon;
-} 
+}
 parameters {
     real intercept;
-    
+
     vector[n_counties] county_raw;
     real<lower=0> county_sd;
-    
+
     real floor_effect;
-    
+
     vector[n_counties] county_floor_raw;
     real<lower=0> county_floor_sd;
-    
+
     real<lower=0> sigma;
-} 
+}
 transformed parameters {
     vector[n_counties] county_effect;
     vector[n_counties] county_floor_effect;
@@ -155,17 +155,17 @@ transformed parameters {
 }
 model {
     intercept ~ normal(0, 10);
-    
+
     county_raw ~ normal(0, 1);
     county_sd ~ normal(0, 1);
-    
+
     floor_effect ~ normal(0, 2);
-    
+
     county_floor_raw ~ normal(0, 1);
     county_floor_sd ~ normal(0, 1);
-    
+
     sigma ~ normal(0, 1.5);
-    
+
     log_radon ~ normal(mu, sigma);
 }
 ```
@@ -305,13 +305,13 @@ for name, val in data_stan.items():
     if isinstance(val, int):
         data_json[name] = int(val)
         continue
-    
+
     if val.dtype == np.int64:
         data_json[name] = list(int(x) for x in val)
         continue
-    
+
     data_json[name] = list(val)
-    
+
 with open("radon.json", "w") as file:
     json.dump(data_json, file)
 ```
