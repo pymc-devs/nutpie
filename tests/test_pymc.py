@@ -15,7 +15,7 @@ def test_pymc_model():
     trace.posterior.a
 
 
-def test_pymc_model():
+def test_pymc_model_with_coordinate():
     with pm.Model() as model:
         model.add_coord("foo", length=5)
         pm.Normal("a", dims="foo")
