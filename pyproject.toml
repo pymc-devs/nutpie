@@ -36,3 +36,50 @@ all = [
     "pymc >= 5.5.0",
     "numba >= 0.57.1",
 ]
+
+[tool.ruff]
+line-length = 88
+target-version = "py39"
+show-fixes = true
+output-format = "full"
+
+[tool.ruff.lint]
+select = [
+    "E",  # pycodestyle errors
+    "W",  # pycodestyle warnings
+    "F",  # Pyflakes
+    "I",  # isort
+    "C4",  # flake8-comprehensions
+    "B",  # flake8-bugbear
+    "UP",  # pyupgrade
+    "RUF",  # Ruff-specific rules
+    "TID",  # flake8-tidy-imports
+    "BLE",  # flake8-blind-except
+    "PTH",  # flake8-pathlib
+    "A",  # flake8-builtins
+]
+ignore = [
+    "C408",  # unnecessary-collection-call (allow dict(a=1, b=2); clarity over speed!)
+    # The following list is recommended to disable these when using ruff's formatter.
+    # (Not all of the following are actually enabled.)
+    "W191",  # tab-indentation
+    "E111",  # indentation-with-invalid-multiple
+    "E114",  # indentation-with-invalid-multiple-comment
+    "E117",  # over-indented
+    "D206",  # indent-with-spaces
+    "D300",  # triple-single-quotes
+    "Q000",  # bad-quotes-inline-string
+    "Q001",  # bad-quotes-multiline-string
+    "Q002",  # bad-quotes-docstring
+    "Q003",  # avoidable-escaped-quote
+    "COM812",  # missing-trailing-comma
+    "COM819",  # prohibited-trailing-comma
+    "ISC001",  # single-line-implicit-string-concatenation
+    "ISC002",  # multi-line-implicit-string-concatenation
+]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+[tool.ruff.lint.isort]
+known-first-party = ["nutpie"]
