@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Optional
 
 import arviz
 import fastprogress
@@ -12,14 +12,14 @@ from nutpie import _lib
 
 @dataclass(frozen=True)
 class CompiledModel:
-    dims: Optional[Dict[str, Tuple[str, ...]]]
+    dims: Optional[dict[str, tuple[str, ...]]]
 
     @property
     def n_dim(self) -> int:
         raise NotImplementedError()
 
     @property
-    def shapes(self) -> Optional[Dict[str, Tuple[int, ...]]]:
+    def shapes(self) -> Optional[dict[str, tuple[int, ...]]]:
         raise NotImplementedError()
 
     @property

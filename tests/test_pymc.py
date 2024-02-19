@@ -12,7 +12,7 @@ def test_pymc_model():
 
     compiled = nutpie.compile_pymc_model(model)
     trace = nutpie.sample(compiled, chains=1)
-    trace.posterior.a
+    trace.posterior.a  # noqa: B018
 
 
 def test_pymc_model_with_coordinate():
@@ -22,7 +22,7 @@ def test_pymc_model_with_coordinate():
 
     compiled = nutpie.compile_pymc_model(model)
     trace = nutpie.sample(compiled, chains=1)
-    trace.posterior.a
+    trace.posterior.a  # noqa: B018
 
 
 def test_trafo():
@@ -31,7 +31,7 @@ def test_trafo():
 
     compiled = nutpie.compile_pymc_model(model)
     trace = nutpie.sample(compiled, chains=1)
-    trace.posterior.a
+    trace.posterior.a  # noqa: B018
 
 
 def test_det():
