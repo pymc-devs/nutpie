@@ -1,8 +1,8 @@
 import json
-import pathlib
 import tempfile
 from dataclasses import dataclass, replace
 from importlib.util import find_spec
+from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
@@ -133,7 +133,7 @@ def compile_stan_model(
     if code is None:
         if filename is None:
             raise ValueError("Either code or filename have to be specified")
-        with open(filename) as file:
+        with Path(filename).open() as file:
             code = file.read()
 
     if model_name is None:
@@ -142,7 +142,7 @@ def compile_stan_model(
     basedir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
     try:
         model_path = (
-            pathlib.Path(basedir.name)
+            Path(basedir.name)
             .joinpath("name")
             .with_name(model_name)  # This verifies that it is a valid filename
             .with_suffix(".stan")
