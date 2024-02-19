@@ -37,10 +37,10 @@ jobs:
         with:
           target: ${{ matrix.target }}
           args: --release --out dist --find-interpreter
-          sccache: 'true'
           manylinux: 2_28
           before-script-linux: |
             dnf install -y clang-libs clang || apt install llvm-dev libclang-dev clang
+
       - name: Upload wheels
         uses: actions/upload-artifact@v3
         with:
