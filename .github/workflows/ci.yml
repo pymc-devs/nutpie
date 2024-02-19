@@ -24,6 +24,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # If you update the targets here, be sure to also update the
+        # download-artifact step in the release job!
         target: [x86_64]
         # pytensor is currently giving me issues on the other targets...
         #target: [x86_64, aarch64, s390x, ppc64le]
@@ -42,9 +44,9 @@ jobs:
             dnf install -y clang-libs clang || apt install llvm-dev libclang-dev clang
 
       - name: Upload wheels
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
-          name: wheels
+          name: linux-${{ matrix.target }}-wheels
           path: dist
       - name: pytest
         if: ${{ startsWith(matrix.target, 'x86_64') }}
@@ -76,6 +78,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # If you update the targets here, be sure to also update the
+        # download-artifact step in the release job!
         target: [x64]
     steps:
       - uses: actions/checkout@v4
@@ -101,9 +105,9 @@ jobs:
           args: --release --out dist --find-interpreter
           sccache: 'true'
       - name: Upload wheels
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
-          name: wheels
+          name: windows-${{ matrix.target }}-wheels
           path: dist
       - name: pytest
         if: ${{ !startsWith(matrix.target, 'aarch64') }}
@@ -120,6 +124,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # If you update the targets here, be sure to also update the
+        # download-artifact step in the release job!
         target: [x86_64, aarch64]
     steps:
       - uses: actions/checkout@v4
@@ -136,9 +142,9 @@ jobs:
           args: --release --out dist --find-interpreter
           sccache: 'true'
       - name: Upload wheels
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
-          name: wheels
+          name: macos-${{ matrix.target }}-wheels
           path: dist
       - name: pytest
         if: ${{ !startsWith(matrix.target, 'aarch64') }}
@@ -160,9 +166,9 @@ jobs:
           command: sdist
           args: --out dist
       - name: Upload sdist
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
-          name: wheels
+          name: sdist
           path: dist
 
   release:
@@ -171,9 +177,28 @@ jobs:
     if: "startsWith(github.ref, 'refs/tags/')"
     needs: [linux, windows, macos, sdist]
     steps:
+      # Combine all the wheels and sdists into a single directory
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-x86_64-wheels
+          path: dist
       - uses: actions/download-artifact@v4
         with:
-          name: wheels
+          name: windows-x64-wheels
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-x86_64-wheels
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-aarch64-wheels
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
       - name: Publish to PyPI
         uses: PyO3/maturin-action@v1
         env:
