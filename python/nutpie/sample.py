@@ -76,10 +76,10 @@ def _trace_to_arviz(traces, n_tune, shapes, **kwargs):
         dtype = col.chunks[0].values.to_numpy().dtype
         if dtype in [np.float64, np.float32]:
             data = np.full(
-                (n_chains, length) + tuple(shapes[name]), np.nan, dtype=dtype
+                (n_chains, length, *tuple(shapes[name])), np.nan, dtype=dtype
             )
         else:
-            data = np.zeros((n_chains, length) + tuple(shapes[name]), dtype=dtype)
+            data = np.zeros((n_chains, length, *tuple(shapes[name])), dtype=dtype)
         for i, chunk in enumerate(col.chunks):
             data[i, : len(chunk)] = chunk.values.to_numpy().reshape(
                 (len(chunk),) + shapes[name]
@@ -103,16 +103,16 @@ def _trace_to_arviz(traces, n_tune, shapes, **kwargs):
         length = max(lengths)
 
         if dtype in [np.float64, np.float32]:
-            data = np.full((n_chains, length) + last_shape, np.nan, dtype=dtype)
+            data = np.full((n_chains, length, *last_shape), np.nan, dtype=dtype)
         else:
-            data = np.zeros((n_chains, length) + last_shape, dtype=dtype)
+            data = np.zeros((n_chains, length, *last_shape), dtype=dtype)
 
         for i, chunk in enumerate(col.chunks):
             if hasattr(chunk, "values"):
                 values = chunk.values.to_numpy(False)
             else:
                 values = chunk.to_numpy(False)
-            data[i, : len(chunk)] = values.reshape((len(chunk),) + last_shape)
+            data[i, : len(chunk)] = values.reshape((len(chunk), *last_shape))
             stats_dict[name] = data[:, n_tune:]
             stats_dict_tune[name] = data[:, :n_tune]
 

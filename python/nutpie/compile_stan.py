@@ -133,7 +133,7 @@ def compile_stan_model(
     if code is None:
         if filename is None:
             raise ValueError("Either code or filename have to be specified")
-        with open(filename, "r") as file:
+        with open(filename) as file:
             code = file.read()
 
     if model_name is None:

@@ -269,7 +269,7 @@ def _compute_shapes(model):
         mode=pytensor.compile.mode.FAST_COMPILE,
         on_unused_input="ignore",
     )
-    return {name: shape for name, shape in zip(trace_vars.keys(), shape_func())}
+    return dict(zip(trace_vars.keys(), shape_func()))
 
 
 def _make_functions(model):
