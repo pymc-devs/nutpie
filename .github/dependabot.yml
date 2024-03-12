@@ -8,3 +8,7 @@ updates:
     labels:
       - "Github CI/CD"
       - "no releasenotes"
+  - package-ecosystem: "cargo"
+    directory: "/rust"
+    schedule:
+      interval: "weekly"
