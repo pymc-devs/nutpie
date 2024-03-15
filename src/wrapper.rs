@@ -13,7 +13,7 @@ use pyo3::{
     exceptions::PyValueError,
     ffi::Py_uintptr_t,
     prelude::*,
-    types::{PyList, PyTuple},
+    types::{PyBool, PyList, PyTuple},
 };
 
 #[pyclass]
@@ -304,6 +304,10 @@ impl PySampler {
                 .collect::<Result<Vec<_>>>()?,
         );
         Ok(list.into_py(py))
+    }
+
+    fn is_finished(&self, py: Python<'_>) -> Py<PyBool> {
+        PyBool::new(py, self.sampler.as_ref().map_or(true, |sampler| sampler.is_finished())).into()
     }
 }
 
