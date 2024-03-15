@@ -1,4 +1,3 @@
-import math
 import time
 from dataclasses import dataclass
 from typing import Any, Literal, Optional, overload
@@ -167,6 +166,10 @@ class _BackgroundSampler:
             total=chains * (draws + tune),
             display=progress_bar,
         )
+        # fastprogress seems to reset the progress bar
+        # if we create a new iterator, but we don't want
+        # this for multiple calls to wait.
+        self._bar = iter(self._progress)
 
     def wait(self, *, timeout=None):
         """Wait until sampling is finished.
@@ -179,17 +182,10 @@ class _BackgroundSampler:
         if self._sampler is None:
             raise ValueError("Sampler is already finalized")
 
-        if timeout is None:
-            timeout = math.inf
-
         start_time = time.time()
 
         try:
-            for info in self._progress:
-                current_time = time.time()
-                if current_time - start_time > timeout:
-                    raise TimeoutError("Sampling did not finish")
-
+            for info in self._bar:
                 if info.draw == self._tune - 1:
                     self._chains_tuning -= 1
                 if info.draw == self._tune + self._draws - 1:
@@ -208,6 +204,11 @@ class _BackgroundSampler:
                     self._progress.comment = (
                         f" Sampling chains: {count}, Divergences: {divs}"
                     )
+
+                if timeout is not None:
+                    current_time = time.time()
+                    if current_time - start_time > timeout:
+                        raise TimeoutError("Sampling did not finish")
         except KeyboardInterrupt:
             pass
 
@@ -242,6 +243,12 @@ class _BackgroundSampler:
                 },
                 save_warmup=self._save_warmup,
             )
+
+    @property
+    def is_finished(self):
+        if self._sampler is None:
+            return True
+        return self._sampler.is_finished()
 
     def abort(self):
         """Abort sampling and discard progress."""
