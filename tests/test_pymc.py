@@ -15,6 +15,17 @@ def test_pymc_model():
     trace.posterior.a  # noqa: B018
 
 
+def test_blocking():
+    with pm.Model() as model:
+        pm.Normal("a")
+
+    compiled = nutpie.compile_pymc_model(model)
+    sampler = nutpie.sample(compiled, chains=1, blocking=False)
+    sampler.wait()
+    trace = sampler.finalize()
+    trace.posterior.a  # noqa: B018
+
+
 def test_pymc_model_with_coordinate():
     with pm.Model() as model:
         model.add_coord("foo", length=5)
