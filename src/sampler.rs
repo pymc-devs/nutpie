@@ -1,14 +1,17 @@
 use std::{
     sync::{
         self,
-        mpsc::{channel, RecvTimeoutError, Sender},
+        mpsc::{
+            channel, sync_channel, Receiver, RecvError, RecvTimeoutError, Sender, SyncSender,
+            TryRecvError,
+        },
         Arc,
     },
-    thread,
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
-use anyhow::{Result, Context};
+use anyhow::{anyhow, Context, Result};
 use arrow2::array::Array;
 use itertools::Itertools;
 use nuts_rs::{new_sampler, ArrowBuilder, Chain, CpuLogpFunc, SampleStats, SamplerArgs};
@@ -80,20 +83,23 @@ pub(crate) trait Model: Send + Sync + 'static {
     }
 }
 
+type ChainResult = (u64, Box<dyn Array>, Option<Box<dyn Array>>);
+pub(crate) type SamplerResult = Vec<(Box<dyn Array>, Option<Box<dyn Array>>)>;
+
 pub(crate) struct Sampler {
     /// For each thread we return the chain id, the draws and the stats
-    main_thread: thread::JoinHandle<Result<Vec<(u64, Box<dyn Array>, Option<Box<dyn Array>>)>>>,
+    main_thread: thread::JoinHandle<Result<Vec<ChainResult>>>,
     updates: sync::mpsc::Receiver<Box<dyn SampleStats>>,
 }
 
 impl Sampler {
-    fn run_sampler<M: Model>(
+    fn run_chain<M: Model>(
         seed: Option<u64>,
         chain: u64,
         model: Arc<M>,
         settings: SamplerArgs,
-        updates: Sender<Box<dyn SampleStats>>,
-    ) -> Result<(u64, Box<dyn Array>, Option<Box<dyn Array>>)> {
+        updates: SyncSender<Box<dyn SampleStats>>,
+    ) -> Result<ChainResult> {
         let mut rng = if let Some(seed) = seed {
             ChaCha8Rng::seed_from_u64(seed)
         } else {
@@ -151,7 +157,9 @@ impl Sampler {
 
         Ok((
             chain,
-            trace.finalize().context("Failed to finalize the trace object")?,
+            trace
+                .finalize()
+                .context("Failed to finalize the trace object")?,
             stats.finalize().map(|x| x.boxed()),
         ))
     }
@@ -164,7 +172,7 @@ impl Sampler {
         seed: Option<u64>,
     ) -> Self {
         let model = Arc::new(model);
-        let (send_updates, updates) = channel();
+        let (send_updates, updates) = sync_channel((4 * chains) as usize);
 
         let thread = thread::spawn(move || {
             let pool = rayon::ThreadPoolBuilder::new()
@@ -182,7 +190,7 @@ impl Sampler {
                 let send_updates = send_updates.clone();
 
                 pool.spawn(move || {
-                    let _ = tx.send(Sampler::run_sampler(
+                    let _ = tx.send(Sampler::run_chain(
                         seed,
                         chain,
                         model,
@@ -203,27 +211,151 @@ impl Sampler {
         }
     }
 
-    pub(crate) fn is_finished(&self) -> bool {
-        self.main_thread.is_finished()
+    pub fn finalize(self) -> Result<SamplerResult> {
+        drop(self.updates);
+        match self.main_thread.join() {
+            Ok(vals) => vals.map(|vals| {
+                vals.into_iter()
+                    .sorted_by_key(|&(chain, _, _)| chain)
+                    .map(|(_, tr, stats)| (tr, stats))
+                    .collect()
+            }),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
     }
 }
 
-impl Sampler {
-    pub fn next_draw_timeout(
-        &mut self,
-        timeout: Duration,
-    ) -> Result<Box<dyn SampleStats>, RecvTimeoutError> {
-        self.updates.recv_timeout(timeout)
+type SamplerCallback = Box<dyn FnMut(Box<dyn SampleStats>) + Send>;
+
+enum Command {
+    Pause,
+    Resume,
+}
+
+pub(crate) struct SamplerControl {
+    poll_thread: JoinHandle<()>,
+    commands: SyncSender<Command>,
+    results: Receiver<Result<SamplerResult>>,
+}
+
+pub(crate) enum SamplerWaitResult {
+    Result(Result<SamplerResult>),
+    Timeout(SamplerControl),
+}
+
+impl SamplerControl {
+    pub(crate) fn new(sampler: Sampler, mut callback: SamplerCallback) -> Self {
+        let (command_tx, command_rx) = sync_channel(0);
+        let (result_tx, result_rx) = sync_channel(0);
+        let poll_thread = thread::spawn(move || {
+            let mut message = command_rx.try_recv();
+            loop {
+                match message {
+                    Ok(Command::Pause) => {
+                        message = command_rx.recv().map_err(|e| e.into());
+                    }
+                    Ok(Command::Resume) => {
+                        message = command_rx.try_recv();
+                    }
+                    Err(TryRecvError::Empty) => {
+                        if let Ok(draw) = sampler.updates.recv() {
+                            callback(draw);
+                            message = command_rx.try_recv();
+                            continue;
+                        } else {
+                            drop(command_rx);
+                            result_tx
+                                .send(sampler.finalize())
+                                .expect("Could not send results to parent thread");
+                            return;
+                        }
+                    }
+                    Err(TryRecvError::Disconnected) => {
+                        drop(command_rx);
+                        result_tx
+                            .send(sampler.finalize())
+                            .expect("Could not send results to parent thread");
+                        return;
+                    }
+                }
+            }
+        });
+
+        SamplerControl {
+            poll_thread,
+            commands: command_tx,
+            results: result_rx,
+        }
     }
 
-    pub fn finalize(self) -> Result<Vec<(Box<dyn Array>, Option<Box<dyn Array>>)>> {
-        drop(self.updates);
-        let vals = self.main_thread.join().unwrap();
-        vals.map(|vals| {
-            vals.into_iter()
-                .sorted_by_key(|&(chain, _, _)| chain)
-                .map(|(_, tr, stats)| (tr, stats))
-                .collect()
-        })
+    pub(crate) fn pause(&mut self) -> Result<()> {
+        Ok(self
+            .commands
+            .send(Command::Pause)
+            .context("Could not send pause command to sampler")?)
+    }
+
+    pub(crate) fn resume(&mut self) -> Result<()> {
+        Ok(self
+            .commands
+            .send(Command::Resume)
+            .context("Could not send resume command to sampler")?)
+    }
+
+    pub(crate) fn wait_timeout(mut self, timeout: Duration) -> SamplerWaitResult {
+        // We want to ignore this error, because this only
+        // fails if the sampler thread is done, and in this case
+        // we don't need to do anything.
+        let _ = self.resume();
+        match self.results.recv_timeout(timeout) {
+            Err(RecvTimeoutError::Timeout) => SamplerWaitResult::Timeout(self),
+            Err(err @ RecvTimeoutError::Disconnected) => SamplerWaitResult::Result(
+                Err(err).context("Could not get sampler result in wait, sampler thread is dead"),
+            ),
+            Ok(result) => SamplerWaitResult::Result(result),
+        }
+    }
+
+    pub(crate) fn abort(self) -> Result<SamplerResult> {
+        drop(self.commands);
+
+        let result = match self.results.recv() {
+            Err(err @ RecvError) => {
+                Err(err).context("Could not get sampler result in abort, sampler thread is dead")
+            }
+            Ok(result) => result,
+        };
+
+        drop(self.results);
+        let poll_result = self.poll_thread.join();
+        if let Err(_) = poll_result {
+            Err(anyhow!("Sample polling thread paniced."))?
+        }
+        result
+    }
+
+    pub(crate) fn finalize(mut self) -> Result<SamplerResult> {
+        // We want to ignore this error, because this only
+        // fails if the sampler thread is done, and in this case
+        // we don't need to do anything.
+        let _ = self.resume();
+        let result = match self.results.recv() {
+            Err(err @ RecvError) => {
+                Err(err).context("Could not get sampler result in finalize, sampler thread is dead")
+            }
+            Ok(result) => result,
+        };
+
+        drop(self.commands);
+        drop(self.results);
+        let poll_result = self.poll_thread.join();
+        if let Err(_) = poll_result {
+            Err(anyhow!("Sample polling thread paniced."))?
+        }
+        result
+    }
+
+    pub(crate) fn is_finished(&self) -> bool {
+        self.poll_thread.is_finished()
     }
 }
