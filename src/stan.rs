@@ -280,13 +280,15 @@ pub struct StanTrace<'model> {
 
 impl<'model> Trace for StanTrace<'model> {
     fn append_value(&mut self, point: &[f64]) -> anyhow::Result<()> {
-        self.inner.param_constrain(
-            point,
-            true,
-            true,
-            &mut self.expanded_buffer,
-            Some(&mut self.rng),
-        ).context("Failed to constrain the parameters of the draw")?;
+        self.inner
+            .param_constrain(
+                point,
+                true,
+                true,
+                &mut self.expanded_buffer,
+                Some(&mut self.rng),
+            )
+            .context("Failed to constrain the parameters of the draw")?;
         for (var, trace) in self.model.variables.iter().zip_eq(self.trace.iter_mut()) {
             let slice = &self.expanded_buffer[var.start_idx..var.end_idx];
             assert!(slice.len() == var.size);

@@ -1,3 +1,4 @@
+from threading import Condition, Event, Thread
 import time
 from dataclasses import dataclass
 from typing import Any, Literal, Optional, overload
@@ -170,6 +171,39 @@ class _BackgroundSampler:
         # if we create a new iterator, but we don't want
         # this for multiple calls to wait.
         self._bar = iter(self._progress)
+
+        self._exit_event = Event()
+        self._pause_event = Event()
+        self._continue = Condition()
+
+        def show_progress():
+            for info in self._bar:
+                if info.draw == self._tune - 1:
+                    self._chains_tuning -= 1
+                if info.draw == self._tune + self._draws - 1:
+                    self._chains_finished += 1
+                if info.is_diverging and info.draw > self._tune:
+                    self._num_divs += 1
+                if self._chains_tuning > 0:
+                    count = self._chains_tuning
+                    divs = self._num_divs
+                    self._progress.comment = (
+                        f" Chains in warmup: {count}, Divergences: {divs}"
+                    )
+                else:
+                    count = self._chains - self._chains_finished
+                    divs = self._num_divs
+                    self._progress.comment = (
+                        f" Sampling chains: {count}, Divergences: {divs}"
+                    )
+
+                if timeout is not None:
+                    current_time = time.time()
+                    if current_time - start_time > timeout:
+                        raise TimeoutError("Sampling did not finish")
+
+
+        self._thread = Thread(target=show_progress)
 
     def wait(self, *, timeout=None):
         """Wait until sampling is finished.

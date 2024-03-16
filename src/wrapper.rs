@@ -1,19 +1,19 @@
-use std::{sync::mpsc::RecvTimeoutError, time::Duration};
+use std::time::{Duration, Instant};
 
 use crate::{
     pymc::{ExpandFunc, LogpFunc, PyMcModel},
-    sampler::Sampler,
+    sampler::{Sampler, SamplerControl, SamplerResult, SamplerWaitResult},
     stan::{StanLibrary, StanModel},
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use arrow2::{array::Array, datatypes::Field};
 use nuts_rs::{SampleStats, SamplerArgs};
 use pyo3::{
     exceptions::PyValueError,
     ffi::Py_uintptr_t,
     prelude::*,
-    types::{PyBool, PyList, PyTuple},
+    types::{PyList, PyTuple},
 };
 
 #[pyclass]
@@ -212,9 +212,25 @@ impl PySamplerArgs {
     }
 }
 
+pub(crate) enum SamplerState {
+    Running(SamplerControl),
+    Finished(Result<SamplerResult>),
+    Empty,
+}
+
 #[pyclass]
 struct PySampler {
-    sampler: Option<Sampler>,
+    state: SamplerState,
+}
+
+fn make_callback(callback: Option<Py<PyAny>>) -> Box<dyn FnMut(Box<dyn SampleStats>) + Send> {
+    if let Some(callback) = callback {
+        Box::new(move |stats| {
+            let _ = Python::with_gil(|py| callback.call1(py, (PySampleStats { stats },)));
+        })
+    } else {
+        Box::new(|_| {})
+    }
 }
 
 #[pymethods]
@@ -226,9 +242,12 @@ impl PySampler {
         cores: usize,
         model: PyMcModel,
         seed: Option<u64>,
+        callback: Option<Py<PyAny>>,
     ) -> PyResult<PySampler> {
+        let sampler = Sampler::new(model, settings.inner, cores, chains, seed);
+        let control = SamplerControl::new(sampler, make_callback(callback));
         Ok(PySampler {
-            sampler: Some(Sampler::new(model, settings.inner, cores, chains, seed)),
+            state: SamplerState::Running(control),
         })
     }
 
@@ -239,50 +258,124 @@ impl PySampler {
         cores: usize,
         model: StanModel,
         seed: Option<u64>,
+        callback: Option<Py<PyAny>>,
     ) -> PyResult<PySampler> {
+        let sampler = Sampler::new(model, settings.inner, cores, chains, seed);
+        let control = SamplerControl::new(sampler, make_callback(callback));
         Ok(PySampler {
-            sampler: Some(Sampler::new(model, settings.inner, cores, chains, seed)),
+            state: SamplerState::Running(control),
         })
     }
 
-    fn __iter__(self_: PyRef<Self>) -> PyResult<Py<PySampler>> {
-        if self_.sampler.is_none() {
-            Err(PyValueError::new_err("Sampler is finished"))
+    fn is_finished(&mut self) -> bool {
+        if let SamplerState::Running(ref control) = self.state {
+            control.is_finished()
         } else {
-            Ok(self_.into())
+            true
         }
     }
 
-    fn __next__(mut self_: PyRefMut<Self>, py: Python<'_>) -> PyResult<Option<PySampleStats>> {
-        let sampler = self_
-            .sampler
-            .as_mut()
-            .ok_or_else(|| PyValueError::new_err("Sampler is already finished"))?;
-        py.allow_threads(|| loop {
-            match sampler.next_draw_timeout(Duration::from_millis(100)) {
-                Err(RecvTimeoutError::Timeout) => {
-                    Python::with_gil(|py| py.check_signals())?;
-                    continue;
-                }
-                Err(RecvTimeoutError::Disconnected) => {
-                    return Ok(None);
-                }
-                Ok(stats) => {
-                    let stats = PySampleStats { stats };
-                    return Ok(Some(stats));
-                }
-            };
+    fn pause(&mut self, py: Python<'_>) -> PyResult<()> {
+        py.allow_threads(|| {
+            if let SamplerState::Running(ref mut control) = self.state {
+                control.pause()?
+            }
+            Ok(())
         })
     }
 
-    fn finalize(&mut self, py: Python<'_>) -> PyResult<Py<PyList>> {
-        let sampler = self
-            .sampler
-            .take()
-            .ok_or_else(|| PyValueError::new_err("Sampler is empty"))?;
-        let values = sampler
-            .finalize()
-            .map_err(|e| PyValueError::new_err(format!("Sampling failed: {:?}", e)))?;
+    fn resume(&mut self, py: Python<'_>) -> PyResult<()> {
+        py.allow_threads(|| {
+            if let SamplerState::Running(ref mut control) = self.state {
+                control.resume()?
+            }
+            Ok(())
+        })
+    }
+
+    fn wait_timeout(&mut self, py: Python<'_>, timeout_seconds: f64) -> PyResult<()> {
+        py.allow_threads(|| {
+            let timeout =
+                Duration::try_from_secs_f64(timeout_seconds).context("Invalid timeout")?;
+
+            let state = std::mem::replace(&mut self.state, SamplerState::Empty);
+
+            let SamplerState::Running(mut control) = state else {
+                let _ = std::mem::replace(&mut self.state, state);
+                return Ok(());
+            };
+
+            let start_time = Instant::now();
+            let step = Duration::from_millis(100);
+
+            let (final_state, retval) = loop {
+                let time_so_far = Instant::now().saturating_duration_since(start_time);
+                let Some(remaining) = timeout.checked_sub(time_so_far) else {
+                    break (SamplerState::Running(control), Ok(()));
+                };
+                let next_timeout = remaining.min(step);
+                dbg!(timeout, time_so_far, remaining, next_timeout);
+
+                match control.wait_timeout(next_timeout) {
+                    SamplerWaitResult::Result(result) => {
+                        break (SamplerState::Finished(result), Ok(()))
+                    }
+                    SamplerWaitResult::Timeout(new_control) => {
+                        control = new_control;
+                    }
+                }
+
+                if let Err(err) = Python::with_gil(|py| py.check_signals()) {
+                    break (SamplerState::Running(control), Err(err));
+                }
+            };
+
+            let _ = std::mem::replace(&mut self.state, final_state);
+            retval
+        })
+    }
+
+    fn abort(&mut self, py: Python<'_>) -> PyResult<()> {
+        py.allow_threads(|| {
+            let state = std::mem::replace(&mut self.state, SamplerState::Empty);
+
+            let SamplerState::Running(control) = state else {
+                let _ = std::mem::replace(&mut self.state, state);
+                return Err(anyhow::anyhow!("Sampler is already finalized"))?;
+            };
+
+            let result = control.abort();
+            let _ = std::mem::replace(&mut self.state, SamplerState::Finished(result));
+            Ok(())
+        })
+    }
+
+    fn finalize(&mut self, py: Python<'_>) -> PyResult<()> {
+        py.allow_threads(|| {
+            let state = std::mem::replace(&mut self.state, SamplerState::Empty);
+
+            let SamplerState::Running(control) = state else {
+                let _ = std::mem::replace(&mut self.state, state);
+                return Err(anyhow::anyhow!("Sampler is already finalized"))?;
+            };
+
+            let result = control.finalize();
+            let _ = std::mem::replace(&mut self.state, SamplerState::Finished(result));
+            Ok(())
+        })
+    }
+
+    fn extract_results(&mut self, py: Python<'_>) -> PyResult<Py<PyList>> {
+        let state = std::mem::replace(&mut self.state, SamplerState::Empty);
+
+        let SamplerState::Finished(values) = state else {
+            let _ = std::mem::replace(&mut self.state, state);
+            // Must have called finalize or abort
+            return Err(anyhow::anyhow!("Sampler is not finalized"))?;
+        };
+
+        let values =
+            values.map_err(|e| PyValueError::new_err(format!("Sampling failed: {:?}", e)))?;
 
         let list = PyList::new(
             py,
@@ -304,10 +397,6 @@ impl PySampler {
                 .collect::<Result<Vec<_>>>()?,
         );
         Ok(list.into_py(py))
-    }
-
-    fn is_finished(&self, py: Python<'_>) -> Py<PyBool> {
-        PyBool::new(py, self.sampler.as_ref().map_or(true, |sampler| sampler.is_finished())).into()
     }
 }
 
