@@ -1,6 +1,5 @@
-from threading import Condition, Event, Thread
-import time
 from dataclasses import dataclass
+from threading import Condition, Event
 from typing import Any, Literal, Optional, overload
 
 import arviz
@@ -142,8 +141,11 @@ class _BackgroundSampler:
     def __init__(
         self,
         compiled_model,
-        sampler,
+        settings,
+        init_mean,
         chains,
+        cores,
+        seed,
         draws,
         tune,
         *,
@@ -151,20 +153,20 @@ class _BackgroundSampler:
         save_warmup=True,
         return_raw_trace=False,
     ):
-        self._sampler = sampler
         self._num_divs = 0
-        self._tune = tune
-        self._draws = draws
+        self._tune = settings.num_tune
+        self._draws = settings.num_draws
+        self._settings = settings
         self._chains_tuning = chains
         self._chains_finished = 0
         self._chains = chains
-        self._sampler = sampler
         self._compiled_model = compiled_model
         self._save_warmup = save_warmup
         self._return_raw_trace = return_raw_trace
+        total_draws = (self._draws + self._tune) * self._chains
         self._progress = fastprogress.progress_bar(
-            sampler,
-            total=chains * (draws + tune),
+            range(total_draws),
+            total=total_draws,
             display=progress_bar,
         )
         # fastprogress seems to reset the progress bar
@@ -176,83 +178,65 @@ class _BackgroundSampler:
         self._pause_event = Event()
         self._continue = Condition()
 
-        def show_progress():
-            for info in self._bar:
-                if info.draw == self._tune - 1:
-                    self._chains_tuning -= 1
-                if info.draw == self._tune + self._draws - 1:
-                    self._chains_finished += 1
-                if info.is_diverging and info.draw > self._tune:
-                    self._num_divs += 1
-                if self._chains_tuning > 0:
-                    count = self._chains_tuning
-                    divs = self._num_divs
-                    self._progress.comment = (
-                        f" Chains in warmup: {count}, Divergences: {divs}"
-                    )
-                else:
-                    count = self._chains - self._chains_finished
-                    divs = self._num_divs
-                    self._progress.comment = (
-                        f" Sampling chains: {count}, Divergences: {divs}"
-                    )
+        self._finished_draws = 0
 
-                if timeout is not None:
-                    current_time = time.time()
-                    if current_time - start_time > timeout:
-                        raise TimeoutError("Sampling did not finish")
+        next(self._bar)
 
+        def progress_callback(info):
+            if info.draw == self._tune - 1:
+                self._chains_tuning -= 1
+            if info.draw == self._tune + self._draws - 1:
+                self._chains_finished += 1
+            if info.is_diverging and info.draw > self._tune:
+                self._num_divs += 1
+            if self._chains_tuning > 0:
+                count = self._chains_tuning
+                divs = self._num_divs
+                self._progress.comment = (
+                    f" Chains in warmup: {count}, Divergences: {divs}"
+                )
+            else:
+                count = self._chains - self._chains_finished
+                divs = self._num_divs
+                self._progress.comment = (
+                    f" Sampling chains: {count}, Divergences: {divs}"
+                )
+            try:
+                next(self._bar)
+            except StopIteration:
+                pass
+            self._finished_draws += 1
 
-        self._thread = Thread(target=show_progress)
+        if progress_bar:
+            callback = progress_callback
+        else:
+            callback = None
+
+        self._sampler = compiled_model._make_sampler(
+            settings,
+            init_mean,
+            chains,
+            cores,
+            seed,
+            callback=callback,
+        )
 
     def wait(self, *, timeout=None):
-        """Wait until sampling is finished.
+        """Wait until sampling is finished and return the trace.
 
         KeyboardInterrupt will lead to interrupt the waiting.
 
         This will return after `timeout` seconds even if sampling is
         not finished at this point.
+
+        This resumes the sampler in case it had been paused.
         """
-        if self._sampler is None:
-            raise ValueError("Sampler is already finalized")
+        self._sampler.wait(timeout)
+        self._sampler.finalize()
+        return self._extract()
 
-        start_time = time.time()
-
-        try:
-            for info in self._bar:
-                if info.draw == self._tune - 1:
-                    self._chains_tuning -= 1
-                if info.draw == self._tune + self._draws - 1:
-                    self._chains_finished += 1
-                if info.is_diverging and info.draw > self._tune:
-                    self._num_divs += 1
-                if self._chains_tuning > 0:
-                    count = self._chains_tuning
-                    divs = self._num_divs
-                    self._progress.comment = (
-                        f" Chains in warmup: {count}, Divergences: {divs}"
-                    )
-                else:
-                    count = self._chains - self._chains_finished
-                    divs = self._num_divs
-                    self._progress.comment = (
-                        f" Sampling chains: {count}, Divergences: {divs}"
-                    )
-
-                if timeout is not None:
-                    current_time = time.time()
-                    if current_time - start_time > timeout:
-                        raise TimeoutError("Sampling did not finish")
-        except KeyboardInterrupt:
-            pass
-
-    def finalize(self):
-        """Free resources of the sampler and return the trace produced so far."""
-        if self._sampler is None:
-            raise ValueError("Sampler has already been finalized")
-
-        results = self._sampler.finalize()
-        self._sampler = None
+    def _extract(self):
+        results = self._sampler.extract_results()
 
         dims = {name: list(dim) for name, dim in self._compiled_model.dims.items()}
         dims["mass_matrix_inv"] = ["unconstrained_parameter"]
@@ -278,20 +262,30 @@ class _BackgroundSampler:
                 save_warmup=self._save_warmup,
             )
 
+    def pause(self):
+        """Pause the sampler."""
+        self._sampler.pause()
+
+    def resume(self):
+        """Resume a paused sampler."""
+        self._sampler.resume()
+
     @property
     def is_finished(self):
-        if self._sampler is None:
-            return True
         return self._sampler.is_finished()
 
     def abort(self):
+        """Abort sampling and return the trace produced so far."""
+        self._sampler.abort()
+        return self._extract()
+
+    def cancel(self):
         """Abort sampling and discard progress."""
-        if self._sampler is not None:
-            self._sampler.finalize()
-            self._sampler = None
+        self._sampler.abort()
 
     def __del__(self):
-        self.abort()
+        if not self._sampler.is_empty():
+            self.cancel()
 
 
 @overload
@@ -417,12 +411,13 @@ def sample(
     if init_mean is None:
         init_mean = np.zeros(compiled_model.n_dim)
 
-    sampler = compiled_model._make_sampler(settings, init_mean, chains, cores, seed)
-
     sampler = _BackgroundSampler(
         compiled_model,
-        sampler,
+        settings,
+        init_mean,
         chains,
+        cores,
+        seed,
         draws,
         tune,
         progress_bar=progress_bar,
@@ -434,11 +429,11 @@ def sample(
         return sampler
 
     try:
-        sampler.wait()
+        result = sampler.wait()
     except KeyboardInterrupt:
-        pass
+        result = sampler.abort()
     except:
-        sampler.abort()
+        sampler.cancel()
         raise
 
-    return sampler.finalize()
+    return result

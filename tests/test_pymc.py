@@ -21,8 +21,7 @@ def test_blocking():
 
     compiled = nutpie.compile_pymc_model(model)
     sampler = nutpie.sample(compiled, chains=1, blocking=False)
-    sampler.wait()
-    trace = sampler.finalize()
+    trace = sampler.wait()
     trace.posterior.a  # noqa: B018
 
 
