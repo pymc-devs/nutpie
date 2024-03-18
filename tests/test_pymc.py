@@ -25,6 +25,28 @@ def test_blocking():
     trace.posterior.a  # noqa: B018
 
 
+@pytest.mark.timeout(2)
+def test_wait_timeout():
+    with pm.Model() as model:
+        pm.Normal("a", shape=100_000)
+    compiled = nutpie.compile_pymc_model(model)
+    sampler = nutpie.sample(compiled, chains=1, blocking=False)
+    with pytest.raises(TimeoutError):
+        sampler.wait(timeout=0.1)
+    sampler.cancel()
+
+
+@pytest.mark.timeout(2)
+def test_pause():
+    with pm.Model() as model:
+        pm.Normal("a", shape=100_000)
+    compiled = nutpie.compile_pymc_model(model)
+    sampler = nutpie.sample(compiled, chains=1, blocking=False)
+    sampler.pause()
+    sampler.resume()
+    sampler.cancel()
+
+
 def test_pymc_model_with_coordinate():
     with pm.Model() as model:
         model.add_coord("foo", length=5)
