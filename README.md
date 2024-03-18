@@ -94,6 +94,26 @@ trace_pymc = nutpie.sample(compiled_model)
 `trace_pymc` now contains an ArviZ `InferenceData` object, including sampling
 statistics and the posterior of the variables defined above.
 
+We can also control the sampler in a non-blocking way:
+
+```python
+# The sampler will now run the the background
+sampler = nutpie.sample(compiled_model, blocking=False)
+
+# Pause and resume the sampling
+sampler.pause()
+sampler.resume()
+
+# Wait for the sampler to finish (up to timeout seconds)
+# sampler.wait(timeout=0.1)
+
+# or we can also abort the sampler (and return the incomplete trace)
+incomplete_trace = sampler.abort()
+
+# or cancel and discard all progress:
+sampler.cancel()
+```
+
 ## Usage with Stan
 
 In order to sample from Stan model, `bridgestan` needs to be installed.
