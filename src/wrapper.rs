@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use arrow2::{array::Array, datatypes::Field};
 use nuts_rs::{SampleStats, SamplerArgs};
 use pyo3::{
-    exceptions::PyValueError,
+    exceptions::{PyTimeoutError, PyValueError},
     ffi::Py_uintptr_t,
     prelude::*,
     types::{PyList, PyTuple},
@@ -267,11 +267,23 @@ impl PySampler {
         })
     }
 
-    fn is_finished(&mut self) -> bool {
-        if let SamplerState::Running(ref control) = self.state {
-            control.is_finished()
-        } else {
-            true
+    fn is_finished(&mut self) -> PyResult<bool> {
+        let state = std::mem::replace(&mut self.state, SamplerState::Empty);
+
+        let SamplerState::Running(control) = state else {
+            let _ = std::mem::replace(&mut self.state, state);
+            return Ok(true);
+        };
+
+        match control.try_finalize() {
+            SamplerWaitResult::Result(result) => {
+                let _ = std::mem::replace(&mut self.state, SamplerState::Finished(result));
+                Ok(true)
+            }
+            SamplerWaitResult::Timeout(control) => {
+                let _ = std::mem::replace(&mut self.state, SamplerState::Running(control));
+                Ok(false)
+            }
         }
     }
 
@@ -293,10 +305,12 @@ impl PySampler {
         })
     }
 
-    fn wait_timeout(&mut self, py: Python<'_>, timeout_seconds: f64) -> PyResult<()> {
+    fn wait(&mut self, py: Python<'_>, timeout_seconds: Option<f64>) -> PyResult<()> {
         py.allow_threads(|| {
-            let timeout =
-                Duration::try_from_secs_f64(timeout_seconds).context("Invalid timeout")?;
+            let timeout = match timeout_seconds {
+                Some(val) => Some(Duration::try_from_secs_f64(val).context("Invalid timeout")?),
+                None => None,
+            };
 
             let state = std::mem::replace(&mut self.state, SamplerState::Empty);
 
@@ -310,11 +324,20 @@ impl PySampler {
 
             let (final_state, retval) = loop {
                 let time_so_far = Instant::now().saturating_duration_since(start_time);
-                let Some(remaining) = timeout.checked_sub(time_so_far) else {
-                    break (SamplerState::Running(control), Ok(()));
+                let next_timeout = match timeout {
+                    Some(timeout) => {
+                        let Some(remaining) = timeout.checked_sub(time_so_far) else {
+                            break (
+                                SamplerState::Running(control),
+                                Err(PyTimeoutError::new_err(
+                                    "Timeout while waiting for sampler to finish",
+                                )),
+                            );
+                        };
+                        remaining.min(step)
+                    }
+                    None => step,
                 };
-                let next_timeout = remaining.min(step);
-                dbg!(timeout, time_so_far, remaining, next_timeout);
 
                 match control.wait_timeout(next_timeout) {
                     SamplerWaitResult::Result(result) => {
@@ -341,7 +364,7 @@ impl PySampler {
 
             let SamplerState::Running(control) = state else {
                 let _ = std::mem::replace(&mut self.state, state);
-                return Err(anyhow::anyhow!("Sampler is already finalized"))?;
+                return Ok(());
             };
 
             let result = control.abort();
@@ -356,7 +379,7 @@ impl PySampler {
 
             let SamplerState::Running(control) = state else {
                 let _ = std::mem::replace(&mut self.state, state);
-                return Err(anyhow::anyhow!("Sampler is already finalized"))?;
+                return Ok(());
             };
 
             let result = control.finalize();
@@ -397,6 +420,14 @@ impl PySampler {
                 .collect::<Result<Vec<_>>>()?,
         );
         Ok(list.into_py(py))
+    }
+
+    fn is_empty(&self) -> bool {
+        match self.state {
+            SamplerState::Running(_) => false,
+            SamplerState::Finished(_) => false,
+            SamplerState::Empty => true,
+        }
     }
 }
 

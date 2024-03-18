@@ -2,8 +2,7 @@ use std::{
     sync::{
         self,
         mpsc::{
-            channel, sync_channel, Receiver, RecvError, RecvTimeoutError, Sender, SyncSender,
-            TryRecvError,
+            channel, sync_channel, Receiver, RecvError, RecvTimeoutError, SyncSender, TryRecvError,
         },
         Arc,
     },
@@ -355,7 +354,26 @@ impl SamplerControl {
         result
     }
 
-    pub(crate) fn is_finished(&self) -> bool {
-        self.poll_thread.is_finished()
+    pub(crate) fn try_finalize(mut self) -> SamplerWaitResult {
+        // We want to ignore this error, because this only
+        // fails if the sampler thread is done, and in this case
+        // we don't need to do anything.
+        let _ = self.resume();
+        let result = match self.results.try_recv() {
+            Err(err @ TryRecvError::Disconnected) => Err(err)
+                .context("Could not get sampler result in try_finalize, sampler thread is dead."),
+            Err(TryRecvError::Empty) => {
+                return SamplerWaitResult::Timeout(self);
+            }
+            Ok(result) => result,
+        };
+
+        drop(self.commands);
+        drop(self.results);
+        let poll_result = self.poll_thread.join();
+        if let Err(_) = poll_result {
+            return SamplerWaitResult::Result(Err(anyhow!("Sample polling thread paniced.")));
+        }
+        SamplerWaitResult::Result(result)
     }
 }
