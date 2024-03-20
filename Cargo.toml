@@ -1,6 +1,6 @@
 [package]
 name = "nutpie"
-version = "0.9.2"
+version = "0.10.0"
 authors = [
     "Adrian Seyboldt <adrian.seyboldt@gmail.com>",
     "PyMC Developers <pymc.devs@gmail.com>"
