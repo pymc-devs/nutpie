@@ -2,14 +2,127 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.8.0] - 2023-08-06
+## [0.10.0] - 2024-03-20
+
+### Documentation
+
+- Mention non-blocking sampling in readme  (Adrian Seyboldt)
+
+
+### Features
+
+- Allow sampling in the backgound (Adrian Seyboldt)
+
+- Implement check if background sampling is complete (Adrian Seyboldt)
+
+- Implement pausing and unpausing of samplers (Adrian Seyboldt)
+
+- Filter warnings and compile through pymc (Adrian Seyboldt)
+
+
+### Miscellaneous Tasks
+
+- Bump actions/setup-python from 4 to 5 (dependabot[bot])
+
+- Bump uraimo/run-on-arch-action from 2.5.0 to 2.7.1 (dependabot[bot])
+
+- Bump actions/checkout from 3 to 4 (dependabot[bot])
+
+- Bump actions/upload-artifact from 3 to 4 (dependabot[bot])
+
+- Bump the cargo group across 1 directory with 2 updates (dependabot[bot])
+
+- Some major version bumps in rust deps  (Adrian Seyboldt)
+
+- Bump dependency versions (Adrian Seyboldt)
+
+- Update changelog (Adrian Seyboldt)
+
+- Bump version (Adrian Seyboldt)
+
+
+### Performance
+
+- Set the number of parallel chains dynamically (Adrian Seyboldt)
+
+
+## [0.9.2] - 2024-02-19
+
+### Bug Fixes
+
+- Allow dims with only length specified (Adrian Seyboldt)
+
+
+### Documentation
+
+- Update suggested mamba commands in README (#70) (Ben Mares)
+
+- Fix README typo bridgestan→nutpie (#69) (Ben Mares)
+
+
+### Features
+
+- Handle missing libraries more robustly (#72) (Ben Mares)
+
+
+### Miscellaneous Tasks
+
+- Bump actions/download-artifact from 3 to 4 (dependabot[bot])
+
+
+### Ci
+
+- Make sure the local nutpie is installed (Adrian Seyboldt)
+
+- Install local nutpie package in all jobs (Adrian Seyboldt)
+
+
+## [0.9.0] - 2023-09-12
+
+### Bug Fixes
+
+- Better error context for init point errors (Adrian Seyboldt)
+
+
+### Features
+
+- Improve error message by providing context (Adrian Seyboldt)
+
+- Use standard normal to initialize chains (Adrian Seyboldt)
+
+
+### Miscellaneous Tasks
+
+- Update deps (Adrian Seyboldt)
+
+- Rename stan model transpose function (Adrian Seyboldt)
+
+- Update nutpie (Adrian Seyboldt)
+
+
+### Styling
+
+- Fix formatting (Adrian Seyboldt)
+
+
+## [0.8.0] - 2023-08-18
 
 ### Bug Fixes
 
 - Initialize points in uniform(-2, 2) (Adrian Seyboldt)
 
+- Multidimensional stan variables were stored in incorrect order (Adrian Seyboldt)
+
+- Fix with_coords for stan models (Adrian Seyboldt)
+
 
 ### Miscellaneous Tasks
+
+- Update deps (Adrian Seyboldt)
+
+- Update deps (Adrian Seyboldt)
+
+- Bump version (Adrian Seyboldt)
 
 - Update deps (Adrian Seyboldt)
 
