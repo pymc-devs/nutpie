@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass
 from threading import Condition, Event
 from typing import Any, Literal, Optional, overload
@@ -295,7 +296,7 @@ def sample(
     draws: int,
     tune: int,
     chains: int,
-    cores: int,
+    cores: Optional[int],
     seed: Optional[int],
     save_warmup: bool,
     progress_bar: bool,
@@ -313,7 +314,7 @@ def sample(
     draws: int,
     tune: int,
     chains: int,
-    cores: int,
+    cores: Optional[int],
     seed: Optional[int],
     save_warmup: bool,
     progress_bar: bool,
@@ -330,7 +331,7 @@ def sample(
     draws: int = 1000,
     tune: int = 300,
     chains: int = 6,
-    cores: int = 6,
+    cores: Optional[int] = None,
     seed: Optional[int] = None,
     save_warmup: bool = True,
     progress_bar: bool = True,
@@ -407,6 +408,14 @@ def sample(
 
     for name, val in kwargs.items():
         setattr(settings, name, val)
+
+    if cores is None:
+        try:
+            # Only available in python>=3.13
+            available = os.process_cpu_count()
+        except AttributeError:
+            available = os.cpu_count()
+        cores = min(chains, available)
 
     if init_mean is None:
         init_mean = np.zeros(compiled_model.n_dim)
