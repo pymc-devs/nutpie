@@ -1,5 +1,6 @@
 import dataclasses
 import itertools
+import warnings
 from dataclasses import dataclass
 from importlib.util import find_spec
 from math import prod
@@ -200,12 +201,26 @@ def compile_pymc_model(model: "pm.Model", **kwargs) -> CompiledPyMCModel:
     logp_numba_raw, c_sig = _make_c_logp_func(
         n_dim, logp_fn, user_data, shared_logp, shared_data
     )
-    logp_numba = numba.cfunc(c_sig, **kwargs)(logp_numba_raw)
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="Cannot cache compiled function .* as it uses dynamic globals",
+            category=numba.NumbaWarning,
+        )
+
+        logp_numba = numba.cfunc(c_sig, **kwargs)(logp_numba_raw)
 
     expand_numba_raw, c_sig_expand = _make_c_expand_func(
         n_dim, n_expanded, expand_fn, user_data, shared_expand, shared_data
     )
-    expand_numba = numba.cfunc(c_sig_expand, **kwargs)(expand_numba_raw)
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="Cannot cache compiled function .* as it uses dynamic globals",
+            category=numba.NumbaWarning,
+        )
+
+        expand_numba = numba.cfunc(c_sig_expand, **kwargs)(expand_numba_raw)
 
     coords = {}
     for name, vals in model.coords.items():
@@ -276,6 +291,7 @@ def _make_functions(model):
     import pytensor
     import pytensor.link.numba.dispatch
     import pytensor.tensor as pt
+    from pymc.pytensorf import compile_pymc
 
     shapes = _compute_shapes(model)
 
@@ -340,9 +356,8 @@ def _make_functions(model):
     (logp, grad) = pytensor.graph_replace([logp, grad], replacements)
 
     # We should avoid compiling the function, and optimize only
-    logp_fn_pt = pytensor.compile.function.function(
-        (joined,), (logp, grad), mode=pytensor.compile.NUMBA
-    )
+    with model:
+        logp_fn_pt = compile_pymc((joined,), (logp, grad), mode=pytensor.compile.NUMBA)
 
     logp_fn = logp_fn_pt.vm.jit_fn
 
@@ -368,12 +383,13 @@ def _make_functions(model):
     num_expanded = count
 
     allvars = pt.concatenate([joined, *[var.ravel() for var in remaining_rvs]])
-    expand_fn_pt = pytensor.compile.function.function(
-        (joined,),
-        (allvars,),
-        givens=list(replacements.items()),
-        mode=pytensor.compile.NUMBA,
-    )
+    with model:
+        expand_fn_pt = compile_pymc(
+            (joined,),
+            (allvars,),
+            givens=list(replacements.items()),
+            mode=pytensor.compile.NUMBA,
+        )
     expand_fn = expand_fn_pt.vm.jit_fn
 
     return (
