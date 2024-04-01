@@ -88,7 +88,7 @@ jobs:
           python-version: '3.10'
           architecture: ${{ matrix.target }}
       - name: Install LLVM and Clang
-        uses: KyleMayes/install-llvm-action@v1
+        uses: KyleMayes/install-llvm-action@v2
         with:
           version: "15.0"
           directory: ${{ runner.temp }}/llvm
