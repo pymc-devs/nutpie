@@ -128,6 +128,87 @@ def _trace_to_arviz(traces, n_tune, shapes, **kwargs):
     )
 
 
+class _ChainProgress:
+    bar: Any
+    total: int
+    finished: bool
+    tuning: bool
+    draws: int
+    started: bool
+    chain_id: int
+    num_divs: int
+    step_size: float
+    num_steps: int
+
+    def __init__(self, total, chain_id):
+        self.bar = fastprogress.progress_bar(range(total))
+        self.total = total
+        self.finished = False
+        self.tuning = True
+        self.draws = 0
+        self.started = False
+        self.chain_id = chain_id
+        self.num_divs = 0
+        self.step_size = 0.
+        self.num_steps = 0
+        self.bar.update(0)
+
+    def callback(self, info):
+        try:
+            if self.finished:
+                return
+
+            if info.finished_draws == info.total_draws:
+                self.finished = True
+
+            if not info.tuning:
+                self.tuning = False
+
+            self.draws = info.finished_draws
+            if info.started:
+                self.started = True
+
+            self.num_divs = info.divergences
+            self.step_size = info.step_size
+            self.num_steps = info.num_steps
+
+            if self.tuning:
+                state = "warmup"
+            else:
+                state = "sampling"
+
+            self.bar.comment = (
+                f"Chain {self.chain_id:2} {state}: "
+                f"trajectory {self.num_steps:3} / "
+                f"diverging {self.num_divs: 2} / "
+                f"step {self.step_size:.2g}"
+            )
+            self.bar.update(self.draws)
+        except Exception as e:
+            print(e)
+
+
+class _DetailedProgress:
+    chains: list[_ChainProgress]
+
+    def __init__(self, total_draws, num_chains):
+        self.chains = [_ChainProgress(total_draws, i) for i in range(num_chains)]
+
+    def callback(self, info):
+        for chain, chain_info in zip(self.chains, info):
+            chain.callback(chain_info)
+
+
+class _SummaryProgress:
+    bar: Any
+
+    def __init__(self, total_draws, num_chains):
+        pass
+
+    def callback(self, info):
+        return None
+
+
 class _BackgroundSampler:
     _sampler: Any
     _num_divs: int
@@ -144,81 +225,30 @@ class _BackgroundSampler:
         compiled_model,
         settings,
         init_mean,
-        chains,
         cores,
-        seed,
-        draws,
-        tune,
         *,
         progress_bar=True,
         save_warmup=True,
         return_raw_trace=False,
     ):
-        self._num_divs = 0
-        self._tune = settings.num_tune
-        self._draws = settings.num_draws
         self._settings = settings
-        self._chains_tuning = chains
-        self._chains_finished = 0
-        self._chains = chains
         self._compiled_model = compiled_model
         self._save_warmup = save_warmup
         self._return_raw_trace = return_raw_trace
-        total_draws = (self._draws + self._tune) * self._chains
-        self._progress = fastprogress.progress_bar(
-            range(total_draws),
-            total=total_draws,
-            display=progress_bar,
-        )
-        # fastprogress seems to reset the progress bar
-        # if we create a new iterator, but we don't want
-        # this for multiple calls to wait.
-        self._bar = iter(self._progress)
 
-        self._exit_event = Event()
-        self._pause_event = Event()
-        self._continue = Condition()
-
-        self._finished_draws = 0
-
-        next(self._bar)
-
-        def progress_callback(info):
-            if info.draw == self._tune - 1:
-                self._chains_tuning -= 1
-            if info.draw == self._tune + self._draws - 1:
-                self._chains_finished += 1
-            if info.is_diverging and info.draw > self._tune:
-                self._num_divs += 1
-            if self._chains_tuning > 0:
-                count = self._chains_tuning
-                divs = self._num_divs
-                self._progress.comment = (
-                    f" Chains in warmup: {count}, Divergences: {divs}"
-                )
-            else:
-                count = self._chains - self._chains_finished
-                divs = self._num_divs
-                self._progress.comment = (
-                    f" Sampling chains: {count}, Divergences: {divs}"
-                )
-            try:
-                next(self._bar)
-            except StopIteration:
-                pass
-            self._finished_draws += 1
+        total_draws = settings.num_draws + settings.num_tune
 
         if progress_bar:
-            callback = progress_callback
+            self._progress = _DetailedProgress(total_draws, settings.num_chains)
+            callback = self._progress.callback
         else:
+            self._progress = None
             callback = None
 
         self._sampler = compiled_model._make_sampler(
             settings,
             init_mean,
-            chains,
             cores,
-            seed,
             callback=callback,
         )
 
@@ -233,12 +263,10 @@ class _BackgroundSampler:
         This resumes the sampler in case it had been paused.
         """
         self._sampler.wait(timeout)
-        self._sampler.finalize()
-        return self._extract()
-
-    def _extract(self):
         results = self._sampler.extract_results()
+        return self._extract(results)
 
+    def _extract(self, results):
         dims = {name: list(dim) for name, dim in self._compiled_model.dims.items()}
         dims["mass_matrix_inv"] = ["unconstrained_parameter"]
         dims["gradient"] = ["unconstrained_parameter"]
@@ -253,7 +281,7 @@ class _BackgroundSampler:
         else:
             return _trace_to_arviz(
                 results,
-                self._tune,
+                self._settings.num_tune,
                 self._compiled_model.shapes,
                 dims=dims,
                 coords={
@@ -262,6 +290,11 @@ class _BackgroundSampler:
                 },
                 save_warmup=self._save_warmup,
             )
+
+    def inspect(self):
+        """Get a copy of the current state of the trace"""
+        results = self._sampler.inspect()
+        return self._extract(results)
 
     def pause(self):
         """Pause the sampler."""
@@ -278,7 +311,8 @@ class _BackgroundSampler:
     def abort(self):
         """Abort sampling and return the trace produced so far."""
         self._sampler.abort()
-        return self._extract()
+        results = self._sampler.extract_results()
+        return self._extract(results)
 
     def cancel(self):
         """Abort sampling and discard progress."""
@@ -402,9 +436,10 @@ def sample(
     trace : arviz.InferenceData
         An ArviZ ``InferenceData`` object that contains the samples.
     """
-    settings = _lib.PySamplerArgs()
+    settings = _lib.PyDiagGradNutsSettings(seed)
     settings.num_tune = tune
     settings.num_draws = draws
+    settings.num_chains = chains
 
     for name, val in kwargs.items():
         setattr(settings, name, val)
@@ -424,11 +459,7 @@ def sample(
         compiled_model,
         settings,
         init_mean,
-        chains,
         cores,
-        seed,
-        draws,
-        tune,
         progress_bar=progress_bar,
         save_warmup=save_warmup,
         return_raw_trace=return_raw_trace,

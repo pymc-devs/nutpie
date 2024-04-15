@@ -2,120 +2,132 @@ use std::time::{Duration, Instant};
 
 use crate::{
     pymc::{ExpandFunc, LogpFunc, PyMcModel},
-    sampler::{Sampler, SamplerControl, SamplerResult, SamplerWaitResult},
     stan::{StanLibrary, StanModel},
 };
 
 use anyhow::{Context, Result};
 use arrow2::{array::Array, datatypes::Field};
-use nuts_rs::{SampleStats, SamplerArgs};
+use nuts_rs::{ChainProgress, DiagGradNutsSettings, ProgressCallback, Sampler, SamplerWaitResult, Trace};
 use pyo3::{
-    exceptions::{PyTimeoutError, PyValueError},
+    exceptions::PyTimeoutError,
     ffi::Py_uintptr_t,
     prelude::*,
     types::{PyList, PyTuple},
 };
+use rand::{thread_rng, RngCore};
 
 #[pyclass]
-struct PySampleStats {
-    stats: Box<dyn SampleStats>,
-}
+struct PyChainProgress(ChainProgress);
+
 
 #[pymethods]
-impl PySampleStats {
+impl PyChainProgress {
     #[getter]
-    fn depth(&self) -> u64 {
-        self.stats.depth()
+    fn finished_draws(&self) -> usize {
+        self.0.finished_draws
     }
 
     #[getter]
-    fn is_diverging(&self) -> bool {
-        self.stats.divergence_info().is_some()
+    fn total_draws(&self) -> usize {
+        self.0.total_draws
     }
 
     #[getter]
-    fn divergence_trajectory_idx(&self) -> Option<i64> {
-        self.stats.divergence_info().as_ref()?.end_idx_in_trajectory
+    fn divergences(&self) -> usize {
+        self.0.divergences
     }
 
     #[getter]
-    fn logp(&self) -> f64 {
-        self.stats.logp()
+    fn started(&self) -> bool {
+        self.0.started
     }
 
     #[getter]
-    fn index_in_trajectory(&self) -> i64 {
-        self.stats.index_in_trajectory()
+    fn tuning(&self) -> bool {
+        self.0.tuning
     }
 
     #[getter]
-    fn chain(&self) -> u64 {
-        self.stats.chain()
+    fn num_steps(&self) -> usize {
+        self.0.latest_num_steps
     }
 
     #[getter]
-    fn draw(&self) -> u64 {
-        self.stats.draw()
+    fn step_size(&self) -> f64 {
+        self.0.step_size
     }
 }
 
 #[pyclass]
 #[derive(Clone, Default)]
-pub struct PySamplerArgs {
-    inner: SamplerArgs,
-}
+pub struct PyDiagGradNutsSettings(DiagGradNutsSettings);
+
 
 #[pymethods]
-impl PySamplerArgs {
+impl PyDiagGradNutsSettings {
     #[new]
-    fn new() -> PySamplerArgs {
-        PySamplerArgs {
-            inner: SamplerArgs::default(),
-        }
+    fn new(seed: Option<u64>) -> Self {
+        let seed = seed.unwrap_or_else(|| {
+            let mut rng = thread_rng();
+            rng.next_u64()
+        });
+        let mut settings = DiagGradNutsSettings::default();
+        settings.seed = seed;
+        PyDiagGradNutsSettings(settings)
     }
 
     #[getter]
     fn num_tune(&self) -> u64 {
-        self.inner.num_tune
+        self.0.num_tune
     }
 
     #[setter(num_tune)]
     fn set_num_tune(&mut self, val: u64) {
-        self.inner.num_tune = val
+        self.0.num_tune = val
+    }
+
+    #[getter]
+    fn num_chains(&self) -> usize {
+        self.0.num_chains
+    }
+
+    #[setter(num_chains)]
+    fn set_num_chains(&mut self, val: usize) {
+        self.0.num_chains = val;
     }
 
     #[getter]
     fn num_draws(&self) -> u64 {
-        self.inner.num_draws
+        self.0.num_draws
     }
 
     #[setter(num_draws)]
     fn set_num_draws(&mut self, val: u64) {
-        self.inner.num_draws = val;
+        self.0.num_draws = val;
     }
 
     #[getter]
     fn window_switch_freq(&self) -> u64 {
-        self.inner.mass_matrix_adapt.mass_matrix_switch_freq
+        self.0.mass_matrix_adapt.mass_matrix_switch_freq
     }
 
     #[setter(window_switch_freq)]
     fn set_window_switch_freq(&mut self, val: u64) {
-        self.inner.mass_matrix_adapt.mass_matrix_switch_freq = val;
+        self.0.mass_matrix_adapt.mass_matrix_switch_freq = val;
     }
 
     #[getter]
     fn early_window_switch_freq(&self) -> u64 {
-        self.inner.mass_matrix_adapt.early_mass_matrix_switch_freq
+        self.0.mass_matrix_adapt.early_mass_matrix_switch_freq
     }
 
     #[setter(early_window_switch_freq)]
     fn set_early_window_switch_freq(&mut self, val: u64) {
-        self.inner.mass_matrix_adapt.early_mass_matrix_switch_freq = val;
+        self.0.mass_matrix_adapt.early_mass_matrix_switch_freq = val;
     }
     #[getter]
     fn initial_step(&self) -> f64 {
-        self.inner
+        self.0
             .mass_matrix_adapt
             .dual_average_options
             .initial_step
@@ -123,7 +135,7 @@ impl PySamplerArgs {
 
     #[setter(initial_step)]
     fn set_initial_step(&mut self, val: f64) {
-        self.inner
+        self.0
             .mass_matrix_adapt
             .dual_average_options
             .initial_step = val
@@ -131,57 +143,57 @@ impl PySamplerArgs {
 
     #[getter]
     fn maxdepth(&self) -> u64 {
-        self.inner.maxdepth
+        self.0.maxdepth
     }
 
     #[setter(maxdepth)]
     fn set_maxdepth(&mut self, val: u64) {
-        self.inner.maxdepth = val
+        self.0.maxdepth = val
     }
 
     #[getter]
     fn store_gradient(&self) -> bool {
-        self.inner.store_gradient
+        self.0.store_gradient
     }
 
     #[setter(store_gradient)]
     fn set_store_gradient(&mut self, val: bool) {
-        self.inner.store_gradient = val;
+        self.0.store_gradient = val;
     }
 
     #[getter]
     fn store_unconstrained(&self) -> bool {
-        self.inner.store_unconstrained
+        self.0.store_unconstrained
     }
 
     #[setter(store_unconstrained)]
     fn set_store_unconstrained(&mut self, val: bool) {
-        self.inner.store_unconstrained = val;
+        self.0.store_unconstrained = val;
     }
 
     #[getter]
     fn store_divergences(&self) -> bool {
-        self.inner.store_divergences
+        self.0.store_divergences
     }
 
     #[setter(store_divergences)]
     fn set_store_divergences(&mut self, val: bool) {
-        self.inner.store_divergences = val;
+        self.0.store_divergences = val;
     }
 
     #[getter]
     fn max_energy_error(&self) -> f64 {
-        self.inner.max_energy_error
+        self.0.max_energy_error
     }
 
     #[setter(max_energy_error)]
     fn set_max_energy_error(&mut self, val: f64) {
-        self.inner.max_energy_error = val
+        self.0.max_energy_error = val
     }
 
     #[setter(target_accept)]
     fn set_target_accept(&mut self, val: f64) {
-        self.inner
+        self.0
             .mass_matrix_adapt
             .dual_average_options
             .target_accept = val;
@@ -189,7 +201,7 @@ impl PySamplerArgs {
 
     #[getter]
     fn target_accept(&self) -> f64 {
-        self.inner
+        self.0
             .mass_matrix_adapt
             .dual_average_options
             .target_accept
@@ -197,7 +209,7 @@ impl PySamplerArgs {
 
     #[getter]
     fn store_mass_matrix(&self) -> bool {
-        self.inner
+        self.0
             .mass_matrix_adapt
             .mass_matrix_options
             .store_mass_matrix
@@ -205,7 +217,7 @@ impl PySamplerArgs {
 
     #[setter(store_mass_matrix)]
     fn set_store_mass_matrix(&mut self, val: bool) {
-        self.inner
+        self.0
             .mass_matrix_adapt
             .mass_matrix_options
             .store_mass_matrix = val;
@@ -213,23 +225,28 @@ impl PySamplerArgs {
 }
 
 pub(crate) enum SamplerState {
-    Running(SamplerControl),
-    Finished(Result<SamplerResult>),
+    Running(Sampler),
+    Finished(Option<Trace>),
     Empty,
 }
 
 #[pyclass]
-struct PySampler {
-    state: SamplerState,
-}
+struct PySampler(SamplerState);
 
-fn make_callback(callback: Option<Py<PyAny>>) -> Box<dyn FnMut(Box<dyn SampleStats>) + Send> {
-    if let Some(callback) = callback {
-        Box::new(move |stats| {
-            let _ = Python::with_gil(|py| callback.call1(py, (PySampleStats { stats },)));
-        })
-    } else {
-        Box::new(|_| {})
+fn make_callback(callback: Option<Py<PyAny>>) -> Option<ProgressCallback> {
+    match callback {
+        Some(callback) => {
+            Some(Box::new(move |stats: Box<[ChainProgress]>| {
+                let _ = Python::with_gil(|py| {
+                    let args = PyList::new_bound(
+                        py,
+                        stats.into_vec().into_iter().map(|prog| PyChainProgress(prog).into_py(py))
+                    );
+                    callback.call1(py, (args,))
+                });
+            }))
+        },
+        None => { None },
     }
 }
 
@@ -237,59 +254,55 @@ fn make_callback(callback: Option<Py<PyAny>>) -> Box<dyn FnMut(Box<dyn SampleSta
 impl PySampler {
     #[staticmethod]
     fn from_pymc(
-        settings: PySamplerArgs,
-        chains: u64,
+        settings: PyDiagGradNutsSettings,
         cores: usize,
         model: PyMcModel,
-        seed: Option<u64>,
         callback: Option<Py<PyAny>>,
     ) -> PyResult<PySampler> {
-        let sampler = Sampler::new(model, settings.inner, cores, chains, seed);
-        let control = SamplerControl::new(sampler, make_callback(callback));
-        Ok(PySampler {
-            state: SamplerState::Running(control),
-        })
+        let sampler = Sampler::new(model, settings.0, cores, make_callback(callback))?;
+        Ok(PySampler(SamplerState::Running(sampler)))
     }
 
     #[staticmethod]
     fn from_stan(
-        settings: PySamplerArgs,
-        chains: u64,
+        settings: PyDiagGradNutsSettings,
         cores: usize,
         model: StanModel,
-        seed: Option<u64>,
         callback: Option<Py<PyAny>>,
     ) -> PyResult<PySampler> {
-        let sampler = Sampler::new(model, settings.inner, cores, chains, seed);
-        let control = SamplerControl::new(sampler, make_callback(callback));
-        Ok(PySampler {
-            state: SamplerState::Running(control),
-        })
+        let sampler = Sampler::new(model, settings.0, cores, make_callback(callback))?;
+        Ok(PySampler(SamplerState::Running(sampler)))
     }
 
-    fn is_finished(&mut self) -> PyResult<bool> {
-        let state = std::mem::replace(&mut self.state, SamplerState::Empty);
+    fn is_finished(&mut self, py: Python<'_>) -> PyResult<bool> {
+        py.allow_threads(|| {
+            let state = std::mem::replace(&mut self.0, SamplerState::Empty);
 
-        let SamplerState::Running(control) = state else {
-            let _ = std::mem::replace(&mut self.state, state);
-            return Ok(true);
-        };
+            let SamplerState::Running(sampler) = state else {
+                let _ = std::mem::replace(&mut self.0, state);
+                return Ok(true);
+            };
 
-        match control.try_finalize() {
-            SamplerWaitResult::Result(result) => {
-                let _ = std::mem::replace(&mut self.state, SamplerState::Finished(result));
-                Ok(true)
+            match sampler.wait_timeout(Duration::from_millis(1)) {
+                SamplerWaitResult::Trace(trace) => {
+                    let _ = std::mem::replace(&mut self.0, SamplerState::Finished(Some(trace)));
+                    Ok(true)
+                }
+                SamplerWaitResult::Timeout(sampler) => {
+                    let _ = std::mem::replace(&mut self.0, SamplerState::Running(sampler));
+                    Ok(false)
+                }
+                SamplerWaitResult::Err(err, trace) => {
+                    let _ = std::mem::replace(&mut self.0, SamplerState::Finished(trace));
+                    Err(err.into())
+                }
             }
-            SamplerWaitResult::Timeout(control) => {
-                let _ = std::mem::replace(&mut self.state, SamplerState::Running(control));
-                Ok(false)
-            }
-        }
+        })
     }
 
     fn pause(&mut self, py: Python<'_>) -> PyResult<()> {
         py.allow_threads(|| {
-            if let SamplerState::Running(ref mut control) = self.state {
+            if let SamplerState::Running(ref mut control) = self.0 {
                 control.pause()?
             }
             Ok(())
@@ -298,7 +311,7 @@ impl PySampler {
 
     fn resume(&mut self, py: Python<'_>) -> PyResult<()> {
         py.allow_threads(|| {
-            if let SamplerState::Running(ref mut control) = self.state {
+            if let SamplerState::Running(ref mut control) = self.0 {
                 control.resume()?
             }
             Ok(())
@@ -312,10 +325,10 @@ impl PySampler {
                 None => None,
             };
 
-            let state = std::mem::replace(&mut self.state, SamplerState::Empty);
+            let state = std::mem::replace(&mut self.0, SamplerState::Empty);
 
             let SamplerState::Running(mut control) = state else {
-                let _ = std::mem::replace(&mut self.state, state);
+                let _ = std::mem::replace(&mut self.0, state);
                 return Ok(());
             };
 
@@ -340,11 +353,14 @@ impl PySampler {
                 };
 
                 match control.wait_timeout(next_timeout) {
-                    SamplerWaitResult::Result(result) => {
-                        break (SamplerState::Finished(result), Ok(()))
+                    SamplerWaitResult::Trace(trace) => {
+                        break (SamplerState::Finished(Some(trace)), Ok(()))
                     }
                     SamplerWaitResult::Timeout(new_control) => {
                         control = new_control;
+                    }
+                    SamplerWaitResult::Err(err, trace) => {
+                        break (SamplerState::Finished(trace), Err(err.into()))
                     }
                 }
 
@@ -353,86 +369,103 @@ impl PySampler {
                 }
             };
 
-            let _ = std::mem::replace(&mut self.state, final_state);
+            let _ = std::mem::replace(&mut self.0, final_state);
             retval
         })
     }
 
     fn abort(&mut self, py: Python<'_>) -> PyResult<()> {
         py.allow_threads(|| {
-            let state = std::mem::replace(&mut self.state, SamplerState::Empty);
+            let state = std::mem::replace(&mut self.0, SamplerState::Empty);
 
             let SamplerState::Running(control) = state else {
-                let _ = std::mem::replace(&mut self.state, state);
+                let _ = std::mem::replace(&mut self.0, state);
                 return Ok(());
             };
 
-            let result = control.abort();
-            let _ = std::mem::replace(&mut self.state, SamplerState::Finished(result));
+            let (result, trace) = control.abort();
+            let _ = std::mem::replace(&mut self.0, SamplerState::Finished(trace));
+            result?;
             Ok(())
         })
     }
 
+    /*
     fn finalize(&mut self, py: Python<'_>) -> PyResult<()> {
         py.allow_threads(|| {
-            let state = std::mem::replace(&mut self.state, SamplerState::Empty);
+            let state = std::mem::replace(&mut self.0, SamplerState::Empty);
 
-            let SamplerState::Running(control) = state else {
-                let _ = std::mem::replace(&mut self.state, state);
+            let SamplerState::Running(sampler) = state else {
+                let _ = std::mem::replace(&mut self.0, state);
                 return Ok(());
             };
 
-            let result = control.finalize();
-            let _ = std::mem::replace(&mut self.state, SamplerState::Finished(result));
+            let result = sampler.finalize();
+            let _ = std::mem::replace(&mut self.0, SamplerState::Finished(result));
             Ok(())
         })
     }
+    */
 
-    fn extract_results(&mut self, py: Python<'_>) -> PyResult<Py<PyList>> {
-        let state = std::mem::replace(&mut self.state, SamplerState::Empty);
+    fn extract_results<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let state = std::mem::replace(&mut self.0, SamplerState::Empty);
 
-        let SamplerState::Finished(values) = state else {
-            let _ = std::mem::replace(&mut self.state, state);
-            // Must have called finalize or abort
-            return Err(anyhow::anyhow!("Sampler is not finalized"))?;
+        let SamplerState::Finished(trace) = state else {
+            let _ = std::mem::replace(&mut self.0, state);
+            return Err(anyhow::anyhow!("Sampler is not finished"))?;
         };
 
-        let values =
-            values.map_err(|e| PyValueError::new_err(format!("Sampling failed: {:?}", e)))?;
+        let Some(trace) = trace else {
+            return Err(anyhow::anyhow!("Sampler failed and did not produce a trace"))?;
+        };
 
-        let list = PyList::new(
-            py,
-            values
-                .into_iter()
-                .map(|(stats, draws)| {
-                    Ok(PyTuple::new(
-                        py,
-                        [
-                            export_array(py, "sampler_stats".into(), stats)?,
-                            draws
-                                .map(|draws| export_array(py, "draws".into(), draws))
-                                .transpose()?
-                                .into_py(py),
-                        ]
-                        .into_iter(),
-                    ))
-                })
-                .collect::<Result<Vec<_>>>()?,
-        );
-        Ok(list.into_py(py))
+        trace_to_list(trace, py)
     }
 
     fn is_empty(&self) -> bool {
-        match self.state {
+        match self.0 {
             SamplerState::Running(_) => false,
             SamplerState::Finished(_) => false,
             SamplerState::Empty => true,
         }
     }
+
+    fn inspect<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let trace = py.allow_threads(|| {
+            let SamplerState::Running(ref mut sampler) = self.0 else {
+                return Err(anyhow::anyhow!("Sampler is not running"))?;
+            };
+
+            sampler.inspect_trace()
+        })?;
+        trace_to_list(trace, py)
+    }
+}
+
+
+fn trace_to_list<'py>(trace: Trace, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+    let list = PyList::new_bound(
+        py,
+        trace
+            .chains
+            .into_iter()
+            .map(|chain| {
+                Ok(PyTuple::new_bound(
+                    py,
+                    [
+                        export_array(py, "draws".into(), chain.draws)?,
+                        export_array(py, "sampler_stats".into(), chain.stats)?,
+                    ]
+                    .into_iter(),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?,
+    );
+    Ok(list)
 }
 
 fn export_array(py: Python<'_>, name: String, data: Box<dyn Array>) -> PyResult<PyObject> {
-    let pa = py.import("pyarrow")?;
+    let pa = py.import_bound("pyarrow")?;
     let array = pa.getattr("Array")?;
 
     let schema = arrow2::ffi::export_field_to_c(&Field::new(name, data.data_type().clone(), false));
@@ -451,15 +484,15 @@ fn export_array(py: Python<'_>, name: String, data: Box<dyn Array>) -> PyResult<
 
 /// A Python module implemented in Rust.
 #[pymodule]
-pub fn _lib(_py: Python, m: &PyModule) -> PyResult<()> {
-    m.add_class::<PySamplerArgs>()?;
-    m.add_class::<PySampleStats>()?;
+pub fn _lib<'py>(m: &Bound<'py, PyModule>) -> PyResult<()> {
     m.add_class::<PySampler>()?;
     m.add_class::<PyMcModel>()?;
     m.add_class::<LogpFunc>()?;
     m.add_class::<ExpandFunc>()?;
     m.add_class::<StanLibrary>()?;
     m.add_class::<StanModel>()?;
+    m.add_class::<PyDiagGradNutsSettings>()?;
+    m.add_class::<PyChainProgress>()?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }
