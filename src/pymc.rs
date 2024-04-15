@@ -7,13 +7,11 @@ use arrow2::{
 };
 use itertools::{izip, Itertools};
 use numpy::PyReadonlyArray1;
-use nuts_rs::{CpuLogpFunc, LogpError, SamplerArgs};
-use pyo3::{pyclass, pymethods, types::PyList, PyObject, PyResult, Python};
+use nuts_rs::{CpuLogpFunc, CpuMath, DrawStorage, LogpError, Model, Settings};
+use pyo3::{pyclass, pymethods, types::{PyAnyMethods, PyList}, Bound, PyObject, PyResult};
 use rand::{distributions::Uniform, prelude::Distribution};
 
 use thiserror::Error;
-
-use crate::sampler::{Model, Trace};
 
 type UserData = *const std::ffi::c_void;
 
@@ -111,13 +109,13 @@ impl LogpError for ErrorCode {
 }
 
 impl<'a> CpuLogpFunc for &'a LogpFunc {
-    type Err = ErrorCode;
+    type LogpError = ErrorCode;
 
     fn dim(&self) -> usize {
         self.dim
     }
 
-    fn logp(&mut self, position: &[f64], gradient: &mut [f64]) -> Result<f64, Self::Err> {
+    fn logp(&mut self, position: &[f64], gradient: &mut [f64]) -> Result<f64, Self::LogpError> {
         let mut logp = 0f64;
         let logp_ptr = (&mut logp) as *mut f64;
         assert!(position.len() == self.dim);
@@ -138,6 +136,7 @@ impl<'a> CpuLogpFunc for &'a LogpFunc {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct PyMcTrace<'model> {
     dim: usize,
     data: Vec<Vec<f64>>,
@@ -146,7 +145,7 @@ pub(crate) struct PyMcTrace<'model> {
     expand: &'model ExpandFunc,
 }
 
-impl<'model> Trace for PyMcTrace<'model> {
+impl<'model> DrawStorage for PyMcTrace<'model> {
     fn append_value(&mut self, point: &[f64]) -> Result<()> {
         assert!(point.len() == self.dim);
 
@@ -181,11 +180,15 @@ impl<'model> Trace for PyMcTrace<'model> {
         let dtype = DataType::Struct(fields);
         Ok(StructArray::try_new(dtype, arrays, None)?.boxed())
     }
+
+    fn inspect(&mut self) -> Result<Box<dyn Array>> {
+        self.clone().finalize()
+    }
 }
 
 impl<'model> PyMcTrace<'model> {
-    fn new(model: &'model PyMcModel, settings: &SamplerArgs) -> Self {
-        let draws = (settings.num_tune + settings.num_draws) as usize;
+    fn new(model: &'model PyMcModel, settings: &impl Settings) -> Self {
+        let draws = (settings.hint_num_draws() + settings.hint_num_tune()) as usize;
         Self {
             dim: model.dim,
             data: model
@@ -233,24 +236,24 @@ pub(crate) struct PyMcModel {
 impl PyMcModel {
     #[new]
     fn new<'py>(
-        _py: Python<'py>,
         dim: usize,
         density: LogpFunc,
         expand: ExpandFunc,
-        var_sizes: &'py PyList,
-        var_names: &'py PyList,
+        var_sizes: &Bound<'py, PyList>,
+        var_names: &Bound<'py, PyList>,
         start_point: PyReadonlyArray1<'py, f64>,
     ) -> PyResult<Self> {
         Ok(Self {
             dim,
             density,
             expand,
-            mu: start_point.to_vec()?.into(),
+            mu: start_point.as_slice()?.into(),
             var_names: var_names.extract()?,
             var_sizes: var_sizes.extract()?,
         })
     }
 
+    /*
     fn benchmark_logp<'py>(
         &self,
         py: Python<'py>,
@@ -268,24 +271,16 @@ impl PyMcModel {
         );
         Ok(out)
     }
+    */
 }
 
 impl Model for PyMcModel {
-    type Density<'a> = &'a LogpFunc;
+    type Math<'model> = CpuMath<&'model LogpFunc>;
 
-    type Trace<'a> = PyMcTrace<'a>;
+    type DrawStorage<'model, S: Settings> = PyMcTrace<'model>;
 
-    fn new_trace<'a, R: rand::Rng + ?Sized>(
-        &'a self,
-        _rng: &mut R,
-        _chain: u64,
-        settings: &SamplerArgs,
-    ) -> Result<Self::Trace<'a>> {
-        Ok(PyMcTrace::new(self, settings))
-    }
-
-    fn density(&self) -> Result<Self::Density<'_>> {
-        Ok(&self.density)
+    fn math(&self) -> Result<Self::Math<'_>> {
+        Ok(CpuMath::new(&self.density))
     }
 
     fn init_position<R: rand::Rng + ?Sized>(
@@ -299,5 +294,14 @@ impl Model for PyMcModel {
             .zip_eq(self.mu.iter())
             .for_each(|(x, mu)| *x = dist.sample(rng) + mu);
         Ok(())
+    }
+
+    fn new_trace<'model, S: Settings, R: rand::prelude::Rng + ?Sized>(
+        &'model self,
+        _rng: &mut R,
+        _chain_id: u64,
+        settings: &'model S,
+    ) -> Result<Self::DrawStorage<'model, S>> {
+        Ok(PyMcTrace::new(self, settings))
     }
 }

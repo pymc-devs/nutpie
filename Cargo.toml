@@ -21,14 +21,14 @@ name = "_lib"
 crate-type = ["cdylib"]
 
 [dependencies]
-nuts-rs = "0.8.0"
-numpy = "0.20.0"
+nuts-rs = "0.9.0"
+numpy = "0.21.0"
 ndarray = "0.15.6"
 rand = "0.8.5"
 thiserror = "1.0.44"
 rand_chacha = "0.3.1"
 rayon = "1.9.0"
-arrow2 = "0.17.0"
+arrow2 = "0.18.0"
 anyhow = "1.0.72"
 itertools = "0.12.0"
 bridgestan = "2.1.2"
@@ -36,7 +36,7 @@ rand_distr = "0.4.3"
 smallvec = "1.11.0"
 
 [dependencies.pyo3]
-version = "0.20.0"
+version = "0.21.0"
 features = ["extension-module", "anyhow"]
 
 [dev-dependencies]

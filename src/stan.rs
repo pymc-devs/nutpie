@@ -5,17 +5,15 @@ use arrow2::array::{FixedSizeListArray, Float64Array, StructArray};
 use arrow2::datatypes::{DataType, Field};
 use bridgestan::open_library;
 use itertools::{izip, Itertools};
-use numpy::PyReadonlyArray1;
-use nuts_rs::{CpuLogpFunc, LogpError};
+use nuts_rs::{CpuLogpFunc, CpuMath, DrawStorage, LogpError, Model, Settings};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyTuple};
+use pyo3::types::{PyDict, PyTuple};
 use pyo3::{exceptions::PyValueError, pyclass, pymethods, PyResult};
 use rand::prelude::Distribution;
 use rand::{thread_rng, RngCore};
 use rand_distr::StandardNormal;
 use smallvec::{SmallVec, ToSmallVec};
 
-use crate::sampler::{Model, Trace};
 use thiserror::Error;
 
 type InnerModel = bridgestan::Model<Arc<bridgestan::StanLibrary>>;
@@ -54,8 +52,8 @@ impl StanVariable {
     }
 
     #[getter]
-    fn shape<'py>(&self, py: Python<'py>) -> &'py PyTuple {
-        PyTuple::new(py, self.0.shape.iter())
+    fn shape<'py>(&self, py: Python<'py>) -> Bound<'py, PyTuple> {
+        PyTuple::new_bound(py, self.0.shape.iter())
     }
 
     #[getter]
@@ -152,8 +150,8 @@ impl StanModel {
         Ok(StanModel { model, variables })
     }
 
-    pub fn variables<'py>(&self, py: Python<'py>) -> PyResult<&'py PyDict> {
-        let out = PyDict::new(py);
+    pub fn variables<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let out = PyDict::new_bound(py);
         let results: Result<Vec<_>, _> = self
             .variables
             .iter()
@@ -177,6 +175,7 @@ impl StanModel {
             .collect())
     }
 
+    /*
     fn benchmark_logp<'py>(
         &self,
         py: Python<'py>,
@@ -184,7 +183,7 @@ impl StanModel {
         cores: usize,
         evals: usize,
     ) -> PyResult<&'py PyList> {
-        let point = point.to_vec()?;
+        let point = point.as_slice()?;
         let durations = py.allow_threads(|| Model::benchmark_logp(self, &point, cores, evals))?;
         let out = PyList::new(
             py,
@@ -194,6 +193,7 @@ impl StanModel {
         );
         Ok(out)
     }
+    */
 }
 
 pub struct StanDensity<'model>(&'model InnerModel);
@@ -213,9 +213,9 @@ impl LogpError for StanLogpError {
 }
 
 impl<'model> CpuLogpFunc for StanDensity<'model> {
-    type Err = StanLogpError;
+    type LogpError = StanLogpError;
 
-    fn logp(&mut self, position: &[f64], grad: &mut [f64]) -> Result<f64, Self::Err> {
+    fn logp(&mut self, position: &[f64], grad: &mut [f64]) -> Result<f64, Self::LogpError> {
         let logp = self.0.log_density_gradient(position, true, true, grad)?;
         if !logp.is_finite() {
             return Err(StanLogpError::BadLogp(logp));
@@ -278,7 +278,24 @@ pub struct StanTrace<'model> {
     rng: bridgestan::Rng<&'model bridgestan::StanLibrary>,
 }
 
-impl<'model> Trace for StanTrace<'model> {
+impl<'model> Clone for StanTrace<'model> {
+    fn clone(&self) -> Self {
+        // TODO We should avoid this Clone implementation.
+        // We only need it for `StanTrace.inspect`, which
+        // doesn't need rng, so we could avoid this strange
+        // seed of zeros.
+        let rng = self.model.model.new_rng(0).expect("Could not create stan rng");
+        Self {
+            inner: self.inner,
+            model: self.model,
+            trace: self.trace.clone(),
+            expanded_buffer: self.expanded_buffer.clone(),
+            rng,
+        }
+    }
+}
+
+impl<'model> DrawStorage for StanTrace<'model> {
     fn append_value(&mut self, point: &[f64]) -> anyhow::Result<()> {
         self.inner
             .param_constrain(
@@ -326,20 +343,24 @@ impl<'model> Trace for StanTrace<'model> {
         let dtype = DataType::Struct(fields);
         Ok(StructArray::try_new(dtype, arrays, None)?.boxed())
     }
+
+    fn inspect(&mut self) -> anyhow::Result<Box<dyn arrow2::array::Array>> {
+        self.clone().finalize()
+    }
 }
 
 impl Model for StanModel {
-    type Density<'a> = StanDensity<'a>;
+    type Math<'model> = CpuMath<StanDensity<'model>>;
 
-    type Trace<'a> = StanTrace<'a>;
+    type DrawStorage<'model, S: nuts_rs::Settings> = StanTrace<'model>;
 
-    fn new_trace<'a, R: rand::Rng + ?Sized>(
+    fn new_trace<'a, S: Settings, R: rand::Rng + ?Sized>(
         &'a self,
         _rng: &mut R,
         chain: u64,
-        settings: &nuts_rs::SamplerArgs,
-    ) -> anyhow::Result<Self::Trace<'a>> {
-        let draws = (settings.num_tune + settings.num_draws) as usize;
+        settings: &S,
+    ) -> anyhow::Result<Self::DrawStorage<'a, S>> {
+        let draws = (settings.hint_num_tune() + settings.hint_num_draws()) as usize;
         let trace = self
             .variables
             .iter()
@@ -356,8 +377,8 @@ impl Model for StanModel {
         })
     }
 
-    fn density(&self) -> anyhow::Result<Self::Density<'_>> {
-        Ok(StanDensity(&self.model))
+    fn math(&self) -> anyhow::Result<Self::Math<'_>> {
+        Ok(CpuMath::new(StanDensity(&self.model)))
     }
 
     fn init_position<R: rand::Rng + ?Sized>(

@@ -80,9 +80,9 @@ class CompiledStanModel(CompiledModel):
             return self.with_data().model
         return self.model
 
-    def _make_sampler(self, settings, init_mean, chains, cores, seed, callback=None):
+    def _make_sampler(self, settings, init_mean, cores, callback=None):
         model = self._make_model(init_mean)
-        return _lib.PySampler.from_stan(settings, chains, cores, model, seed, callback)
+        return _lib.PySampler.from_stan(settings, cores, model, callback)
 
     @property
     def n_dim(self):
