@@ -246,7 +246,7 @@ struct PySampler(SamplerState);
 fn make_callback(callback: Option<Py<PyAny>>) -> Option<ProgressCallback> {
     match callback {
         Some(callback) => {
-            Some(Box::new(move |stats: Box<[ChainProgress]>| {
+            let callback = Box::new(move |stats: Box<[ChainProgress]>| {
                 let _ = Python::with_gil(|py| {
                     let args = PyList::new_bound(
                         py,
@@ -254,7 +254,11 @@ fn make_callback(callback: Option<Py<PyAny>>) -> Option<ProgressCallback> {
                     );
                     callback.call1(py, (args,))
                 });
-            }))
+            });
+            Some(ProgressCallback {
+                callback,
+                rate: Duration::from_millis(500),
+            })
         },
         None => { None },
     }
