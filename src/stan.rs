@@ -117,9 +117,7 @@ fn params(
                 Some(shape)
             })
             .unwrap_or(vec![]);
-        shape
-            .iter_mut()
-            .for_each(|max_idx| *max_idx = (*max_idx) + 1);
+        shape.iter_mut().for_each(|max_idx| *max_idx += 1);
         let size = shape.iter().product();
         let end_idx = start_idx + size;
         variables.push(Parameter {
@@ -170,7 +168,7 @@ impl StanModel {
             .ok_or_else(|| anyhow::format_err!("Model is currently in use"))
             .context("Failed to access the names of unconstrained parameters")?
             .param_unc_names()
-            .split(",")
+            .split(',')
             .map(|name| name.to_string())
             .collect())
     }
@@ -261,8 +259,8 @@ fn fortran_to_c_order(data: &[f64], shape: &[usize], out: &mut Vec<f64>) {
             }
 
             idx[axis] = 0;
-            position = position - shape[axis] * strides[axis];
-            axis = axis + 1;
+            position -= shape[axis] * strides[axis];
+            axis += 1;
             if axis == rank {
                 break 'iterate;
             }
@@ -284,7 +282,11 @@ impl<'model> Clone for StanTrace<'model> {
         // We only need it for `StanTrace.inspect`, which
         // doesn't need rng, so we could avoid this strange
         // seed of zeros.
-        let rng = self.model.model.new_rng(0).expect("Could not create stan rng");
+        let rng = self
+            .model
+            .model
+            .new_rng(0)
+            .expect("Could not create stan rng");
         Self {
             inner: self.inner,
             model: self.model,
@@ -360,7 +362,7 @@ impl Model for StanModel {
         chain: u64,
         settings: &S,
     ) -> anyhow::Result<Self::DrawStorage<'a, S>> {
-        let draws = (settings.hint_num_tune() + settings.hint_num_draws()) as usize;
+        let draws = settings.hint_num_tune() + settings.hint_num_draws();
         let trace = self
             .variables
             .iter()
@@ -408,13 +410,13 @@ mod tests {
         let data = vec![0., 1., 2., 3., 4., 5.];
         let mut out = vec![];
         fortran_to_c_order(&data, &[2, 3], &mut out);
-        let expect = vec![0., 2., 4., 1., 3., 5.];
+        let expect = [0., 2., 4., 1., 3., 5.];
         assert!(expect.iter().zip_eq(out.iter()).all(|(a, b)| a == b));
 
         let data = vec![0., 1., 2., 3., 4., 5.];
         let mut out = vec![];
         fortran_to_c_order(&data, &[3, 2], &mut out);
-        let expect = vec![0., 3., 1., 4., 2., 5.];
+        let expect = [0., 3., 1., 4., 2., 5.];
         assert!(expect.iter().zip_eq(out.iter()).all(|(a, b)| a == b));
 
         let data = vec![
