@@ -222,6 +222,16 @@ impl PyDiagGradNutsSettings {
             .mass_matrix_options
             .store_mass_matrix = val;
     }
+
+    #[getter]
+    fn use_grad_based_mass_matrix(&self) -> bool {
+        self.0.mass_matrix_adapt.mass_matrix_options.use_grad_based_estimate
+    }
+
+    #[setter(use_grad_based_mass_matrix)]
+    fn set_use_grad_based_mass_matrix(&mut self, val: bool) {
+        self.0.mass_matrix_adapt.mass_matrix_options.use_grad_based_estimate = val
+    }
 }
 
 pub(crate) enum SamplerState {

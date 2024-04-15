@@ -428,6 +428,10 @@ def sample(
     return_raw_trace: bool, default=False
         Return the raw trace object (an apache arrow structure)
         instead of converting to arviz.
+    use_grad_based_mass_matrix: bool, default=True
+        Use a mass matrix estimate that is based on draw and gradient
+        variance. Set to `False` to get mass matrix adaptation more
+        similar to PyMC and Stan.
     **kwargs
         Pass additional arguments to nutpie._lib.PySamplerArgs
 
