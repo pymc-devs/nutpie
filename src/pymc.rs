@@ -8,7 +8,11 @@ use arrow2::{
 use itertools::{izip, Itertools};
 use numpy::PyReadonlyArray1;
 use nuts_rs::{CpuLogpFunc, CpuMath, DrawStorage, LogpError, Model, Settings};
-use pyo3::{pyclass, pymethods, types::{PyAnyMethods, PyList}, Bound, PyObject, PyResult};
+use pyo3::{
+    pyclass, pymethods,
+    types::{PyAnyMethods, PyList},
+    Bound, PyObject, PyResult,
+};
 use rand::{distributions::Uniform, prelude::Distribution};
 
 use thiserror::Error;
@@ -188,7 +192,7 @@ impl<'model> DrawStorage for PyMcTrace<'model> {
 
 impl<'model> PyMcTrace<'model> {
     fn new(model: &'model PyMcModel, settings: &impl Settings) -> Self {
-        let draws = (settings.hint_num_draws() + settings.hint_num_tune()) as usize;
+        let draws = settings.hint_num_draws() + settings.hint_num_tune();
         Self {
             dim: model.dim,
             data: model

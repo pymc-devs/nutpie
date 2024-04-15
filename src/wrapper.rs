@@ -7,7 +7,9 @@ use crate::{
 
 use anyhow::{Context, Result};
 use arrow2::{array::Array, datatypes::Field};
-use nuts_rs::{ChainProgress, DiagGradNutsSettings, ProgressCallback, Sampler, SamplerWaitResult, Trace};
+use nuts_rs::{
+    ChainProgress, DiagGradNutsSettings, ProgressCallback, Sampler, SamplerWaitResult, Trace,
+};
 use pyo3::{
     exceptions::PyTimeoutError,
     ffi::Py_uintptr_t,
@@ -18,7 +20,6 @@ use rand::{thread_rng, RngCore};
 
 #[pyclass]
 struct PyChainProgress(ChainProgress);
-
 
 #[pymethods]
 impl PyChainProgress {
@@ -62,7 +63,6 @@ impl PyChainProgress {
 #[derive(Clone, Default)]
 pub struct PyDiagGradNutsSettings(DiagGradNutsSettings);
 
-
 #[pymethods]
 impl PyDiagGradNutsSettings {
     #[new]
@@ -71,8 +71,10 @@ impl PyDiagGradNutsSettings {
             let mut rng = thread_rng();
             rng.next_u64()
         });
-        let mut settings = DiagGradNutsSettings::default();
-        settings.seed = seed;
+        let settings = DiagGradNutsSettings {
+            seed,
+            ..Default::default()
+        };
         PyDiagGradNutsSettings(settings)
     }
 
@@ -127,18 +129,12 @@ impl PyDiagGradNutsSettings {
     }
     #[getter]
     fn initial_step(&self) -> f64 {
-        self.0
-            .mass_matrix_adapt
-            .dual_average_options
-            .initial_step
+        self.0.mass_matrix_adapt.dual_average_options.initial_step
     }
 
     #[setter(initial_step)]
     fn set_initial_step(&mut self, val: f64) {
-        self.0
-            .mass_matrix_adapt
-            .dual_average_options
-            .initial_step = val
+        self.0.mass_matrix_adapt.dual_average_options.initial_step = val
     }
 
     #[getter]
@@ -193,18 +189,12 @@ impl PyDiagGradNutsSettings {
 
     #[setter(target_accept)]
     fn set_target_accept(&mut self, val: f64) {
-        self.0
-            .mass_matrix_adapt
-            .dual_average_options
-            .target_accept = val;
+        self.0.mass_matrix_adapt.dual_average_options.target_accept = val;
     }
 
     #[getter]
     fn target_accept(&self) -> f64 {
-        self.0
-            .mass_matrix_adapt
-            .dual_average_options
-            .target_accept
+        self.0.mass_matrix_adapt.dual_average_options.target_accept
     }
 
     #[getter]
@@ -225,12 +215,18 @@ impl PyDiagGradNutsSettings {
 
     #[getter]
     fn use_grad_based_mass_matrix(&self) -> bool {
-        self.0.mass_matrix_adapt.mass_matrix_options.use_grad_based_estimate
+        self.0
+            .mass_matrix_adapt
+            .mass_matrix_options
+            .use_grad_based_estimate
     }
 
     #[setter(use_grad_based_mass_matrix)]
     fn set_use_grad_based_mass_matrix(&mut self, val: bool) {
-        self.0.mass_matrix_adapt.mass_matrix_options.use_grad_based_estimate = val
+        self.0
+            .mass_matrix_adapt
+            .mass_matrix_options
+            .use_grad_based_estimate = val
     }
 }
 
@@ -250,7 +246,10 @@ fn make_callback(callback: Option<Py<PyAny>>) -> Option<ProgressCallback> {
                 let _ = Python::with_gil(|py| {
                     let args = PyList::new_bound(
                         py,
-                        stats.into_vec().into_iter().map(|prog| PyChainProgress(prog).into_py(py))
+                        stats
+                            .into_vec()
+                            .into_iter()
+                            .map(|prog| PyChainProgress(prog).into_py(py)),
                     );
                     callback.call1(py, (args,))
                 });
@@ -259,8 +258,8 @@ fn make_callback(callback: Option<Py<PyAny>>) -> Option<ProgressCallback> {
                 callback,
                 rate: Duration::from_millis(500),
             })
-        },
-        None => { None },
+        }
+        None => None,
     }
 }
 
@@ -430,7 +429,9 @@ impl PySampler {
         };
 
         let Some(trace) = trace else {
-            return Err(anyhow::anyhow!("Sampler failed and did not produce a trace"))?;
+            return Err(anyhow::anyhow!(
+                "Sampler failed and did not produce a trace"
+            ))?;
         };
 
         trace_to_list(trace, py)
@@ -456,8 +457,7 @@ impl PySampler {
     }
 }
 
-
-fn trace_to_list<'py>(trace: Trace, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+fn trace_to_list(trace: Trace, py: Python<'_>) -> PyResult<Bound<'_, PyList>> {
     let list = PyList::new_bound(
         py,
         trace
@@ -498,7 +498,7 @@ fn export_array(py: Python<'_>, name: String, data: Box<dyn Array>) -> PyResult<
 
 /// A Python module implemented in Rust.
 #[pymodule]
-pub fn _lib<'py>(m: &Bound<'py, PyModule>) -> PyResult<()> {
+pub fn _lib(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySampler>()?;
     m.add_class::<PyMcModel>()?;
     m.add_class::<LogpFunc>()?;
