@@ -92,5 +92,5 @@ def test_pymc_model_shared():
     np.testing.assert_allclose(trace2.posterior.a.mean().values, 10.0, atol=0.5)
 
     compiled3 = compiled.with_data(mu=0.5, sigma=3 * np.ones(4))
-    with pytest.raises(ValueError):
+    with pytest.raises(RuntimeError):
         nutpie.sample(compiled3, chains=1)
