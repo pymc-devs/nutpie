@@ -87,9 +87,11 @@ class CompiledPyMCModel(CompiledModel):
             user_data=user_data,
         )
 
-    def _make_sampler(self, settings, init_mean, cores, callback=None):
+    def _make_sampler(self, settings, init_mean, cores, template, rate, callback=None):
         model = self._make_model(init_mean)
-        return _lib.PySampler.from_pymc(settings, cores, model, callback)
+        return _lib.PySampler.from_pymc(
+            settings, cores, model, template, rate, callback
+        )
 
     def _make_model(self, init_mean):
         expand_fn = _lib.ExpandFunc(

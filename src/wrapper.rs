@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
 use crate::{
+    progress::ProgressHandler,
     pymc::{ExpandFunc, LogpFunc, PyMcModel},
     stan::{StanLibrary, StanModel},
 };
@@ -239,27 +240,20 @@ pub(crate) enum SamplerState {
 #[pyclass]
 struct PySampler(SamplerState);
 
-fn make_callback(callback: Option<Py<PyAny>>) -> Option<ProgressCallback> {
+fn make_callback(
+    template: String,
+    n_cores: usize,
+    rate: Duration,
+    callback: Option<Py<PyAny>>,
+) -> Result<Option<ProgressCallback>> {
     match callback {
         Some(callback) => {
-            let callback = Box::new(move |stats: Box<[ChainProgress]>| {
-                let _ = Python::with_gil(|py| {
-                    let args = PyList::new_bound(
-                        py,
-                        stats
-                            .into_vec()
-                            .into_iter()
-                            .map(|prog| PyChainProgress(prog).into_py(py)),
-                    );
-                    callback.call1(py, (args,))
-                });
-            });
-            Some(ProgressCallback {
-                callback,
-                rate: Duration::from_millis(500),
-            })
+            let handler = ProgressHandler::new(callback, rate, template, n_cores);
+            let callback = handler.into_callback()?;
+
+            Ok(Some(callback))
         }
-        None => None,
+        None => Ok(None),
     }
 }
 
@@ -270,9 +264,13 @@ impl PySampler {
         settings: PyDiagGradNutsSettings,
         cores: usize,
         model: PyMcModel,
+        template: String,
+        rate: u64,
         callback: Option<Py<PyAny>>,
     ) -> PyResult<PySampler> {
-        let sampler = Sampler::new(model, settings.0, cores, make_callback(callback))?;
+        let rate = Duration::from_millis(rate);
+        let callback = make_callback(template, cores, rate, callback)?;
+        let sampler = Sampler::new(model, settings.0, cores, callback)?;
         Ok(PySampler(SamplerState::Running(sampler)))
     }
 
@@ -281,9 +279,13 @@ impl PySampler {
         settings: PyDiagGradNutsSettings,
         cores: usize,
         model: StanModel,
+        template: String,
+        rate: u64,
         callback: Option<Py<PyAny>>,
     ) -> PyResult<PySampler> {
-        let sampler = Sampler::new(model, settings.0, cores, make_callback(callback))?;
+        let rate = Duration::from_millis(rate);
+        let callback = make_callback(template, cores, rate, callback)?;
+        let sampler = Sampler::new(model, settings.0, cores, callback)?;
         Ok(PySampler(SamplerState::Running(sampler)))
     }
 
