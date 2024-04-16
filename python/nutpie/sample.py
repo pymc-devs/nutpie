@@ -1,10 +1,8 @@
 import os
 from dataclasses import dataclass
-from threading import Condition, Event
 from typing import Any, Literal, Optional, overload
 
 import arviz
-import fastprogress
 import numpy as np
 import pandas as pd
 import pyarrow
@@ -128,85 +126,183 @@ def _trace_to_arviz(traces, n_tune, shapes, **kwargs):
     )
 
 
-class _ChainProgress:
-    bar: Any
-    total: int
-    finished: bool
-    tuning: bool
-    draws: int
-    started: bool
-    chain_id: int
-    num_divs: int
-    step_size: float
-    num_steps: int
+_progress_style = """
+<style>
+    :root {
+        --column-width-1: 40%; /* Progress column width */
+        --column-width-2: 15%; /* Chain column width */
+        --column-width-3: 15%; /* Divergences column width */
+        --column-width-4: 15%; /* Step Size column width */
+        --column-width-5: 15%; /* Gradients/Draw column width */
+    }
 
-    def __init__(self, total, chain_id):
-        self.bar = fastprogress.progress_bar(range(total))
-        self.total = total
-        self.finished = False
-        self.tuning = True
-        self.draws = 0
-        self.started = False
-        self.chain_id = chain_id
-        self.num_divs = 0
-        self.step_size = 0.
-        self.num_steps = 0
-        self.bar.update(0)
+    .nutpie {
+        max-width: 800px;
+        margin: 10px auto;
+        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        //color: #333;
+        //background-color: #fff;
+        padding: 10px;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        border-radius: 8px;
+        font-size: 14px; /* Smaller font size for a more compact look */
+    }
+    .nutpie table {
+        width: 100%;
+        border-collapse: collapse; /* Remove any extra space between borders */
+    }
+    .nutpie th, .nutpie td {
+        padding: 8px 10px; /* Reduce padding to make table more compact */
+        text-align: left;
+        border-bottom: 1px solid #888;
+    }
+    .nutpie th {
+        //background-color: #f0f0f0;
+    }
 
-    def callback(self, info):
+    .nutpie th:nth-child(1) { width: var(--column-width-1); }
+    .nutpie th:nth-child(2) { width: var(--column-width-2); }
+    .nutpie th:nth-child(3) { width: var(--column-width-3); }
+    .nutpie th:nth-child(4) { width: var(--column-width-4); }
+    .nutpie th:nth-child(5) { width: var(--column-width-5); }
+
+    .nutpie progress {
+        width: 100%;
+        height: 15px; /* Smaller progress bars */
+        border-radius: 5px;
+    }
+    progress::-webkit-progress-bar {
+        background-color: #eee;
+        border-radius: 5px;
+    }
+    progress::-webkit-progress-value {
+        background-color: #5cb85c;
+        border-radius: 5px;
+    }
+    progress::-moz-progress-bar {
+        background-color: #5cb85c;
+        border-radius: 5px;
+    }
+    .nutpie .progress-cell {
+        width: 100%;
+    }
+
+    .nutpie p strong { font-size: 16px; font-weight: bold; }
+
+    @media (prefers-color-scheme: dark) {
+        .nutpie {
+            //color: #ddd;
+            //background-color: #1e1e1e;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.2);
+        }
+        .nutpie table, .nutpie th, .nutpie td {
+            border-color: #555;
+            color: #ccc;
+        }
+        .nutpie th {
+            background-color: #2a2a2a;
+        }
+        .nutpie progress::-webkit-progress-bar {
+            background-color: #444;
+        }
+        .nutpie progress::-webkit-progress-value {
+            background-color: #3178c6;
+        }
+        .nutpie progress::-moz-progress-bar {
+            background-color: #3178c6;
+        }
+    }
+</style>
+"""
+
+
+_progress_template = """
+<div class="nutpie">
+    <p><strong>Sampler Progress</strong></p>
+    <p>Total Chains: <span id="total-chains">{{ num_chains }}</span></p>
+    <p>Active Chains: <span id="active-chains">{{ running_chains }}</span></p>
+    <p>
+        Finished Chains:
+        <span id="active-chains">{{ finished_chains }}</span>
+    </p>
+    <p>Sampling for {{ time_sampling }}</p>
+    <p>
+        Estimated Time to Completion:
+        <span id="eta">{{ time_remaining_estimate }}</span>
+    </p>
+
+    <progress
+        id="total-progress-bar"
+        max="{{ total_draws }}"
+        value="{{ total_finished_draws }}">
+    </progress>
+    <table>
+        <thead>
+            <tr>
+                <th>Progress</th>
+                <th>Chain</th>
+                <th>Divergences</th>
+                <th>Step Size</th>
+                <th>Gradients/Draw</th>
+            </tr>
+        </thead>
+        <tbody id="chain-details">
+            {% for chain in chains %}
+                <tr>
+                    <td class="progress-cell">
+                        <progress
+                            max="{{ chain.total_draws }}"
+                            value="{{ chain.finished_draws }}">
+                        </progress>
+                    </td>
+                    <td>{{ chain.chain_index }}</td>
+                    <td>{{ chain.divergences }}</td>
+                    <td>{{ chain.step_size }}</td>
+                    <td>{{ chain.latest_num_steps }}</td>
+                </tr>
+            {% endfor %}
+            </tr>
+        </tbody>
+    </table>
+</div>
+"""
+
+
+# Adapted from fastprogress
+def in_notebook():
+    def in_colab():
+        "Check if the code is running in Google Colaboratory"
         try:
-            if self.finished:
-                return
+            from google import colab  # noqa: F401
 
-            if info.finished_draws == info.total_draws:
-                self.finished = True
+            return True
+        except ImportError:
+            return False
 
-            if not info.tuning:
-                self.tuning = False
+    if in_colab():
+        return True
+    try:
+        shell = get_ipython().__class__.__name__
+        if shell == "ZMQInteractiveShell":  # Jupyter notebook, Spyder or qtconsole
+            try:
+                from IPython.display import HTML, clear_output, display  # noqa: F401
 
-            self.draws = info.finished_draws
-            if info.started:
-                self.started = True
+                return True
+            except ImportError:
+                import warnings
 
-            self.num_divs = info.divergences
-            self.step_size = info.step_size
-            self.num_steps = info.num_steps
-
-            if self.tuning:
-                state = "warmup"
-            else:
-                state = "sampling"
-
-            self.bar.comment = (
-                f"Chain {self.chain_id:2} {state}: "
-                f"trajectory {self.num_steps:3} / "
-                f"diverging {self.num_divs: 2} / "
-                f"step {self.step_size:.2g}"
-            )
-            self.bar.update(self.draws)
-        except Exception as e:
-            print(e)
-
-
-class _DetailedProgress:
-    chains: list[_ChainProgress]
-
-    def __init__(self, total_draws, num_chains):
-        self.chains = [_ChainProgress(total_draws, i) for i in range(num_chains)]
-
-    def callback(self, info):
-        for chain, chain_info in zip(self.chains, info):
-            chain.callback(chain_info)
-
-
-class _SummaryProgress:
-    bar: Any
-
-    def __init__(self, total_draws, num_chains):
-        pass
-
-    def callback(self, info):
-        return None
+                warnings.warn(
+                    "Couldn't import ipywidgets properly, "
+                    "progress bar will be disabled",
+                    stacklevel=2,
+                )
+                return False
+        elif shell == "TerminalInteractiveShell":
+            return False  # Terminal running IPython
+        else:
+            return False  # Other type (?)
+    except NameError:
+        return False  # Probably standard Python interpreter
 
 
 class _BackgroundSampler:
@@ -230,25 +326,46 @@ class _BackgroundSampler:
         progress_bar=True,
         save_warmup=True,
         return_raw_trace=False,
+        progress_template=None,
+        progress_style=None,
+        progress_rate=100,
     ):
         self._settings = settings
         self._compiled_model = compiled_model
         self._save_warmup = save_warmup
         self._return_raw_trace = return_raw_trace
 
-        total_draws = settings.num_draws + settings.num_tune
+        self._html = None
 
-        if progress_bar:
-            self._progress = _DetailedProgress(total_draws, settings.num_chains)
-            callback = self._progress.callback
-        else:
-            self._progress = None
+        if progress_template is None:
+            progress_template = _progress_template
+
+        if progress_style is None:
+            progress_style = _progress_style
+
+        if not progress_bar or not in_notebook():
+            progress_template = ""
             callback = None
+        else:
+            import IPython
+
+            self._html = ""
+
+            if progress_style is not None:
+                IPython.display.display(IPython.display.HTML(progress_style))
+
+            self.display_id = IPython.display.display(self, display_id=True)
+
+            def callback(formatted):
+                self._html = formatted
+                self.display_id.update(self)
 
         self._sampler = compiled_model._make_sampler(
             settings,
             init_mean,
             cores,
+            progress_template,
+            progress_rate,
             callback=callback,
         )
 
@@ -322,6 +439,9 @@ class _BackgroundSampler:
         if not self._sampler.is_empty():
             self.cancel()
 
+    def _repr_html_(self):
+        return self._html
+
 
 @overload
 def sample(
@@ -372,6 +492,9 @@ def sample(
     init_mean: Optional[np.ndarray] = None,
     return_raw_trace: bool = False,
     blocking: bool = True,
+    progress_template: Optional[str] = None,
+    progress_style: Optional[str] = None,
+    progress_rate: int = 100,
     **kwargs,
 ) -> arviz.InferenceData:
     """Sample the posterior distribution for a compiled model.
@@ -432,6 +555,14 @@ def sample(
         Use a mass matrix estimate that is based on draw and gradient
         variance. Set to `False` to get mass matrix adaptation more
         similar to PyMC and Stan.
+    progress_template: str
+        This is only exposed for experimentation. upon template
+        for the html progress representation.
+    progress_style: str
+        This is only exposed for experimentation. Common HTML
+        for the progress bar (eg CSS).
+    progress_rate: int, default=500
+        Rate in ms at which the progress should be updated.
     **kwargs
         Pass additional arguments to nutpie._lib.PySamplerArgs
 
@@ -467,6 +598,9 @@ def sample(
         progress_bar=progress_bar,
         save_warmup=save_warmup,
         return_raw_trace=return_raw_trace,
+        progress_template=progress_template,
+        progress_style=progress_style,
+        progress_rate=progress_rate,
     )
 
     if not blocking:

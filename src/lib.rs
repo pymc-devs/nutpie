@@ -1,3 +1,4 @@
+mod progress;
 mod pymc;
 mod stan;
 mod wrapper;
