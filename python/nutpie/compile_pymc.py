@@ -341,10 +341,7 @@ def _make_functions(model):
     if use_split:
         variables = pt.split(joined, splits, len(splits))
     else:
-        variables = [
-            joined[slice_val].reshape(shape)
-            for slice_val, shape in zip(joined_slices, joined_shapes)
-        ]
+        variables = [joined[slice_val] for slice_val in zip(joined_slices)]
 
     replacements = {
         model.rvs_to_values[var]: value.reshape(shape) if len(shape) != 1 else value
@@ -355,7 +352,7 @@ def _make_functions(model):
         )
     }
 
-    (logp, grad) = pytensor.graph_replace([logp, grad], replacements)
+    (logp, grad) = pytensor.clone_replace([logp, grad], replacements)
 
     # We should avoid compiling the function, and optimize only
     with model:
