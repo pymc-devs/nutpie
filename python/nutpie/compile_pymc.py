@@ -427,6 +427,7 @@ def _compute_shapes(model):
 
 
 def _make_functions(model, *, mode, compute_grad, join_expanded):
+    # TODO do we want to freeze the model?
     import pytensor
     import pytensor.link.numba.dispatch
     import pytensor.tensor as pt
