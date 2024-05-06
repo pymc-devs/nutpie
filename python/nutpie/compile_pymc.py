@@ -12,7 +12,7 @@ from numpy.typing import NDArray
 
 from nutpie import _lib
 from nutpie.compiled_pyfunc import from_pyfunc
-from nutpie.sample import CompiledModel
+from nutpie.sampling import CompiledModel
 
 try:
     from numba.extending import intrinsic
