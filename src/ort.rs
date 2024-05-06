@@ -8,7 +8,8 @@ use itertools::Itertools;
 use nuts_rs::{CpuLogpFunc, CpuMath, DrawStorage, LogpError, Model};
 use ort::{
     inputs, CPUExecutionProvider, CUDAExecutionProvider, ExecutionProviderDispatch,
-    InMemorySession, Session, SessionBuilder, SessionInputValue, SessionInputs, Value,
+    InMemorySession, Session, SessionBuilder, SessionInputValue, SessionInputs,
+    TensorRTExecutionProvider, Value,
 };
 use pyo3::{
     pyclass, pymethods,
@@ -210,6 +211,12 @@ impl OnnxProviders {
 
     pub fn add_cuda(&mut self) -> Result<()> {
         self.providers.push(CUDAExecutionProvider::default().into());
+        Ok(())
+    }
+
+    pub fn add_tensorrt(&mut self) -> Result<()> {
+        self.providers
+            .push(TensorRTExecutionProvider::default().into());
         Ok(())
     }
 }
