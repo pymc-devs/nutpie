@@ -129,18 +129,20 @@ def update_user_data(user_data, user_data_storage):
     return np.asarray(user_data)
 
 
-def make_user_data(func, shared_data):
-    shared_vars = func.get_shared()
+def make_user_data(shared_vars, shared_data):
     record_dtype = np.dtype(
         [
             (
                 "shared",
                 [
-                    ("data", [(var.name, np.uintp) for var in shared_vars]),
-                    ("size", [(var.name, np.uintp) for var in shared_vars]),
+                    ("data", [(var_name, np.uintp) for var_name in shared_vars]),
+                    ("size", [(var_name, np.uintp) for var_name in shared_vars]),
                     (
                         "shape",
-                        [(var.name, np.uint, (var.ndim,)) for var in shared_vars],
+                        [
+                            (var_name, np.uint, (var.ndim,))
+                            for var_name, var in shared_vars.items()
+                        ],
                     ),
                 ],
             )
@@ -192,16 +194,23 @@ def compile_pymc_model(model: "pm.Model", **kwargs) -> CompiledPyMCModel:
         shape_info,
     ) = _make_functions(model)
 
-    shared_data = {val.name: val.get_value().copy() for val in logp_fn_pt.get_shared()}
+    shared_data = {}
+    shared_vars = {}
+    seen = set()
+    for val in [*logp_fn_pt.get_shared(), *expand_fn_pt.get_shared()]:
+        if val.name in shared_data and val not in seen:
+            raise ValueError(f"Shared variables must have unique names: {val.name}")
+        shared_data[val.name] = val.get_value().copy()
+        shared_vars[val.name] = val
+
     for val in shared_data.values():
         val.flags.writeable = False
 
-    shared_logp = [var.name for var in logp_fn_pt.get_shared()]
+    user_data = make_user_data(shared_vars, shared_data)
 
-    user_data = make_user_data(logp_fn_pt, shared_data)
-
+    logp_shared_names = [var.name for var in logp_fn_pt.get_shared()]
     logp_numba_raw, c_sig = _make_c_logp_func(
-        n_dim, logp_fn, user_data, shared_logp, shared_data
+        n_dim, logp_fn, user_data, logp_shared_names, shared_data
     )
     with warnings.catch_warnings():
         warnings.filterwarnings(
@@ -212,8 +221,9 @@ def compile_pymc_model(model: "pm.Model", **kwargs) -> CompiledPyMCModel:
 
         logp_numba = numba.cfunc(c_sig, **kwargs)(logp_numba_raw)
 
+    expand_shared_names = [var.name for var in expand_fn_pt.get_shared()]
     expand_numba_raw, c_sig_expand = _make_c_expand_func(
-        n_dim, n_expanded, expand_fn, user_data, shared_expand, shared_data
+        n_dim, n_expanded, expand_fn, user_data, expand_shared_names, shared_data
     )
     with warnings.catch_warnings():
         warnings.filterwarnings(

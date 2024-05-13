@@ -94,3 +94,14 @@ def test_pymc_model_shared():
     compiled3 = compiled.with_data(mu=0.5, sigma=3 * np.ones(4))
     with pytest.raises(RuntimeError):
         nutpie.sample(compiled3, chains=1)
+
+
+def test_missing():
+    with pm.Model(coords={"obs": range(4)}) as model:
+        mu = pm.Normal("mu")
+        pm.Normal("y", mu, observed=[0, -1, 1, np.nan], dims="obs")
+
+    compiled = nutpie.compile_pymc_model(model)
+    tr = nutpie.sample(compiled, chains=1, seed=1)
+    print(tr.posterior)
+    assert hasattr(tr.posterior, "y_unobserved")
