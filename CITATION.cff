@@ -1,0 +1,24 @@
+# This CITATION.cff file was generated with cffinit.
+# Visit https://bit.ly/cffinit to generate yours today!
+
+cff-version: 1.2.0
+title: nutpie
+message: >-
+  If you use this software, please cite it using the
+  metadata from this file.
+type: software
+authors:
+  - given-names: Adrian
+    family-names: Seyboldt
+    email: adrian.seyboldt@gmail.com
+    affiliation: PyMC Labs
+    orcid: 'https://orcid.org/0000-0002-4239-4541'
+  - name: PyMC Developers
+    website: 'https://github.com/pymc-devs/'
+repository-code: 'https://github.com/pymc-devs/nutpie'
+abstract: 'A fast sampler for Bayesian posteriors, wrapping nuts-rs.'
+keywords:
+  - NUTS
+  - Bayesian inference
+  - MCMC
+license: MIT
