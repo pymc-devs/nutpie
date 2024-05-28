@@ -1,8 +1,9 @@
-use std::{ffi::CString, path::PathBuf, sync::Arc};
+use std::sync::Arc;
+use std::{ffi::CString, path::PathBuf};
 
 use anyhow::Context;
-use arrow2::array::{FixedSizeListArray, Float64Array, StructArray};
-use arrow2::datatypes::{DataType, Field};
+use arrow::array::{Array, FixedSizeListArray, Float64Array, StructArray};
+use arrow::datatypes::{DataType, Field};
 use bridgestan::open_library;
 use itertools::{izip, Itertools};
 use nuts_rs::{CpuLogpFunc, CpuMath, DrawStorage, LogpError, Model, Settings};
@@ -103,7 +104,7 @@ fn params(
 
     let mut variables = Vec::new();
     let mut start_idx = 0;
-    for (name, idxs) in &name_idxs?.iter().group_by(|(name, _)| name) {
+    for (name, idxs) in &name_idxs?.iter().chunk_by(|(name, _)| name) {
         let mut shape: Vec<usize> = idxs
             .map(|(_name, idx)| idx)
             .fold(None, |acc, elem| {
@@ -328,25 +329,31 @@ impl<'model> DrawStorage for StanTrace<'model> {
         Ok(())
     }
 
-    fn finalize(self) -> anyhow::Result<Box<dyn arrow2::array::Array>> {
-        let (fields, arrays) = izip!(self.trace, &self.model.variables)
+    fn finalize(self) -> anyhow::Result<Arc<dyn Array>> {
+        let (fields, arrays): (Vec<_>, Vec<_>) = izip!(self.trace, &self.model.variables)
             .map(|(data, variable)| {
-                let data = Float64Array::from_vec(data);
-                let inner_field = Field::new("item", DataType::Float64, false);
-                let dtype = DataType::FixedSizeList(Box::new(inner_field), variable.size);
-                let field = Field::new(variable.name.clone(), dtype.clone(), false);
-                (
-                    field,
-                    FixedSizeListArray::new(dtype, data.boxed(), None).boxed(),
-                )
+                let data = Float64Array::from(data);
+                let item_field = Arc::new(Field::new("item", DataType::Float64, false));
+                let array = FixedSizeListArray::new(
+                    item_field.clone(),
+                    variable.size as _,
+                    Arc::new(data),
+                    None,
+                );
+                let dtype = DataType::FixedSizeList(item_field, variable.size as i32);
+                let field = Arc::new(Field::new(variable.name.clone(), dtype.clone(), false));
+                let list: Arc<dyn Array> = Arc::new(array);
+                (field, list)
             })
             .unzip();
 
-        let dtype = DataType::Struct(fields);
-        Ok(StructArray::try_new(dtype, arrays, None)?.boxed())
+        Ok(Arc::new(
+            StructArray::try_new(fields.into(), arrays, None)
+                .context("Could not create arrow StructArray")?,
+        ))
     }
 
-    fn inspect(&mut self) -> anyhow::Result<Box<dyn arrow2::array::Array>> {
+    fn inspect(&self) -> anyhow::Result<Arc<dyn Array>> {
         self.clone().finalize()
     }
 }

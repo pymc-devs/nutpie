@@ -1,4 +1,7 @@
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use crate::{
     progress::ProgressHandler,
@@ -7,7 +10,7 @@ use crate::{
 };
 
 use anyhow::{Context, Result};
-use arrow2::{array::Array, datatypes::Field};
+use arrow::array::Array;
 use nuts_rs::{
     ChainProgress, DiagGradNutsSettings, ProgressCallback, Sampler, SamplerWaitResult, Trace,
 };
@@ -469,8 +472,8 @@ fn trace_to_list(trace: Trace, py: Python<'_>) -> PyResult<Bound<'_, PyList>> {
                 Ok(PyTuple::new_bound(
                     py,
                     [
-                        export_array(py, "draws".into(), chain.draws)?,
-                        export_array(py, "sampler_stats".into(), chain.stats)?,
+                        export_array(py, chain.draws)?,
+                        export_array(py, chain.stats)?,
                     ]
                     .into_iter(),
                 ))
@@ -480,21 +483,23 @@ fn trace_to_list(trace: Trace, py: Python<'_>) -> PyResult<Bound<'_, PyList>> {
     Ok(list)
 }
 
-fn export_array(py: Python<'_>, name: String, data: Box<dyn Array>) -> PyResult<PyObject> {
+fn export_array(py: Python<'_>, data: Arc<dyn Array>) -> PyResult<PyObject> {
     let pa = py.import_bound("pyarrow")?;
     let array = pa.getattr("Array")?;
 
-    let schema = arrow2::ffi::export_field_to_c(&Field::new(name, data.data_type().clone(), false));
+    let data = data.into_data();
 
-    let data = arrow2::ffi::export_array_to_c(data);
+    let (data, schema) = arrow::ffi::to_ffi(&data).context("Could not convert to arrow ffi")?;
 
-    let data = array.call_method1(
-        "_import_from_c",
-        (
-            (&data as *const _ as Py_uintptr_t).into_py(py),
-            (&schema as *const _ as Py_uintptr_t).into_py(py),
-        ),
-    )?;
+    let data = array
+        .call_method1(
+            "_import_from_c",
+            (
+                (&data as *const _ as Py_uintptr_t).into_py(py),
+                (&schema as *const _ as Py_uintptr_t).into_py(py),
+            ),
+        )
+        .context("Could not import arrow trace in python")?;
     Ok(data.into_py(py))
 }
 
