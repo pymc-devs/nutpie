@@ -6,7 +6,6 @@ import arviz
 import numpy as np
 import pandas as pd
 import pyarrow
-from fastprogress.fastprogress import ConsoleProgressBar
 
 from nutpie import _lib
 
@@ -314,7 +313,6 @@ class _BackgroundSampler:
     _chains_finished: int
     _compiled_model: CompiledModel
     _save_warmup: bool
-    _progress = ConsoleProgressBar
 
     def __init__(
         self,
