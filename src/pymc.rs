@@ -1,9 +1,9 @@
-use std::{ffi::c_void, fmt::Display};
+use std::{ffi::c_void, fmt::Display, sync::Arc};
 
 use anyhow::{Context, Result};
-use arrow2::{
+use arrow::{
     array::{Array, FixedSizeListArray, Float64Array, StructArray},
-    datatypes::{DataType, Field},
+    datatypes::{DataType, Field, Fields},
 };
 use itertools::{izip, Itertools};
 use numpy::PyReadonlyArray1;
@@ -167,25 +167,25 @@ impl<'model> DrawStorage for PyMcTrace<'model> {
         Ok(())
     }
 
-    fn finalize(self) -> Result<Box<dyn Array>> {
-        let (fields, arrays) = izip!(self.data, self.var_names, self.var_sizes)
+    fn finalize(self) -> Result<Arc<dyn Array>> {
+        let (fields, arrays): (Vec<_>, _) = izip!(self.data, self.var_names, self.var_sizes)
             .map(|(data, name, size)| {
-                let data = Float64Array::from_vec(data);
-                let inner_field = Field::new("item", DataType::Float64, false);
-                let dtype = DataType::FixedSizeList(Box::new(inner_field), size);
-                let field = Field::new(name, dtype.clone(), false);
-                (
-                    field,
-                    FixedSizeListArray::new(dtype, data.boxed(), None).boxed(),
-                )
+                let data = Float64Array::from(data);
+                let item_field = Arc::new(Field::new("item", DataType::Float64, false));
+                let array =
+                    FixedSizeListArray::new(item_field.clone(), size as _, Arc::new(data), None);
+                let field = Field::new(name, DataType::FixedSizeList(item_field, size as _), false);
+                (Arc::new(field), Arc::new(array) as Arc<dyn Array>)
             })
             .unzip();
 
-        let dtype = DataType::Struct(fields);
-        Ok(StructArray::try_new(dtype, arrays, None)?.boxed())
+        let fields = Fields::from(fields);
+        Ok(Arc::new(
+            StructArray::try_new(fields, arrays, None).context("Could not create arrow struct")?,
+        ))
     }
 
-    fn inspect(&mut self) -> Result<Box<dyn Array>> {
+    fn inspect(&self) -> Result<Arc<dyn Array>> {
         self.clone().finalize()
     }
 }

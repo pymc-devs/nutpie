@@ -2,8 +2,8 @@
 name = "nutpie"
 version = "0.10.0"
 authors = [
-    "Adrian Seyboldt <adrian.seyboldt@gmail.com>",
-    "PyMC Developers <pymc.devs@gmail.com>"
+  "Adrian Seyboldt <adrian.seyboldt@gmail.com>",
+  "PyMC Developers <pymc.devs@gmail.com>",
 ]
 edition = "2021"
 license = "MIT"
@@ -21,17 +21,18 @@ name = "_lib"
 crate-type = ["cdylib"]
 
 [dependencies]
-nuts-rs = "0.9.0"
+nuts-rs = "0.10.0"
 numpy = "0.21.0"
 ndarray = "0.15.6"
 rand = "0.8.5"
 thiserror = "1.0.44"
 rand_chacha = "0.3.1"
 rayon = "1.9.0"
-arrow2 = "0.18.0"
+# Keep arrow in sync with nuts-rs requirements
+arrow = { version = "51.0.0", default-features = false, features = ["ffi"] }
 anyhow = "1.0.72"
-itertools = "0.12.0"
-bridgestan = "2.1.2"
+itertools = "0.13.0"
+bridgestan = "2.4.1"
 rand_distr = "0.4.3"
 smallvec = "1.11.0"
 upon = { version = "0.8.1", default-features = false, features = [] }
