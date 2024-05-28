@@ -240,7 +240,7 @@ _progress_template = """
         <thead>
             <tr>
                 <th>Progress</th>
-                <th>Chain</th>
+                <th>Draws</th>
                 <th>Divergences</th>
                 <th>Step Size</th>
                 <th>Gradients/Draw</th>
@@ -255,7 +255,7 @@ _progress_template = """
                             value="{{ chain.finished_draws }}">
                         </progress>
                     </td>
-                    <td>{{ chain.chain_index }}</td>
+                    <td>{{ chain.total_draws }}</td>
                     <td>{{ chain.divergences }}</td>
                     <td>{{ chain.step_size }}</td>
                     <td>{{ chain.latest_num_steps }}</td>
