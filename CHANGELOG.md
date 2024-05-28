@@ -2,6 +2,59 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.0] - 2024-05-28
+
+### Bug Fixes
+
+- Use clone_replace instead of graph_replace (Adrian Seyboldt)
+
+- Allow shared vars to differ in expand and logp (Adrian Seyboldt)
+
+
+### Features
+
+- Add option to use draw base mass matrix estimate (Adrian Seyboldt)
+
+- Report detailed progress (Adrian Seyboldt)
+
+- Show the number of draws in progress overview (Adrian Seyboldt)
+
+
+### Miscellaneous Tasks
+
+- Bump KyleMayes/install-llvm-action from 1 to 2 (dependabot[bot])
+
+- Bump uraimo/run-on-arch-action from 2.7.1 to 2.7.2 (dependabot[bot])
+
+- Update dependencies (Adrian Seyboldt)
+
+
+### Refactor
+
+- Move threaded sampling to nuts-rs (Adrian Seyboldt)
+
+- Specify callback rate (Adrian Seyboldt)
+
+- Switch to arrow-rs (Adrian Seyboldt)
+
+
+### Styling
+
+- Fix formatting and clippy (Adrian Seyboldt)
+
+
+### Testing
+
+- Fix incorrect error type in test (Adrian Seyboldt)
+
+
+### Ci
+
+- Fix uploads of releases (Adrian Seyboldt)
+
+- Fix architectures in CI (Adrian Seyboldt)
+
+
 ## [0.10.0] - 2024-03-20
 
 ### Documentation
@@ -36,9 +89,9 @@ All notable changes to this project will be documented in this file.
 
 - Bump dependency versions (Adrian Seyboldt)
 
-- Update changelog (Adrian Seyboldt)
-
 - Bump version (Adrian Seyboldt)
+
+- Update changelog (Adrian Seyboldt)
 
 
 ### Performance
