@@ -99,7 +99,8 @@ def test_pymc_model_shared():
 def test_missing():
     with pm.Model(coords={"obs": range(4)}) as model:
         mu = pm.Normal("mu")
-        pm.Normal("y", mu, observed=[0, -1, 1, np.nan], dims="obs")
+        y = pm.Normal("y", mu, observed=[0, -1, 1, np.nan], dims="obs")
+        pm.Deterministic("y2", 2 * y, dims="obs")
 
     compiled = nutpie.compile_pymc_model(model)
     tr = nutpie.sample(compiled, chains=1, seed=1)
