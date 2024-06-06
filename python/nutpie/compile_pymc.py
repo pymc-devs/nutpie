@@ -202,6 +202,7 @@ def compile_pymc_model(model: "pm.Model", **kwargs) -> CompiledPyMCModel:
             raise ValueError(f"Shared variables must have unique names: {val.name}")
         shared_data[val.name] = val.get_value().copy()
         shared_vars[val.name] = val
+        seen.add(val)
 
     for val in shared_data.values():
         val.flags.writeable = False
