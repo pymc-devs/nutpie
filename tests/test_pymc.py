@@ -57,6 +57,27 @@ def test_pymc_model_with_coordinate():
     trace.posterior.a  # noqa: B018
 
 
+def test_pymc_model_store_extra():
+    with pm.Model() as model:
+        model.add_coord("foo", length=5)
+        pm.Normal("a", dims="foo")
+
+    compiled = nutpie.compile_pymc_model(model)
+    trace = nutpie.sample(
+        compiled,
+        chains=1,
+        store_mass_matrix=True,
+        store_divergences=True,
+        store_unconstrained=True,
+        store_gradient=True,
+    )
+    trace.posterior.a  # noqa: B018
+    _ = trace.sample_stats.unconstrained_draw
+    _ = trace.sample_stats.gradient
+    _ = trace.sample_stats.divergence_start
+    _ = trace.sample_stats.mass_matrix_inv
+
+
 def test_trafo():
     with pm.Model() as model:
         pm.Uniform("a")

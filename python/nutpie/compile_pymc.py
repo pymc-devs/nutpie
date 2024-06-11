@@ -87,10 +87,13 @@ class CompiledPyMCModel(CompiledModel):
             user_data=user_data,
         )
 
-    def _make_sampler(self, settings, init_mean, cores, template, rate, callback=None):
+    def _make_sampler(self, settings, init_mean, cores, progress_type):
         model = self._make_model(init_mean)
         return _lib.PySampler.from_pymc(
-            settings, cores, model, template, rate, callback
+            settings,
+            cores,
+            model,
+            progress_type,
         )
 
     def _make_model(self, init_mean):

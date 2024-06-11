@@ -80,10 +80,13 @@ class CompiledStanModel(CompiledModel):
             return self.with_data().model
         return self.model
 
-    def _make_sampler(self, settings, init_mean, cores, template, rate, callback=None):
+    def _make_sampler(self, settings, init_mean, cores, progress_type):
         model = self._make_model(init_mean)
         return _lib.PySampler.from_stan(
-            settings, cores, model, template, rate, callback
+            settings,
+            cores,
+            model,
+            progress_type,
         )
 
     @property
