@@ -254,7 +254,7 @@ _progress_template = """
                             value="{{ chain.finished_draws }}">
                         </progress>
                     </td>
-                    <td>{{ chain.total_draws }}</td>
+                    <td>{{ chain.finished_draws }}</td>
                     <td>{{ chain.divergences }}</td>
                     <td>{{ chain.step_size }}</td>
                     <td>{{ chain.latest_num_steps }}</td>
@@ -335,16 +335,16 @@ class _BackgroundSampler:
 
         self._html = None
 
-        if progress_template is None:
-            progress_template = _progress_template
+        if not progress_bar:
+            progress_type = _lib.ProgressType.none()
 
-        if progress_style is None:
-            progress_style = _progress_style
+        elif in_notebook():
+            if progress_template is None:
+                progress_template = _progress_template
 
-        if not progress_bar or not in_notebook():
-            progress_template = ""
-            callback = None
-        else:
+            if progress_style is None:
+                progress_style = _progress_style
+
             import IPython
 
             self._html = ""
@@ -358,13 +358,17 @@ class _BackgroundSampler:
                 self._html = formatted
                 self.display_id.update(self)
 
+            progress_type = _lib.ProgressType.template_callback(
+                progress_rate, progress_template, cores, callback
+            )
+        else:
+            progress_type = _lib.ProgressType.indicatif(progress_rate)
+
         self._sampler = compiled_model._make_sampler(
             settings,
             init_mean,
             cores,
-            progress_template,
-            progress_rate,
-            callback=callback,
+            progress_type,
         )
 
     def wait(self, *, timeout=None):

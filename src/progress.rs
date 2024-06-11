@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, time::Duration};
 
 use anyhow::{Context, Result};
+use indicatif::ProgressBar;
 use nuts_rs::{ChainProgress, ProgressCallback};
 use pyo3::{Py, PyAny, Python};
 use time_humanize::{Accuracy, Tense};
@@ -193,13 +194,15 @@ fn estimate_remaining_time(
     time_sampling: Duration,
     progress: &[ChainProgress],
 ) -> Option<Duration> {
-    let finished_draws: f64 = progress
+    let finished_draws: u64 = progress
         .iter()
-        .map(|chain| chain.finished_draws as f64)
+        .map(|chain| chain.finished_draws as u64)
         .sum();
-    if !(finished_draws > 0.) {
+    if finished_draws == 0 {
         return None;
     }
+
+    let finished_draws = finished_draws as f64;
 
     // TODO this assumes that so far all cores were used all the time
     let time_per_draw = time_sampling.mul_f64((n_cores as f64) / finished_draws);
@@ -220,4 +223,58 @@ fn estimate_remaining_time(
         });
 
     Some(core_times.into_iter().max().unwrap_or(Duration::ZERO))
+}
+
+pub struct IndicatifHandler {
+    rate: Duration,
+}
+
+impl IndicatifHandler {
+    pub fn new(rate: Duration) -> Self {
+        Self { rate }
+    }
+
+    pub fn into_callback(self) -> Result<ProgressCallback> {
+        let mut finished = false;
+        let mut last_draws = 0;
+        let mut bar = None;
+
+        let callback = move |_time_sampling, progress: Box<[ChainProgress]>| {
+            let total: u64 = progress.iter().map(|chain| chain.total_draws as u64).sum();
+
+            if bar.is_none() {
+                bar = Some(ProgressBar::new(total));
+            }
+
+            let Some(ref bar) = bar else { unreachable!() };
+
+            if finished {
+                return;
+            }
+            if progress
+                .iter()
+                .all(|chain| chain.finished_draws == chain.total_draws)
+            {
+                finished = true;
+                bar.set_position(total);
+                bar.finish();
+            }
+
+            let finished_draws: u64 = progress
+                .iter()
+                .map(|chain| chain.finished_draws as u64)
+                .sum();
+
+            let delta = finished_draws.saturating_sub(last_draws);
+            if delta > 0 {
+                bar.set_position(finished_draws);
+                last_draws = finished_draws;
+            }
+        };
+
+        Ok(ProgressCallback {
+            callback: Box::new(callback),
+            rate: self.rate,
+        })
+    }
 }

@@ -4,7 +4,7 @@ use std::{
 };
 
 use crate::{
-    progress::ProgressHandler,
+    progress::{IndicatifHandler, ProgressHandler},
     pymc::{ExpandFunc, LogpFunc, PyMcModel},
     stan::{StanLibrary, StanModel},
 };
@@ -240,25 +240,71 @@ pub(crate) enum SamplerState {
     Empty,
 }
 
+#[derive(Clone)]
 #[pyclass]
-struct PySampler(SamplerState);
+pub enum ProgressType {
+    Callback {
+        rate: Duration,
+        n_cores: usize,
+        template: String,
+        callback: Py<PyAny>,
+    },
+    Indicatif {
+        rate: Duration,
+    },
+    None {},
+}
 
-fn make_callback(
-    template: String,
-    n_cores: usize,
-    rate: Duration,
-    callback: Option<Py<PyAny>>,
-) -> Result<Option<ProgressCallback>> {
-    match callback {
-        Some(callback) => {
-            let handler = ProgressHandler::new(callback, rate, template, n_cores);
-            let callback = handler.into_callback()?;
+impl ProgressType {
+    fn into_callback(self) -> Result<Option<ProgressCallback>> {
+        match self {
+            ProgressType::Callback {
+                callback,
+                rate,
+                n_cores,
+                template,
+            } => {
+                let handler = ProgressHandler::new(callback, rate, template, n_cores);
+                let callback = handler.into_callback()?;
 
-            Ok(Some(callback))
+                Ok(Some(callback))
+            }
+            ProgressType::Indicatif { rate } => {
+                let handler = IndicatifHandler::new(rate);
+                Ok(Some(handler.into_callback()?))
+            }
+            ProgressType::None {} => Ok(None),
         }
-        None => Ok(None),
     }
 }
+
+#[pymethods]
+impl ProgressType {
+    #[staticmethod]
+    fn indicatif(rate: u64) -> Self {
+        let rate = Duration::from_millis(rate);
+        ProgressType::Indicatif { rate }
+    }
+
+    #[staticmethod]
+    fn none() -> Self {
+        ProgressType::None {}
+    }
+
+    #[staticmethod]
+    fn template_callback(rate: u64, template: String, n_cores: usize, callback: Py<PyAny>) -> Self {
+        let rate = Duration::from_millis(rate);
+        ProgressType::Callback {
+            callback,
+            template,
+            n_cores,
+            rate,
+        }
+    }
+}
+
+#[pyclass]
+struct PySampler(SamplerState);
 
 #[pymethods]
 impl PySampler {
@@ -267,12 +313,9 @@ impl PySampler {
         settings: PyDiagGradNutsSettings,
         cores: usize,
         model: PyMcModel,
-        template: String,
-        rate: u64,
-        callback: Option<Py<PyAny>>,
+        progress_type: ProgressType,
     ) -> PyResult<PySampler> {
-        let rate = Duration::from_millis(rate);
-        let callback = make_callback(template, cores, rate, callback)?;
+        let callback = progress_type.into_callback()?;
         let sampler = Sampler::new(model, settings.0, cores, callback)?;
         Ok(PySampler(SamplerState::Running(sampler)))
     }
@@ -282,12 +325,9 @@ impl PySampler {
         settings: PyDiagGradNutsSettings,
         cores: usize,
         model: StanModel,
-        template: String,
-        rate: u64,
-        callback: Option<Py<PyAny>>,
+        progress_type: ProgressType,
     ) -> PyResult<PySampler> {
-        let rate = Duration::from_millis(rate);
-        let callback = make_callback(template, cores, rate, callback)?;
+        let callback = progress_type.into_callback()?;
         let sampler = Sampler::new(model, settings.0, cores, callback)?;
         Ok(PySampler(SamplerState::Running(sampler)))
     }
@@ -514,6 +554,7 @@ pub fn _lib(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<StanModel>()?;
     m.add_class::<PyDiagGradNutsSettings>()?;
     m.add_class::<PyChainProgress>()?;
+    m.add_class::<ProgressType>()?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }
