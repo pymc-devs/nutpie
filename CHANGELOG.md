@@ -2,7 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.11.0] - 2024-05-28
+## [0.11.1] - 2024-06-16
+
+### Bug Fixes
+
+- Fix random variables with missing values in pymc deterministics (Adrian Seyboldt)
+
+
+### Features
+
+- Add progress bar on terminal (Adrian Seyboldt)
+
+
+## [0.11.0] - 2024-05-29
 
 ### Bug Fixes
 
@@ -27,6 +39,10 @@ All notable changes to this project will be documented in this file.
 - Bump uraimo/run-on-arch-action from 2.7.1 to 2.7.2 (dependabot[bot])
 
 - Update dependencies (Adrian Seyboldt)
+
+- Update python dependencies (Adrian Seyboldt)
+
+- Prepare release (Adrian Seyboldt)
 
 
 ### Refactor
