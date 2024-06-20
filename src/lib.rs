@@ -1,4 +1,5 @@
 mod progress;
+mod pyfunc;
 mod pymc;
 mod stan;
 mod wrapper;
