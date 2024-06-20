@@ -5,6 +5,7 @@ use std::{
 
 use crate::{
     progress::{IndicatifHandler, ProgressHandler},
+    pyfunc::{ExpandDtype, PyModel, PyVariable, TensorShape},
     pymc::{ExpandFunc, LogpFunc, PyMcModel},
     stan::{StanLibrary, StanModel},
 };
@@ -332,6 +333,18 @@ impl PySampler {
         Ok(PySampler(SamplerState::Running(sampler)))
     }
 
+    #[staticmethod]
+    fn from_pyfunc(
+        settings: PyDiagGradNutsSettings,
+        cores: usize,
+        model: PyModel,
+        progress_type: ProgressType,
+    ) -> PyResult<PySampler> {
+        let callback = progress_type.into_callback()?;
+        let sampler = Sampler::new(model, settings.0, cores, callback)?;
+        Ok(PySampler(SamplerState::Running(sampler)))
+    }
+
     fn is_finished(&mut self, py: Python<'_>) -> PyResult<bool> {
         py.allow_threads(|| {
             let state = std::mem::replace(&mut self.0, SamplerState::Empty);
@@ -555,6 +568,10 @@ pub fn _lib(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDiagGradNutsSettings>()?;
     m.add_class::<PyChainProgress>()?;
     m.add_class::<ProgressType>()?;
+    m.add_class::<TensorShape>()?;
+    m.add_class::<PyModel>()?;
+    m.add_class::<PyVariable>()?;
+    m.add_class::<ExpandDtype>()?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }
