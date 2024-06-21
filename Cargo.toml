@@ -10,6 +10,7 @@ license = "MIT"
 repository = "https://github.com/pymc-devs/nutpie"
 keywords = ["statistics", "bayes"]
 description = "Python wrapper for nuts-rs -- a NUTS sampler written in Rust."
+rust-version = "1.76"
 
 [features]
 extension-module = ["pyo3/extension-module"]

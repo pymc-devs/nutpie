@@ -24,7 +24,9 @@ use thiserror::Error;
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct PyVariable {
+    #[pyo3(get)]
     pub name: String,
+    #[pyo3(get)]
     pub dtype: ExpandDtype,
 }
 
@@ -296,6 +298,17 @@ impl ExpandDtype {
     #[staticmethod]
     fn int64_array(shape: TensorShape) -> Self {
         Self::ArrayInt64 { tensor_type: shape }
+    }
+
+    #[getter]
+    fn shape(&self) -> Option<Vec<usize>> {
+        match self {
+            Self::BooleanArray {tensor_type} => { Some(tensor_type.shape.iter().cloned().collect()) },
+            Self::ArrayFloat64 {tensor_type} => { Some(tensor_type.shape.iter().cloned().collect()) },
+            Self::ArrayFloat32 {tensor_type} => { Some(tensor_type.shape.iter().cloned().collect()) },
+            Self::ArrayInt64 {tensor_type} => { Some(tensor_type.shape.iter().cloned().collect()) },
+            _ => { None },
+        }
     }
 }
 
