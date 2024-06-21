@@ -284,7 +284,8 @@ def in_notebook():
         shell = get_ipython().__class__.__name__
         if shell == "ZMQInteractiveShell":  # Jupyter notebook, Spyder or qtconsole
             try:
-                from IPython.display import HTML, clear_output, display  # noqa: F401
+                from IPython.display import (HTML, clear_output,  # noqa: F401
+                                             display)
 
                 return True
             except ImportError:

@@ -9,9 +9,10 @@ from typing import TYPE_CHECKING, Any, Optional
 import numpy as np
 import pandas as pd
 from numpy.typing import NDArray
+from nutpie.compiled_pyfunc import from_pyfunc
+from nutpie.sample import CompiledModel
 
 from nutpie import _lib
-from nutpie.sample import CompiledModel
 
 try:
     from numba.extending import intrinsic
@@ -156,27 +157,7 @@ def make_user_data(shared_vars, shared_data):
     return user_data
 
 
-def compile_pymc_model(model: "pm.Model", **kwargs) -> CompiledPyMCModel:
-    """Compile necessary functions for sampling a pymc model.
-
-    Parameters
-    ----------
-    model : pymc.Model
-        The model to compile.
-
-    Returns
-    -------
-    compiled_model : CompiledPyMCModel
-        A compiled model object.
-
-    """
-    if find_spec("pymc") is None:
-        raise ImportError(
-            "PyMC is not installed in the current environment. "
-            "Please install it with something like "
-            "'mamba install -c conda-forge pymc numba' "
-            "and restart your kernel in case you are in an interactive session."
-        )
+def _compile_pymc_model_numba(model: "pm.Model", **kwargs) -> CompiledPyMCModel:
     if find_spec("numba") is None:
         raise ImportError(
             "Numba is not installed in the current environment. "
@@ -190,12 +171,12 @@ def compile_pymc_model(model: "pm.Model", **kwargs) -> CompiledPyMCModel:
         n_dim,
         n_expanded,
         logp_fn_pt,
-        logp_fn,
         expand_fn_pt,
-        expand_fn,
-        shared_expand,
         shape_info,
-    ) = _make_functions(model)
+    ) = _make_functions(model, mode="NUMBA", compute_grad=True, join_expanded=True)
+
+    expand_fn = expand_fn_pt.vm.jit_fn
+    logp_fn = logp_fn_pt.vm.jit_fn
 
     shared_data = {}
     shared_vars = {}
@@ -238,6 +219,25 @@ def compile_pymc_model(model: "pm.Model", **kwargs) -> CompiledPyMCModel:
 
         expand_numba = numba.cfunc(c_sig_expand, **kwargs)(expand_numba_raw)
 
+    dims, coords = _prepare_dims_and_coords(model, shape_info)
+
+    return CompiledPyMCModel(
+        _n_dim=n_dim,
+        dims=dims,
+        _coords=coords,
+        _shapes={name: tuple(shape) for name, _, shape in zip(*shape_info)},
+        compiled_logp_func=logp_numba,
+        compiled_expand_func=expand_numba,
+        shared_data=shared_data,
+        user_data=user_data,
+        n_expanded=n_expanded,
+        shape_info=shape_info,
+        logp_func=logp_fn_pt,
+        expand_func=expand_fn_pt,
+    )
+
+
+def _prepare_dims_and_coords(model, shape_info):
     coords = {}
     for name, vals in model.coords.items():
         if vals is None:
@@ -258,20 +258,122 @@ def compile_pymc_model(model: "pm.Model", **kwargs) -> CompiledPyMCModel:
                 names.append(f"{base}_{'.'.join(str(i) for i in idx)}")
     coords["unconstrained_parameter"] = pd.Index(names)
 
-    return CompiledPyMCModel(
-        _n_dim=n_dim,
-        dims=model.named_vars_to_dims,
-        _coords=coords,
-        _shapes={name: tuple(shape) for name, _, shape in zip(*shape_info)},
-        compiled_logp_func=logp_numba,
-        compiled_expand_func=expand_numba,
-        shared_data=shared_data,
-        user_data=user_data,
-        n_expanded=n_expanded,
-        shape_info=shape_info,
-        logp_func=logp_fn_pt,
-        expand_func=expand_fn_pt,
+    dims = model.named_vars_to_dims
+    return dims, coords
+
+
+def _compile_pymc_model_jax(model, *, gradient_backend=None, **kwargs):
+    if find_spec("jax") is None:
+        raise ImportError(
+            "Jax is not installed in the current environment. "
+            "Please install it with something like "
+            "'mamba install -c conda-forge jax' "
+            "and restart your kernel in case you are in an interactive session."
+        )
+    import jax
+
+    if gradient_backend is None:
+        gradient_backend = "pytensor"
+    elif gradient_backend not in ["jax", "pytensor"]:
+        raise ValueError(f"Unknown gradient backend: {name}")
+
+    (
+        n_dim,
+        n_expanded,
+        logp_fn_pt,
+        expand_fn_pt,
+        shape_info,
+    ) = _make_functions(
+        model,
+        mode="JAX",
+        compute_grad=gradient_backend == "pytensor",
+        join_expanded=False,
     )
+
+    logp_fn = logp_fn_pt.vm.jit_fn
+    expand_fn = expand_fn_pt.vm.jit_fn
+
+    shared_data = {}
+    shared_vars = {}
+    seen = set()
+    for val in [*logp_fn_pt.get_shared(), *expand_fn_pt.get_shared()]:
+        if val.name in shared_data and val not in seen:
+            raise ValueError(f"Shared variables must have unique names: {val.name}")
+        shared_data[val.name] = val.get_value().copy()
+        shared_vars[val.name] = val
+        seen.add(val)
+
+    logp_shared_names = [var.name for var in logp_fn_pt.get_shared()]
+    expand_shared_names = [var.name for var in expand_fn_pt.get_shared()]
+
+    def make_logp_func():
+        def logp(x, **shared):
+            logp, grad = logp_fn(
+                x, **{name: shared[name] for name in logp_shared_names}
+            )
+            return float(logp), np.asarray(grad, dtype="float64", order="C")
+
+        return logp
+
+    names, slices, shapes = shape_info
+    dtypes = [np.float64] * len(names)
+
+    def make_expand_func(seed1, seed2, chain):
+        # TODO handle seeds
+        def expand(x, **shared):
+            values = expand_fn(
+                x, **{name: shared[name] for name in expand_shared_names}
+            )
+            return {
+                name: np.asarray(val, order="C", dtype=dtype).ravel()
+                for name, val, dtype in zip(names, values, dtypes, strict=True)
+            }
+
+        return expand
+
+    dims, coords = _prepare_dims_and_coords(model, shape_info)
+
+    return from_pyfunc(
+        n_dim,
+        make_logp_func,
+        make_expand_func,
+        dtypes,
+        shapes,
+        names,
+        shared_data=shared_data,
+        dims=dims,
+        coords=coords,
+    )
+
+
+def compile_pymc_model(
+    model: "pm.Model", *, backend="numba", **kwargs
+) -> CompiledPyMCModel:
+    """Compile necessary functions for sampling a pymc model.
+
+    Parameters
+    ----------
+    model : pymc.Model
+        The model to compile.
+
+    Returns
+    -------
+    compiled_model : CompiledPyMCModel
+        A compiled model object.
+
+    """
+    if find_spec("pymc") is None:
+        raise ImportError(
+            "PyMC is not installed in the current environment. "
+            "Please install it with something like "
+            "'mamba install -c conda-forge pymc numba' "
+            "and restart your kernel in case you are in an interactive session."
+        )
+
+    if backend.lower() == "numba":
+        return _compile_pymc_model_numba(model, **kwargs)
+    elif backend.lower() == "jax":
+        return _compile_pymc_model_jax(model, **kwargs)
 
 
 def _compute_shapes(model):
@@ -303,7 +405,7 @@ def _compute_shapes(model):
     return dict(zip(trace_vars.keys(), shape_func()))
 
 
-def _make_functions(model):
+def _make_functions(model, *, mode, compute_grad, join_expanded):
     import pytensor
     import pytensor.link.numba.dispatch
     import pytensor.tensor as pt
@@ -323,8 +425,10 @@ def _make_functions(model):
         rewrites.append("local_remove_check_parameter")
 
     logp = pytensor.graph.rewrite_graph(logp, include=rewrites)
-    grads = pytensor.gradient.grad(logp, value_vars)
-    grad = pt.concatenate([grad.ravel() for grad in grads])
+
+    if compute_grad:
+        grads = pytensor.gradient.grad(logp, value_vars)
+        grad = pt.concatenate([grad.ravel() for grad in grads])
 
     count = 0
     joined_slices = []
@@ -366,13 +470,14 @@ def _make_functions(model):
         )
     }
 
-    (logp, grad) = pytensor.clone_replace([logp, grad], replacements)
-
-    # We should avoid compiling the function, and optimize only
-    with model:
-        logp_fn_pt = compile_pymc((joined,), (logp, grad), mode=pytensor.compile.NUMBA)
-
-    logp_fn = logp_fn_pt.vm.jit_fn
+    if compute_grad:
+        (logp, grad) = pytensor.clone_replace([logp, grad], replacements)
+        with model:
+            logp_fn_pt = compile_pymc((joined,), (logp, grad), mode=mode)
+    else:
+        (logp,) = pytensor.clone_replace([logp], replacements)
+        with model:
+            logp_fn_pt = compile_pymc((joined,), logp, mode=mode)
 
     # Make function that computes remaining variables for the trace
     remaining_rvs = [
@@ -395,24 +500,23 @@ def _make_functions(model):
 
     num_expanded = count
 
-    allvars = pt.concatenate([joined, *[var.ravel() for var in remaining_rvs]])
+    if join_expanded:
+        allvars = [pt.concatenate([joined, *[var.ravel() for var in remaining_rvs]])]
+    else:
+        allvars = [*variables, *remaining_rvs]
     with model:
         expand_fn_pt = compile_pymc(
             (joined,),
-            (allvars,),
+            allvars,
             givens=list(replacements.items()),
-            mode=pytensor.compile.NUMBA,
+            mode=mode,
         )
-    expand_fn = expand_fn_pt.vm.jit_fn
 
     return (
         num_free_vars,
         num_expanded,
         logp_fn_pt,
-        logp_fn,
         expand_fn_pt,
-        expand_fn,
-        [var.name for var in expand_fn_pt.get_shared()],
         (all_names, all_slices, all_shapes),
     )
 
