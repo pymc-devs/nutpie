@@ -275,11 +275,11 @@ def _compile_pymc_model_jax(model, *, gradient_backend=None, **kwargs):
     if gradient_backend is None:
         gradient_backend = "pytensor"
     elif gradient_backend not in ["jax", "pytensor"]:
-        raise ValueError(f"Unknown gradient backend: {name}")
+        raise ValueError(f"Unknown gradient backend: {gradient_backend}")
 
     (
         n_dim,
-        n_expanded,
+        _,
         logp_fn_pt,
         expand_fn_pt,
         shape_info,
@@ -293,13 +293,22 @@ def _compile_pymc_model_jax(model, *, gradient_backend=None, **kwargs):
     logp_fn = logp_fn_pt.vm.jit_fn
     expand_fn = expand_fn_pt.vm.jit_fn
 
+    if gradient_backend == "jax":
+        orig_logp_fn = logp_fn._fun
+
+        @jax.jit
+        def logp_fn_jax_grad(x):
+            return jax.value_and_grad(lambda x: orig_logp_fn(x)[0])(x)
+
+        logp_fn = logp_fn_jax_grad
+
     shared_data = {}
     shared_vars = {}
     seen = set()
     for val in [*logp_fn_pt.get_shared(), *expand_fn_pt.get_shared()]:
         if val.name in shared_data and val not in seen:
             raise ValueError(f"Shared variables must have unique names: {val.name}")
-        shared_data[val.name] = val.get_value().copy()
+        shared_data[val.name] = jax.numpy.asarray(val.get_value().copy())
         shared_vars[val.name] = val
         seen.add(val)
 
@@ -347,7 +356,7 @@ def _compile_pymc_model_jax(model, *, gradient_backend=None, **kwargs):
 
 
 def compile_pymc_model(
-    model: "pm.Model", *, backend="numba", **kwargs
+    model: "pm.Model", *, backend="numba", gradient_backend=None, **kwargs
 ) -> CompiledPyMCModel:
     """Compile necessary functions for sampling a pymc model.
 
@@ -355,6 +364,11 @@ def compile_pymc_model(
     ----------
     model : pymc.Model
         The model to compile.
+    backend : ["jax", "numba"]
+        The pytensor backend that is used to compile the logp function.
+    gradient_backend: ["pytensor", "jax"]
+        Which library is used to compute the gradients. This can only be
+        changed to "jax" if the jax backend is used.
 
     Returns
     -------
@@ -373,7 +387,9 @@ def compile_pymc_model(
     if backend.lower() == "numba":
         return _compile_pymc_model_numba(model, **kwargs)
     elif backend.lower() == "jax":
-        return _compile_pymc_model_jax(model, **kwargs)
+        return _compile_pymc_model_jax(
+            model, gradient_backend=gradient_backend, **kwargs
+        )
 
 
 def _compute_shapes(model):
@@ -477,7 +493,7 @@ def _make_functions(model, *, mode, compute_grad, join_expanded):
     else:
         (logp,) = pytensor.clone_replace([logp], replacements)
         with model:
-            logp_fn_pt = compile_pymc((joined,), logp, mode=mode)
+            logp_fn_pt = compile_pymc((joined,), (logp,), mode=mode)
 
     # Make function that computes remaining variables for the trace
     remaining_rvs = [
