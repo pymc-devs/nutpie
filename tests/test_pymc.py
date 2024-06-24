@@ -6,63 +6,87 @@ import nutpie
 import nutpie.compile_pymc
 
 
-def test_pymc_model():
+parameterize_backends = pytest.mark.parametrize(
+    "backend, gradient_backend",
+    [("numba", None), ("jax", "pytensor"), ("jax", "jax")],
+)
+
+
+@parameterize_backends
+def test_pymc_model(backend, gradient_backend):
     with pm.Model() as model:
         pm.Normal("a")
 
-    compiled = nutpie.compile_pymc_model(model)
+    compiled = nutpie.compile_pymc_model(
+        model, backend=backend, gradient_backend=gradient_backend
+    )
     trace = nutpie.sample(compiled, chains=1)
     trace.posterior.a  # noqa: B018
 
 
-def test_blocking():
+@parameterize_backends
+def test_blocking(backend, gradient_backend):
     with pm.Model() as model:
         pm.Normal("a")
 
-    compiled = nutpie.compile_pymc_model(model)
+    compiled = nutpie.compile_pymc_model(
+        model, backend=backend, gradient_backend=gradient_backend
+    )
     sampler = nutpie.sample(compiled, chains=1, blocking=False)
     trace = sampler.wait()
     trace.posterior.a  # noqa: B018
 
 
+@parameterize_backends
 @pytest.mark.timeout(2)
-def test_wait_timeout():
+def test_wait_timeout(backend, gradient_backend):
     with pm.Model() as model:
         pm.Normal("a", shape=100_000)
-    compiled = nutpie.compile_pymc_model(model)
+    compiled = nutpie.compile_pymc_model(
+        model, backend=backend, gradient_backend=gradient_backend
+    )
     sampler = nutpie.sample(compiled, chains=1, blocking=False)
     with pytest.raises(TimeoutError):
         sampler.wait(timeout=0.1)
     sampler.cancel()
 
 
+@parameterize_backends
 @pytest.mark.timeout(2)
-def test_pause():
+def test_pause(backend, gradient_backend):
     with pm.Model() as model:
         pm.Normal("a", shape=100_000)
-    compiled = nutpie.compile_pymc_model(model)
+    compiled = nutpie.compile_pymc_model(
+        model, backend=backend, gradient_backend=gradient_backend
+    )
     sampler = nutpie.sample(compiled, chains=1, blocking=False)
     sampler.pause()
     sampler.resume()
     sampler.cancel()
 
 
-def test_pymc_model_with_coordinate():
+@parameterize_backends
+def test_pymc_model_with_coordinate(backend, gradient_backend):
     with pm.Model() as model:
         model.add_coord("foo", length=5)
         pm.Normal("a", dims="foo")
 
-    compiled = nutpie.compile_pymc_model(model)
+    compiled = nutpie.compile_pymc_model(
+        model, backend=backend, gradient_backend=gradient_backend
+    )
     trace = nutpie.sample(compiled, chains=1)
     trace.posterior.a  # noqa: B018
 
 
-def test_pymc_model_store_extra():
+@parameterize_backends
+def test_pymc_model_store_extra(backend, gradient_backend):
     with pm.Model() as model:
         model.add_coord("foo", length=5)
         pm.Normal("a", dims="foo")
 
-    compiled = nutpie.compile_pymc_model(model)
+    compiled = nutpie.compile_pymc_model(
+        model, backend=backend, gradient_backend=gradient_backend
+    )
     trace = nutpie.sample(
         compiled,
         chains=1,
@@ -78,33 +102,42 @@ def test_pymc_model_store_extra():
     _ = trace.sample_stats.mass_matrix_inv
 
 
-def test_trafo():
+@parameterize_backends
+def test_trafo(backend, gradient_backend):
     with pm.Model() as model:
         pm.Uniform("a")
 
-    compiled = nutpie.compile_pymc_model(model)
+    compiled = nutpie.compile_pymc_model(
+        model, backend=backend, gradient_backend=gradient_backend
+    )
     trace = nutpie.sample(compiled, chains=1)
     trace.posterior.a  # noqa: B018
 
 
-def test_det():
+@parameterize_backends
+def test_det(backend, gradient_backend):
     with pm.Model() as model:
         a = pm.Uniform("a", shape=2)
         pm.Deterministic("b", 2 * a)
 
-    compiled = nutpie.compile_pymc_model(model)
+    compiled = nutpie.compile_pymc_model(
+        model, backend=backend, gradient_backend=gradient_backend
+    )
     trace = nutpie.sample(compiled, chains=1)
     assert trace.posterior.a.shape[-1] == 2
     assert trace.posterior.b.shape[-1] == 2
 
 
-def test_pymc_model_shared():
+@parameterize_backends
+def test_pymc_model_shared(backend, gradient_backend):
     with pm.Model() as model:
         mu = pm.MutableData("mu", 0.1)
         sigma = pm.MutableData("sigma", np.ones(3))
         pm.Normal("a", mu=mu, sigma=sigma, shape=3)
 
-    compiled = nutpie.compile_pymc_model(model)
+    compiled = nutpie.compile_pymc_model(
+        model, backend=backend, gradient_backend=gradient_backend
+    )
     trace = nutpie.sample(compiled, chains=1, seed=1)
     np.testing.assert_allclose(trace.posterior.a.mean().values, 0.1, atol=0.05)
 
@@ -117,13 +150,16 @@ def test_pymc_model_shared():
         nutpie.sample(compiled3, chains=1)
 
 
-def test_missing():
+@parameterize_backends
+def test_missing(backend, gradient_backend):
     with pm.Model(coords={"obs": range(4)}) as model:
         mu = pm.Normal("mu")
         y = pm.Normal("y", mu, observed=[0, -1, 1, np.nan], dims="obs")
         pm.Deterministic("y2", 2 * y, dims="obs")
 
-    compiled = nutpie.compile_pymc_model(model)
+    compiled = nutpie.compile_pymc_model(
+        model, backend=backend, gradient_backend=gradient_backend
+    )
     tr = nutpie.sample(compiled, chains=1, seed=1)
     print(tr.posterior)
     assert hasattr(tr.posterior, "y_unobserved")

@@ -297,8 +297,8 @@ def _compile_pymc_model_jax(model, *, gradient_backend=None, **kwargs):
         orig_logp_fn = logp_fn._fun
 
         @jax.jit
-        def logp_fn_jax_grad(x):
-            return jax.value_and_grad(lambda x: orig_logp_fn(x)[0])(x)
+        def logp_fn_jax_grad(x, **shared):
+            return jax.value_and_grad(lambda x: orig_logp_fn(x, **shared)[0])(x)
 
         logp_fn = logp_fn_jax_grad
 
@@ -384,12 +384,17 @@ def compile_pymc_model(
             "and restart your kernel in case you are in an interactive session."
         )
 
+    if backend is None:
+        backend = "numba"
+
     if backend.lower() == "numba":
         return _compile_pymc_model_numba(model, **kwargs)
     elif backend.lower() == "jax":
         return _compile_pymc_model_jax(
             model, gradient_backend=gradient_backend, **kwargs
         )
+    else:
+        raise ValueError(f"Backend must be one of numba and jax. Got {backend}")
 
 
 def _compute_shapes(model):
