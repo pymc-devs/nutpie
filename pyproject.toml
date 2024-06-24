@@ -30,7 +30,13 @@ dependencies = [
 [project.optional-dependencies]
 stan = ["bridgestan >= 2.4.1"]
 pymc = ["pymc >= 5.15.0", "numba >= 0.59.1"]
-all = ["bridgestan >= 2.4.1", "pymc >= 5.15.0", "numba >= 0.59.1"]
+pymc-jax = ["pymc >= 5.15.0", "jax >= 0.4.27"]
+all = [
+  "bridgestan >= 2.4.1",
+  "pymc >= 5.15.0",
+  "numba >= 0.59.1",
+  "jax >= 0.4.27",
+]
 
 [tool.ruff]
 line-length = 88
