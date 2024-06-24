@@ -37,7 +37,7 @@ class PyFuncModel(CompiledModel):
 
         updated = self._shared_data.copy()
         updated.update(**updates)
-        return dataclasses.replace(self, shared_data=updated)
+        return dataclasses.replace(self, _shared_data=updated)
 
     def _make_sampler(self, settings, init_mean, cores, progress_type):
         model = self._make_model(init_mean)
@@ -49,7 +49,6 @@ class PyFuncModel(CompiledModel):
         )
 
     def _make_model(self, init_mean):
-
         def make_logp_func():
             logp_fn = self._make_logp_func()
             return partial(logp_fn, **self._shared_data)
