@@ -8,9 +8,9 @@ from typing import Any, Optional
 import numpy as np
 import pandas as pd
 from numpy.typing import NDArray
-from nutpie.sample import CompiledModel
 
 from nutpie import _lib
+from nutpie.sample import CompiledModel
 
 
 class _NumpyArrayEncoder(json.JSONEncoder):

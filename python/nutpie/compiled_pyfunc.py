@@ -1,12 +1,12 @@
 import dataclasses
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Callable, List
+from typing import Any, Callable
 
 import numpy as np
-from nutpie.sample import CompiledModel
 
 from nutpie import _lib
+from nutpie.sample import CompiledModel
 
 
 @dataclass(frozen=True)
@@ -15,7 +15,7 @@ class PyFuncModel(CompiledModel):
     _make_expand_func: Callable
     _shared_data: dict[str, Any]
     _n_dim: int
-    _variables: List[_lib.PyVariable]
+    _variables: list[_lib.PyVariable]
     _coords: dict[str, Any]
 
     @property
@@ -66,17 +66,17 @@ class PyFuncModel(CompiledModel):
 
 
 def from_pyfunc(
-    ndim,
-    make_logp_fn,
-    make_expand_fn,
-    expanded_dtypes,
-    expanded_shapes,
-    expanded_names,
+    ndim: int,
+    make_logp_fn: Callable,
+    make_expand_fn: Callable,
+    expanded_dtypes: list[np.dtype],
+    expanded_shapes: list[tuple[int, ...]],
+    expanded_names: list[str],
     *,
-    initial_mean=None,
-    coords=None,
-    dims=None,
-    shared_data=None,
+    initial_mean: np.ndarray | None = None,
+    coords: dict[str, Any] | None = None,
+    dims: dict[str, tuple[str, ...]] | None = None,
+    shared_data: dict[str, Any] | None = None,
 ):
     variables = []
     for name, shape, dtype in zip(
@@ -90,6 +90,13 @@ def from_pyfunc(
         elif dtype == np.int64:
             dtype = _lib.ExpandDtype.int64_array(shape)
         variables.append(_lib.PyVariable(name, dtype))
+
+    if coords is None:
+        coords = {}
+    if dims is None:
+        dims = {}
+    if shared_data is None:
+        shared_data = {}
 
     if shared_data is None:
         shared_data = dict()

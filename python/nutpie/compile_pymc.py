@@ -4,15 +4,15 @@ import warnings
 from dataclasses import dataclass
 from importlib.util import find_spec
 from math import prod
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Literal, Optional
 
 import numpy as np
 import pandas as pd
 from numpy.typing import NDArray
-from nutpie.compiled_pyfunc import from_pyfunc
-from nutpie.sample import CompiledModel
 
 from nutpie import _lib
+from nutpie.compiled_pyfunc import from_pyfunc
+from nutpie.sample import CompiledModel
 
 try:
     from numba.extending import intrinsic
@@ -184,7 +184,7 @@ def _compile_pymc_model_numba(model: "pm.Model", **kwargs) -> CompiledPyMCModel:
     for val in [*logp_fn_pt.get_shared(), *expand_fn_pt.get_shared()]:
         if val.name in shared_data and val not in seen:
             raise ValueError(f"Shared variables must have unique names: {val.name}")
-        shared_data[val.name] = val.get_value().copy()
+        shared_data[val.name] = val.get_value()
         shared_vars[val.name] = val
         seen.add(val)
 
@@ -308,7 +308,7 @@ def _compile_pymc_model_jax(model, *, gradient_backend=None, **kwargs):
     for val in [*logp_fn_pt.get_shared(), *expand_fn_pt.get_shared()]:
         if val.name in shared_data and val not in seen:
             raise ValueError(f"Shared variables must have unique names: {val.name}")
-        shared_data[val.name] = jax.numpy.asarray(val.get_value().copy())
+        shared_data[val.name] = jax.numpy.asarray(val.get_value())
         shared_vars[val.name] = val
         seen.add(val)
 
@@ -356,8 +356,12 @@ def _compile_pymc_model_jax(model, *, gradient_backend=None, **kwargs):
 
 
 def compile_pymc_model(
-    model: "pm.Model", *, backend="numba", gradient_backend=None, **kwargs
-) -> CompiledPyMCModel:
+    model: "pm.Model",
+    *,
+    backend: Literal["numba", "jax"] = "numba",
+    gradient_backend: Literal["pytensor", "jax"] | None = None,
+    **kwargs,
+) -> CompiledModel:
     """Compile necessary functions for sampling a pymc model.
 
     Parameters

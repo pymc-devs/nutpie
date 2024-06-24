@@ -5,7 +5,6 @@ import pytest
 import nutpie
 import nutpie.compile_pymc
 
-
 parameterize_backends = pytest.mark.parametrize(
     "backend, gradient_backend",
     [("numba", None), ("jax", "pytensor"), ("jax", "jax")],
@@ -131,8 +130,8 @@ def test_det(backend, gradient_backend):
 @parameterize_backends
 def test_pymc_model_shared(backend, gradient_backend):
     with pm.Model() as model:
-        mu = pm.MutableData("mu", 0.1)
-        sigma = pm.MutableData("sigma", np.ones(3))
+        mu = pm.Data("mu", 0.1)
+        sigma = pm.Data("sigma", np.ones(3))
         pm.Normal("a", mu=mu, sigma=sigma, shape=3)
 
     compiled = nutpie.compile_pymc_model(
@@ -150,7 +149,26 @@ def test_pymc_model_shared(backend, gradient_backend):
         nutpie.sample(compiled3, chains=1)
 
 
-@parameterize_backends
+@pytest.mark.parametrize(
+    ("backend", "gradient_backend"),
+    [
+        ("numba", None),
+        pytest.param(
+            "jax",
+            "pytensor",
+            marks=pytest.mark.xfail(
+                reason="https://github.com/pymc-devs/pytensor/issues/853"
+            ),
+        ),
+        pytest.param(
+            "jax",
+            "jax",
+            marks=pytest.mark.xfail(
+                reason="https://github.com/pymc-devs/pytensor/issues/853"
+            ),
+        ),
+    ],
+)
 def test_missing(backend, gradient_backend):
     with pm.Model(coords={"obs": range(4)}) as model:
         mu = pm.Normal("mu")
