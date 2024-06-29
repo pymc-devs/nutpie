@@ -2,6 +2,37 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.12.0] - 2024-06-29
+
+### Features
+
+- Add pyfunc backend (Adrian Seyboldt)
+
+- Add python code for pyfunc backend (Adrian Seyboldt)
+
+- Add gradient_backend argument for pymc models (Adrian Seyboldt)
+
+
+### Miscellaneous Tasks
+
+- Bump version number (Adrian Seyboldt)
+
+
+### Styling
+
+- Fix pre-commit issues (Adrian Seyboldt)
+
+
+### Testing
+
+- Add tests for jax backend (Adrian Seyboldt)
+
+
+### Build
+
+- Add jax as optional dependency (Adrian Seyboldt)
+
+
 ## [0.11.1] - 2024-06-16
 
 ### Bug Fixes
@@ -12,6 +43,11 @@ All notable changes to this project will be documented in this file.
 ### Features
 
 - Add progress bar on terminal (Adrian Seyboldt)
+
+
+### Miscellaneous Tasks
+
+- Prepare release (Adrian Seyboldt)
 
 
 ## [0.11.0] - 2024-05-29
