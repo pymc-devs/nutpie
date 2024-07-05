@@ -24,8 +24,6 @@ All notable changes to this project will be documented in this file.
 
 - Bump version number (Adrian Seyboldt)
 
-- Prepare release (Adrian Seyboldt)
-
 
 ### Styling
 
@@ -52,11 +50,6 @@ All notable changes to this project will be documented in this file.
 ### Features
 
 - Add progress bar on terminal (Adrian Seyboldt)
-
-
-### Miscellaneous Tasks
-
-- Prepare release (Adrian Seyboldt)
 
 
 ## [0.11.0] - 2024-05-29
@@ -86,8 +79,6 @@ All notable changes to this project will be documented in this file.
 - Update dependencies (Adrian Seyboldt)
 
 - Update python dependencies (Adrian Seyboldt)
-
-- Prepare release (Adrian Seyboldt)
 
 
 ### Refactor
