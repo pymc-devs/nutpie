@@ -11,3 +11,4 @@ notebooks/*.hpp
 perf.data*
 wheels
 .vscode/
+*~

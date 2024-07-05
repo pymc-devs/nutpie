@@ -22,7 +22,7 @@ name = "_lib"
 crate-type = ["cdylib"]
 
 [dependencies]
-nuts-rs = "0.11.0"
+nuts-rs = "0.12.0"
 numpy = "0.21.0"
 ndarray = "0.15.6"
 rand = "0.8.5"
@@ -33,7 +33,7 @@ rayon = "1.9.0"
 arrow = { version = "52.0.0", default-features = false, features = ["ffi"] }
 anyhow = "1.0.72"
 itertools = "0.13.0"
-bridgestan = "2.4.1"
+bridgestan = "2.5.0"
 rand_distr = "0.4.3"
 smallvec = "1.11.0"
 upon = { version = "0.8.1", default-features = false, features = [] }
