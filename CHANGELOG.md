@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.13.0] - 2024-07-05
+
+### Features
+
+- Add low rank modified mass matrix adaptation (Adrian Seyboldt)
+
+
 ## [0.12.0] - 2024-06-29
 
 ### Features
@@ -16,6 +23,8 @@ All notable changes to this project will be documented in this file.
 ### Miscellaneous Tasks
 
 - Bump version number (Adrian Seyboldt)
+
+- Prepare release (Adrian Seyboldt)
 
 
 ### Styling

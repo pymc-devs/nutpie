@@ -1372,7 +1372,7 @@ dependencies = [
 
 [[package]]
 name = "nutpie"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -1397,6 +1397,8 @@ dependencies = [
 [[package]]
 name = "nuts-rs"
 version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de107d91c3cfddc03b02fd69a4602d7541f2c153409d72d219567723d2b46969"
 dependencies = [
  "anyhow",
  "arrow",
