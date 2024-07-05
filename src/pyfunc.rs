@@ -41,7 +41,7 @@ impl PyVariable {
                 let field = Arc::new(Field::new("item", DataType::Boolean, false));
                 DataType::FixedSizeList(field, tensor_type.size() as i32)
             }
-            ExpandDtype::ArrayFloat64 { tensor_type } => {
+            ExpandDtype::ArrayFloat64 { tensor_type: _ } => {
                 let field = Arc::new(Field::new("item", DataType::Float64, true));
                 DataType::List(field)
             }
@@ -303,11 +303,11 @@ impl ExpandDtype {
     #[getter]
     fn shape(&self) -> Option<Vec<usize>> {
         match self {
-            Self::BooleanArray {tensor_type} => { Some(tensor_type.shape.iter().cloned().collect()) },
-            Self::ArrayFloat64 {tensor_type} => { Some(tensor_type.shape.iter().cloned().collect()) },
-            Self::ArrayFloat32 {tensor_type} => { Some(tensor_type.shape.iter().cloned().collect()) },
-            Self::ArrayInt64 {tensor_type} => { Some(tensor_type.shape.iter().cloned().collect()) },
-            _ => { None },
+            Self::BooleanArray { tensor_type } => Some(tensor_type.shape.iter().cloned().collect()),
+            Self::ArrayFloat64 { tensor_type } => Some(tensor_type.shape.iter().cloned().collect()),
+            Self::ArrayFloat32 { tensor_type } => Some(tensor_type.shape.iter().cloned().collect()),
+            Self::ArrayInt64 { tensor_type } => Some(tensor_type.shape.iter().cloned().collect()),
+            _ => None,
         }
     }
 }

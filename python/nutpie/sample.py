@@ -460,6 +460,7 @@ def sample(
     seed: Optional[int],
     save_warmup: bool,
     progress_bar: bool,
+    low_rank_modified_mass_matrix: bool = False,
     init_mean: Optional[np.ndarray],
     return_raw_trace: bool,
     blocking: Literal[True],
@@ -478,6 +479,7 @@ def sample(
     seed: Optional[int],
     save_warmup: bool,
     progress_bar: bool,
+    low_rank_modified_mass_matrix: bool = False,
     init_mean: Optional[np.ndarray],
     return_raw_trace: bool,
     blocking: Literal[False],
@@ -495,6 +497,7 @@ def sample(
     seed: Optional[int] = None,
     save_warmup: bool = True,
     progress_bar: bool = True,
+    low_rank_modified_mass_matrix: bool = False,
     init_mean: Optional[np.ndarray] = None,
     return_raw_trace: bool = False,
     blocking: bool = True,
@@ -569,6 +572,9 @@ def sample(
         for the progress bar (eg CSS).
     progress_rate: int, default=500
         Rate in ms at which the progress should be updated.
+    low_rank_modified_mass_matrix: bool, default=False
+        Allow adaptation to some posterior correlations using
+        a low-rank updated mass matrix.
     **kwargs
         Pass additional arguments to nutpie._lib.PySamplerArgs
 
@@ -577,7 +583,11 @@ def sample(
     trace : arviz.InferenceData
         An ArviZ ``InferenceData`` object that contains the samples.
     """
-    settings = _lib.PyDiagGradNutsSettings(seed)
+
+    if low_rank_modified_mass_matrix:
+        settings = _lib.PyNutsSettings.LowRank(seed)
+    else:
+        settings = _lib.PyNutsSettings.Diag(seed)
     settings.num_tune = tune
     settings.num_draws = draws
     settings.num_chains = chains
