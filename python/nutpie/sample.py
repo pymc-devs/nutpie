@@ -574,7 +574,17 @@ def sample(
         Rate in ms at which the progress should be updated.
     low_rank_modified_mass_matrix: bool, default=False
         Allow adaptation to some posterior correlations using
-        a low-rank updated mass matrix.
+        a low-rank updated mass matrix. This is *experimental*
+        and details about this will probably change in the next
+        release.
+    mass_matrix_eigval_cutoff: float > 1, defaul=100
+        Ignore eigenvalues between cutoff and 1/cutoff in the
+        low-rank modified mass matrix estimate. Higher values
+        lead to worse correclation fitting, but increase
+        the performance of leapfrog steps.
+    mass_matrix_gamma: float > 0, default=1e-5
+        Regularisation parameter for the eigenvalues. Only
+        applicable with low_rank_modified_mass_matrix=True.
     **kwargs
         Pass additional arguments to nutpie._lib.PySamplerArgs
 
