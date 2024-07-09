@@ -297,8 +297,8 @@ def _compile_pymc_model_jax(model, *, gradient_backend=None, **kwargs):
         orig_logp_fn = logp_fn._fun
 
         @jax.jit
-        def logp_fn_jax_grad(x, **shared):
-            return jax.value_and_grad(lambda x: orig_logp_fn(x, **shared)[0])(x)
+        def logp_fn_jax_grad(x, *shared):
+            return jax.value_and_grad(lambda x: orig_logp_fn(x, *shared)[0])(x)
 
         logp_fn = logp_fn_jax_grad
 
@@ -317,9 +317,7 @@ def _compile_pymc_model_jax(model, *, gradient_backend=None, **kwargs):
 
     def make_logp_func():
         def logp(x, **shared):
-            logp, grad = logp_fn(
-                x, **{name: shared[name] for name in logp_shared_names}
-            )
+            logp, grad = logp_fn(x, *[shared[name] for name in logp_shared_names])
             return float(logp), np.asarray(grad, dtype="float64", order="C")
 
         return logp
@@ -330,9 +328,7 @@ def _compile_pymc_model_jax(model, *, gradient_backend=None, **kwargs):
     def make_expand_func(seed1, seed2, chain):
         # TODO handle seeds
         def expand(x, **shared):
-            values = expand_fn(
-                x, **{name: shared[name] for name in expand_shared_names}
-            )
+            values = expand_fn(x, *[shared[name] for name in expand_shared_names])
             return {
                 name: np.asarray(val, order="C", dtype=dtype).ravel()
                 for name, val, dtype in zip(names, values, dtypes, strict=True)

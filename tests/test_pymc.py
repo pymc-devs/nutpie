@@ -128,9 +128,25 @@ def test_det(backend, gradient_backend):
 
 
 @parameterize_backends
+def test_non_identifier_names(backend, gradient_backend):
+    with pm.Model() as model:
+        a = pm.Uniform("a/b", shape=2)
+        with pm.Model("foo"):
+            c = pm.Data("c", np.array([2.0, 3.0]))
+            pm.Deterministic("b", c * a)
+
+    compiled = nutpie.compile_pymc_model(
+        model, backend=backend, gradient_backend=gradient_backend
+    )
+    trace = nutpie.sample(compiled, chains=1)
+    assert trace.posterior["a/b"].shape[-1] == 2
+    assert trace.posterior["foo::b"].shape[-1] == 2
+
+
+@parameterize_backends
 def test_pymc_model_shared(backend, gradient_backend):
     with pm.Model() as model:
-        mu = pm.Data("mu", 0.1)
+        mu = pm.Data("mu", -0.1)
         sigma = pm.Data("sigma", np.ones(3))
         pm.Normal("a", mu=mu, sigma=sigma, shape=3)
 
@@ -138,7 +154,7 @@ def test_pymc_model_shared(backend, gradient_backend):
         model, backend=backend, gradient_backend=gradient_backend
     )
     trace = nutpie.sample(compiled, chains=1, seed=1)
-    np.testing.assert_allclose(trace.posterior.a.mean().values, 0.1, atol=0.05)
+    np.testing.assert_allclose(trace.posterior.a.mean().values, -0.1, atol=0.05)
 
     compiled2 = compiled.with_data(mu=10.0, sigma=3 * np.ones(3))
     trace2 = nutpie.sample(compiled2, chains=1, seed=1)
