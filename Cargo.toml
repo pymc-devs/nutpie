@@ -1,6 +1,6 @@
 [package]
 name = "nutpie"
-version = "0.13.0"
+version = "0.13.1"
 authors = [
   "Adrian Seyboldt <adrian.seyboldt@gmail.com>",
   "PyMC Developers <pymc.devs@gmail.com>",
@@ -22,7 +22,7 @@ name = "_lib"
 crate-type = ["cdylib"]
 
 [dependencies]
-nuts-rs = "0.12.0"
+nuts-rs = "0.12.1"
 numpy = "0.21.0"
 ndarray = "0.15.6"
 rand = "0.8.5"

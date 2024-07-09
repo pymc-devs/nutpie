@@ -2,11 +2,33 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.13.1] - 2024-07-09
+
+### Bug Fixes
+
+- Fix jax backend with non-identifier variable names (Adrian Seyboldt)
+
+
+### Miscellaneous Tasks
+
+- Update dependencies (Adrian Seyboldt)
+
+
 ## [0.13.0] - 2024-07-05
+
+### Documentation
+
+- Document low-rank mass matrix parameters (Adrian Seyboldt)
+
 
 ### Features
 
 - Add low rank modified mass matrix adaptation (Adrian Seyboldt)
+
+
+### Miscellaneous Tasks
+
+- Remove releases from changelog (Adrian Seyboldt)
 
 
 ## [0.12.0] - 2024-06-29
