@@ -1,5 +1,3 @@
-#[cfg(feature = "iree")]
-mod iree;
 #[cfg(feature = "onnx")]
 mod ort;
 mod progress;

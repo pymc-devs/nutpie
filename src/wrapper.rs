@@ -9,7 +9,6 @@ use crate::ort::OnnxModel;
 
 use crate::{
     ort::OnnxProviders,
-    progress::ProgressHandler,
     progress::{IndicatifHandler, ProgressHandler},
     pyfunc::{ExpandDtype, PyModel, PyVariable, TensorShape},
     pymc::{ExpandFunc, LogpFunc, PyMcModel},
@@ -577,33 +576,22 @@ impl PySampler {
     #[cfg(feature = "onnx")]
     #[staticmethod]
     fn from_onnx(
-        settings: PyDiagGradNutsSettings,
+        settings: PyNutsSettings,
         cores: usize,
         model: OnnxModel,
-        template: String,
-        rate: u64,
-        callback: Option<Py<PyAny>>,
+        progress_type: ProgressType,
     ) -> PyResult<PySampler> {
-        let rate = Duration::from_millis(rate);
-        let callback = make_callback(template, cores, rate, callback)?;
-        let sampler = Sampler::new(model, settings.0, cores, callback)?;
-        Ok(PySampler(SamplerState::Running(sampler)))
-    }
-
-    #[cfg(feature = "iree")]
-    #[staticmethod]
-    fn from_iree(
-        settings: PyDiagGradNutsSettings,
-        cores: usize,
-        model: IreeModel,
-        template: String,
-        rate: u64,
-        callback: Option<Py<PyAny>>,
-    ) -> PyResult<PySampler> {
-        let rate = Duration::from_millis(rate);
-        let callback = make_callback(template, cores, rate, callback)?;
-        let sampler = Sampler::new(model, settings.0, cores, callback)?;
-        Ok(PySampler(SamplerState::Running(sampler)))
+        let callback = progress_type.into_callback()?;
+        match settings.into_settings() {
+            Settings::LowRank(settings) => {
+                let sampler = Sampler::new(model, settings, cores, callback)?;
+                Ok(PySampler(SamplerState::Running(sampler)))
+            }
+            Settings::Diag(settings) => {
+                let sampler = Sampler::new(model, settings, cores, callback)?;
+                Ok(PySampler(SamplerState::Running(sampler)))
+            }
+        }
     }
 
     fn is_finished(&mut self, py: Python<'_>) -> PyResult<bool> {
@@ -814,7 +802,6 @@ pub fn _lib(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<OnnxModel>()?;
     #[cfg(feature = "onnx")]
     m.add_class::<OnnxProviders>()?;
-    m.add_class::<PyDiagGradNutsSettings>()?;
     m.add_class::<PyChainProgress>()?;
     m.add_class::<ProgressType>()?;
     m.add_class::<TensorShape>()?;

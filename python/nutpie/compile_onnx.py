@@ -1,9 +1,9 @@
-from typing import Any
 import dataclasses
 import io
+from typing import Any
 
-from nutpie.sampling import CompiledModel
 from nutpie import _lib
+from nutpie.sampling import CompiledModel
 
 
 def compile_pytensor_module(module, n_dim):
