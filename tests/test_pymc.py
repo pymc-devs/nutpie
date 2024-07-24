@@ -24,6 +24,21 @@ def test_pymc_model(backend, gradient_backend):
 
 
 @parameterize_backends
+def test_pymc_model_float32(backend, gradient_backend):
+    import pytensor
+
+    with pytensor.config.change_flags(floatX="float32"):
+        with pm.Model() as model:
+            pm.Normal("a")
+
+        compiled = nutpie.compile_pymc_model(
+            model, backend=backend, gradient_backend=gradient_backend
+        )
+        trace = nutpie.sample(compiled, chains=1)
+        trace.posterior.a  # noqa: B018
+
+
+@parameterize_backends
 def test_blocking(backend, gradient_backend):
     with pm.Model() as model:
         pm.Normal("a")
