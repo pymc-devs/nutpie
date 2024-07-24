@@ -483,7 +483,7 @@ def _make_functions(model, *, mode, compute_grad, join_expanded):
         variables = [joined[slice_val] for slice_val in zip(joined_slices)]
 
     replacements = {
-        model.rvs_to_values[var]: value.reshape(shape) if len(shape) != 1 else value
+        model.rvs_to_values[var]: value.reshape(shape).astype(var.dtype)
         for var, shape, value in zip(
             model.free_RVs,
             joined_shapes,
