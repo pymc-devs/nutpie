@@ -24,7 +24,6 @@ crate-type = ["cdylib"]
 [dependencies]
 nuts-rs = "0.12.1"
 numpy = "0.21.0"
-ndarray = "0.15.6"
 rand = "0.8.5"
 thiserror = "1.0.44"
 rand_chacha = "0.3.1"
