@@ -1,6 +1,6 @@
 [package]
 name = "nutpie"
-version = "0.13.1"
+version = "0.13.2"
 authors = [
   "Adrian Seyboldt <adrian.seyboldt@gmail.com>",
   "PyMC Developers <pymc.devs@gmail.com>",
@@ -47,7 +47,6 @@ features = ["extension-module", "anyhow"]
 criterion = "0.5.1"
 
 [profile.release]
-debug = true
 lto = "fat"
 codegen-units = 1
 opt-level = 2

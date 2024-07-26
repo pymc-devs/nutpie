@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.13.2] - 2024-07-26
+
+### Features
+
+- Support float32 settings in pytensor (Adrian Seyboldt)
+
+
+### Miscellaneous Tasks
+
+- Update dependencies (Adrian Seyboldt)
+
+
 ## [0.13.1] - 2024-07-09
 
 ### Bug Fixes
