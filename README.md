@@ -107,7 +107,7 @@ sampler.resume()
 # Wait for the sampler to finish (up to timeout seconds)
 sampler.wait(timeout=0.1)
 # Note that not passing any timeout to `wait` will
-# directly save and return the current results once the sampler finishes:
+# wait until the sampler finishes, then return the InferenceData object:
 idata = sampler.wait()
 
 # or we can also abort the sampler (and return the incomplete trace)
