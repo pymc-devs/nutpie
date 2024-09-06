@@ -6,7 +6,7 @@ from typing import Any, Callable
 import numpy as np
 
 from nutpie import _lib
-from nutpie.sample import CompiledModel
+from nutpie.sampling import CompiledModel
 
 
 @dataclass(frozen=True)

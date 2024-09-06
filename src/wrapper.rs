@@ -4,7 +4,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(feature = "onnx")]
+use crate::ort::OnnxModel;
+
 use crate::{
+    ort::OnnxProviders,
     progress::{IndicatifHandler, ProgressHandler},
     pyfunc::{ExpandDtype, PyModel, PyVariable, TensorShape},
     pymc::{ExpandFunc, LogpFunc, PyMcModel},
@@ -569,6 +573,27 @@ impl PySampler {
         }
     }
 
+    #[cfg(feature = "onnx")]
+    #[staticmethod]
+    fn from_onnx(
+        settings: PyNutsSettings,
+        cores: usize,
+        model: OnnxModel,
+        progress_type: ProgressType,
+    ) -> PyResult<PySampler> {
+        let callback = progress_type.into_callback()?;
+        match settings.into_settings() {
+            Settings::LowRank(settings) => {
+                let sampler = Sampler::new(model, settings, cores, callback)?;
+                Ok(PySampler(SamplerState::Running(sampler)))
+            }
+            Settings::Diag(settings) => {
+                let sampler = Sampler::new(model, settings, cores, callback)?;
+                Ok(PySampler(SamplerState::Running(sampler)))
+            }
+        }
+    }
+
     fn is_finished(&mut self, py: Python<'_>) -> PyResult<bool> {
         py.allow_threads(|| {
             let state = std::mem::replace(&mut self.0, SamplerState::Empty);
@@ -773,6 +798,10 @@ pub fn _lib(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<StanLibrary>()?;
     m.add_class::<StanModel>()?;
     m.add_class::<PyNutsSettings>()?;
+    #[cfg(feature = "onnx")]
+    m.add_class::<OnnxModel>()?;
+    #[cfg(feature = "onnx")]
+    m.add_class::<OnnxProviders>()?;
     m.add_class::<PyChainProgress>()?;
     m.add_class::<ProgressType>()?;
     m.add_class::<TensorShape>()?;
