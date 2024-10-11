@@ -12,7 +12,7 @@ from numpy.typing import NDArray
 
 from nutpie import _lib
 from nutpie.compiled_pyfunc import from_pyfunc
-from nutpie.sample import CompiledModel
+from nutpie.sampling import CompiledModel
 
 try:
     from numba.extending import intrinsic
@@ -426,6 +426,7 @@ def _compute_shapes(model):
 
 
 def _make_functions(model, *, mode, compute_grad, join_expanded):
+    # TODO do we want to freeze the model?
     import pytensor
     import pytensor.link.numba.dispatch
     import pytensor.tensor as pt
