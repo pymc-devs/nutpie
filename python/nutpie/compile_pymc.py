@@ -354,8 +354,8 @@ def _compile_pymc_model_jax(model, *, gradient_backend=None, **kwargs):
 def compile_pymc_model(
     model: "pm.Model",
     *,
-    backend: Literal["numba", "jax"] | None = None,
-    gradient_backend: Literal["pytensor", "jax"] | None = None,
+    backend: Literal["numba", "jax"] = "numba",
+    gradient_backend: Literal["pytensor", "jax"] = "pytensor",
     **kwargs,
 ) -> CompiledModel:
     """Compile necessary functions for sampling a pymc model.
@@ -384,10 +384,9 @@ def compile_pymc_model(
             "and restart your kernel in case you are in an interactive session."
         )
 
-    if backend is None:
-        backend = "numba"
-
     if backend.lower() == "numba":
+        if gradient_backend == "jax":
+            raise ValueError("Gradient backend cannot be jax when using numba backend")
         return _compile_pymc_model_numba(model, **kwargs)
     elif backend.lower() == "jax":
         return _compile_pymc_model_jax(
