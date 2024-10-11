@@ -354,7 +354,7 @@ def _compile_pymc_model_jax(model, *, gradient_backend=None, **kwargs):
 def compile_pymc_model(
     model: "pm.Model",
     *,
-    backend: Literal["numba", "jax"] = "numba",
+    backend: Literal["numba", "jax"] | None = None,
     gradient_backend: Literal["pytensor", "jax"] | None = None,
     **kwargs,
 ) -> CompiledModel:
