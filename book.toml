@@ -1,0 +1,6 @@
+[book]
+authors = ["Adrian Seyboldt"]
+language = "en"
+multilingual = false
+src = "docs"
+title = "nutpie"
