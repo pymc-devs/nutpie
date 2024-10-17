@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from functools import wraps
 from importlib.util import find_spec
 from math import prod
-from typing import TYPE_CHECKING, Any, Callable, Literal, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Literal, Optional, Union, cast
 
 import numpy as np
 import pandas as pd
@@ -270,7 +270,7 @@ def _compile_pymc_model_numba(
         warnings.filterwarnings(
             "ignore",
             message="Cannot cache compiled function .* as it uses dynamic globals",
-            category=numba.NumbaWarning,
+            category=numba.NumbaWarning,  # type: ignore
         )
 
         logp_numba = numba.cfunc(c_sig, **kwargs)(logp_numba_raw)
@@ -283,7 +283,7 @@ def _compile_pymc_model_numba(
         warnings.filterwarnings(
             "ignore",
             message="Cannot cache compiled function .* as it uses dynamic globals",
-            category=numba.NumbaWarning,
+            category=numba.NumbaWarning,  # type: ignore
         )
 
         expand_numba = numba.cfunc(c_sig_expand, **kwargs)(expand_numba_raw)

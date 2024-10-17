@@ -1,13 +1,13 @@
 import os
 from dataclasses import dataclass
-from typing import Any, Literal, Optional, overload
+from typing import Any, Literal, Optional, cast, overload
 
 import arviz
 import numpy as np
 import pandas as pd
 import pyarrow
 
-from nutpie import _lib
+from nutpie import _lib  # type: ignore
 
 
 @dataclass(frozen=True)
@@ -281,7 +281,7 @@ def in_notebook():
     if in_colab():
         return True
     try:
-        shell = get_ipython().__class__.__name__
+        shell = get_ipython().__class__.__name__  # type: ignore
         if shell == "ZMQInteractiveShell":  # Jupyter notebook, Spyder or qtconsole
             try:
                 from IPython.display import (
@@ -608,10 +608,10 @@ def sample(
     if cores is None:
         try:
             # Only available in python>=3.13
-            available = os.process_cpu_count()
+            available = os.process_cpu_count()  # type: ignore
         except AttributeError:
             available = os.cpu_count()
-        cores = min(chains, available)
+        cores = min(chains, cast(int, available))
 
     if init_mean is None:
         init_mean = np.zeros(compiled_model.n_dim)

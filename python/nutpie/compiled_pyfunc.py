@@ -5,7 +5,7 @@ from typing import Any, Callable
 
 import numpy as np
 
-from nutpie import _lib
+from nutpie import _lib  # type: ignore
 from nutpie.sample import CompiledModel
 
 SeedType = int
