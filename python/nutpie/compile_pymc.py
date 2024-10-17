@@ -371,14 +371,24 @@ def _compile_pymc_model_jax(
     logp_fn = logp_fn_pt.vm.jit_fn
     expand_fn = expand_fn_pt.vm.jit_fn
 
+    logp_shared_names = [var.name for var in logp_fn_pt.get_shared()]
+    expand_shared_names = [var.name for var in expand_fn_pt.get_shared()]
+
     if gradient_backend == "jax":
         orig_logp_fn = logp_fn._fun
 
-        @jax.jit
         def logp_fn_jax_grad(x, *shared):
             return jax.value_and_grad(lambda x: orig_logp_fn(x, *shared)[0])(x)
 
+        static_argnums = list(range(1, len(logp_shared_names) + 1))
+        logp_fn_jax_grad = jax.jit(
+            logp_fn_jax_grad,
+            # static_argnums=static_argnums,
+        )
+
         logp_fn = logp_fn_jax_grad
+    else:
+        orig_logp_fn = None
 
     shared_data = {}
     shared_vars = {}
@@ -390,9 +400,6 @@ def _compile_pymc_model_jax(
         shared_vars[val.name] = val
         seen.add(val)
 
-    logp_shared_names = [var.name for var in logp_fn_pt.get_shared()]
-    expand_shared_names = [var.name for var in expand_fn_pt.get_shared()]
-
     def make_logp_func():
         def logp(x, **shared):
             logp, grad = logp_fn(x, *[shared[name] for name in logp_shared_names])
@@ -401,7 +408,8 @@ def _compile_pymc_model_jax(
         return logp
 
     names, slices, shapes = shape_info
-    dtypes = [np.float64] * len(names)
+    # TODO do not cast to float64
+    dtypes = [np.dtype("float64")] * len(names)
 
     def make_expand_func(seed1, seed2, chain):
         # TODO handle seeds
@@ -427,6 +435,7 @@ def _compile_pymc_model_jax(
         shared_data=shared_data,
         dims=dims,
         coords=coords,
+        raw_logp_fn=orig_logp_fn,
     )
 
 
@@ -506,7 +515,7 @@ def compile_pymc_model(
         raise ValueError(f"Backend must be one of numba and jax. Got {backend}")
 
 
-def _compute_shapes(model):
+def _compute_shapes(model) -> dict[str, tuple[int, ...]]:
     import pytensor
     from pymc.initial_point import make_initial_point_fn
 
@@ -681,7 +690,7 @@ def _make_functions(
 
     for var in remaining_rvs:
         all_names.append(var.name)
-        shape = shapes[var.name]
+        shape = cast(tuple[int, ...], shapes[var.name])
         all_shapes.append(shape)
         length = prod(shape)
         all_slices.append(slice(count, count + length))

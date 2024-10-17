@@ -114,6 +114,7 @@ impl LogpError for ErrorCode {
 
 impl<'a> CpuLogpFunc for &'a LogpFunc {
     type LogpError = ErrorCode;
+    type TransformParams = ();
 
     fn dim(&self) -> usize {
         self.dim

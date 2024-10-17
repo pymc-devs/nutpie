@@ -461,6 +461,7 @@ def sample(
     save_warmup: bool,
     progress_bar: bool,
     low_rank_modified_mass_matrix: bool = False,
+    transform_adapt: bool = False,
     init_mean: Optional[np.ndarray],
     return_raw_trace: bool,
     blocking: Literal[True],
@@ -480,6 +481,7 @@ def sample(
     save_warmup: bool,
     progress_bar: bool,
     low_rank_modified_mass_matrix: bool = False,
+    transform_adapt: bool = False,
     init_mean: Optional[np.ndarray],
     return_raw_trace: bool,
     blocking: Literal[False],
@@ -498,6 +500,7 @@ def sample(
     save_warmup: bool = True,
     progress_bar: bool = True,
     low_rank_modified_mass_matrix: bool = False,
+    transform_adapt: bool = False,
     init_mean: Optional[np.ndarray] = None,
     return_raw_trace: bool = False,
     blocking: bool = True,
@@ -585,6 +588,9 @@ def sample(
     mass_matrix_gamma: float > 0, default=1e-5
         Regularisation parameter for the eigenvalues. Only
         applicable with low_rank_modified_mass_matrix=True.
+    transform_adapt: bool, default=False
+        Use the experimental transform adaptation algorithm
+        during tuning.
     **kwargs
         Pass additional arguments to nutpie._lib.PySamplerArgs
 
@@ -594,10 +600,18 @@ def sample(
         An ArviZ ``InferenceData`` object that contains the samples.
     """
 
+    if low_rank_modified_mass_matrix and transform_adapt:
+        raise ValueError(
+            "Specify only one of `low_rank_modified_mass_matrix` and `transform_adapt`"
+        )
+
     if low_rank_modified_mass_matrix:
         settings = _lib.PyNutsSettings.LowRank(seed)
+    elif transform_adapt:
+        settings = _lib.PyNutsSettings.Transform(seed)
     else:
         settings = _lib.PyNutsSettings.Diag(seed)
+
     settings.num_tune = tune
     settings.num_draws = draws
     settings.num_chains = chains

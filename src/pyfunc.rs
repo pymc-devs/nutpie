@@ -8,11 +8,12 @@ use arrow::{
     },
     datatypes::{DataType, Field, Float32Type, Float64Type, Int64Type},
 };
-use numpy::{PyArray1, PyReadonlyArray1};
+use numpy::{NotContiguousError, PyArray1, PyReadonlyArray1};
 use nuts_rs::{CpuLogpFunc, CpuMath, DrawStorage, LogpError, Model};
 use pyo3::{
-    pyclass, pymethods,
-    types::{PyAnyMethods, PyDict, PyDictMethods},
+    exceptions::PyRuntimeError,
+    intern, pyclass, pymethods,
+    types::{PyAnyMethods, PyDict, PyDictMethods, PyList},
     Bound, Py, PyAny, PyErr, Python,
 };
 use rand::Rng;
@@ -75,6 +76,7 @@ pub struct PyModel {
     make_expand_func: Py<PyAny>,
     init_point_func: Option<Py<PyAny>>,
     variables: Vec<PyVariable>,
+    transform_adapter: Option<Py<PyAny>>,
     ndim: usize,
 }
 
@@ -87,6 +89,7 @@ impl PyModel {
         variables: Vec<PyVariable>,
         ndim: usize,
         init_point_func: Option<Py<PyAny>>,
+        transform_adapter: Option<Py<PyAny>>,
     ) -> Self {
         Self {
             make_logp_func,
@@ -94,6 +97,7 @@ impl PyModel {
             init_point_func,
             variables,
             ndim,
+            transform_adapter,
         }
     }
 }
@@ -103,9 +107,11 @@ pub enum PyLogpError {
     #[error("Bad logp value: {0}")]
     BadLogp(f64),
     #[error("Python error: {0}")]
-    PyError(PyErr),
+    PyError(#[from] PyErr),
     #[error("logp function must return float.")]
     ReturnTypeError(),
+    #[error("Python retured a non-contigous array")]
+    NotContiguousError(#[from] NotContiguousError),
 }
 
 impl LogpError for PyLogpError {
@@ -121,20 +127,29 @@ impl LogpError for PyLogpError {
                     .expect("Could not access is_recoverable in error check");
             }),
             Self::ReturnTypeError() => false,
+            Self::NotContiguousError(_) => false,
         }
     }
 }
 
 pub struct PyDensity {
     logp: Py<PyAny>,
+    transform_adapter: Option<Py<PyAny>>,
     dim: usize,
 }
 
 impl PyDensity {
-    fn new(logp_clone_func: &Py<PyAny>, dim: usize) -> Result<Self> {
+    fn new(
+        logp_clone_func: &Py<PyAny>,
+        dim: usize,
+        transform_adapter: Option<&Py<PyAny>>,
+    ) -> Result<Self> {
         let logp_func = Python::with_gil(|py| logp_clone_func.call0(py))?;
+        let transform_adapter =
+            transform_adapter.map(|val| Python::with_gil(|py| val.clone_ref(py)));
         Ok(Self {
             logp: logp_func,
+            transform_adapter,
             dim,
         })
     }
@@ -142,6 +157,7 @@ impl PyDensity {
 
 impl CpuLogpFunc for PyDensity {
     type LogpError = PyLogpError;
+    type TransformParams = Py<PyAny>;
 
     fn logp(&mut self, position: &[f64], grad: &mut [f64]) -> Result<f64, Self::LogpError> {
         Python::with_gil(|py| {
@@ -171,6 +187,168 @@ impl CpuLogpFunc for PyDensity {
 
     fn dim(&self) -> usize {
         self.dim
+    }
+
+    fn inv_transform_normalize(
+        &mut self,
+        params: &Self::TransformParams,
+        untransformed_position: &[f64],
+        untransofrmed_gradient: &[f64],
+        transformed_position: &mut [f64],
+        transformed_gradient: &mut [f64],
+    ) -> std::result::Result<f64, Self::LogpError> {
+        Python::with_gil(|py| {
+            let untransformed_position = PyArray1::from_slice_bound(py, untransformed_position);
+            let untransformed_gradient = PyArray1::from_slice_bound(py, untransofrmed_gradient);
+
+            let output = params
+                .getattr(py, intern!(py, "inv_transform"))?
+                .call1(py, (untransformed_position, untransformed_gradient))?;
+            let (logdet, transformed_position_out, transformed_gradient_out): (
+                f64,
+                PyReadonlyArray1<f64>,
+                PyReadonlyArray1<f64>,
+            ) = output.extract(py)?;
+
+            transformed_position.copy_from_slice(transformed_position_out.as_slice()?);
+            transformed_gradient.copy_from_slice(transformed_gradient_out.as_slice()?);
+            Ok(logdet)
+        })
+    }
+
+    fn init_from_transformed_position(
+        &mut self,
+        params: &Self::TransformParams,
+        untransformed_position: &mut [f64],
+        untransformed_gradient: &mut [f64],
+        transformed_position: &[f64],
+        transformed_gradient: &mut [f64],
+    ) -> std::result::Result<(f64, f64), Self::LogpError> {
+        Python::with_gil(|py| {
+            let transformed_position = PyArray1::from_slice_bound(py, transformed_position);
+
+            let output = params
+                .getattr(py, intern!(py, "init_from_transformed_position"))?
+                .call1(py, (transformed_position,))?;
+            let (
+                logp,
+                logdet,
+                untransformed_position_out,
+                untransformed_gradient_out,
+                transformed_gradient_out,
+            ): (
+                f64,
+                f64,
+                PyReadonlyArray1<f64>,
+                PyReadonlyArray1<f64>,
+                PyReadonlyArray1<f64>,
+            ) = output.extract(py)?;
+
+            untransformed_position.copy_from_slice(untransformed_position_out.as_slice()?);
+            untransformed_gradient.copy_from_slice(untransformed_gradient_out.as_slice()?);
+            transformed_gradient.copy_from_slice(transformed_gradient_out.as_slice()?);
+            Ok((logp, logdet))
+        })
+    }
+
+    fn init_from_untransformed_position(
+        &mut self,
+        params: &Self::TransformParams,
+        untransformed_position: &[f64],
+        untransformed_gradient: &mut [f64],
+        transformed_position: &mut [f64],
+        transformed_gradient: &mut [f64],
+    ) -> std::result::Result<(f64, f64), Self::LogpError> {
+        Python::with_gil(|py| {
+            let untransformed_position = PyArray1::from_slice_bound(py, untransformed_position);
+
+            let output = params
+                .getattr(py, intern!(py, "init_from_untransformed_position"))?
+                .call1(py, (untransformed_position,))?;
+            let (
+                logp,
+                logdet,
+                untransformed_gradient_out,
+                transformed_position_out,
+                transformed_gradient_out,
+            ): (
+                f64,
+                f64,
+                PyReadonlyArray1<f64>,
+                PyReadonlyArray1<f64>,
+                PyReadonlyArray1<f64>,
+            ) = output.extract(py)?;
+
+            untransformed_gradient.copy_from_slice(untransformed_gradient_out.as_slice()?);
+            transformed_position.copy_from_slice(transformed_position_out.as_slice()?);
+            transformed_gradient.copy_from_slice(transformed_gradient_out.as_slice()?);
+            Ok((logp, logdet))
+        })
+    }
+
+    fn update_transformation<'a, R: rand::Rng + ?Sized>(
+        &'a mut self,
+        rng: &mut R,
+        untransformed_positions: impl ExactSizeIterator<Item = &'a [f64]>,
+        untransformed_gradients: impl ExactSizeIterator<Item = &'a [f64]>,
+        params: &'a mut Self::TransformParams,
+    ) -> std::result::Result<(), Self::LogpError> {
+        Python::with_gil(|py| {
+            let positions = PyList::new_bound(
+                py,
+                untransformed_positions.map(|pos| PyArray1::from_slice_bound(py, pos)),
+            );
+            let gradients = PyList::new_bound(
+                py,
+                untransformed_gradients.map(|grad| PyArray1::from_slice_bound(py, grad)),
+            );
+
+            let seed = rng.next_u64();
+
+            params
+                .getattr(py, intern!(py, "update"))?
+                .call1(py, (seed, positions, gradients))?;
+            Ok(())
+        })
+    }
+
+    fn new_transformation<R: rand::Rng + ?Sized>(
+        &mut self,
+        rng: &mut R,
+        untransformed_position: &[f64],
+        untransfogmed_gradient: &[f64],
+        chain: u64,
+    ) -> std::result::Result<Self::TransformParams, Self::LogpError> {
+        Python::with_gil(|py| {
+            let position = PyArray1::from_slice_bound(py, untransformed_position);
+            let gradient = PyArray1::from_slice_bound(py, untransfogmed_gradient);
+
+            let seed = rng.next_u64();
+
+            let transformer = self
+                .transform_adapter
+                .as_ref()
+                .ok_or_else(|| {
+                    PyLogpError::PyError(PyRuntimeError::new_err(
+                        "No transformation adapter specified",
+                    ))
+                })?
+                .call1(py, (seed, position, gradient, chain))?;
+
+            Ok(transformer)
+        })
+    }
+
+    fn transformation_id(
+        &self,
+        params: &Self::TransformParams,
+    ) -> std::result::Result<i64, Self::LogpError> {
+        Python::with_gil(|py| {
+            let id: i64 = params
+                .getattr(py, intern!(py, "transformation_id"))?
+                .extract(py)?;
+            Ok(id)
+        })
     }
 }
 
@@ -471,6 +649,7 @@ impl Model for PyModel {
         Ok(CpuMath::new(PyDensity::new(
             &self.make_logp_func,
             self.ndim,
+            self.transform_adapter.as_ref(),
         )?))
     }
 
