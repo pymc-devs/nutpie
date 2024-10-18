@@ -170,7 +170,7 @@ def make_transform_adapter(*, verbose=True, window_size=2000, show_progress=Fals
                 untransformed_position, untransformed_gradient, 0.0
             )
         )
-        return -logdet, transformed_position, transformed_gradient
+        return logdet, transformed_position, transformed_gradient
 
     class TransformAdapter:
         def __init__(
@@ -220,8 +220,11 @@ def make_transform_adapter(*, verbose=True, window_size=2000, show_progress=Fals
                     )
                     return
 
-                positions = np.array(positions[-self._window_size :])
-                gradients = np.array(gradients[-self._window_size :])
+                positions = np.array(positions[500:][-self._window_size :])
+                gradients = np.array(gradients[500:][-self._window_size :])
+
+                if len(positions) == 0:
+                    return
 
                 assert np.isfinite(positions).all()
                 assert np.isfinite(gradients).all()
