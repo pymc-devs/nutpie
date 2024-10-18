@@ -11,7 +11,7 @@ from nutpie.sample import CompiledModel
 SeedType = int
 
 
-def make_transform_adapter(*, verbose=False, window_size=2000):
+def make_transform_adapter(*, verbose=True, window_size=2000, show_progress=False):
     import jax
     import equinox as eqx
     import jax.numpy as jnp
@@ -50,16 +50,7 @@ def make_transform_adapter(*, verbose=False, window_size=2000):
                 ).mean()
             )
 
-    def _get_untransformed(bijection, draw_trafo, grad_trafo):
-        bijection = flowjax.train.losses.unwrap(bijection)
-        draw = bijection.inverse(draw_trafo)
-        _, pull_grad_fn = jax.vjp(bijection.transform_and_log_det, draw)
-        (grad,) = pull_grad_fn((grad_trafo, 1.0))
-        return draw, grad
-
-    pull_points = eqx.filter_jit(jax.vmap(_get_untransformed, [None, 0, 0]))
-
-    def fit_flow(key, bijection, positions, gradients, **kwargs):
+    def fit_flow(key, bijection, loss_fn, positions, gradients, **kwargs):
         flow = flowjax.flows.Transformed(
             flowjax.distributions.StandardNormal(bijection.shape), bijection
         )
@@ -72,12 +63,11 @@ def make_transform_adapter(*, verbose=False, window_size=2000):
             key=train_key,
             dist=flow,
             x=points,
-            loss_fn=FisherLoss(),
+            loss_fn=loss_fn,
             **kwargs,
         )
 
-        draws_pulled, grads_pulled = pull_points(fit.bijection, positions, gradients)
-        final_cost = np.log(((draws_pulled + grads_pulled) ** 2).sum(1).mean(0))
+        final_cost = losses["val"][-1]
         return fit, final_cost, opt_state
 
     def make_flow(seed, positions, gradients, *, n_layers):
@@ -108,7 +98,7 @@ def make_transform_adapter(*, verbose=False, window_size=2000):
         ]
 
         for layer in range(n_layers):
-            key, key_couple, key_permute, key_init = jax.random.split(key, 4)
+            key, key_couple, key_permute = jax.random.split(key, 3)
 
             scale = flowjax.wrappers.Parameterize(
                 lambda x: jnp.exp(jnp.arcsinh(x)), jnp.array(0.0)
@@ -194,12 +184,16 @@ def make_transform_adapter(*, verbose=False, window_size=2000):
             make_flow_fn,
             verbose=False,
             window_size=2000,
+            show_progress=False,
         ):
             self._logp_fn = logp_fn
             self._make_flow_fn = make_flow_fn
             self._chain = chain
             self._verbose = verbose
             self._window_size = window_size
+            self._optimizer = optax.adabelief(1e-3)
+            self._loss_fn = FisherLoss()
+            self._show_progress = show_progress
             try:
                 self._bijection = make_flow_fn(seed, [position], [gradient], n_layers=0)
             except Exception as e:
@@ -246,10 +240,11 @@ def make_transform_adapter(*, verbose=False, window_size=2000):
                 fit, final_cost, _ = fit_flow(
                     key,
                     self._bijection,
+                    self._loss_fn,
                     positions,
                     gradients,
-                    show_progress=self._verbose,
-                    optimizer=optax.adabelief(1e-3),
+                    show_progress=self._show_progress,
+                    optimizer=self._optimizer,
                     batch_size=128,
                 )
                 if self._verbose:
@@ -306,6 +301,7 @@ def make_transform_adapter(*, verbose=False, window_size=2000):
         verbose=verbose,
         window_size=window_size,
         make_flow_fn=make_flow,
+        show_progress=show_progress,
     )
 
 
