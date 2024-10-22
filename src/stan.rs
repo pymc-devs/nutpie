@@ -213,6 +213,7 @@ impl LogpError for StanLogpError {
 
 impl<'model> CpuLogpFunc for StanDensity<'model> {
     type LogpError = StanLogpError;
+    type TransformParams = ();
 
     fn logp(&mut self, position: &[f64], grad: &mut [f64]) -> Result<f64, Self::LogpError> {
         let logp = self.0.log_density_gradient(position, true, true, grad)?;
