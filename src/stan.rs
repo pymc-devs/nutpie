@@ -7,6 +7,7 @@ use arrow::datatypes::{DataType, Field};
 use bridgestan::open_library;
 use itertools::{izip, Itertools};
 use nuts_rs::{CpuLogpFunc, CpuMath, DrawStorage, LogpError, Model, Settings};
+use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 use pyo3::{exceptions::PyValueError, pyclass, pymethods, PyResult};
@@ -16,6 +17,8 @@ use rand_distr::StandardNormal;
 use smallvec::{SmallVec, ToSmallVec};
 
 use thiserror::Error;
+
+use crate::wrapper::PyTransformAdapt;
 
 type InnerModel = bridgestan::Model<Arc<bridgestan::StanLibrary>>;
 
@@ -68,6 +71,7 @@ impl StanVariable {
 pub struct StanModel {
     model: Arc<InnerModel>,
     variables: Vec<Parameter>,
+    transform_adapter: Option<PyTransformAdapt>,
 }
 
 /// Return meta information about the constrained parameters of the model
@@ -136,7 +140,13 @@ fn params(
 #[pymethods]
 impl StanModel {
     #[new]
-    pub fn new(lib: StanLibrary, seed: Option<u32>, data: Option<String>) -> anyhow::Result<Self> {
+    #[pyo3(signature = (lib, seed=None, data=None, transform_adapter=None))]
+    pub fn new(
+        lib: StanLibrary,
+        seed: Option<u32>,
+        data: Option<String>,
+        transform_adapter: Option<Py<PyAny>>,
+    ) -> anyhow::Result<Self> {
         let seed = match seed {
             Some(seed) => seed,
             None => thread_rng().next_u32(),
@@ -146,7 +156,12 @@ impl StanModel {
             bridgestan::Model::new(lib.0, data.as_ref(), seed).map_err(anyhow::Error::new)?,
         );
         let variables = params(&model, true, true)?;
-        Ok(StanModel { model, variables })
+        let transform_adapter = transform_adapter.map(PyTransformAdapt::new);
+        Ok(StanModel {
+            model,
+            variables,
+            transform_adapter,
+        })
     }
 
     pub fn variables<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
@@ -195,7 +210,10 @@ impl StanModel {
     */
 }
 
-pub struct StanDensity<'model>(&'model InnerModel);
+pub struct StanDensity<'model> {
+    inner: &'model InnerModel,
+    transform_adapter: Option<PyTransformAdapt>,
+}
 
 #[derive(Debug, Error)]
 pub enum StanLogpError {
@@ -203,6 +221,10 @@ pub enum StanLogpError {
     BridgeStan(#[from] bridgestan::BridgeStanError),
     #[error("Bad logp value: {0}")]
     BadLogp(f64),
+    #[error("Python exception: {0}")]
+    PyErr(#[from] PyErr),
+    #[error("Unspecified Error: {0}")]
+    Anyhow(#[from] anyhow::Error),
 }
 
 impl LogpError for StanLogpError {
@@ -213,10 +235,12 @@ impl LogpError for StanLogpError {
 
 impl<'model> CpuLogpFunc for StanDensity<'model> {
     type LogpError = StanLogpError;
-    type TransformParams = ();
+    type TransformParams = Py<PyAny>;
 
     fn logp(&mut self, position: &[f64], grad: &mut [f64]) -> Result<f64, Self::LogpError> {
-        let logp = self.0.log_density_gradient(position, true, true, grad)?;
+        let logp = self
+            .inner
+            .log_density_gradient(position, true, true, grad)?;
         if !logp.is_finite() {
             return Err(StanLogpError::BadLogp(logp));
         }
@@ -224,7 +248,141 @@ impl<'model> CpuLogpFunc for StanDensity<'model> {
     }
 
     fn dim(&self) -> usize {
-        self.0.param_unc_num()
+        self.inner.param_unc_num()
+    }
+
+    fn inv_transform_normalize(
+        &mut self,
+        params: &Py<PyAny>,
+        untransformed_position: &[f64],
+        untransformed_gradient: &[f64],
+        transformed_position: &mut [f64],
+        transformed_gradient: &mut [f64],
+    ) -> std::result::Result<f64, Self::LogpError> {
+        let logdet = self
+            .transform_adapter
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?
+            .inv_transform_normalize(
+                params,
+                untransformed_position,
+                untransformed_gradient,
+                transformed_position,
+                transformed_gradient,
+            )
+            .context("failed inv_transform_normalize")?;
+        Ok(logdet)
+    }
+
+    fn init_from_transformed_position(
+        &mut self,
+        params: &Py<PyAny>,
+        untransformed_position: &mut [f64],
+        untransformed_gradient: &mut [f64],
+        transformed_position: &[f64],
+        transformed_gradient: &mut [f64],
+    ) -> std::result::Result<(f64, f64), Self::LogpError> {
+        let adapter = self
+            .transform_adapter
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?;
+
+        let part1 = adapter
+            .init_from_transformed_position_part1(
+                params,
+                untransformed_position,
+                transformed_position,
+            )
+            .context("Failed init_from_transformed_position_part1")?;
+
+        let logp = self.logp(untransformed_position, untransformed_gradient)?;
+
+        let adapter = self
+            .transform_adapter
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?;
+
+        let logdet = adapter
+            .init_from_transformed_position_part2(
+                params,
+                part1,
+                untransformed_gradient,
+                transformed_gradient,
+            )
+            .context("Failed init_from_transformed_position_part2")?;
+        Ok((logp, logdet))
+    }
+
+    fn init_from_untransformed_position(
+        &mut self,
+        params: &Py<PyAny>,
+        untransformed_position: &[f64],
+        untransformed_gradient: &mut [f64],
+        transformed_position: &mut [f64],
+        transformed_gradient: &mut [f64],
+    ) -> std::result::Result<(f64, f64), Self::LogpError> {
+        let logp = self
+            .logp(untransformed_position, untransformed_gradient)
+            .context("Failed to call stan logp function")?;
+
+        let logdet = self
+            .transform_adapter
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?
+            .inv_transform_normalize(
+                params,
+                untransformed_position,
+                untransformed_gradient,
+                transformed_position,
+                transformed_gradient,
+            )
+            .context("Failed inv_transform_normalize in stan init_from_untransformed_position")?;
+        Ok((logp, logdet))
+    }
+
+    fn update_transformation<'a, R: rand::Rng + ?Sized>(
+        &'a mut self,
+        rng: &mut R,
+        untransformed_positions: impl ExactSizeIterator<Item = &'a [f64]>,
+        untransformed_gradients: impl ExactSizeIterator<Item = &'a [f64]>,
+        params: &'a mut Py<PyAny>,
+    ) -> std::result::Result<(), Self::LogpError> {
+        self.transform_adapter
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?
+            .update_transformation(
+                rng,
+                untransformed_positions,
+                untransformed_gradients,
+                params,
+            )
+            .context("Failed to update the transformation")?;
+        Ok(())
+    }
+
+    fn new_transformation<R: rand::Rng + ?Sized>(
+        &mut self,
+        rng: &mut R,
+        untransformed_position: &[f64],
+        untransformed_gradient: &[f64],
+        chain: u64,
+    ) -> std::result::Result<Py<PyAny>, Self::LogpError> {
+        let trafo = self
+            .transform_adapter
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?
+            .new_transformation(rng, untransformed_position, untransformed_gradient, chain)
+            .context("Could not create transformation adapter")?;
+        Ok(trafo)
+    }
+
+    fn transformation_id(&self, params: &Py<PyAny>) -> std::result::Result<i64, Self::LogpError> {
+        let id = self
+            .transform_adapter
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?
+            .transformation_id(params)?;
+        Ok(id)
     }
 }
 
@@ -388,7 +546,10 @@ impl Model for StanModel {
     }
 
     fn math(&self) -> anyhow::Result<Self::Math<'_>> {
-        Ok(CpuMath::new(StanDensity(&self.model)))
+        Ok(CpuMath::new(StanDensity {
+            inner: &self.model,
+            transform_adapter: self.transform_adapter.as_ref().map(|v| v.clone()),
+        }))
     }
 
     fn init_position<R: rand::Rng + ?Sized>(

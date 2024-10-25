@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use indicatif::ProgressBar;
@@ -10,13 +10,13 @@ use upon::{Engine, Value};
 pub struct ProgressHandler {
     engine: Engine<'static>,
     template: String,
-    callback: Py<PyAny>,
+    callback: Arc<Py<PyAny>>,
     rate: Duration,
     n_cores: usize,
 }
 
 impl ProgressHandler {
-    pub fn new(callback: Py<PyAny>, rate: Duration, template: String, n_cores: usize) -> Self {
+    pub fn new(callback: Arc<Py<PyAny>>, rate: Duration, template: String, n_cores: usize) -> Self {
         let engine = Engine::new();
         Self {
             engine,

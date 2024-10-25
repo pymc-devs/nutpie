@@ -12,14 +12,16 @@ use numpy::{NotContiguousError, PyArray1, PyReadonlyArray1};
 use nuts_rs::{CpuLogpFunc, CpuMath, DrawStorage, LogpError, Model};
 use pyo3::{
     exceptions::PyRuntimeError,
-    intern, pyclass, pymethods,
-    types::{PyAnyMethods, PyDict, PyDictMethods, PyList},
+    pyclass, pymethods,
+    types::{PyAnyMethods, PyDict, PyDictMethods},
     Bound, Py, PyAny, PyErr, Python,
 };
 use rand::Rng;
 use rand_distr::{Distribution, StandardNormal, Uniform};
 use smallvec::SmallVec;
 use thiserror::Error;
+
+use crate::wrapper::PyTransformAdapt;
 
 #[pyclass]
 #[derive(Debug, Clone)]
@@ -72,17 +74,18 @@ impl PyVariable {
 #[pyclass]
 #[derive(Debug, Clone)]
 pub struct PyModel {
-    make_logp_func: Py<PyAny>,
-    make_expand_func: Py<PyAny>,
-    init_point_func: Option<Py<PyAny>>,
-    variables: Vec<PyVariable>,
-    transform_adapter: Option<Py<PyAny>>,
+    make_logp_func: Arc<Py<PyAny>>,
+    make_expand_func: Arc<Py<PyAny>>,
+    init_point_func: Arc<Option<Py<PyAny>>>,
+    variables: Arc<Vec<PyVariable>>,
+    transform_adapter: Option<PyTransformAdapt>,
     ndim: usize,
 }
 
 #[pymethods]
 impl PyModel {
     #[new]
+    #[pyo3(signature = (make_logp_func, make_expand_func, variables, ndim, transform_adapter=None))]
     fn new<'py>(
         make_logp_func: Py<PyAny>,
         make_expand_func: Py<PyAny>,
@@ -92,12 +95,12 @@ impl PyModel {
         transform_adapter: Option<Py<PyAny>>,
     ) -> Self {
         Self {
-            make_logp_func,
-            make_expand_func,
-            init_point_func,
-            variables,
+            make_logp_func: Arc::new(make_logp_func),
+            make_expand_func: Arc::new(make_expand_func),
+            init_point_func: Arc::new(init_point_func),
+            variables: Arc::new(variables),
             ndim,
-            transform_adapter,
+            transform_adapter: transform_adapter.map(PyTransformAdapt::new),
         }
     }
 }
@@ -112,6 +115,8 @@ pub enum PyLogpError {
     ReturnTypeError(),
     #[error("Python retured a non-contigous array")]
     NotContiguousError(#[from] NotContiguousError),
+    #[error("Unknown error: {0}")]
+    Anyhow(#[from] anyhow::Error),
 }
 
 impl LogpError for PyLogpError {
@@ -128,13 +133,14 @@ impl LogpError for PyLogpError {
             }),
             Self::ReturnTypeError() => false,
             Self::NotContiguousError(_) => false,
+            Self::Anyhow(_) => false,
         }
     }
 }
 
 pub struct PyDensity {
     logp: Py<PyAny>,
-    transform_adapter: Option<Py<PyAny>>,
+    transform_adapter: Option<PyTransformAdapt>,
     dim: usize,
 }
 
@@ -142,11 +148,10 @@ impl PyDensity {
     fn new(
         logp_clone_func: &Py<PyAny>,
         dim: usize,
-        transform_adapter: Option<&Py<PyAny>>,
+        transform_adapter: Option<&PyTransformAdapt>,
     ) -> Result<Self> {
         let logp_func = Python::with_gil(|py| logp_clone_func.call0(py))?;
-        let transform_adapter =
-            transform_adapter.map(|val| Python::with_gil(|py| val.clone_ref(py)));
+        let transform_adapter = transform_adapter.map(|val| val.clone());
         Ok(Self {
             logp: logp_func,
             transform_adapter,
@@ -191,99 +196,68 @@ impl CpuLogpFunc for PyDensity {
 
     fn inv_transform_normalize(
         &mut self,
-        params: &Self::TransformParams,
+        params: &Py<PyAny>,
         untransformed_position: &[f64],
-        untransofrmed_gradient: &[f64],
+        untransformed_gradient: &[f64],
         transformed_position: &mut [f64],
         transformed_gradient: &mut [f64],
     ) -> std::result::Result<f64, Self::LogpError> {
-        Python::with_gil(|py| {
-            let untransformed_position = PyArray1::from_slice_bound(py, untransformed_position);
-            let untransformed_gradient = PyArray1::from_slice_bound(py, untransofrmed_gradient);
-
-            let output = params
-                .getattr(py, intern!(py, "inv_transform"))?
-                .call1(py, (untransformed_position, untransformed_gradient))?;
-            let (logdet, transformed_position_out, transformed_gradient_out): (
-                f64,
-                PyReadonlyArray1<f64>,
-                PyReadonlyArray1<f64>,
-            ) = output.extract(py)?;
-
-            transformed_position.copy_from_slice(transformed_position_out.as_slice()?);
-            transformed_gradient.copy_from_slice(transformed_gradient_out.as_slice()?);
-            Ok(logdet)
-        })
+        let logdet = self
+            .transform_adapter
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?
+            .inv_transform_normalize(
+                params,
+                untransformed_position,
+                untransformed_gradient,
+                transformed_position,
+                transformed_gradient,
+            )?;
+        Ok(logdet)
     }
 
     fn init_from_transformed_position(
         &mut self,
-        params: &Self::TransformParams,
+        params: &Py<PyAny>,
         untransformed_position: &mut [f64],
         untransformed_gradient: &mut [f64],
         transformed_position: &[f64],
         transformed_gradient: &mut [f64],
     ) -> std::result::Result<(f64, f64), Self::LogpError> {
-        Python::with_gil(|py| {
-            let transformed_position = PyArray1::from_slice_bound(py, transformed_position);
-
-            let output = params
-                .getattr(py, intern!(py, "init_from_transformed_position"))?
-                .call1(py, (transformed_position,))?;
-            let (
-                logp,
-                logdet,
-                untransformed_position_out,
-                untransformed_gradient_out,
-                transformed_gradient_out,
-            ): (
-                f64,
-                f64,
-                PyReadonlyArray1<f64>,
-                PyReadonlyArray1<f64>,
-                PyReadonlyArray1<f64>,
-            ) = output.extract(py)?;
-
-            untransformed_position.copy_from_slice(untransformed_position_out.as_slice()?);
-            untransformed_gradient.copy_from_slice(untransformed_gradient_out.as_slice()?);
-            transformed_gradient.copy_from_slice(transformed_gradient_out.as_slice()?);
-            Ok((logp, logdet))
-        })
+        let (logp, logdet) = self
+            .transform_adapter
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?
+            .init_from_transformed_position(
+                params,
+                untransformed_position,
+                untransformed_gradient,
+                transformed_position,
+                transformed_gradient,
+            )?;
+        Ok((logp, logdet))
     }
 
     fn init_from_untransformed_position(
         &mut self,
-        params: &Self::TransformParams,
+        params: &Py<PyAny>,
         untransformed_position: &[f64],
         untransformed_gradient: &mut [f64],
         transformed_position: &mut [f64],
         transformed_gradient: &mut [f64],
     ) -> std::result::Result<(f64, f64), Self::LogpError> {
-        Python::with_gil(|py| {
-            let untransformed_position = PyArray1::from_slice_bound(py, untransformed_position);
-
-            let output = params
-                .getattr(py, intern!(py, "init_from_untransformed_position"))?
-                .call1(py, (untransformed_position,))?;
-            let (
-                logp,
-                logdet,
-                untransformed_gradient_out,
-                transformed_position_out,
-                transformed_gradient_out,
-            ): (
-                f64,
-                f64,
-                PyReadonlyArray1<f64>,
-                PyReadonlyArray1<f64>,
-                PyReadonlyArray1<f64>,
-            ) = output.extract(py)?;
-
-            untransformed_gradient.copy_from_slice(untransformed_gradient_out.as_slice()?);
-            transformed_position.copy_from_slice(transformed_position_out.as_slice()?);
-            transformed_gradient.copy_from_slice(transformed_gradient_out.as_slice()?);
-            Ok((logp, logdet))
-        })
+        let (logp, logdet) = self
+            .transform_adapter
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?
+            .init_from_untransformed_position(
+                params,
+                untransformed_position,
+                untransformed_gradient,
+                transformed_position,
+                transformed_gradient,
+            )?;
+        Ok((logp, logdet))
     }
 
     fn update_transformation<'a, R: rand::Rng + ?Sized>(
@@ -291,70 +265,48 @@ impl CpuLogpFunc for PyDensity {
         rng: &mut R,
         untransformed_positions: impl ExactSizeIterator<Item = &'a [f64]>,
         untransformed_gradients: impl ExactSizeIterator<Item = &'a [f64]>,
-        params: &'a mut Self::TransformParams,
+        params: &'a mut Py<PyAny>,
     ) -> std::result::Result<(), Self::LogpError> {
-        Python::with_gil(|py| {
-            let positions = PyList::new_bound(
-                py,
-                untransformed_positions.map(|pos| PyArray1::from_slice_bound(py, pos)),
-            );
-            let gradients = PyList::new_bound(
-                py,
-                untransformed_gradients.map(|grad| PyArray1::from_slice_bound(py, grad)),
-            );
-
-            let seed = rng.next_u64();
-
-            params
-                .getattr(py, intern!(py, "update"))?
-                .call1(py, (seed, positions, gradients))?;
-            Ok(())
-        })
+        self.transform_adapter
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?
+            .update_transformation(
+                rng,
+                untransformed_positions,
+                untransformed_gradients,
+                params,
+            )?;
+        Ok(())
     }
 
     fn new_transformation<R: rand::Rng + ?Sized>(
         &mut self,
         rng: &mut R,
         untransformed_position: &[f64],
-        untransfogmed_gradient: &[f64],
+        untransformed_gradient: &[f64],
         chain: u64,
-    ) -> std::result::Result<Self::TransformParams, Self::LogpError> {
-        Python::with_gil(|py| {
-            let position = PyArray1::from_slice_bound(py, untransformed_position);
-            let gradient = PyArray1::from_slice_bound(py, untransfogmed_gradient);
-
-            let seed = rng.next_u64();
-
-            let transformer = self
-                .transform_adapter
-                .as_ref()
-                .ok_or_else(|| {
-                    PyLogpError::PyError(PyRuntimeError::new_err(
-                        "No transformation adapter specified",
-                    ))
-                })?
-                .call1(py, (seed, position, gradient, chain))?;
-
-            Ok(transformer)
-        })
+    ) -> std::result::Result<Py<PyAny>, Self::LogpError> {
+        let trafo = self
+            .transform_adapter
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?
+            .new_transformation(rng, untransformed_position, untransformed_gradient, chain)?;
+        Ok(trafo)
     }
 
-    fn transformation_id(
-        &self,
-        params: &Self::TransformParams,
-    ) -> std::result::Result<i64, Self::LogpError> {
-        Python::with_gil(|py| {
-            let id: i64 = params
-                .getattr(py, intern!(py, "transformation_id"))?
-                .extract(py)?;
-            Ok(id)
-        })
+    fn transformation_id(&self, params: &Py<PyAny>) -> std::result::Result<i64, Self::LogpError> {
+        let id = self
+            .transform_adapter
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?
+            .transformation_id(params)?;
+        Ok(id)
     }
 }
 
 pub struct PyTrace {
     expand: Py<PyAny>,
-    variables: Vec<PyVariable>,
+    variables: Arc<Vec<PyVariable>>,
     builder: StructBuilder,
 }
 
@@ -362,7 +314,7 @@ impl PyTrace {
     pub fn new<R: Rng + ?Sized>(
         rng: &mut R,
         chain: u64,
-        variables: Vec<PyVariable>,
+        variables: Arc<Vec<PyVariable>>,
         make_expand_func: &Py<PyAny>,
         capacity: usize,
     ) -> Result<Self> {
@@ -412,6 +364,7 @@ impl TensorShape {
 #[pymethods]
 impl TensorShape {
     #[new]
+    #[pyo3(signature = (shape, dims=None))]
     fn py_new(shape: Vec<usize>, dims: Option<Vec<Option<String>>>) -> Result<Self> {
         let dims = dims.unwrap_or(shape.iter().map(|_| None).collect());
         if dims.len() != shape.len() {
