@@ -10,7 +10,7 @@ import pandas as pd
 from numpy.typing import NDArray
 
 from nutpie import _lib
-from nutpie.sample import CompiledModel
+from nutpie.sampling import CompiledModel
 
 
 class _NumpyArrayEncoder(json.JSONEncoder):
