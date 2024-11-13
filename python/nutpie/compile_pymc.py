@@ -2,16 +2,18 @@ import dataclasses
 import itertools
 import warnings
 from dataclasses import dataclass
+from functools import wraps
 from importlib.util import find_spec
 from math import prod
-from typing import TYPE_CHECKING, Any, Literal, Optional
+from typing import TYPE_CHECKING, Any, Callable, Literal, Optional, Union
 
 import numpy as np
 import pandas as pd
 from numpy.typing import NDArray
+from pymc.initial_point import make_initial_point_fn
 
 from nutpie import _lib
-from nutpie.compiled_pyfunc import from_pyfunc
+from nutpie.compiled_pyfunc import SeedType, from_pyfunc
 from nutpie.sample import CompiledModel
 
 try:
@@ -25,6 +27,60 @@ except ImportError:
 if TYPE_CHECKING:
     import numba.core.ccallback
     import pymc as pm
+    from pytensor.tensor import TensorVariable, Variable
+
+
+def rv_dict_to_flat_array_wrapper(
+    fn: Callable[[SeedType], dict[str, np.ndarray]],
+    names: list[str],
+    shapes: list[tuple[int]],
+) -> Callable[[SeedType], np.ndarray]:
+    """
+    Wraps a function that returns a dictionary of string:array key:value pairs
+    and returns a single flat float64 array. Also checks that the shapes of
+    the arrays match the expected shapes.
+
+    Parameters
+    ----------
+    fn: Callable
+        Function that takes a seed and return a dictionary of variable names
+        to initial values. This function should be the output of
+        pymc.initial_point.make_initial_point_fn
+    names: list of str
+        List of random variable names in the model
+    shapes: list of tuple of int
+        Shape of random variables in the model
+
+    Returns
+    -------
+    seeded_array_fn: Callable
+        Function that takes a seed and returns a flat, contiguous float64
+        array of initial values. The ordering of the random variables inside
+        the array is controlled by the ``names`` parameter.
+    """
+
+    @wraps(fn)
+    def seeded_array_fn(seed: SeedType = None):
+        initial_value_dict = fn(seed)
+        total_size = sum(np.prod(shape).astype(int) for shape in shapes)
+        flat_array = np.empty(total_size, dtype="float64", order="C")
+        cursor = 0
+
+        for name, shape in zip(names, shapes, strict=True):
+            initial_value = initial_value_dict[name]
+            n = int(np.prod(initial_value.shape))
+            if initial_value.shape != shape:
+                raise ValueError(
+                    f"Size of initial value for {name} is {initial_value.shape}, "
+                    f"expected {shape}"
+                )
+
+            flat_array[cursor : cursor + n] = initial_value.ravel().astype("float64")
+            cursor += n
+
+        return flat_array
+
+    return seeded_array_fn
 
 
 @intrinsic
@@ -44,6 +100,7 @@ def address_as_void_pointer(typingctx, src):
 class CompiledPyMCModel(CompiledModel):
     compiled_logp_func: "numba.core.ccallback.CFunc"
     compiled_expand_func: "numba.core.ccallback.CFunc"
+    initial_point_func: Callable[[SeedType], np.ndarray]
     shared_data: dict[str, NDArray]
     user_data: NDArray
     n_expanded: int
@@ -113,14 +170,15 @@ class CompiledPyMCModel(CompiledModel):
         )
 
         var_sizes = [prod(shape) for shape in self.shape_info[2]]
+        var_names = self.shape_info[0]
 
         return _lib.PyMcModel(
             self.n_dim,
             logp_fn,
             expand_fn,
+            self.initial_point_func,
             var_sizes,
-            self.shape_info[0],
-            init_mean,
+            var_names,
         )
 
 
@@ -157,7 +215,11 @@ def make_user_data(shared_vars, shared_data):
     return user_data
 
 
-def _compile_pymc_model_numba(model: "pm.Model", **kwargs) -> CompiledPyMCModel:
+def _compile_pymc_model_numba(
+    model: "pm.Model",
+    pymc_initial_point_fn: Callable[[SeedType], dict[str, np.ndarray]],
+    **kwargs,
+) -> CompiledPyMCModel:
     if find_spec("numba") is None:
         raise ImportError(
             "Numba is not installed in the current environment. "
@@ -172,8 +234,15 @@ def _compile_pymc_model_numba(model: "pm.Model", **kwargs) -> CompiledPyMCModel:
         n_expanded,
         logp_fn_pt,
         expand_fn_pt,
+        initial_point_fn,
         shape_info,
-    ) = _make_functions(model, mode="NUMBA", compute_grad=True, join_expanded=True)
+    ) = _make_functions(
+        model,
+        mode="NUMBA",
+        compute_grad=True,
+        join_expanded=True,
+        pymc_initial_point_fn=pymc_initial_point_fn,
+    )
 
     expand_fn = expand_fn_pt.vm.jit_fn
     logp_fn = logp_fn_pt.vm.jit_fn
@@ -228,6 +297,7 @@ def _compile_pymc_model_numba(model: "pm.Model", **kwargs) -> CompiledPyMCModel:
         _shapes={name: tuple(shape) for name, _, shape in zip(*shape_info)},
         compiled_logp_func=logp_numba,
         compiled_expand_func=expand_numba,
+        initial_point_func=initial_point_fn,
         shared_data=shared_data,
         user_data=user_data,
         n_expanded=n_expanded,
@@ -262,7 +332,13 @@ def _prepare_dims_and_coords(model, shape_info):
     return dims, coords
 
 
-def _compile_pymc_model_jax(model, *, gradient_backend=None, **kwargs):
+def _compile_pymc_model_jax(
+    model,
+    *,
+    gradient_backend=None,
+    pymc_initial_point_fn: Callable[[SeedType], dict[str, np.ndarray]],
+    **kwargs,
+):
     if find_spec("jax") is None:
         raise ImportError(
             "Jax is not installed in the current environment. "
@@ -282,12 +358,14 @@ def _compile_pymc_model_jax(model, *, gradient_backend=None, **kwargs):
         _,
         logp_fn_pt,
         expand_fn_pt,
+        initial_point_fn,
         shape_info,
     ) = _make_functions(
         model,
         mode="JAX",
         compute_grad=gradient_backend == "pytensor",
         join_expanded=False,
+        pymc_initial_point_fn=pymc_initial_point_fn,
     )
 
     logp_fn = logp_fn_pt.vm.jit_fn
@@ -339,12 +417,13 @@ def _compile_pymc_model_jax(model, *, gradient_backend=None, **kwargs):
     dims, coords = _prepare_dims_and_coords(model, shape_info)
 
     return from_pyfunc(
-        n_dim,
-        make_logp_func,
-        make_expand_func,
-        dtypes,
-        shapes,
-        names,
+        ndim=n_dim,
+        make_logp_fn=make_logp_func,
+        make_expand_fn=make_expand_func,
+        make_initial_point_fn=initial_point_fn,
+        expanded_dtypes=dtypes,
+        expanded_shapes=shapes,
+        expanded_names=names,
         shared_data=shared_data,
         dims=dims,
         coords=coords,
@@ -356,6 +435,9 @@ def compile_pymc_model(
     *,
     backend: Literal["numba", "jax"] = "numba",
     gradient_backend: Literal["pytensor", "jax"] = "pytensor",
+    overrides: dict[Union["Variable", str], np.ndarray | float | int] | None = None,
+    jitter_rvs: set["TensorVariable"] | None = None,
+    default_strategy: Literal["support_point", "prior"] = "prior",
     **kwargs,
 ) -> CompiledModel:
     """Compile necessary functions for sampling a pymc model.
@@ -367,9 +449,18 @@ def compile_pymc_model(
     backend : ["jax", "numba"]
         The pytensor backend that is used to compile the logp function.
     gradient_backend: ["pytensor", "jax"]
-        Which library is used to compute the gradients. This can only be
-        changed to "jax" if the jax backend is used.
-
+        Which library is used to compute the gradients. This can only be changed
+        to "jax" if the jax backend is used.
+    jitter_rvs : set
+        The set (or list or tuple) of random variables for which a U(-1, +1)
+        jitter should be added to the initial value. Only available for
+        variables that have a transform or real-valued support.
+    default_strategy : str
+        Which of { "support_point", "prior" } to prefer if the initval setting
+        for an RV is None.
+    overrides : dict
+        Initial value (strategies) to use instead of what's specified in
+        `Model.initial_values`.
     Returns
     -------
     compiled_model : CompiledPyMCModel
@@ -384,13 +475,29 @@ def compile_pymc_model(
             "and restart your kernel in case you are in an interactive session."
         )
 
+    if default_strategy == "support_point" and jitter_rvs is None:
+        jitter_rvs = set(model.free_RVs)
+
+    initial_point_fn = make_initial_point_fn(
+        model=model,
+        overrides=overrides,
+        default_strategy=default_strategy,
+        jitter_rvs=jitter_rvs,
+        return_transformed=True,
+    )
+
     if backend.lower() == "numba":
         if gradient_backend == "jax":
             raise ValueError("Gradient backend cannot be jax when using numba backend")
-        return _compile_pymc_model_numba(model, **kwargs)
+        return _compile_pymc_model_numba(
+            model=model, pymc_initial_point_fn=initial_point_fn, **kwargs
+        )
     elif backend.lower() == "jax":
         return _compile_pymc_model_jax(
-            model, gradient_backend=gradient_backend, **kwargs
+            model=model,
+            gradient_backend=gradient_backend,
+            pymc_initial_point_fn=initial_point_fn,
+            **kwargs,
         )
     else:
         raise ValueError(f"Backend must be one of numba and jax. Got {backend}")
@@ -425,9 +532,64 @@ def _compute_shapes(model):
     return dict(zip(trace_vars.keys(), shape_func()))
 
 
-def _make_functions(model, *, mode, compute_grad, join_expanded):
+def _make_functions(
+    model: "pm.Model",
+    *,
+    mode: Literal["JAX", "NUMBA"],
+    compute_grad: bool,
+    join_expanded: bool,
+    pymc_initial_point_fn: Callable[[SeedType], dict[str, np.ndarray]],
+) -> tuple[
+    int,
+    int,
+    Callable,
+    Callable,
+    Callable,
+    tuple[list[str], list[slice], list[tuple[int, ...]]],
+]:
+    """
+    Compile functions required by nuts-rs from a given PyMC model.
+
+    Parameters
+    ----------
+    model: pymc.Model
+        The model to compile
+    mode: str
+        Pytensor compile mode. One of "NUMBA" or "JAX"
+    compute_grad: bool
+        Whether to compute gradients using pytensor. Must be True if mode is
+        "NUMBA", otherwise False implies Jax will be used to compute gradients
+    join_expanded: bool
+        Whether to join the expanded variables into a single array. If False,
+        the expanded variables will be returned as a list of arrays.
+    pymc_initial_point_fn: Callable
+        Initial point function created by
+        pymc.initial_point.make_initial_point_fn
+
+    Returns
+    -------
+    num_free_vars: int
+        Number of free (root) random variables in the model
+    num_expanded: int
+        Total number of all random variables (root and dependent) in the model
+    logp_fn_pt: Callable
+        Compiled pytensor log probability function. If compute_grad is True, the
+        function will return both the logp and the gradient, otherwise only the
+        logp is returned.
+    expand_fn_pt: Callable
+        Compiled pytensor function that computes the remaining variables for the
+        trace
+    initial_point_fn: Callable
+        Python function that takes a random seed and returns a flat array of
+        initial values
+    param_data: tuple of lists
+        Tuple containing data necessary to unravel a flat array of model
+        variables back into a ragged list of arrays. The first list contains the
+        names of the variables, the second list contains the slices that
+        correspond to the variables in the flat array, and the third list
+        contains the shapes of the variables.
+    """
     import pytensor
-    import pytensor.link.numba.dispatch
     import pytensor.tensor as pt
     from pymc.pytensorf import compile_pymc
 
@@ -470,6 +632,10 @@ def _make_functions(model, *, mode, compute_grad, join_expanded):
         splits.append(length)
 
     num_free_vars = count
+
+    initial_point_fn = rv_dict_to_flat_array_wrapper(
+        pymc_initial_point_fn, names=joined_names, shapes=joined_shapes
+    )
 
     joined = pt.TensorType("float64", shape=(num_free_vars,))(
         name="_unconstrained_point"
@@ -537,6 +703,7 @@ def _make_functions(model, *, mode, compute_grad, join_expanded):
         num_expanded,
         logp_fn_pt,
         expand_fn_pt,
+        initial_point_fn,
         (all_names, all_slices, all_shapes),
     )
 

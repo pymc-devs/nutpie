@@ -16,7 +16,7 @@ use pyo3::{
     Bound, Py, PyAny, PyErr, Python,
 };
 use rand::Rng;
-use rand_distr::{Distribution, StandardNormal};
+use rand_distr::{Distribution, StandardNormal, Uniform};
 use smallvec::SmallVec;
 use thiserror::Error;
 
@@ -73,6 +73,7 @@ impl PyVariable {
 pub struct PyModel {
     make_logp_func: Py<PyAny>,
     make_expand_func: Py<PyAny>,
+    init_point_func: Option<Py<PyAny>>,
     variables: Vec<PyVariable>,
     ndim: usize,
 }
@@ -85,10 +86,12 @@ impl PyModel {
         make_expand_func: Py<PyAny>,
         variables: Vec<PyVariable>,
         ndim: usize,
+        init_point_func: Option<Py<PyAny>>,
     ) -> Self {
         Self {
             make_logp_func,
             make_expand_func,
+            init_point_func,
             variables,
             ndim,
         }
@@ -437,11 +440,13 @@ impl DrawStorage for PyTrace {
 }
 
 impl Model for PyModel {
-    type Math<'model> = CpuMath<PyDensity>
+    type Math<'model>
+        = CpuMath<PyDensity>
     where
         Self: 'model;
 
-    type DrawStorage<'model, S: nuts_rs::Settings> = PyTrace
+    type DrawStorage<'model, S: nuts_rs::Settings>
+        = PyTrace
     where
         Self: 'model;
 
@@ -474,10 +479,34 @@ impl Model for PyModel {
         rng: &mut R,
         position: &mut [f64],
     ) -> Result<()> {
-        let dist = StandardNormal;
-        dist.sample_iter(rng)
-            .zip(position.iter_mut())
-            .for_each(|(val, pos)| *pos = val);
+        let Some(init_func) = self.init_point_func.as_ref() else {
+            let dist = Uniform::new(-2f64, 2f64);
+            position.iter_mut().for_each(|x| *x = dist.sample(rng));
+            return Ok(());
+        };
+
+        let seed = rng.next_u64();
+
+        Python::with_gil(|py| {
+            let init_point = init_func
+                .call1(py, (seed,))
+                .context("Failed to initialize point")?;
+
+            let init_point: PyReadonlyArray1<f64> = init_point
+                .extract(py)
+                .context("Initializition array returned incorrect argument")?;
+
+            let init_point = init_point
+                .as_slice()
+                .context("Initial point must be contiguous")?;
+
+            if init_point.len() != position.len() {
+                bail!("Initial point has incorrect length");
+            }
+
+            position.copy_from_slice(init_point);
+            Ok(())
+        })?;
         Ok(())
     }
 }
