@@ -1,6 +1,6 @@
 use std::{ffi::c_void, fmt::Display, sync::Arc};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use arrow::{
     array::{Array, FixedSizeListArray, Float64Array, StructArray},
     datatypes::{DataType, Field, Fields},
@@ -11,7 +11,7 @@ use nuts_rs::{CpuLogpFunc, CpuMath, DrawStorage, LogpError, Model, Settings};
 use pyo3::{
     pyclass, pymethods,
     types::{PyAnyMethods, PyList},
-    Bound, PyObject, PyResult,
+    Bound, Py, PyAny, PyObject, PyResult, Python,
 };
 use rand::{distributions::Uniform, prelude::Distribution};
 
@@ -231,7 +231,7 @@ pub(crate) struct PyMcModel {
     dim: usize,
     density: LogpFunc,
     expand: ExpandFunc,
-    mu: Box<[f64]>,
+    init_func: Py<PyAny>,
     var_sizes: Vec<usize>,
     var_names: Vec<String>,
 }
@@ -243,15 +243,15 @@ impl PyMcModel {
         dim: usize,
         density: LogpFunc,
         expand: ExpandFunc,
+        init_func: Py<PyAny>,
         var_sizes: &Bound<'py, PyList>,
         var_names: &Bound<'py, PyList>,
-        start_point: PyReadonlyArray1<'py, f64>,
     ) -> PyResult<Self> {
         Ok(Self {
             dim,
             density,
             expand,
-            mu: start_point.as_slice()?.into(),
+            init_func,
             var_names: var_names.extract()?,
             var_sizes: var_sizes.extract()?,
         })
@@ -292,11 +292,29 @@ impl Model for PyMcModel {
         rng: &mut R,
         position: &mut [f64],
     ) -> Result<()> {
-        let dist = Uniform::new(-2f64, 2f64);
-        position
-            .iter_mut()
-            .zip_eq(self.mu.iter())
-            .for_each(|(x, mu)| *x = dist.sample(rng) + mu);
+        let seed = rng.next_u64();
+
+        Python::with_gil(|py| {
+            let init_point = self
+                .init_func
+                .call1(py, (seed,))
+                .context("Failed to initialize point")?;
+
+            let init_point: PyReadonlyArray1<f64> = init_point
+                .extract(py)
+                .context("Initializition array returned incorrect argument")?;
+
+            let init_point = init_point
+                .as_slice()
+                .context("Initial point must be contiguous")?;
+
+            if init_point.len() != position.len() {
+                bail!("Initial point has incorrect length");
+            }
+
+            position.copy_from_slice(init_point);
+            Ok(())
+        })?;
         Ok(())
     }
 
