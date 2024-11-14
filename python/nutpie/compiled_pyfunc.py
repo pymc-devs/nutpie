@@ -82,9 +82,8 @@ class PyFuncModel(CompiledModel):
             make_expand_func,
             self._variables,
             self.n_dim,
-            self._make_initial_points,
-            make_transform_adapter,
-            make_adapter,
+            init_point_func=self._make_initial_points,
+            transform_adapter=make_adapter,
         )
 
 

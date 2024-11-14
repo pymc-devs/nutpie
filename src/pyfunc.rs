@@ -17,7 +17,7 @@ use pyo3::{
     Bound, Py, PyAny, PyErr, Python,
 };
 use rand::Rng;
-use rand_distr::{Distribution, StandardNormal, Uniform};
+use rand_distr::{Distribution, Uniform};
 use smallvec::SmallVec;
 use thiserror::Error;
 
@@ -76,7 +76,7 @@ impl PyVariable {
 pub struct PyModel {
     make_logp_func: Arc<Py<PyAny>>,
     make_expand_func: Arc<Py<PyAny>>,
-    init_point_func: Arc<Option<Py<PyAny>>>,
+    init_point_func: Option<Arc<Py<PyAny>>>,
     variables: Arc<Vec<PyVariable>>,
     transform_adapter: Option<PyTransformAdapt>,
     ndim: usize,
@@ -85,7 +85,7 @@ pub struct PyModel {
 #[pymethods]
 impl PyModel {
     #[new]
-    #[pyo3(signature = (make_logp_func, make_expand_func, variables, ndim, transform_adapter=None))]
+    #[pyo3(signature = (make_logp_func, make_expand_func, variables, ndim, *, init_point_func=None, transform_adapter=None))]
     fn new<'py>(
         make_logp_func: Py<PyAny>,
         make_expand_func: Py<PyAny>,
@@ -97,7 +97,7 @@ impl PyModel {
         Self {
             make_logp_func: Arc::new(make_logp_func),
             make_expand_func: Arc::new(make_expand_func),
-            init_point_func: Arc::new(init_point_func),
+            init_point_func: init_point_func.map(|x| x.into()),
             variables: Arc::new(variables),
             ndim,
             transform_adapter: transform_adapter.map(PyTransformAdapt::new),

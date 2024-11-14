@@ -13,7 +13,6 @@ use pyo3::{
     types::{PyAnyMethods, PyList},
     Bound, Py, PyAny, PyObject, PyResult, Python,
 };
-use rand::{distributions::Uniform, prelude::Distribution};
 
 use thiserror::Error;
 
@@ -232,7 +231,7 @@ pub(crate) struct PyMcModel {
     dim: usize,
     density: LogpFunc,
     expand: ExpandFunc,
-    init_func: Py<PyAny>,
+    init_func: Arc<Py<PyAny>>,
     var_sizes: Vec<usize>,
     var_names: Vec<String>,
 }
@@ -252,7 +251,7 @@ impl PyMcModel {
             dim,
             density,
             expand,
-            init_func,
+            init_func: init_func.into(),
             var_names: var_names.extract()?,
             var_sizes: var_sizes.extract()?,
         })
