@@ -2,8 +2,8 @@
 name = "nutpie"
 version = "0.14.0"
 authors = [
-    "Adrian Seyboldt <adrian.seyboldt@gmail.com>",
-    "PyMC Developers <pymc.devs@gmail.com>",
+  "Adrian Seyboldt <adrian.seyboldt@gmail.com>",
+  "PyMC Developers <pymc.devs@gmail.com>",
 ]
 edition = "2021"
 license = "MIT"
@@ -25,7 +25,7 @@ crate-type = ["cdylib"]
 nuts-rs = "0.13.0"
 numpy = "0.22.0"
 rand = "0.8.5"
-thiserror = "1.0.44"
+thiserror = "2.0.3"
 rand_chacha = "0.3.1"
 rayon = "1.10.0"
 # Keep arrow in sync with nuts-rs requirements
