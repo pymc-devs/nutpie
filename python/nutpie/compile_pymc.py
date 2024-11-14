@@ -435,9 +435,12 @@ def compile_pymc_model(
     *,
     backend: Literal["numba", "jax"] = "numba",
     gradient_backend: Literal["pytensor", "jax"] = "pytensor",
-    overrides: dict[Union["Variable", str], np.ndarray | float | int] | None = None,
+    initial_points: dict[Union["Variable", str], np.ndarray | float | int]
+    | None = None,
     jitter_rvs: set["TensorVariable"] | None = None,
-    default_strategy: Literal["support_point", "prior"] = "prior",
+    default_initialization_strategy: Literal[
+        "support_point", "prior"
+    ] = "support_point",
     **kwargs,
 ) -> CompiledModel:
     """Compile necessary functions for sampling a pymc model.
@@ -455,10 +458,10 @@ def compile_pymc_model(
         The set (or list or tuple) of random variables for which a U(-1, +1)
         jitter should be added to the initial value. Only available for
         variables that have a transform or real-valued support.
-    default_strategy : str
+    default_initialization_strategy : str
         Which of { "support_point", "prior" } to prefer if the initval setting
         for an RV is None.
-    overrides : dict
+    initial_points : dict
         Initial value (strategies) to use instead of what's specified in
         `Model.initial_values`.
     Returns
@@ -475,13 +478,13 @@ def compile_pymc_model(
             "and restart your kernel in case you are in an interactive session."
         )
 
-    if default_strategy == "support_point" and jitter_rvs is None:
+    if default_initialization_strategy == "support_point" and jitter_rvs is None:
         jitter_rvs = set(model.free_RVs)
 
     initial_point_fn = make_initial_point_fn(
         model=model,
-        overrides=overrides,
-        default_strategy=default_strategy,
+        overrides=initial_points,
+        default_strategy=default_initialization_strategy,
         jitter_rvs=jitter_rvs,
         return_transformed=True,
     )

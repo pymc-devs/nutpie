@@ -8,14 +8,14 @@ import numpy as np
 from nutpie import _lib
 from nutpie.sample import CompiledModel
 
-SeedType = int | float | np.random.Generator | None
+SeedType = int
 
 
 @dataclass(frozen=True)
 class PyFuncModel(CompiledModel):
     _make_logp_func: Callable
     _make_expand_func: Callable
-    _make_initial_points: Callable[[SeedType], np.ndarray]
+    _make_initial_points: Callable[[SeedType], np.ndarray] | None
     _shared_data: dict[str, Any]
     _n_dim: int
     _variables: list[_lib.PyVariable]
@@ -73,7 +73,6 @@ def from_pyfunc(
     ndim: int,
     make_logp_fn: Callable,
     make_expand_fn: Callable,
-    make_initial_point_fn: Callable[[SeedType], np.ndarray],
     expanded_dtypes: list[np.dtype],
     expanded_shapes: list[tuple[int, ...]],
     expanded_names: list[str],
@@ -81,6 +80,7 @@ def from_pyfunc(
     coords: dict[str, Any] | None = None,
     dims: dict[str, tuple[str, ...]] | None = None,
     shared_data: dict[str, Any] | None = None,
+    make_initial_point_fn: Callable[[SeedType], np.ndarray] | None,
 ):
     variables = []
     for name, shape, dtype in zip(
