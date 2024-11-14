@@ -12,18 +12,18 @@ def make_transform_adapter(
     untransformed_dim=None,
     zero_init=True,
 ):
-    import jax
-    import equinox as eqx
-    import jax.numpy as jnp
-    import flowjax
-    import flowjax.train
-    import flowjax.flows
-    import optax
     import traceback
-    from paramax import Parameterize, unwrap
     from functools import partial
 
+    import equinox as eqx
+    import flowjax
+    import flowjax.flows
+    import flowjax.train
+    import jax
+    import jax.numpy as jnp
     import numpy as np
+    import optax
+    from paramax import Parameterize, unwrap
 
     class FisherLoss:
         @eqx.filter_jit
@@ -363,7 +363,7 @@ def make_transform_adapter(
                 else:
                     base = self._bijection
 
-                # make_flow might still only return a single trafo if the for 1d problems
+                # make_flow might still only return a single trafo for 1d problems
                 if len(base.bijections) == 1:
                     self._bijection = base
                     return
@@ -436,6 +436,7 @@ def make_transform_adapter(
             except Exception as e:
                 print("update error:", e)
                 print(traceback.format_exc())
+                raise
 
         def init_from_transformed_position(self, transformed_position):
             try:

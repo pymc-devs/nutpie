@@ -380,7 +380,7 @@ def _compile_pymc_model_jax(
         def logp_fn_jax_grad(x, *shared):
             return jax.value_and_grad(lambda x: orig_logp_fn(x, *shared)[0])(x)
 
-        static_argnums = list(range(1, len(logp_shared_names) + 1))
+        # static_argnums = list(range(1, len(logp_shared_names) + 1))
         logp_fn_jax_grad = jax.jit(
             logp_fn_jax_grad,
             # static_argnums=static_argnums,

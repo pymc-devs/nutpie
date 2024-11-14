@@ -1,10 +1,10 @@
-from functools import partial
 import json
 import tempfile
 from dataclasses import dataclass, replace
+from functools import partial
 from importlib.util import find_spec
 from pathlib import Path
-from typing import Any, Optional, Callable
+from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
