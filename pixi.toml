@@ -17,8 +17,18 @@ numba = ">=0.60.0,<0.61"
 pytest = ">=8.3.3,<9"
 maturin = ">=1.7.4,<2"
 pip = ">=24.3.1,<25"
-jax = ">=0.4.34,<0.5"
+#jax = ">=0.4.34,<0.5"
+ipykernel = ">=6.29.5,<7"
+seaborn = ">=0.13.2,<0.14"
+threadpoolctl = ">=3.5.0,<4"
+# The jaxlib cuda build seems to be broken around version 0.4.34
+#jaxlib = { version = "*", build = "*cuda12*" }
 
 [pypi-dependencies]
 bridgestan = ">=2.5.0, <3"
 flowjax = { git = "https://github.com/aseyboldt/flowjax.git", rev = "1c282f2ded78e81c7ce6a96f61523a9f18bf8edc" }
+posteriordb = ">=0.2.0, <0.3"
+jax = { version = "==0.4.35", extras = ["cuda12"] }
+
+[system-requirements]
+#cuda = "12"

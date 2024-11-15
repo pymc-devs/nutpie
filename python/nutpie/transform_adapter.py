@@ -11,6 +11,7 @@ def make_transform_adapter(
     scale_layer=False,
     untransformed_dim=None,
     zero_init=True,
+    batch_size=128,
 ):
     import traceback
     from functools import partial
@@ -271,6 +272,7 @@ def make_transform_adapter(
             learning_rate=1e-3,
             zero_init=True,
             untransformed_dim=None,
+            batch_size=128,
         ):
             self._logp_fn = logp_fn
             self._make_flow_fn = make_flow_fn
@@ -283,6 +285,7 @@ def make_transform_adapter(
             self._num_diag_windows = num_diag_windows
             self._zero_init = zero_init
             self._untransformed_dim = untransformed_dim
+            self._batch_size = batch_size
             try:
                 self._bijection = make_flow_fn(seed, [position], [gradient], n_layers=0)
             except Exception as e:
@@ -375,7 +378,7 @@ def make_transform_adapter(
                     points,
                     show_progress=self._show_progress,
                     optimizer=self._optimizer,
-                    batch_size=128,
+                    batch_size=self._batch_size,
                 )
 
                 flow = flowjax.flows.Transformed(
@@ -526,4 +529,5 @@ def make_transform_adapter(
         learning_rate=learning_rate,
         zero_init=zero_init,
         untransformed_dim=untransformed_dim,
+        batch_size=batch_size,
     )
