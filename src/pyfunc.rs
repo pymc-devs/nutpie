@@ -124,7 +124,7 @@ impl LogpError for PyLogpError {
         match self {
             Self::BadLogp(_) => true,
             Self::PyError(err) => Python::with_gil(|py| {
-                let Ok(attr) = err.value_bound(py).getattr("is_recoverable") else {
+                let Ok(attr) = err.value(py).getattr("is_recoverable") else {
                     return false;
                 };
                 return attr
@@ -166,7 +166,7 @@ impl CpuLogpFunc for PyDensity {
 
     fn logp(&mut self, position: &[f64], grad: &mut [f64]) -> Result<f64, Self::LogpError> {
         Python::with_gil(|py| {
-            let pos_array = PyArray1::from_slice_bound(py, position);
+            let pos_array = PyArray1::from_slice(py, position);
             let result = self.logp.call1(py, (pos_array,));
             match result {
                 Ok(val) => {
@@ -451,7 +451,7 @@ impl ExpandDtype {
 impl DrawStorage for PyTrace {
     fn append_value(&mut self, point: &[f64]) -> Result<()> {
         Python::with_gil(|py| {
-            let point = PyArray1::from_slice_bound(py, point);
+            let point = PyArray1::from_slice(py, point);
             let full_point = self
                 .expand
                 .call1(py, (point,))

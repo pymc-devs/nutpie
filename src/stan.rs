@@ -56,8 +56,8 @@ impl StanVariable {
     }
 
     #[getter]
-    fn shape<'py>(&self, py: Python<'py>) -> Bound<'py, PyTuple> {
-        PyTuple::new_bound(py, self.0.shape.iter())
+    fn shape<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        PyTuple::new(py, self.0.shape.iter())
     }
 
     #[getter]
@@ -165,11 +165,16 @@ impl StanModel {
     }
 
     pub fn variables<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let out = PyDict::new_bound(py);
+        let out = PyDict::new(py);
         let results: Result<Vec<_>, _> = self
             .variables
             .iter()
-            .map(|var| out.set_item(var.name.clone(), StanVariable(var.clone()).into_py(py)))
+            .map(|var| {
+                out.set_item(
+                    var.name.clone(),
+                    StanVariable(var.clone()).into_pyobject(py)?,
+                )
+            })
             .collect();
         results?;
         Ok(out)

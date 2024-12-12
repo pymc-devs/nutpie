@@ -1,6 +1,7 @@
 use std::{
     fmt::Debug,
-    sync::Arc,
+    ops::{Deref, DerefMut},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -703,7 +704,7 @@ impl ProgressType {
 }
 
 #[pyclass]
-struct PySampler(SamplerState);
+struct PySampler(Mutex<SamplerState>);
 
 #[pymethods]
 impl PySampler {
@@ -718,15 +719,15 @@ impl PySampler {
         match settings.inner {
             Settings::LowRank(settings) => {
                 let sampler = Sampler::new(model, settings, cores, callback)?;
-                Ok(PySampler(SamplerState::Running(sampler)))
+                Ok(PySampler(SamplerState::Running(sampler).into()))
             }
             Settings::Diag(settings) => {
                 let sampler = Sampler::new(model, settings, cores, callback)?;
-                Ok(PySampler(SamplerState::Running(sampler)))
+                Ok(PySampler(SamplerState::Running(sampler).into()))
             }
             Settings::Transforming(settings) => {
                 let sampler = Sampler::new(model, settings, cores, callback)?;
-                Ok(PySampler(SamplerState::Running(sampler)))
+                Ok(PySampler(SamplerState::Running(sampler).into()))
             }
         }
     }
@@ -742,15 +743,15 @@ impl PySampler {
         match settings.inner {
             Settings::LowRank(settings) => {
                 let sampler = Sampler::new(model, settings, cores, callback)?;
-                Ok(PySampler(SamplerState::Running(sampler)))
+                Ok(PySampler(SamplerState::Running(sampler).into()))
             }
             Settings::Diag(settings) => {
                 let sampler = Sampler::new(model, settings, cores, callback)?;
-                Ok(PySampler(SamplerState::Running(sampler)))
+                Ok(PySampler(SamplerState::Running(sampler).into()))
             }
             Settings::Transforming(settings) => {
                 let sampler = Sampler::new(model, settings, cores, callback)?;
-                Ok(PySampler(SamplerState::Running(sampler)))
+                Ok(PySampler(SamplerState::Running(sampler).into()))
             }
         }
     }
@@ -766,39 +767,42 @@ impl PySampler {
         match settings.inner {
             Settings::LowRank(settings) => {
                 let sampler = Sampler::new(model, settings, cores, callback)?;
-                Ok(PySampler(SamplerState::Running(sampler)))
+                Ok(PySampler(SamplerState::Running(sampler).into()))
             }
             Settings::Diag(settings) => {
                 let sampler = Sampler::new(model, settings, cores, callback)?;
-                Ok(PySampler(SamplerState::Running(sampler)))
+                Ok(PySampler(SamplerState::Running(sampler).into()))
             }
             Settings::Transforming(settings) => {
                 let sampler = Sampler::new(model, settings, cores, callback)?;
-                Ok(PySampler(SamplerState::Running(sampler)))
+                Ok(PySampler(SamplerState::Running(sampler).into()))
             }
         }
     }
 
     fn is_finished(&mut self, py: Python<'_>) -> PyResult<bool> {
         py.allow_threads(|| {
-            let state = std::mem::replace(&mut self.0, SamplerState::Empty);
+            let guard = &mut self.0.lock().expect("Poisond sampler state mutex");
+            let slot = guard.deref_mut();
+
+            let state = std::mem::replace(slot, SamplerState::Empty);
 
             let SamplerState::Running(sampler) = state else {
-                let _ = std::mem::replace(&mut self.0, state);
+                let _ = std::mem::replace(slot, state);
                 return Ok(true);
             };
 
             match sampler.wait_timeout(Duration::from_millis(1)) {
                 SamplerWaitResult::Trace(trace) => {
-                    let _ = std::mem::replace(&mut self.0, SamplerState::Finished(Some(trace)));
+                    let _ = std::mem::replace(slot, SamplerState::Finished(Some(trace)));
                     Ok(true)
                 }
                 SamplerWaitResult::Timeout(sampler) => {
-                    let _ = std::mem::replace(&mut self.0, SamplerState::Running(sampler));
+                    let _ = std::mem::replace(slot, SamplerState::Running(sampler));
                     Ok(false)
                 }
                 SamplerWaitResult::Err(err, trace) => {
-                    let _ = std::mem::replace(&mut self.0, SamplerState::Finished(trace));
+                    let _ = std::mem::replace(slot, SamplerState::Finished(trace));
                     Err(err.into())
                 }
             }
@@ -807,7 +811,12 @@ impl PySampler {
 
     fn pause(&mut self, py: Python<'_>) -> PyResult<()> {
         py.allow_threads(|| {
-            if let SamplerState::Running(ref mut control) = self.0 {
+            if let SamplerState::Running(ref mut control) = self
+                .0
+                .lock()
+                .expect("Poised sampler state mutex")
+                .deref_mut()
+            {
                 control.pause()?
             }
             Ok(())
@@ -816,7 +825,12 @@ impl PySampler {
 
     fn resume(&mut self, py: Python<'_>) -> PyResult<()> {
         py.allow_threads(|| {
-            if let SamplerState::Running(ref mut control) = self.0 {
+            if let SamplerState::Running(ref mut control) = self
+                .0
+                .lock()
+                .expect("Poisond sampler state mutex")
+                .deref_mut()
+            {
                 control.resume()?
             }
             Ok(())
@@ -826,15 +840,18 @@ impl PySampler {
     #[pyo3(signature = (timeout_seconds=None))]
     fn wait(&mut self, py: Python<'_>, timeout_seconds: Option<f64>) -> PyResult<()> {
         py.allow_threads(|| {
+            let guard = &mut self.0.lock().expect("Poisond sampler state mutex");
+            let slot = guard.deref_mut();
+
             let timeout = match timeout_seconds {
                 Some(val) => Some(Duration::try_from_secs_f64(val).context("Invalid timeout")?),
                 None => None,
             };
 
-            let state = std::mem::replace(&mut self.0, SamplerState::Empty);
+            let state = std::mem::replace(slot, SamplerState::Empty);
 
             let SamplerState::Running(mut control) = state else {
-                let _ = std::mem::replace(&mut self.0, state);
+                let _ = std::mem::replace(slot, state);
                 return Ok(());
             };
 
@@ -875,32 +892,38 @@ impl PySampler {
                 }
             };
 
-            let _ = std::mem::replace(&mut self.0, final_state);
+            let _ = std::mem::replace(slot, final_state);
             retval
         })
     }
 
     fn abort(&mut self, py: Python<'_>) -> PyResult<()> {
         py.allow_threads(|| {
-            let state = std::mem::replace(&mut self.0, SamplerState::Empty);
+            let guard = &mut self.0.lock().expect("Poisond sampler state mutex");
+            let slot = guard.deref_mut();
+
+            let state = std::mem::replace(slot, SamplerState::Empty);
 
             let SamplerState::Running(control) = state else {
-                let _ = std::mem::replace(&mut self.0, state);
+                let _ = std::mem::replace(slot, state);
                 return Ok(());
             };
 
             let (result, trace) = control.abort();
-            let _ = std::mem::replace(&mut self.0, SamplerState::Finished(trace));
+            let _ = std::mem::replace(slot, SamplerState::Finished(trace));
             result?;
             Ok(())
         })
     }
 
     fn extract_results<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        let state = std::mem::replace(&mut self.0, SamplerState::Empty);
+        let guard = &mut self.0.lock().expect("Poisond sampler state mutex");
+        let slot = guard.deref_mut();
+
+        let state = std::mem::replace(slot, SamplerState::Empty);
 
         let SamplerState::Finished(trace) = state else {
-            let _ = std::mem::replace(&mut self.0, state);
+            let _ = std::mem::replace(slot, state);
             return Err(anyhow::anyhow!("Sampler is not finished"))?;
         };
 
@@ -914,7 +937,7 @@ impl PySampler {
     }
 
     fn is_empty(&self) -> bool {
-        match self.0 {
+        match self.0.lock().expect("Poisoned sampler state lock").deref() {
             SamplerState::Running(_) => false,
             SamplerState::Finished(_) => false,
             SamplerState::Empty => true,
@@ -923,7 +946,8 @@ impl PySampler {
 
     fn inspect<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let trace = py.allow_threads(|| {
-            let SamplerState::Running(ref mut sampler) = self.0 else {
+            let mut guard = self.0.lock().unwrap();
+            let SamplerState::Running(ref mut sampler) = guard.deref_mut() else {
                 return Err(anyhow::anyhow!("Sampler is not running"))?;
             };
 
@@ -934,28 +958,28 @@ impl PySampler {
 }
 
 fn trace_to_list(trace: Trace, py: Python<'_>) -> PyResult<Bound<'_, PyList>> {
-    let list = PyList::new_bound(
+    let list = PyList::new(
         py,
         trace
             .chains
             .into_iter()
             .map(|chain| {
-                Ok(PyTuple::new_bound(
+                Ok(PyTuple::new(
                     py,
                     [
                         export_array(py, chain.draws)?,
                         export_array(py, chain.stats)?,
                     ]
                     .into_iter(),
-                ))
+                )?)
             })
             .collect::<Result<Vec<_>>>()?,
-    );
+    )?;
     Ok(list)
 }
 
 fn export_array(py: Python<'_>, data: Arc<dyn Array>) -> PyResult<PyObject> {
-    let pa = py.import_bound("pyarrow")?;
+    let pa = py.import("pyarrow")?;
     let array = pa.getattr("Array")?;
 
     let data = data.into_data();
@@ -966,12 +990,12 @@ fn export_array(py: Python<'_>, data: Arc<dyn Array>) -> PyResult<PyObject> {
         .call_method1(
             "_import_from_c",
             (
-                (&data as *const _ as Py_uintptr_t).into_py(py),
-                (&schema as *const _ as Py_uintptr_t).into_py(py),
+                (&data as *const _ as Py_uintptr_t).into_pyobject(py)?,
+                (&schema as *const _ as Py_uintptr_t).into_pyobject(py)?,
             ),
         )
         .context("Could not import arrow trace in python")?;
-    Ok(data.into_py(py))
+    Ok(data.unbind())
 }
 
 #[pyclass]
@@ -996,8 +1020,8 @@ impl PyTransformAdapt {
         transformed_gradient: &mut [f64],
     ) -> Result<f64> {
         Python::with_gil(|py| {
-            let untransformed_position = PyArray1::from_slice_bound(py, untransformed_position);
-            let untransformed_gradient = PyArray1::from_slice_bound(py, untransformed_gradient);
+            let untransformed_position = PyArray1::from_slice(py, untransformed_position);
+            let untransformed_gradient = PyArray1::from_slice(py, untransformed_gradient);
 
             let output = params
                 .getattr(py, intern!(py, "inv_transform"))
@@ -1051,7 +1075,7 @@ impl PyTransformAdapt {
         transformed_gradient: &mut [f64],
     ) -> Result<(f64, f64)> {
         Python::with_gil(|py| {
-            let transformed_position = PyArray1::from_slice_bound(py, transformed_position);
+            let transformed_position = PyArray1::from_slice(py, transformed_position);
 
             let output = params
                 .getattr(py, intern!(py, "init_from_transformed_position"))?
@@ -1084,7 +1108,7 @@ impl PyTransformAdapt {
         transformed_position: &[f64],
     ) -> Result<Py<PyAny>> {
         Python::with_gil(|py| {
-            let transformed_position = PyArray1::from_slice_bound(py, transformed_position);
+            let transformed_position = PyArray1::from_slice(py, transformed_position);
 
             let output = params
                 .getattr(py, intern!(py, "init_from_transformed_position_part1"))?
@@ -1105,7 +1129,7 @@ impl PyTransformAdapt {
         transformed_gradient: &mut [f64],
     ) -> Result<f64> {
         Python::with_gil(|py| {
-            let untransformed_gradient = PyArray1::from_slice_bound(py, untransformed_gradient);
+            let untransformed_gradient = PyArray1::from_slice(py, untransformed_gradient);
 
             let output = params
                 .getattr(py, intern!(py, "init_from_transformed_position_part2"))?
@@ -1127,7 +1151,7 @@ impl PyTransformAdapt {
         transformed_gradient: &mut [f64],
     ) -> Result<(f64, f64)> {
         Python::with_gil(|py| {
-            let untransformed_position = PyArray1::from_slice_bound(py, untransformed_position);
+            let untransformed_position = PyArray1::from_slice(py, untransformed_position);
 
             let output = params
                 .getattr(py, intern!(py, "init_from_untransformed_position"))
@@ -1166,16 +1190,16 @@ impl PyTransformAdapt {
         params: &'a mut Py<PyAny>,
     ) -> Result<()> {
         Python::with_gil(|py| {
-            let positions = PyList::new_bound(
+            let positions = PyList::new(
                 py,
-                untransformed_positions.map(|pos| PyArray1::from_slice_bound(py, pos)),
-            );
-            let gradients = PyList::new_bound(
+                untransformed_positions.map(|pos| PyArray1::from_slice(py, pos)),
+            )?;
+            let gradients = PyList::new(
                 py,
-                untransformed_gradients.map(|grad| PyArray1::from_slice_bound(py, grad)),
-            );
+                untransformed_gradients.map(|grad| PyArray1::from_slice(py, grad)),
+            )?;
 
-            let logps = PyArray1::from_iter_bound(py, untransformed_logp.copied());
+            let logps = PyArray1::from_iter(py, untransformed_logp.copied());
             let seed = rng.next_u64();
 
             params
@@ -1193,8 +1217,8 @@ impl PyTransformAdapt {
         chain: u64,
     ) -> Result<Py<PyAny>> {
         Python::with_gil(|py| {
-            let position = PyArray1::from_slice_bound(py, untransformed_position);
-            let gradient = PyArray1::from_slice_bound(py, untransformed_gradient);
+            let position = PyArray1::from_slice(py, untransformed_position);
+            let gradient = PyArray1::from_slice(py, untransformed_gradient);
 
             let seed = rng.next_u64();
 
