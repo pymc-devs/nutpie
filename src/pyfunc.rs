@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
 use arrow::{
@@ -76,7 +76,7 @@ impl PyVariable {
 pub struct PyModel {
     make_logp_func: Arc<Py<PyAny>>,
     make_expand_func: Arc<Py<PyAny>>,
-    init_point_func: Option<Arc<Mutex<Py<PyAny>>>>,
+    init_point_func: Option<Arc<Py<PyAny>>>,
     variables: Arc<Vec<PyVariable>>,
     transform_adapter: Option<PyTransformAdapt>,
     ndim: usize,
@@ -97,7 +97,7 @@ impl PyModel {
         Self {
             make_logp_func: Arc::new(make_logp_func),
             make_expand_func: Arc::new(make_expand_func),
-            init_point_func: init_point_func.map(|x| Mutex::new(x).into()),
+            init_point_func: init_point_func.map(|x| x.into()),
             variables: Arc::new(variables),
             ndim,
             transform_adapter: transform_adapter.map(PyTransformAdapt::new),
@@ -265,6 +265,7 @@ impl CpuLogpFunc for PyDensity {
         rng: &mut R,
         untransformed_positions: impl ExactSizeIterator<Item = &'a [f64]>,
         untransformed_gradients: impl ExactSizeIterator<Item = &'a [f64]>,
+        untransformed_logp: impl ExactSizeIterator<Item = &'a f64>,
         params: &'a mut Py<PyAny>,
     ) -> std::result::Result<(), Self::LogpError> {
         self.transform_adapter
@@ -274,6 +275,7 @@ impl CpuLogpFunc for PyDensity {
                 rng,
                 untransformed_positions,
                 untransformed_gradients,
+                untransformed_logp,
                 params,
             )?;
         Ok(())
@@ -618,11 +620,6 @@ impl Model for PyModel {
         };
 
         let seed = rng.next_u64();
-
-        // Acquire the init_func lock before we wait for the GIL
-        let init_func = init_func
-            .lock()
-            .expect("Could not acquire lock for init func");
 
         Python::with_gil(|py| {
             let init_point = init_func

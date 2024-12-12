@@ -345,6 +345,7 @@ impl<'model> CpuLogpFunc for StanDensity<'model> {
         rng: &mut R,
         untransformed_positions: impl ExactSizeIterator<Item = &'a [f64]>,
         untransformed_gradients: impl ExactSizeIterator<Item = &'a [f64]>,
+        untransformed_logp: impl ExactSizeIterator<Item = &'a f64>,
         params: &'a mut Py<PyAny>,
     ) -> std::result::Result<(), Self::LogpError> {
         self.transform_adapter
@@ -354,6 +355,7 @@ impl<'model> CpuLogpFunc for StanDensity<'model> {
                 rng,
                 untransformed_positions,
                 untransformed_gradients,
+                untransformed_logp,
                 params,
             )
             .context("Failed to update the transformation")?;

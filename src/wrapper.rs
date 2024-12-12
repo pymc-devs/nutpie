@@ -601,6 +601,33 @@ impl PyNutsSettings {
         }
         Ok(())
     }
+
+    #[getter]
+    fn train_on_orbit(&self) -> Result<bool> {
+        match &self.inner {
+            Settings::LowRank(_) => {
+                bail!("gamma not available for low rank mass matrix adaptation");
+            }
+            Settings::Diag(_) => {
+                bail!("gamma not available for diag mass matrix adaptation");
+            }
+            Settings::Transforming(inner) => Ok(inner.adapt_options.use_orbit_for_training),
+        }
+    }
+
+    #[setter(train_on_orbit)]
+    fn set_train_on_orbit(&mut self, val: bool) -> Result<()> {
+        match &mut self.inner {
+            Settings::LowRank(_) => {
+                bail!("gamma not available for low rank mass matrix adaptation");
+            }
+            Settings::Diag(_) => {
+                bail!("gamma not available for diag mass matrix adaptation");
+            }
+            Settings::Transforming(inner) => inner.adapt_options.use_orbit_for_training = val,
+        }
+        Ok(())
+    }
 }
 
 pub(crate) enum SamplerState {
@@ -1135,6 +1162,7 @@ impl PyTransformAdapt {
         rng: &mut R,
         untransformed_positions: impl ExactSizeIterator<Item = &'a [f64]>,
         untransformed_gradients: impl ExactSizeIterator<Item = &'a [f64]>,
+        untransformed_logp: impl ExactSizeIterator<Item = &'a f64>,
         params: &'a mut Py<PyAny>,
     ) -> Result<()> {
         Python::with_gil(|py| {
@@ -1147,11 +1175,12 @@ impl PyTransformAdapt {
                 untransformed_gradients.map(|grad| PyArray1::from_slice_bound(py, grad)),
             );
 
+            let logps = PyArray1::from_iter_bound(py, untransformed_logp.copied());
             let seed = rng.next_u64();
 
             params
                 .getattr(py, intern!(py, "update"))?
-                .call1(py, (seed, positions, gradients))?;
+                .call1(py, (seed, positions, gradients, logps))?;
             Ok(())
         })
     }
