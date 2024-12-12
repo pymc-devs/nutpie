@@ -12,3 +12,6 @@ perf.data*
 wheels
 .vscode/
 *~
+.zed
+.cargo
+*traces*
