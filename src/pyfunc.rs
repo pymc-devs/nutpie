@@ -477,36 +477,51 @@ impl DrawStorage for PyTrace {
                                 self.builder.field_builder(i).context(
                                     "Builder has incorrect type",
                                 )?;
-                            builder.append_value(value.extract().expect("Return value from expand function could not be converted to boolean"))
+                            let value = value
+                                .extract()
+                                .expect("Return value from expand function could not be converted to boolean");
+                            builder.append_value(value)
                         },
                         ExpandDtype::Float64 {} => {
                             let builder: &mut Float64Builder =
                                 self.builder.field_builder(i).context(
                                     "Builder has incorrect type",
                                 )?;
-                            builder.append_value(value.extract().expect("Return value from expand function could not be converted to float64"))
+                            builder.append_value(
+                                value
+                                .extract()
+                                .expect("Return value from expand function could not be converted to float64")
+                            )
                         },
                         ExpandDtype::Float32 {} => {
                             let builder: &mut Float32Builder =
                                 self.builder.field_builder(i).context(
                                     "Builder has incorrect type",
                                 )?;
-                            builder.append_value(value.extract().expect("Return value from expand function could not be converted to float32"))
-
+                            builder.append_value(
+                                value
+                                .extract()
+                                .expect("Return value from expand function could not be converted to float32")
+                            )
                         },
                         ExpandDtype::Int64 {} => {
                             let builder: &mut Int64Builder =
                                 self.builder.field_builder(i).context(
                                     "Builder has incorrect type",
                                 )?;
-                            builder.append_value(value.extract().expect("Return value from expand function could not be converted to int64"))
+                            let value = value.extract().expect("Return value from expand function could not be converted to int64");
+                            builder.append_value(value)
                         },
                         ExpandDtype::BooleanArray { tensor_type} => {
                             let builder: &mut FixedSizeListBuilder<Box<dyn ArrayBuilder>> =
                                 self.builder.field_builder(i).context(
                                     "Builder has incorrect type",
                                 )?;
-                            let value_builder = builder.values().as_any_mut().downcast_mut::<BooleanBuilder>().context("Could not downcast builder to boolean type")?;
+                            let value_builder = builder
+                                .values()
+                                .as_any_mut()
+                                .downcast_mut::<BooleanBuilder>()
+                                .context("Could not downcast builder to boolean type")?;
                             let values: PyReadonlyArray1<bool> = value.extract().context("Could not convert object to array")?;
                             if values.len()? != tensor_type.size() {
                                 bail!("Extracted array has incorrect shape");
@@ -520,7 +535,11 @@ impl DrawStorage for PyTrace {
                                 self.builder.field_builder(i).context(
                                     "Builder has incorrect type",
                                 )?;
-                            let value_builder = builder.values().as_any_mut().downcast_mut::<PrimitiveBuilder<Float64Type>>().context("Could not downcast builder to float64 type")?;
+                            let value_builder = builder
+                                .values()
+                                .as_any_mut()
+                                .downcast_mut::<PrimitiveBuilder<Float64Type>>()
+                                .context("Could not downcast builder to float64 type")?;
                             let values: PyReadonlyArray1<f64> = value.extract().context("Could not convert object to array")?;
                             if values.len()? != tensor_type.size() {
                                 bail!("Extracted array has incorrect shape");
@@ -533,7 +552,11 @@ impl DrawStorage for PyTrace {
                                 self.builder.field_builder(i).context(
                                     "Builder has incorrect type",
                                 )?;
-                            let value_builder = builder.values().as_any_mut().downcast_mut::<PrimitiveBuilder<Float32Type>>().context("Could not downcast builder to float32 type")?;
+                            let value_builder = builder
+                                .values()
+                                .as_any_mut()
+                                .downcast_mut::<PrimitiveBuilder<Float32Type>>()
+                                .context("Could not downcast builder to float32 type")?;
                             let values: PyReadonlyArray1<f32> = value.extract().context("Could not convert object to array")?;
                             if values.len()? != tensor_type.size() {
                                 bail!("Extracted array has incorrect shape");
@@ -546,7 +569,11 @@ impl DrawStorage for PyTrace {
                                 self.builder.field_builder(i).context(
                                     "Builder has incorrect type",
                                 )?;
-                            let value_builder = builder.values().as_any_mut().downcast_mut::<PrimitiveBuilder<Int64Type>>().context("Could not downcast builder to i64 type")?;
+                            let value_builder = builder
+                                .values()
+                                .as_any_mut()
+                                .downcast_mut::<PrimitiveBuilder<Int64Type>>()
+                                .context("Could not downcast builder to i64 type")?;
                             let values: PyReadonlyArray1<i64> = value.extract().context("Could not convert object to array")?;
                             if values.len()? != tensor_type.size() {
                                 bail!("Extracted array has incorrect shape");
