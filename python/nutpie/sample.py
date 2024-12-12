@@ -398,6 +398,8 @@ class _BackgroundSampler:
         dims["divergence_start_gradient"] = ["unconstrained_parameter"]
         dims["divergence_end"] = ["unconstrained_parameter"]
         dims["divergence_momentum"] = ["unconstrained_parameter"]
+        dims["transformed_gradient"] = ["unconstrained_parameter"]
+        dims["transformed_position"] = ["unconstrained_parameter"]
 
         if self._return_raw_trace:
             return results
@@ -453,8 +455,8 @@ class _BackgroundSampler:
 def sample(
     compiled_model: CompiledModel,
     *,
-    draws: int,
-    tune: int,
+    draws: int | None,
+    tune: int | None,
     chains: int,
     cores: Optional[int],
     seed: Optional[int],
@@ -473,8 +475,8 @@ def sample(
 def sample(
     compiled_model: CompiledModel,
     *,
-    draws: int,
-    tune: int,
+    draws: int | None,
+    tune: int | None,
     chains: int,
     cores: Optional[int],
     seed: Optional[int],
@@ -492,8 +494,8 @@ def sample(
 def sample(
     compiled_model: CompiledModel,
     *,
-    draws: int = 1000,
-    tune: int = 300,
+    draws: int | None = None,
+    tune: int | None = None,
     chains: int = 6,
     cores: Optional[int] = None,
     seed: Optional[int] = None,
@@ -513,9 +515,9 @@ def sample(
 
     Parameters
     ----------
-    draws: int
+    draws: int | None
         The number of draws after tuning in each chain.
-    tune: int
+    tune: int | None
         The number of tuning (warmup) draws in each chain.
     chains: int
         The number of chains to sample.
@@ -612,8 +614,10 @@ def sample(
     else:
         settings = _lib.PyNutsSettings.Diag(seed)
 
-    settings.num_tune = tune
-    settings.num_draws = draws
+    if tune is not None:
+        settings.num_tune = tune
+    if draws is not None:
+        settings.num_draws = draws
     settings.num_chains = chains
 
     for name, val in kwargs.items():
