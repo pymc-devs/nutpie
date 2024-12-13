@@ -34,7 +34,7 @@ bridgestan = ">=2.5.0, <3"
 flowjax = { path = "../flowjax/", editable = true }
 samplerlab = { path = "../pymc-labs/benchmark-pymc", editable = true }
 posteriordb = ">=0.2.0, <0.3"
-jax = { version = ">=0.4.35, <0.5", extras = ["cuda12"] }
+jax = { version = "<0.4.37, <0.5", extras = ["cuda12"] }
 watermark = ">=2.5.0, <3"
 
 [system-requirements]

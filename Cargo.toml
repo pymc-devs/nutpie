@@ -22,7 +22,7 @@ name = "_lib"
 crate-type = ["cdylib"]
 
 [dependencies]
-nuts-rs = "0.13.0"
+nuts-rs = "0.14.0"
 numpy = "0.23.0"
 rand = "0.8.5"
 thiserror = "2.0.3"
