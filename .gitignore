@@ -8,6 +8,7 @@ tvm_libs/*
 notebooks/*.stan
 notebooks/*.csv
 notebooks/*.hpp
+notebooks/radon*
 perf.data*
 wheels
 .vscode/
@@ -15,3 +16,4 @@ wheels
 .zed
 .cargo
 *traces*
+.pyrightconfig.json
