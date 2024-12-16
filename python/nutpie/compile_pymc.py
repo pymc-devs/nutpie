@@ -1,5 +1,6 @@
 import dataclasses
 import itertools
+import threading
 import warnings
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -31,7 +32,7 @@ if TYPE_CHECKING:
     from pytensor.tensor import TensorVariable, Variable
 
 
-def rv_dict_to_flat_array_wrapper(
+def _rv_dict_to_flat_array_wrapper(
     fn: Callable[[SeedType], dict[str, np.ndarray]],
     names: list[str],
     shapes: list[tuple[int]],
@@ -509,6 +510,8 @@ def compile_pymc_model(
         return_transformed=True,
     )
 
+    initial_point_fn = _wrap_with_lock(initial_point_fn)
+
     if backend.lower() == "numba":
         if gradient_backend == "jax":
             raise ValueError("Gradient backend cannot be jax when using numba backend")
@@ -530,7 +533,18 @@ def compile_pymc_model(
         raise ValueError(f"Backend must be one of numba and jax. Got {backend}")
 
 
-def _compute_shapes(model):
+def _wrap_with_lock(func: Callable) -> Callable:
+    lock = threading.Lock()
+
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        with lock:
+            return func(*args, **kwargs)
+
+    return wrapper
+
+
+def _compute_shapes(model) -> dict[str, tuple[int, ...]]:
     import pytensor
     from pymc.initial_point import make_initial_point_fn
 
@@ -663,7 +677,7 @@ def _make_functions(
 
     num_free_vars = count
 
-    initial_point_fn = rv_dict_to_flat_array_wrapper(
+    initial_point_fn = _rv_dict_to_flat_array_wrapper(
         pymc_initial_point_fn, names=joined_names, shapes=joined_shapes
     )
 
