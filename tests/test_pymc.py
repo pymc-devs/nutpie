@@ -179,7 +179,10 @@ def test_pymc_model_shared(backend, gradient_backend):
         pm.Normal("a", mu=mu, sigma=sigma, shape=3)
 
     compiled = nutpie.compile_pymc_model(
-        model, backend=backend, gradient_backend=gradient_backend
+        model,
+        backend=backend,
+        gradient_backend=gradient_backend,
+        freeze_model=False,
     )
     trace = nutpie.sample(compiled, chains=1, seed=1)
     np.testing.assert_allclose(trace.posterior.a.mean().values, -0.1, atol=0.05)

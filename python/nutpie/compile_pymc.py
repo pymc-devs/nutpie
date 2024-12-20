@@ -447,6 +447,7 @@ def compile_pymc_model(
         "support_point", "prior"
     ] = "support_point",
     var_names: Iterable[str] | None = None,
+    freeze_model: bool | None = None,
     **kwargs,
 ) -> CompiledModel:
     """Compile necessary functions for sampling a pymc model.
@@ -472,6 +473,9 @@ def compile_pymc_model(
         `Model.initial_values`.
     var_names : list[str] | None
         A list of variables to store in the trace. If None, store all variables.
+    freeze_model : bool | None
+        Freeze all dimensions and shared variables to treat them as compile time
+        constants.
     Returns
     -------
     compiled_model : CompiledPyMCModel
@@ -485,6 +489,14 @@ def compile_pymc_model(
             "'mamba install -c conda-forge pymc numba' "
             "and restart your kernel in case you are in an interactive session."
         )
+
+    from pymc.model.transform.optimization import freeze_dims_and_data
+
+    if freeze_model is None:
+        freeze_model = backend == "jax"
+
+    if freeze_model:
+        model = freeze_dims_and_data(model)
 
     if default_initialization_strategy == "support_point" and jitter_rvs is None:
         jitter_rvs = set(model.free_RVs)
