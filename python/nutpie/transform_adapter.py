@@ -2,6 +2,7 @@ from typing import cast
 
 _BIJECTION_TRACE = []
 
+
 def make_transform_adapter(
     *,
     verbose=False,
@@ -63,25 +64,31 @@ def make_transform_adapter(
             flow = unwrap(eqx.combine(params, static, is_leaf=eqx.is_inexact_array))
 
             if return_elemwise_costs:
+
                 def compute_loss(bijection, draw, grad, logp):
                     if True:
                         draw, grad, logp = bijection.inverse_gradient_and_val(
                             draw, grad, logp
                         )
                     else:
-                        draw, grad, logp = flowjax.bijections.AbstractBijection.inverse_gradient_and_val(
-                            bijection, draw, grad, logp
+                        draw, grad, logp = (
+                            flowjax.bijections.AbstractBijection.inverse_gradient_and_val(
+                                bijection, draw, grad, logp
+                            )
                         )
                     cost = (draw + grad) ** 2
                     return cost
 
                 costs = jax.vmap(compute_loss, [None, 0, 0, 0])(
-                    flow.bijection, draws, grads, logps,
+                    flow.bijection,
+                    draws,
+                    grads,
+                    logps,
                 )
                 return costs.mean(0)
 
-
             if self._gamma is None:
+
                 def compute_loss(bijection, draw, grad, logp):
                     draw, grad, logp = bijection.inverse_gradient_and_val(
                         draw, grad, logp
@@ -90,7 +97,10 @@ def make_transform_adapter(
                     return cost
 
                 costs = jax.vmap(compute_loss, [None, 0, 0, 0])(
-                    flow.bijection, draws, grads, logps,
+                    flow.bijection,
+                    draws,
+                    grads,
+                    logps,
                 )
 
                 if return_all_costs:
@@ -102,10 +112,13 @@ def make_transform_adapter(
                     return jnp.log(costs.mean())
 
             else:
+
                 def transform(draw, grad, logp):
                     return flow.bijection.inverse_gradient_and_val(draw, grad, logp)
 
-                draws, grads, logps = jax.vmap(transform, [0, 0, 0], (0, 0, 0))(draws, grads, logps)
+                draws, grads, logps = jax.vmap(transform, [0, 0, 0], (0, 0, 0))(
+                    draws, grads, logps
+                )
                 fisher_loss = ((draws + grads) ** 2).sum(1).mean(0)
                 normal_logps = -(draws * draws).sum(1) / 2
                 var_loss = (logps - normal_logps).var()
@@ -168,11 +181,12 @@ def make_transform_adapter(
             diag = jnp.sqrt(pos_std / grad_std)
             mean = positions.mean(0) + gradients.mean(0) * diag * diag
 
+        print("seed", seed)
         key = jax.random.PRNGKey(seed % (2**63))
 
         diag_param = Parameterize(
-            lambda x: x + jnp.sqrt(1 + x ** 2),
-            (diag ** 2 - 1) / (2 * diag),
+            lambda x: x + jnp.sqrt(1 + x**2),
+            (diag**2 - 1) / (2 * diag),
         )
 
         diag_affine = eqx.tree_at(
@@ -199,15 +213,17 @@ def make_transform_adapter(
             replace=scale,
         )
         params = jnp.ones(n_dim) * 1e-5
-        params = params.at[-1].set(1.)
+        params = params.at[-1].set(1.0)
 
         hh = flowjax.bijections.Householder(params)
         flows.append(
             bijections.Sandwich(
-                bijections.Chain([
-                    bijections.Vmap(bijections.SoftPlusX(), axis_size=n_dim),
-                    hh,
-                ]),
+                bijections.Chain(
+                    [
+                        bijections.Vmap(bijections.SoftPlusX(), axis_size=n_dim),
+                        hh,
+                    ]
+                ),
                 affine,
             )
         )
@@ -262,7 +278,9 @@ def make_transform_adapter(
                 if dim == 2:
                     outer = flowjax.bijections.Flip((dim,))
                 else:
-                    outer = flowjax.bijections.Permute(jax.random.permutation(key, jnp.arange(dim)))
+                    outer = flowjax.bijections.Permute(
+                        jax.random.permutation(key, jnp.arange(dim))
+                    )
 
                 return flowjax.bijections.Sandwich(outer, bijection)
 
@@ -270,7 +288,7 @@ def make_transform_adapter(
 
             if householder_layer:
                 params = jnp.ones(n_dim) * 1e-5
-                params = params.at[0].set(1.)
+                params = params.at[0].set(1.0)
 
                 outer = flowjax.bijections.Householder(params)
                 flow = flowjax.bijections.Sandwich(outer, flow)
@@ -285,19 +303,25 @@ def make_transform_adapter(
                 replace=scale,
             )
             params = jnp.ones(n_dim) * 1e-5
-            params = params.at[-1].set(1.)
+            params = params.at[-1].set(1.0)
 
             hh = flowjax.bijections.Householder(params)
-            flow = bijections.Chain([
-                bijections.Sandwich(
-                    bijections.Chain([
-                        bijections.Vmap(bijections.SoftPlusX(), axis_size=n_dim),
-                        hh,
-                    ]),
-                    affine,
-                ),
-                flow
-            ])
+            flow = bijections.Chain(
+                [
+                    bijections.Sandwich(
+                        bijections.Chain(
+                            [
+                                bijections.Vmap(
+                                    bijections.SoftPlusX(), axis_size=n_dim
+                                ),
+                                hh,
+                            ]
+                        ),
+                        affine,
+                    ),
+                    flow,
+                ]
+            )
             return flow
 
         keys = jax.random.split(key, n_layers)
@@ -309,7 +333,6 @@ def make_transform_adapter(
         else:
             layers = []
             for i, (key, num_untrafo) in enumerate(zip(keys, untransformed_dim)):
-
                 if i % 2 == 0 or not dct_layer:
                     layers.append(make_layer(key, num_untrafo))
                 else:
@@ -367,14 +390,11 @@ def make_transform_adapter(
         if dct:
             flow = flowjax.flows.Transformed(
                 flowjax.distributions.StandardNormal(base.shape),
-                bijections.Chain(
-                    [bijections.DCT(shape=(n_dim,)), base]
-                ),
+                bijections.Chain([bijections.DCT(shape=(n_dim,)), base]),
             )
         else:
             flow = flowjax.flows.Transformed(
-                flowjax.distributions.StandardNormal(base.shape),
-                base
+                flowjax.distributions.StandardNormal(base.shape), base
             )
 
         params, static = eqx.partition(flow, eqx.is_inexact_array)
@@ -421,16 +441,22 @@ def make_transform_adapter(
             if layer % 2 == 0:
                 pre.append(bijections.Neg(shape=(n_dim,)))
 
-            nonlin_affine = bijections.Chain([
-                bijections.Sandwich(
-                    bijections.Chain([
-                        *pre,
-                        bijections.Vmap(bijections.SoftPlusX(), axis_size=n_dim),
-                    ]),
-                    affine,
-                ),
-                affine2,
-            ])
+            nonlin_affine = bijections.Chain(
+                [
+                    bijections.Sandwich(
+                        bijections.Chain(
+                            [
+                                *pre,
+                                bijections.Vmap(
+                                    bijections.SoftPlusX(), axis_size=n_dim
+                                ),
+                            ]
+                        ),
+                        affine,
+                    ),
+                    affine2,
+                ]
+            )
 
             if nn_width is None:
                 width = extension_var_count * 16
@@ -457,7 +483,7 @@ def make_transform_adapter(
                 )
 
             params = jnp.ones(extension_var_count) * 1e-5
-            params = params.at[-1].set(1.)
+            params = params.at[-1].set(1.0)
 
             hh = flowjax.bijections.Householder(params)
             inner_permute = flowjax.bijections.Permute(
@@ -528,10 +554,14 @@ def make_transform_adapter(
                 )
 
                 inner_permute = flowjax.bijections.Permute(
-                    jnp.concatenate([
-                        jnp.arange(n_dim - extension_var_count),
-                        jax.random.permutation(key, jnp.arange(n_dim - extension_var_count, n_dim)),
-                    ])
+                    jnp.concatenate(
+                        [
+                            jnp.arange(n_dim - extension_var_count),
+                            jax.random.permutation(
+                                key, jnp.arange(n_dim - extension_var_count, n_dim)
+                            ),
+                        ]
+                    )
                 )
             else:
                 coupling = flowjax.bijections.coupling.Coupling(
@@ -545,10 +575,14 @@ def make_transform_adapter(
                 )
 
                 inner_permute = flowjax.bijections.Permute(
-                    jnp.concatenate([
-                        jax.random.permutation(key, jnp.arange(n_dim - extension_var_count, n_dim)),
-                        jnp.arange(n_dim - extension_var_count),
-                    ])
+                    jnp.concatenate(
+                        [
+                            jax.random.permutation(
+                                key, jnp.arange(n_dim - extension_var_count, n_dim)
+                            ),
+                            jnp.arange(n_dim - extension_var_count),
+                        ]
+                    )
                 )
 
             if zero_init:
@@ -608,10 +642,14 @@ def make_transform_adapter(
 
                 inner = bijections.Sandwich(
                     inner.outer,
-                    bijections.Chain([
-                        bijections.Sandwich(bijections.Flip(shape=(n_dim,)), coupling),
-                        inner.inner,
-                    ]),
+                    bijections.Chain(
+                        [
+                            bijections.Sandwich(
+                                bijections.Flip(shape=(n_dim,)), coupling
+                            ),
+                            inner.inner,
+                        ]
+                    ),
                 )
 
         if dct:
@@ -637,10 +675,12 @@ def make_transform_adapter(
             pre.append(bijections.Neg(shape=(n_dim,)))
 
         nonlin_layer = bijections.Sandwich(
-            bijections.Chain([
-                *pre,
-                bijections.Vmap(bijections.SoftPlusX(), axis_size=n_dim),
-            ]),
+            bijections.Chain(
+                [
+                    *pre,
+                    bijections.Vmap(bijections.SoftPlusX(), axis_size=n_dim),
+                ]
+            ),
             affine,
         )
         scale = Parameterize(
@@ -653,7 +693,6 @@ def make_transform_adapter(
             replace=scale,
         )
         return bijections.Chain([new_layer, nonlin_layer, affine, base])
-
 
     @eqx.filter_jit
     def _init_from_transformed_position(logp_fn, bijection, transformed_position):
@@ -760,7 +799,9 @@ def make_transform_adapter(
             self._window_size = window_size
             self._initial_skip = initial_skip
             if make_optimizer is None:
-                self._make_optimizer = lambda: optax.apply_if_finite(optax.adabelief(learning_rate), 50)
+                self._make_optimizer = lambda: optax.apply_if_finite(
+                    optax.adabelief(learning_rate), 50
+                )
             else:
                 self._make_optimizer = make_optimizer
             self._optimizer = self._make_optimizer()
@@ -832,7 +873,9 @@ def make_transform_adapter(
                         flowjax.distributions.StandardNormal(fit.shape), fit
                     )
                     params, static = eqx.partition(flow, eqx.is_inexact_array)
-                    new_loss = self._loss_fn(params, static, positions, gradients, logps)
+                    new_loss = self._loss_fn(
+                        params, static, positions, gradients, logps
+                    )
 
                     if self._verbose:
                         print("loss from diag:", new_loss)
@@ -843,9 +886,13 @@ def make_transform_adapter(
 
                     return
 
-                positions = np.array(positions[self._initial_skip:][-self._window_size :])
-                gradients = np.array(gradients[self._initial_skip:][-self._window_size :])
-                logps = np.array(logps[self._initial_skip:][-self._window_size:])
+                positions = np.array(
+                    positions[self._initial_skip :][-self._window_size :]
+                )
+                gradients = np.array(
+                    gradients[self._initial_skip :][-self._window_size :]
+                )
+                logps = np.array(logps[self._initial_skip :][-self._window_size :])
 
                 if len(positions) < 10:
                     return
@@ -878,7 +925,13 @@ def make_transform_adapter(
                     if self._verbose:
                         print(
                             "loss before optimization: ",
-                            self._loss_fn(params, static, positions[-500:], gradients[-500:], logps[-500:]),
+                            self._loss_fn(
+                                params,
+                                static,
+                                positions[-100:],
+                                gradients[-100:],
+                                logps[-100:],
+                            ),
                         )
                 else:
                     base = self._bijection
@@ -916,7 +969,9 @@ def make_transform_adapter(
                     self._bijection,
                 )
                 params, static = eqx.partition(flow, eqx.is_inexact_array)
-                old_loss = self._loss_fn(params, static, positions[-100:], gradients[-100:], logps[-100:])
+                old_loss = self._loss_fn(
+                    params, static, positions[-128:], gradients[-128:], logps[-128:]
+                )
 
                 if np.isfinite(old_loss) and old_loss < -5 and self.index > 10:
                     if self._verbose:
@@ -941,7 +996,9 @@ def make_transform_adapter(
                     flowjax.distributions.StandardNormal(fit.shape), fit
                 )
                 params, static = eqx.partition(flow, eqx.is_inexact_array)
-                new_loss = self._loss_fn(params, static, positions[-100:], gradients[-100:], logps[-100:])
+                new_loss = self._loss_fn(
+                    params, static, positions[-128:], gradients[-128:], logps[-128:]
+                )
 
                 if self._verbose:
                     print(
@@ -956,7 +1013,12 @@ def make_transform_adapter(
                     params, static = eqx.partition(flow, eqx.is_inexact_array)
                     print(
                         self._loss_fn(
-                            params, static, positions[-100:], gradients[-100:], logps[-100:], return_all_costs=True
+                            params,
+                            static,
+                            positions[-128:],
+                            gradients[-128:],
+                            logps[-128:],
+                            return_all_costs=True,
                         )
                     )
 
@@ -967,7 +1029,12 @@ def make_transform_adapter(
                     params, static = eqx.partition(flow, eqx.is_inexact_array)
                     print(
                         self._loss_fn(
-                            params, static, positions[-100:], gradients[-100:], logps[-100:], return_all_costs=True
+                            params,
+                            static,
+                            positions[-128:],
+                            gradients[-128:],
+                            logps[-128:],
+                            return_all_costs=True,
                         )
                     )
 
@@ -988,7 +1055,9 @@ def make_transform_adapter(
                 self._opt_state = opt_state
 
                 if self._debug_save_bijection:
-                    _BIJECTION_TRACE.append((self.index, fit, (positions, gradients, logps)))
+                    _BIJECTION_TRACE.append(
+                        (self.index, fit, (positions, gradients, logps))
+                    )
 
             except Exception as e:
                 print("update error:", e)
