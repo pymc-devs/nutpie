@@ -4,7 +4,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use arrow::{
     array::{
         Array, ArrayBuilder, BooleanBuilder, FixedSizeListBuilder, Float32Builder, Float64Builder,
-        Int64Builder, ListBuilder, PrimitiveBuilder, StructBuilder,
+        Int64Builder, LargeListBuilder, ListBuilder, PrimitiveBuilder, StructBuilder,
     },
     datatypes::{DataType, Field, Float32Type, Float64Type, Int64Type},
 };
@@ -40,21 +40,21 @@ impl PyVariable {
             ExpandDtype::Float64 {} => DataType::Float64,
             ExpandDtype::Float32 {} => DataType::Float32,
             ExpandDtype::Int64 {} => DataType::Int64,
-            ExpandDtype::BooleanArray { tensor_type } => {
+            ExpandDtype::BooleanArray { tensor_type: _ } => {
                 let field = Arc::new(Field::new("item", DataType::Boolean, false));
-                DataType::FixedSizeList(field, tensor_type.size() as i32)
+                DataType::LargeList(field)
             }
             ExpandDtype::ArrayFloat64 { tensor_type: _ } => {
                 let field = Arc::new(Field::new("item", DataType::Float64, true));
-                DataType::List(field)
+                DataType::LargeList(field)
             }
-            ExpandDtype::ArrayFloat32 { tensor_type } => {
+            ExpandDtype::ArrayFloat32 { tensor_type: _ } => {
                 let field = Arc::new(Field::new("item", DataType::Float32, false));
-                DataType::FixedSizeList(field, tensor_type.size() as i32)
+                DataType::LargeList(field)
             }
-            ExpandDtype::ArrayInt64 { tensor_type } => {
+            ExpandDtype::ArrayInt64 { tensor_type: _ } => {
                 let field = Arc::new(Field::new("item", DataType::Int64, false));
-                DataType::FixedSizeList(field, tensor_type.size() as i32)
+                DataType::LargeList(field)
             }
         }
     }
@@ -512,10 +512,10 @@ impl DrawStorage for PyTrace {
                             let value = value.extract().expect("Return value from expand function could not be converted to int64");
                             builder.append_value(value)
                         },
-                        ExpandDtype::BooleanArray { tensor_type} => {
-                            let builder: &mut FixedSizeListBuilder<Box<dyn ArrayBuilder>> =
+                        ExpandDtype::BooleanArray { tensor_type } => {
+                            let builder: &mut LargeListBuilder<Box<dyn ArrayBuilder>> =
                                 self.builder.field_builder(i).context(
-                                    "Builder has incorrect type",
+                                    "Builder has incorrect type. Expected LargeListBuilder of Bool",
                                 )?;
                             let value_builder = builder
                                 .values()
@@ -531,9 +531,9 @@ impl DrawStorage for PyTrace {
                         },
                         ExpandDtype::ArrayFloat64 { tensor_type } => {
                             //let builder: &mut FixedSizeListBuilder<Box<dyn ArrayBuilder>> =
-                            let builder: &mut ListBuilder<Box<dyn ArrayBuilder>> =
+                            let builder: &mut LargeListBuilder<Box<dyn ArrayBuilder>> =
                                 self.builder.field_builder(i).context(
-                                    "Builder has incorrect type",
+                                    "Builder has incorrect type. Expected LargeListBuilder of Float64",
                                 )?;
                             let value_builder = builder
                                 .values()
@@ -548,9 +548,9 @@ impl DrawStorage for PyTrace {
                             builder.append(true);
                         },
                         ExpandDtype::ArrayFloat32 { tensor_type } => {
-                            let builder: &mut FixedSizeListBuilder<Box<dyn ArrayBuilder>> =
+                            let builder: &mut LargeListBuilder<Box<dyn ArrayBuilder>> =
                                 self.builder.field_builder(i).context(
-                                    "Builder has incorrect type",
+                                    "Builder has incorrect type. Expected LargeListBuilder of Float32",
                                 )?;
                             let value_builder = builder
                                 .values()
@@ -565,9 +565,9 @@ impl DrawStorage for PyTrace {
                             builder.append(true);
                         },
                         ExpandDtype::ArrayInt64 {tensor_type} => {
-                            let builder: &mut FixedSizeListBuilder<Box<dyn ArrayBuilder>> =
+                            let builder: &mut LargeListBuilder<Box<dyn ArrayBuilder>> =
                                 self.builder.field_builder(i).context(
-                                    "Builder has incorrect type",
+                                    "Builder has incorrect type. Expected LargeListBuilder of Int64",
                                 )?;
                             let value_builder = builder
                                 .values()
