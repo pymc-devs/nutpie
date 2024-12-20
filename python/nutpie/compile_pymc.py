@@ -451,6 +451,7 @@ def compile_pymc_model(
     default_initialization_strategy: Literal[
         "support_point", "prior"
     ] = "support_point",
+    freeze_model: bool | None = None,
     **kwargs,
 ) -> CompiledModel:
     """Compile necessary functions for sampling a pymc model.
@@ -487,6 +488,14 @@ def compile_pymc_model(
             "'mamba install -c conda-forge pymc numba' "
             "and restart your kernel in case you are in an interactive session."
         )
+
+    from pymc.model.transform.optimization import freeze_dims_and_data
+
+    if freeze_model is None:
+        freeze_model = backend == "jax"
+
+    if freeze_model:
+        model = freeze_dims_and_data(model)
 
     if default_initialization_strategy == "support_point" and jitter_rvs is None:
         jitter_rvs = set(model.free_RVs)
