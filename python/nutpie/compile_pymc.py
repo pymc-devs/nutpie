@@ -69,7 +69,7 @@ def rv_dict_to_flat_array_wrapper(
         for name, shape in zip(names, shapes, strict=True):
             initial_value = initial_value_dict[name]
             n = int(np.prod(initial_value.shape))
-            if initial_value.shape != shape:
+            if tuple(initial_value.shape) != tuple(shape):
                 raise ValueError(
                     f"Size of initial value for {name} is {initial_value.shape}, "
                     f"expected {shape}"
