@@ -12,7 +12,7 @@ name = "nutpie"
 description = "Sample Stan or PyMC models"
 authors = [{ name = "PyMC Developers", email = "pymc.devs@gmail.com" }]
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.13"
 license = { text = "MIT" }
 classifiers = [
   "Programming Language :: Rust",
