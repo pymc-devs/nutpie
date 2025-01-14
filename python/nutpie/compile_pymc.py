@@ -1,11 +1,12 @@
 import dataclasses
 import itertools
 import warnings
+from collections.abc import Iterable
 from dataclasses import dataclass
 from functools import wraps
 from importlib.util import find_spec
 from math import prod
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Literal, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Literal, Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -500,7 +501,10 @@ def compile_pymc_model(
         if gradient_backend == "jax":
             raise ValueError("Gradient backend cannot be jax when using numba backend")
         return _compile_pymc_model_numba(
-            model=model, pymc_initial_point_fn=initial_point_fn, var_names=var_names, **kwargs
+            model=model,
+            pymc_initial_point_fn=initial_point_fn,
+            var_names=var_names,
+            **kwargs,
         )
     elif backend.lower() == "jax":
         return _compile_pymc_model_jax(

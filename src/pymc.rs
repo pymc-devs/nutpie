@@ -2,9 +2,7 @@ use std::{ffi::c_void, fmt::Display, sync::Arc};
 
 use anyhow::{bail, Context, Result};
 use arrow::{
-    array::{
-        Array, FixedSizeListArray, Float64Array, LargeListArray, LargeListBuilder, StructArray,
-    },
+    array::{Array, Float64Array, LargeListArray, StructArray},
     buffer::OffsetBuffer,
     datatypes::{DataType, Field, Fields},
 };
@@ -16,7 +14,6 @@ use pyo3::{
     types::{PyAnyMethods, PyList},
     Bound, Py, PyAny, PyObject, PyResult, Python,
 };
-use rand::{distributions::Uniform, prelude::Distribution};
 
 use thiserror::Error;
 

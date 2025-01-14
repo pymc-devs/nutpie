@@ -204,7 +204,10 @@ def test_pymc_var_names(backend, gradient_backend):
         pm.Deterministic("c", mu * b)
 
     compiled = nutpie.compile_pymc_model(
-        model, backend=backend, gradient_backend=gradient_backend, var_names=None,
+        model,
+        backend=backend,
+        gradient_backend=gradient_backend,
+        var_names=None,
     )
     trace = nutpie.sample(compiled, chains=1, seed=1)
 
@@ -213,7 +216,10 @@ def test_pymc_var_names(backend, gradient_backend):
     assert hasattr(trace.posterior, "c")
 
     compiled = nutpie.compile_pymc_model(
-        model, backend=backend, gradient_backend=gradient_backend, var_names=[],
+        model,
+        backend=backend,
+        gradient_backend=gradient_backend,
+        var_names=[],
     )
     trace = nutpie.sample(compiled, chains=1, seed=1)
 
@@ -222,7 +228,10 @@ def test_pymc_var_names(backend, gradient_backend):
     assert not hasattr(trace.posterior, "c")
 
     compiled = nutpie.compile_pymc_model(
-        model, backend=backend, gradient_backend=gradient_backend, var_names=["b"],
+        model,
+        backend=backend,
+        gradient_backend=gradient_backend,
+        var_names=["b"],
     )
     trace = nutpie.sample(compiled, chains=1, seed=1)
 
