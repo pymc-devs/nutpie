@@ -26,6 +26,7 @@ dependencies = [
   "xarray >= 2023.06.0",
   "arviz >= 0.15.0",
 ]
+dynamic = ["version"]
 
 [project.optional-dependencies]
 stan = ["bridgestan >= 2.4.1"]
