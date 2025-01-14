@@ -31,8 +31,8 @@ rayon = "1.9.0"
 # Keep arrow in sync with nuts-rs requirements
 arrow = { version = "52.0.0", default-features = false, features = ["ffi"] }
 anyhow = "1.0.72"
-itertools = "0.13.0"
-bridgestan = "2.5.0"
+itertools = "0.14.0"
+bridgestan = "2.6.1"
 rand_distr = "0.4.3"
 smallvec = "1.11.0"
 upon = { version = "0.8.1", default-features = false, features = [] }
