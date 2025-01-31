@@ -188,15 +188,14 @@ def make_transform_adapter(
             lambda x: x + jnp.sqrt(1 + x**2),
             (diag**2 - 1) / (2 * diag),
         )
-
+        diag_affine = bijections.Affine(mean, diag)
         diag_affine = eqx.tree_at(
             where=lambda aff: aff.scale,
-            pytree=bijections.Affine(mean, diag),
+            pytree=diag_affine,
             replace=diag_param,
         )
 
         flows = [
-            #flowjax.flows.Affine(loc=mean, scale=diag),
             diag_affine,
         ]
 
@@ -212,21 +211,23 @@ def make_transform_adapter(
             pytree=flowjax.bijections.Affine(jnp.zeros(n_dim), jnp.ones(n_dim)),
             replace=scale,
         )
-        params = jnp.ones(n_dim) * 1e-5
-        params = params.at[-1].set(1.0)
 
-        hh = flowjax.bijections.Householder(params)
-        flows.append(
-            bijections.Sandwich(
-                bijections.Chain(
-                    [
-                        bijections.Vmap(bijections.SoftPlusX(), axis_size=n_dim),
-                        hh,
-                    ]
-                ),
-                affine,
+        if False:
+            params = jnp.ones(n_dim) * 1e-5
+            params = params.at[-1].set(1.0)
+
+            hh = flowjax.bijections.Householder(params)
+            flows.append(
+                bijections.Sandwich(
+                    bijections.Chain(
+                        [
+                            bijections.Vmap(bijections.SoftPlusX(), axis_size=n_dim),
+                            hh,
+                        ]
+                    ),
+                    affine,
+                )
             )
-        )
 
         if untransformed_dim is None:
             untransformed_dim = n_dim // 2
@@ -240,10 +241,22 @@ def make_transform_adapter(
                 lambda x: x + jnp.sqrt(1 + x**2),
                 jnp.array(0.0),
             )
+            theta = Parameterize(
+                lambda x: x + jnp.sqrt(1 + x**2),
+                jnp.array(0.0),
+            )
+
+            affine = flowjax.bijections.AsymmetricAffine(jnp.zeros(()), jnp.ones(()), jnp.ones(()))
+
             affine = eqx.tree_at(
                 where=lambda aff: aff.scale,
-                pytree=flowjax.bijections.Affine(),
+                pytree=affine,
                 replace=scale,
+            )
+            affine = eqx.tree_at(
+                where=lambda aff: aff.theta,
+                pytree=affine,
+                replace=theta,
             )
 
             if nn_width is None:
@@ -256,6 +269,9 @@ def make_transform_adapter(
 
             if untransformed_dim < 0:
                 untransformed_dim = n_dim + untransformed_dim
+
+            if width > 2 * untransformed_dim:
+                width = 2 * untransformed_dim
 
             coupling = flowjax.bijections.coupling.Coupling(
                 key_couple,
@@ -293,35 +309,41 @@ def make_transform_adapter(
                 outer = flowjax.bijections.Householder(params)
                 flow = flowjax.bijections.Sandwich(outer, flow)
 
-            scale = Parameterize(
-                lambda x: x + jnp.sqrt(1 + x**2),
-                jnp.zeros(n_dim),
-            )
-            affine = eqx.tree_at(
-                where=lambda aff: aff.scale,
-                pytree=flowjax.bijections.Affine(jnp.zeros(n_dim), jnp.ones(n_dim)),
-                replace=scale,
-            )
-            params = jnp.ones(n_dim) * 1e-5
-            params = params.at[-1].set(1.0)
+            if True:
+                scale = Parameterize(
+                    lambda x: x + jnp.sqrt(1 + x**2),
+                    jnp.zeros(n_dim),
+                )
+                theta = Parameterize(
+                    lambda x: x + jnp.sqrt(1 + x**2),
+                    jnp.zeros(n_dim),
+                )
+                affine = bijections.AsymmetricAffine(jnp.zeros(n_dim), jnp.ones(n_dim), jnp.ones(n_dim))
+                affine = eqx.tree_at(
+                    where=lambda aff: aff.scale,
+                    pytree=affine,
+                    replace=scale,
+                )
+                affine = eqx.tree_at(
+                    where=lambda aff: aff.theta,
+                    pytree=affine,
+                    replace=theta,
+                )
 
-            hh = flowjax.bijections.Householder(params)
-            flow = bijections.Chain(
-                [
-                    bijections.Sandwich(
-                        bijections.Chain(
-                            [
-                                bijections.Vmap(
-                                    bijections.SoftPlusX(), axis_size=n_dim
-                                ),
-                                hh,
-                            ]
+                params = jnp.ones(n_dim) * 1e-5
+                params = params.at[-1].set(1.0)
+
+                hh = bijections.Householder(params)
+                flow = bijections.Chain(
+                    [
+                        bijections.Sandwich(
+                            hh,
+                            affine,
                         ),
-                        affine,
-                    ),
-                    flow,
-                ]
-            )
+                        flow,
+                    ]
+                )
+
             return flow
 
         keys = jax.random.split(key, n_layers)
@@ -466,6 +488,9 @@ def make_transform_adapter(
             if untransformed_dim is None:
                 untransformed_dim = extension_var_count // 2
 
+            if width > 2 * untransformed_dim:
+                width = 2 * untransformed_dim
+
             coupling = flowjax.bijections.coupling.Coupling(
                 key,
                 transformer=nonlin_affine,
@@ -500,10 +525,22 @@ def make_transform_adapter(
                 lambda x: x + jnp.sqrt(1 + x**2),
                 jnp.array(0.0),
             )
+            theta = Parameterize(
+                lambda x: x + jnp.sqrt(1 + x**2),
+                jnp.array(0.0),
+            )
+
+            affine = flowjax.bijections.AsymmetricAffine(jnp.zeros(()), jnp.ones(()), jnp.ones(()))
+
             affine = eqx.tree_at(
                 where=lambda aff: aff.scale,
-                pytree=flowjax.bijections.Affine(),
+                pytree=affine,
                 replace=scale,
+            )
+            affine = eqx.tree_at(
+                where=lambda aff: aff.theta,
+                pytree=affine,
+                replace=theta,
             )
 
             """
@@ -1038,6 +1075,11 @@ def make_transform_adapter(
                         )
                     )
 
+                if self._debug_save_bijection:
+                    _BIJECTION_TRACE.append(
+                        (self.index, fit, (positions, gradients, logps))
+                    )
+
                 if (not np.isfinite(old_loss)) and (not np.isfinite(new_loss)):
                     self._bijection = self._make_flow_fn(
                         seed, positions, gradients, n_layers=0
@@ -1053,11 +1095,6 @@ def make_transform_adapter(
 
                 self._bijection = fit
                 self._opt_state = opt_state
-
-                if self._debug_save_bijection:
-                    _BIJECTION_TRACE.append(
-                        (self.index, fit, (positions, gradients, logps))
-                    )
 
             except Exception as e:
                 print("update error:", e)
