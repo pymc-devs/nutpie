@@ -225,12 +225,13 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/zipp-3.21.0-pyhd8ed1ab_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/zstd-1.5.6-ha6fb4c9_0.conda
       - pypi: https://files.pythonhosted.org/packages/a2/ad/e0d3c824784ff121c03cc031f944bc7e139a8f1870ffd2845cc2dd76f6c4/absl_py-2.1.0-py3-none-any.whl
-      - pypi: https://files.pythonhosted.org/packages/02/c8/542c1f9513136b431b101d06fb547e94d3ebc1d33740c3024315b55d4ada/bridgestan-2.5.0-py3-none-any.whl
+      - pypi: https://files.pythonhosted.org/packages/8c/ce/b9a154415fe7f51a481bece2bd998c679ce0ef93833ad4e7c87c60f0e461/bridgestan-2.6.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/16/92/92a76dc2ff3a12e69ba94e7e05168d37d0345fa08c87e1fe24d0c2a42223/charset_normalizer-3.4.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/58/a0/e4bebe76bdd0a68077030f1b5e48b545597473ae1b773c84150311152efc/chex-0.1.88-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/e9/59/f189b03d743364a350c972b89fe08a6db5bbbdc5f1ea6b604b3eee0a7967/dllist-1.2.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/3a/af/411e94c165229882eb2d0a329114826aa52c7c61ef3108d0d3d8ad7189ed/equinox-0.11.10-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/4f/4a/ff8aa2c57300613b69905308c5afe92c5b01112d766c25a305fd6796170a/etils-1.11.0-py3-none-any.whl
+      - pypi: git+https://github.com/aseyboldt/flowjax?rev=07e7e32217bcfcaa7d68a304f332c925d26ab76f#07e7e32217bcfcaa7d68a304f332c925d26ab76f
       - pypi: https://files.pythonhosted.org/packages/76/c6/c88e154df9c4e1a2a66ccf0005a88dfb2650c1dffb6f5ce603dfbd452ce3/idna-3.10-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/62/20/6c57c50c0ccc645fea1895950f1e5cd02f961ee44b3ffe83617fa46b0c1d/jax-0.4.35-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/d7/aa/f15ea857ad9bcff7a0c942dc570ca718b026cc0cc5c513525bb08cacf3c0/jax_cuda12_pjrt-0.4.35-py3-none-manylinux2014_x86_64.whl
@@ -253,11 +254,10 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/20/f8/7b1f5b84f84e43face7349ac2df23f0f75d36b5b4a1c1c0305edce82bcc8/paramax-0.0.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/8f/4d/b72e0782abec07f3d8dabf24cf12673d26b173af2046eb4e67365c776ccf/posteriordb-0.2.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/f9/9b/335f9764261e915ed497fcdeb11df5dfd6f7bf257d4a6a2a686d80da4d54/requests-2.32.3-py3-none-any.whl
+      - pypi: git+https://github.com/aseyboldt/samplerlab#5ae57577f2a586fd941d77afd1f450bbdda796ac
       - pypi: https://files.pythonhosted.org/packages/d0/30/dc54f88dd4a2b5dc8a0279bdd7270e735851848b762aeb1c1184ed1f6b14/tqdm-4.67.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/ce/d9/5f4c13cecde62396b0d3fe530a50ccea91e7dfc1ccf0e09c228841bb5ba8/urllib3-2.2.3-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/c3/ac/1847959031ce09eb65a70b16d0f07633d7ddaf8a97752cc924f9a8cbe253/watermark-2.5.0-py2.py3-none-any.whl
-      - pypi: ../flowjax/
-      - pypi: ../pymc-labs/benchmark-pymc
 packages:
 - conda: https://conda.anaconda.org/conda-forge/linux-64/_libgcc_mutex-0.1-conda_forge.tar.bz2
   sha256: fe51de6107f9edc7aa4f786a70f4a883943bc9d39b3bb7307c04c41410990726
@@ -400,10 +400,10 @@ packages:
   purls: []
   size: 15609
   timestamp: 1729642921261
-- pypi: https://files.pythonhosted.org/packages/02/c8/542c1f9513136b431b101d06fb547e94d3ebc1d33740c3024315b55d4ada/bridgestan-2.5.0-py3-none-any.whl
+- pypi: https://files.pythonhosted.org/packages/8c/ce/b9a154415fe7f51a481bece2bd998c679ce0ef93833ad4e7c87c60f0e461/bridgestan-2.6.1-py3-none-any.whl
   name: bridgestan
-  version: 2.5.0
-  sha256: f417836f35258688759ad46351621d8bb03440d84965f778c82ee702be93f300
+  version: 2.6.1
+  sha256: 142ea79542db6022e8d85b8d5eaed7817f0429ad0156dbef7e147c72e72bcd98
   requires_dist:
   - numpy
   - dllist
@@ -797,10 +797,9 @@ packages:
   - pkg:pypi/filelock?source=hash-mapping
   size: 17441
   timestamp: 1733240909987
-- pypi: ../flowjax/
+- pypi: git+https://github.com/aseyboldt/flowjax?rev=07e7e32217bcfcaa7d68a304f332c925d26ab76f#07e7e32217bcfcaa7d68a304f332c925d26ab76f
   name: flowjax
-  version: 16.0.0
-  sha256: 44c0d14eacfee77e1254f841f2f2b6d169c5d3a34360240d4b9fcf252b9b951c
+  version: 17.0.2
   requires_dist:
   - jax>=0.4.16
   - equinox>=0.10
@@ -819,7 +818,6 @@ packages:
   - ipython ; extra == 'dev'
   - numpyro ; extra == 'dev'
   requires_python: '>=3.10'
-  editable: true
 - conda: https://conda.anaconda.org/conda-forge/noarch/font-ttf-dejavu-sans-mono-2.37-hab24e00_0.tar.bz2
   sha256: 58d7f40d2940dd0a8aa28651239adbf5613254df0f75789919c4e6762054403b
   md5: 0c96522c6bdaed4b1566d11387caaf45
@@ -3055,16 +3053,14 @@ packages:
   - pkg:pypi/rich?source=hash-mapping
   size: 185646
   timestamp: 1733342347277
-- pypi: ../pymc-labs/benchmark-pymc
+- pypi: git+https://github.com/aseyboldt/samplerlab#5ae57577f2a586fd941d77afd1f450bbdda796ac
   name: samplerlab
   version: '0.1'
-  sha256: 3229a0e9de6c13db630469c1501ae97625ca85287d2f955280a154dbadd900cd
   requires_dist:
   - numpy
   - arviz
   - pymc
   requires_python: '>=3.11'
-  editable: true
 - conda: https://conda.anaconda.org/conda-forge/linux-64/scipy-1.14.1-py312h62794b6_2.conda
   sha256: 6e4916d610dc15f9b504517bd6c1f3dbbae019a3c7abf0aeb55f310c452a4474
   md5: 94688dd449f6c092e5f951780235aca1
