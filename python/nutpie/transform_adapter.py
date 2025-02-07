@@ -1,7 +1,424 @@
-from typing import cast
+from typing import Callable, Literal, Union, cast
+import itertools
+import math
+import numpy as np
+import equinox as eqx
+import jax
 
 _BIJECTION_TRACE = []
 
+
+class FactoredMLP(eqx.Module, strict=True):
+    """Standard Multi-Layer Perceptron; also known as a feed-forward network.
+
+    !!! faq
+
+        If you get a TypeError saying an object is not a valid JAX type, see the
+            [FAQ](https://docs.kidger.site/equinox/faq/)."""
+
+    layers: tuple[tuple[eqx.nn.Linear, eqx.nn.Linear], ...]
+    activation: tuple[Callable, ...]
+    final_activation: Callable
+    use_bias: bool = eqx.field(static=True)
+    use_final_bias: bool = eqx.field(static=True)
+    in_size: Union[int, Literal["scalar"]] = eqx.field(static=True)
+    out_size: Union[int, Literal["scalar"]] = eqx.field(static=True)
+    width_size: tuple[int, ...] = eqx.field(static=True)
+    depth: int = eqx.field(static=True)
+
+    def __init__(
+        self,
+        in_size: Union[int, Literal["scalar"]],
+        out_size: Union[int, Literal["scalar"]],
+        width_size: int | tuple[int | tuple[int, int], ...],
+        depth: int,
+        activation: Callable = jax.nn.relu,
+        final_activation: Callable = lambda x: x,
+        use_bias: bool = True,
+        use_final_bias: bool = True,
+        dtype=None,
+        *,
+        key,
+    ):
+        """**Arguments**:
+
+        - `in_size`: The input size. The input to the module should be a vector of
+            shape `(in_features,)`
+        - `out_size`: The output size. The output from the module will be a vector
+            of shape `(out_features,)`.
+        - `width_size`: The size of each hidden layer.
+        - `depth`: The number of hidden layers, including the output layer.
+            For example, `depth=2` results in an network with layers:
+            [`Linear(in_size, width_size)`, `Linear(width_size, width_size)`,
+            `Linear(width_size, out_size)`].
+        - `activation`: The activation function after each hidden layer. Defaults to
+            ReLU.
+        - `final_activation`: The activation function after the output layer. Defaults
+            to the identity.
+        - `use_bias`: Whether to add on a bias to internal layers. Defaults
+            to `True`.
+        - `use_final_bias`: Whether to add on a bias to the final layer. Defaults
+            to `True`.
+        - `dtype`: The dtype to use for all the weights and biases in this MLP.
+            Defaults to either `jax.numpy.float32` or `jax.numpy.float64` depending
+            on whether JAX is in 64-bit mode.
+        - `key`: A `jax.random.PRNGKey` used to provide randomness for parameter
+            initialisation. (Keyword only argument.)
+
+        Note that `in_size` also supports the string `"scalar"` as a special value.
+        In this case the input to the module should be of shape `()`.
+
+        Likewise `out_size` can also be a string `"scalar"`, in which case the
+        output from the module will have shape `()`.
+        """
+        #dtype = default_floating_dtype() if dtype is None else dtype
+        keys = jax.random.split(key, depth + 1)
+        layers = []
+        if isinstance(width_size, int):
+            width_size = (width_size,) * depth
+
+        assert len(width_size) == depth
+        activations: list[Callable] = []
+
+        if depth == 0:
+            layers.append(
+                eqx.nn.Linear(in_size, out_size, use_final_bias, dtype=dtype, key=keys[0])
+            )
+        else:
+            if isinstance(width_size[0], tuple):
+                n, k = width_size[0]
+                key1, key2 = jax.random.split(keys[0])
+                U = eqx.nn.Linear(in_size, n, use_bias=False, dtype=dtype, key=key1)
+                K = eqx.nn.Linear(n, k, use_bias=True, dtype=dtype, key=key2)
+                layers.append((U, K))
+            else:
+                k = width_size[0]
+                layers.append(
+                    eqx.nn.Linear(in_size, k, use_bias, dtype=dtype, key=keys[0])
+                )
+            activations.append(eqx.filter_vmap(lambda: activation, axis_size=k)())
+
+            for i in range(depth - 1):
+                if isinstance(width_size[i + 1], tuple):
+                    n, k_new = width_size[i + 1]
+                    key1, key2 = jax.random.split(keys[i + 1])
+                    U = eqx.nn.Linear(k, n, use_bias=False, dtype=dtype, key=key1)
+                    K = eqx.nn.Linear(n, k_new, use_bias=True, dtype=dtype, key=key2)
+                    layers.append((U, K))
+                    k = k_new
+                else:
+                    layers.append(
+                        eqx.nn.Linear(
+                            k, width_size[i + 1], use_bias, dtype=dtype, key=keys[i + 1]
+                        )
+                    )
+                    k = width_size[i + 1]
+                activations.append(eqx.filter_vmap(lambda: activation, axis_size=k)())
+
+            if isinstance(out_size, tuple):
+                n, k_new = out_size
+                key1, key2 = jax.random.split(keys[-1])
+                U = eqx.nn.Linear(k, n, use_bias=False, dtype=dtype, key=key1)
+                K = eqx.nn.Linear(n, k_new, use_bias=True, dtype=dtype, key=key2)
+                k = k_new
+                layers.append((U, K))
+            else:
+                layers.append(
+                    eqx.nn.Linear(k, out_size, use_final_bias, dtype=dtype, key=keys[-1])
+                )
+        self.layers = tuple(layers)
+        self.in_size = in_size
+        self.out_size = out_size
+        self.width_size = width_size
+        self.depth = depth
+        # In case `activation` or `final_activation` are learnt, then make a separate
+        # copy of their weights for every neuron.
+        self.activation = tuple(activations)
+        #self.activation = eqx.filter_vmap(
+        #    eqx.filter_vmap(lambda: activation), axis_size=depth
+        #)()
+        if out_size == "scalar":
+            self.final_activation = final_activation
+        else:
+            self.final_activation = eqx.filter_vmap(
+                lambda: final_activation, axis_size=out_size
+            )()
+        self.use_bias = use_bias
+        self.use_final_bias = use_final_bias
+
+    @jax.named_scope("eqx.nn.MLP")
+    def __call__(self, x: jax.Array, *, key = None) -> jax.Array:
+        """**Arguments:**
+
+        - `x`: A JAX array with shape `(in_size,)`. (Or shape `()` if
+            `in_size="scalar"`.)
+        - `key`: Ignored; provided for compatibility with the rest of the Equinox API.
+            (Keyword only argument.)
+
+        **Returns:**
+
+        A JAX array with shape `(out_size,)`. (Or shape `()` if `out_size="scalar"`.)
+        """
+        for i, (layer, act) in enumerate(zip(self.layers[:-1], self.activation)):
+            if isinstance(layer, tuple):
+                U, K = layer
+                x = U(x)
+                x = K(x)
+            else:
+                x = layer(x)
+            layer_activation = jax.tree.map(
+                lambda x: x[i] if eqx.is_array(x) else x, act
+            )
+            x = eqx.filter_vmap(lambda a, b: a(b))(layer_activation, x)
+
+        if isinstance(self.layers[-1], tuple):
+            U, K = self.layers[-1]
+            x = U(x)
+            x = K(x)
+        else:
+            x = self.layers[-1](x)
+
+        if self.out_size == "scalar":
+            x = self.final_activation(x)
+        else:
+            x = eqx.filter_vmap(lambda a, b: a(b))(self.final_activation, x)
+        return x
+
+
+class MLP(eqx.Module, strict=True):
+    """Standard Multi-Layer Perceptron; also known as a feed-forward network.
+
+    !!! faq
+
+        If you get a TypeError saying an object is not a valid JAX type, see the
+            [FAQ](https://docs.kidger.site/equinox/faq/)."""
+
+    layers: tuple[eqx.nn.Linear, ...]
+    activation: tuple[Callable, ...]
+    final_activation: Callable
+    use_bias: bool = eqx.field(static=True)
+    use_final_bias: bool = eqx.field(static=True)
+    in_size: Union[int, Literal["scalar"]] = eqx.field(static=True)
+    out_size: Union[int, Literal["scalar"]] = eqx.field(static=True)
+    width_size: tuple[int, ...] = eqx.field(static=True)
+    depth: int = eqx.field(static=True)
+
+    def __init__(
+        self,
+        in_size: Union[int, Literal["scalar"]],
+        out_size: Union[int, Literal["scalar"]],
+        width_size: int | tuple[int, ...],
+        depth: int,
+        activation: Callable = jax.nn.relu,
+        final_activation: Callable = lambda x: x,
+        use_bias: bool = True,
+        use_final_bias: bool = True,
+        dtype=None,
+        *,
+        key,
+    ):
+        """**Arguments**:
+
+        - `in_size`: The input size. The input to the module should be a vector of
+            shape `(in_features,)`
+        - `out_size`: The output size. The output from the module will be a vector
+            of shape `(out_features,)`.
+        - `width_size`: The size of each hidden layer.
+        - `depth`: The number of hidden layers, including the output layer.
+            For example, `depth=2` results in an network with layers:
+            [`Linear(in_size, width_size)`, `Linear(width_size, width_size)`,
+            `Linear(width_size, out_size)`].
+        - `activation`: The activation function after each hidden layer. Defaults to
+            ReLU.
+        - `final_activation`: The activation function after the output layer. Defaults
+            to the identity.
+        - `use_bias`: Whether to add on a bias to internal layers. Defaults
+            to `True`.
+        - `use_final_bias`: Whether to add on a bias to the final layer. Defaults
+            to `True`.
+        - `dtype`: The dtype to use for all the weights and biases in this MLP.
+            Defaults to either `jax.numpy.float32` or `jax.numpy.float64` depending
+            on whether JAX is in 64-bit mode.
+        - `key`: A `jax.random.PRNGKey` used to provide randomness for parameter
+            initialisation. (Keyword only argument.)
+
+        Note that `in_size` also supports the string `"scalar"` as a special value.
+        In this case the input to the module should be of shape `()`.
+
+        Likewise `out_size` can also be a string `"scalar"`, in which case the
+        output from the module will have shape `()`.
+        """
+        #dtype = default_floating_dtype() if dtype is None else dtype
+        keys = jax.random.split(key, depth + 1)
+        layers = []
+        if isinstance(width_size, int):
+            width_size = (width_size,) * depth
+
+        assert len(width_size) == depth
+        activations: list[Callable] = []
+
+        if depth == 0:
+            layers.append(
+                eqx.nn.Linear(in_size, out_size, use_final_bias, dtype=dtype, key=keys[0])
+            )
+        else:
+            layers.append(
+                eqx.nn.Linear(in_size, width_size[0], use_bias, dtype=dtype, key=keys[0])
+            )
+            activations.append(eqx.filter_vmap(lambda: activation, axis_size=width_size[0])())
+            for i in range(depth - 1):
+                layers.append(
+                    eqx.nn.Linear(
+                        width_size[i], width_size[i + 1], use_bias, dtype=dtype, key=keys[i + 1]
+                    )
+                )
+                activations.append(eqx.filter_vmap(lambda: activation, axis_size=width_size[i])())
+            layers.append(
+                eqx.nn.Linear(width_size[-1], out_size, use_final_bias, dtype=dtype, key=keys[-1])
+            )
+        self.layers = tuple(layers)
+        self.in_size = in_size
+        self.out_size = out_size
+        self.width_size = width_size
+        self.depth = depth
+        # In case `activation` or `final_activation` are learnt, then make a separate
+        # copy of their weights for every neuron.
+        self.activation = tuple(activations)
+        #self.activation = eqx.filter_vmap(
+        #    eqx.filter_vmap(lambda: activation), axis_size=depth
+        #)()
+        if out_size == "scalar":
+            self.final_activation = final_activation
+        else:
+            self.final_activation = eqx.filter_vmap(
+                lambda: final_activation, axis_size=out_size
+            )()
+        self.use_bias = use_bias
+        self.use_final_bias = use_final_bias
+
+    @jax.named_scope("eqx.nn.MLP")
+    def __call__(self, x: jax.Array, *, key = None) -> jax.Array:
+        """**Arguments:**
+
+        - `x`: A JAX array with shape `(in_size,)`. (Or shape `()` if
+            `in_size="scalar"`.)
+        - `key`: Ignored; provided for compatibility with the rest of the Equinox API.
+            (Keyword only argument.)
+
+        **Returns:**
+
+        A JAX array with shape `(out_size,)`. (Or shape `()` if `out_size="scalar"`.)
+        """
+        for i, (layer, act) in enumerate(zip(self.layers[:-1], self.activation)):
+            x = layer(x)
+            layer_activation = jax.tree.map(
+                lambda x: x[i] if eqx.is_array(x) else x, act
+            )
+            x = eqx.filter_vmap(lambda a, b: a(b))(layer_activation, x)
+        x = self.layers[-1](x)
+        if self.out_size == "scalar":
+            x = self.final_activation(x)
+        else:
+            x = eqx.filter_vmap(lambda a, b: a(b))(self.final_activation, x)
+        return x
+
+def generate_sequences(k, r_vals):
+    """
+    Generate all binary sequences of length k with exactly r 1's.
+    The sequences are stored in a preallocated boolean NumPy array of shape (N, k),
+    where N = comb(k, r). A True value represents a '1' and False represents a '0'.
+
+    Parameters:
+        k (int): The length of each sequence.
+        r (int): The exact number of ones in each sequence.
+
+    Returns:
+        A NumPy boolean array of shape (comb(k, r), k) containing all sequences.
+    """
+    all_sequences = []
+    for r in r_vals:
+        N = math.comb(k, r)  # number of sequences
+        sequences = np.zeros((N, k), dtype=bool)
+        # Use enumerate on all combinations where ones appear.
+        for i, ones_positions in enumerate(itertools.combinations(range(k), r)):
+            sequences[i, list(ones_positions)] = True
+        all_sequences.append(sequences)
+    return np.concatenate(all_sequences, axis=0)
+
+def max_run_length(seq):
+    """
+    Given a 1D boolean NumPy array 'seq', compute the maximum run length of consecutive
+    identical values (either True or False).
+
+    Parameters:
+        seq (np.array): A 1D boolean array.
+
+    Returns:
+        The length (int) of the longest run.
+    """
+    # If the sequence is empty, return 0.
+    if seq.size == 0:
+        return 0
+
+    # Convert boolean to int (0 or 1) so we can use np.diff.
+    arr = seq.astype(int)
+    # Compute differences between consecutive elements.
+    diffs = np.diff(arr)
+    # Positions where the value changes:
+    change_indices = np.nonzero(diffs)[0]
+
+    if change_indices.size == 0:
+        # No changes at all, so the entire sequence is one run.
+        return seq.size
+
+    # To compute the run lengths, add the "start" index (-1) and the last index.
+    # For example, if change_indices = [i1, i2, ..., in],
+    # then the runs are: (i1 - (-1)), (i2 - i1), ..., (seq.size-1 - in).
+    boundaries = np.concatenate(([-1], change_indices, [seq.size - 1]))
+    run_lengths = np.diff(boundaries)
+    return int(run_lengths.max())
+
+def filter_sequences(sequences, m):
+    """
+    Filter a 2D NumPy boolean array 'sequences' (each row a binary sequence) so that
+    only sequences with maximum run length (of 0's or 1's) at most m are kept.
+
+    Parameters:
+        sequences (np.array): A 2D boolean array of shape (N, k).
+        m (int): Maximum allowed run length.
+
+    Returns:
+        A NumPy array containing only the rows (sequences) that pass the filter.
+    """
+    filtered = []
+    for seq in sequences:
+        if max_run_length(seq) <= m:
+            filtered.append(seq)
+    return np.array(filtered)
+
+
+def generate_permutations(rng, n_dim, n_layers, max_run=3):
+    if n_layers == 1:
+        r = [0, 1]
+    elif n_layers == 2:
+        r = [1]
+    else:
+        if n_layers % 2 == 0:
+            half = n_layers // 2
+            r = [half - 1, half, half + 1]
+        else:
+            half = n_layers // 2
+            r = [half, half + 1]
+
+    all_sequences = generate_sequences(n_layers, r)
+    valid_sequences = filter_sequences(all_sequences, max_run)
+
+    valid_sequences = np.repeat(valid_sequences, n_dim // len(valid_sequences) + 1, axis=0)
+    rng.shuffle(valid_sequences, axis=0)
+    is_in_first = valid_sequences[:n_dim]
+    rng = np.random.default_rng(42)
+    permutations = (~is_in_first).argsort(axis=0, kind="stable")
+    return permutations.T, is_in_first.sum(0)
 
 def make_transform_adapter(
     *,
@@ -37,6 +454,7 @@ def make_transform_adapter(
     import flowjax
     import flowjax.flows
     import flowjax.train
+    from flowjax import bijections
     import jax
     import jax.numpy as jnp
     import numpy as np
@@ -67,12 +485,12 @@ def make_transform_adapter(
 
                 def compute_loss(bijection, draw, grad, logp):
                     if True:
-                        draw, grad, logp = bijection.inverse_gradient_and_val(
+                        draw, grad, logp = bijection.inverse_gradient_and_val_(
                             draw, grad, logp
                         )
                     else:
                         draw, grad, logp = (
-                            flowjax.bijections.AbstractBijection.inverse_gradient_and_val(
+                            flowjax.bijections.AbstractBijection.inverse_gradient_and_val_(
                                 bijection, draw, grad, logp
                             )
                         )
@@ -90,7 +508,7 @@ def make_transform_adapter(
             if self._gamma is None:
 
                 def compute_loss(bijection, draw, grad, logp):
-                    draw, grad, logp = bijection.inverse_gradient_and_val(
+                    draw, grad, logp = bijection.inverse_gradient_and_val_(
                         draw, grad, logp
                     )
                     cost = ((draw + grad) ** 2).sum()
@@ -114,7 +532,7 @@ def make_transform_adapter(
             else:
 
                 def transform(draw, grad, logp):
-                    return flow.bijection.inverse_gradient_and_val(draw, grad, logp)
+                    return flow.bijection.inverse_gradient_and_val_(draw, grad, logp)
 
                 draws, grads, logps = jax.vmap(transform, [0, 0, 0], (0, 0, 0))(
                     draws, grads, logps
@@ -141,6 +559,140 @@ def make_transform_adapter(
             **kwargs,
         )
         return fit.bijection, losses, losses["opt_state"]
+
+    def make_mvscale(key, n_dim, size, randomize_base=False):
+        def make_single_hh(key, idx):
+            key1, key2 = jax.random.split(key)
+            params = jax.random.normal(key1, (n_dim,))
+            params = params / jnp.linalg.norm(params)
+            mvscale = bijections.MvScale(params)
+            return mvscale
+
+        keys = jax.random.split(key, size)
+
+        if randomize_base:
+            key, key_base = jax.random.split(key)
+            indices = jax.random.randint(key_base, (size,), 0, n_dim)
+        else:
+            indices = [val % n_dim for val in range(size)]
+
+        return bijections.Chain([make_single_hh(key, idx) for key, idx in zip(keys, indices)])
+
+    def make_hh(key, n_dim, size, randomize_base=False):
+        def make_single_hh(key, idx):
+            key1, key2 = jax.random.split(key)
+            params = jax.random.normal(key1, (n_dim,)) * 1e-2
+            return bijections.Householder(params, base_index=idx)
+
+        keys = jax.random.split(key, size)
+
+        if randomize_base:
+            key, key_base = jax.random.split(key)
+            indices = jax.random.randint(key_base, (size,), 0, n_dim)
+        else:
+            indices = [val % n_dim for val in range(size)]
+
+        return bijections.Chain([make_single_hh(key, idx) for key, idx in zip(keys, indices)])
+
+    def make_elemwise_trafo(key, n_dim, *, count=1):
+        def make_elemwise(key, loc):
+            key1, key2 = jax.random.split(key)
+            scale = Parameterize(
+                lambda x: x + jnp.sqrt(1 + x**2),
+                jnp.zeros(())
+            )
+            theta = Parameterize(
+                lambda x: x + jnp.sqrt(1 + x**2),
+                jnp.zeros(())
+            )
+
+            affine = bijections.AsymmetricAffine(
+                loc,
+                jnp.ones(()),
+                jnp.ones(()),
+            )
+
+            affine = eqx.tree_at(
+                where=lambda aff: aff.scale,
+                pytree=affine,
+                replace=scale,
+            )
+            affine = eqx.tree_at(
+                where=lambda aff: aff.theta,
+                pytree=affine,
+                replace=theta,
+            )
+
+            return affine
+
+        def make(key):
+            keys = jax.random.split(key, count + 1)
+            key, keys = keys[0], keys[1:]
+            loc = jax.random.normal(key=key, shape=(count,)) * 2
+            loc = loc - loc.mean()
+            return bijections.Chain([make_elemwise(key, mu) for key, mu in zip(keys, loc)])
+
+        keys = jax.random.split(key, n_dim)
+        make_affine = eqx.filter_vmap(make, axis_size=n_dim)(keys)
+        return bijections.Vmap(make_affine, in_axes=eqx.if_array(0))
+
+    def make_elemwise_trafo_(key, n_dim, *, count=1):
+        def make_elemwise(key):
+            scale = Parameterize(
+                lambda x: x + jnp.sqrt(1 + x**2),
+                jax.random.normal(key=key) / 5,
+            )
+            theta = Parameterize(
+                lambda x: x + jnp.sqrt(1 + x**2),
+                jax.random.normal(key=key) / 5,
+            )
+
+            affine = bijections.AsymmetricAffine(
+                jax.random.normal(key=key) * 2,
+                jnp.ones(()),
+                jnp.ones(()),
+            )
+
+            affine = eqx.tree_at(
+                where=lambda aff: aff.scale,
+                pytree=affine,
+                replace=scale,
+            )
+            affine = eqx.tree_at(
+                where=lambda aff: aff.theta,
+                pytree=affine,
+                replace=theta,
+            )
+
+            return affine
+
+        def make(key):
+            keys = jax.random.split(key, count)
+            return bijections.Scan(eqx.filter_vmap(make_elemwise)(keys))
+
+        keys = jax.random.split(key, n_dim)
+        make_affine = eqx.filter_vmap(make)(keys)
+        return bijections.Vmap(make_affine())
+
+    def make_coupling(key, dim, n_untransformed, **kwargs):
+        n_transformed = dim - n_untransformed
+
+        mvscale = make_mvscale(key, n_transformed, 1, randomize_base=True)
+
+        transformer = bijections.Chain([
+            make_elemwise_trafo(key, n_transformed, count=3),
+            mvscale,
+        ])
+        mlp1 = lambda out_size: FactoredMLP(
+            n_untransformed,
+            (32, out_size),
+            kwargs["nn_width"],
+            depth=len(kwargs["nn_width"]),
+            key=key,
+            dtype=jnp.float32,
+            activation=jax.nn.gelu,
+        )
+        return bijections.Coupling(key, transformer=transformer, untransformed_dim=n_untransformed, dim=dim, conditioner=mlp1, **kwargs)
 
     def make_flow(
         seed,
@@ -212,52 +764,8 @@ def make_transform_adapter(
             replace=scale,
         )
 
-        if False:
-            params = jnp.ones(n_dim) * 1e-5
-            params = params.at[-1].set(1.0)
-
-            hh = flowjax.bijections.Householder(params)
-            flows.append(
-                bijections.Sandwich(
-                    bijections.Chain(
-                        [
-                            bijections.Vmap(bijections.SoftPlusX(), axis_size=n_dim),
-                            hh,
-                        ]
-                    ),
-                    affine,
-                )
-            )
-
-        if untransformed_dim is None:
-            untransformed_dim = n_dim // 2
-
-        untransformed_dim = cast(list[int | None] | int, untransformed_dim)
-
-        def make_layer(key, untransformed_dim: int | None):
-            key, key_couple, key_permute = jax.random.split(key, 3)
-
-            scale = Parameterize(
-                lambda x: x + jnp.sqrt(1 + x**2),
-                jnp.array(0.0),
-            )
-            theta = Parameterize(
-                lambda x: x + jnp.sqrt(1 + x**2),
-                jnp.array(0.0),
-            )
-
-            affine = flowjax.bijections.AsymmetricAffine(jnp.zeros(()), jnp.ones(()), jnp.ones(()))
-
-            affine = eqx.tree_at(
-                where=lambda aff: aff.scale,
-                pytree=affine,
-                replace=scale,
-            )
-            affine = eqx.tree_at(
-                where=lambda aff: aff.theta,
-                pytree=affine,
-                replace=theta,
-            )
+        def make_layer(key, untransformed_dim: int | None, permutation=None):
+            key, key_couple, key_permute, key_hh = jax.random.split(key, 4)
 
             if nn_width is None:
                 width = n_dim // 2
@@ -270,23 +778,29 @@ def make_transform_adapter(
             if untransformed_dim < 0:
                 untransformed_dim = n_dim + untransformed_dim
 
-            if width > 2 * untransformed_dim:
-                width = 2 * untransformed_dim
+            if isinstance(width, int) and width > 16 * untransformed_dim:
+                width = 16 * untransformed_dim
 
-            coupling = flowjax.bijections.coupling.Coupling(
+            coupling = make_coupling(
                 key_couple,
-                transformer=affine,
-                untransformed_dim=untransformed_dim,
-                dim=n_dim,
-                nn_activation=jax.nn.gelu,
+                n_dim,
+                untransformed_dim,
                 nn_width=width,
                 nn_depth=nn_depth,
+                nn_activation=jax.nn.gelu,
             )
+
             if zero_init:
                 coupling = jax.tree_util.tree_map(
                     lambda x: x * 1e-3 if eqx.is_inexact_array(x) else x,
                     coupling,
                 )
+
+            flow = coupling
+
+            if householder_layer:
+                hh = make_hh(key_hh, n_dim, 1, randomize_base=False)
+                flow = bijections.Sandwich(hh, flow)
 
             def add_default_permute(bijection, dim, key):
                 if dim == 1:
@@ -300,55 +814,34 @@ def make_transform_adapter(
 
                 return flowjax.bijections.Sandwich(outer, bijection)
 
-            flow = add_default_permute(coupling, n_dim, key_permute)
+            if permutation is None:
+                flow = add_default_permute(flow, n_dim, key_permute)
+            else:
+                flow = bijections.Sandwich(bijections.Permute(permutation), flow)
 
-            if householder_layer:
-                params = jnp.ones(n_dim) * 1e-5
-                params = params.at[0].set(1.0)
+            mvscale = make_mvscale(key, n_dim, 1, randomize_base=True)
 
-                outer = flowjax.bijections.Householder(params)
-                flow = flowjax.bijections.Sandwich(outer, flow)
-
-            if True:
-                scale = Parameterize(
-                    lambda x: x + jnp.sqrt(1 + x**2),
-                    jnp.zeros(n_dim),
-                )
-                theta = Parameterize(
-                    lambda x: x + jnp.sqrt(1 + x**2),
-                    jnp.zeros(n_dim),
-                )
-                affine = bijections.AsymmetricAffine(jnp.zeros(n_dim), jnp.ones(n_dim), jnp.ones(n_dim))
-                affine = eqx.tree_at(
-                    where=lambda aff: aff.scale,
-                    pytree=affine,
-                    replace=scale,
-                )
-                affine = eqx.tree_at(
-                    where=lambda aff: aff.theta,
-                    pytree=affine,
-                    replace=theta,
-                )
-
-                params = jnp.ones(n_dim) * 1e-5
-                params = params.at[-1].set(1.0)
-
-                hh = bijections.Householder(params)
-                flow = bijections.Chain(
-                    [
-                        bijections.Sandwich(
-                            hh,
-                            affine,
-                        ),
-                        flow,
-                    ]
-                )
+            flow = bijections.Chain(
+                [
+                    #make_elemwise_trafo(key, n_dim, count=1),
+                    mvscale,
+                    flow,
+                ]
+            )
 
             return flow
 
+        key, key_permute = jax.random.split(key)
         keys = jax.random.split(key, n_layers)
 
-        if isinstance(untransformed_dim, int):
+        if untransformed_dim is None:
+            rng = np.random.default_rng(int(jax.random.randint(key, (), 0, 2**32)))
+            permutation, lengths = generate_permutations(rng, n_dim, n_layers)
+            layers = []
+            for i, (key, p, length) in enumerate(zip(keys, permutation, lengths)):
+                layers.append(make_layer(key, int(length), p))
+            bijection = flowjax.bijections.Chain(layers)
+        elif isinstance(untransformed_dim, int):
             make_layers = eqx.filter_vmap(make_layer)
             layers = make_layers(keys, untransformed_dim)
             bijection = flowjax.bijections.Scan(layers)
@@ -361,20 +854,6 @@ def make_transform_adapter(
                     inner = make_layer(key, num_untrafo)
                     outer = flowjax.bijections.DCT(inner.shape)
 
-                    layers.append(flowjax.bijections.Sandwich(outer, inner))
-
-                    scale_val = jnp.ones(n_dim)
-                    scale = Parameterize(
-                        lambda x: x + jnp.sqrt(1 + x**2),
-                        jnp.zeros(n_dim),
-                    )
-                    mean = jnp.zeros(n_dim)
-                    inner = eqx.tree_at(
-                        where=lambda aff: aff.scale,
-                        pytree=flowjax.bijections.Affine(mean, scale_val),
-                        replace=scale,
-                    )
-                    outer = flowjax.bijections.DCT(inner.shape)
                     layers.append(flowjax.bijections.Sandwich(outer, inner))
 
             bijection = flowjax.bijections.Chain(layers)
@@ -436,91 +915,7 @@ def make_transform_adapter(
 
         permute = bijections.Permute(idxs)
 
-        if False:
-            identity = bijections.Identity(shape=(n_dim - extension_var_count,))
-            print(costs[idxs])
-
-            scale = Parameterize(
-                lambda x: x + jnp.sqrt(1 + x**2),
-                jnp.array(0.0),
-            )
-            affine = eqx.tree_at(
-                where=lambda aff: aff.scale,
-                pytree=flowjax.bijections.Affine(),
-                replace=scale,
-            )
-            scale = Parameterize(
-                lambda x: x + jnp.sqrt(1 + x**2),
-                jnp.array(0.0),
-            )
-            affine2 = eqx.tree_at(
-                where=lambda aff: aff.scale,
-                pytree=flowjax.bijections.Affine(),
-                replace=scale,
-            )
-
-            pre = []
-            if layer % 2 == 0:
-                pre.append(bijections.Neg(shape=(n_dim,)))
-
-            nonlin_affine = bijections.Chain(
-                [
-                    bijections.Sandwich(
-                        bijections.Chain(
-                            [
-                                *pre,
-                                bijections.Vmap(
-                                    bijections.SoftPlusX(), axis_size=n_dim
-                                ),
-                            ]
-                        ),
-                        affine,
-                    ),
-                    affine2,
-                ]
-            )
-
-            if nn_width is None:
-                width = extension_var_count * 16
-            else:
-                width = nn_width * 16
-
-            if untransformed_dim is None:
-                untransformed_dim = extension_var_count // 2
-
-            if width > 2 * untransformed_dim:
-                width = 2 * untransformed_dim
-
-            coupling = flowjax.bijections.coupling.Coupling(
-                key,
-                transformer=nonlin_affine,
-                #transformer=affine,
-                untransformed_dim=untransformed_dim,
-                dim=extension_var_count,
-                nn_activation=jax.nn.gelu,
-                nn_width=width,
-                nn_depth=nn_depth + 1,
-            )
-            if zero_init:
-                coupling = jax.tree_util.tree_map(
-                    lambda x: x * 1e-3 if eqx.is_inexact_array(x) else x,
-                    coupling,
-                )
-
-            params = jnp.ones(extension_var_count) * 1e-5
-            params = params.at[-1].set(1.0)
-
-            hh = flowjax.bijections.Householder(params)
-            inner_permute = flowjax.bijections.Permute(
-                jax.random.permutation(key, jnp.arange(extension_var_count))
-            )
-            coupling = flowjax.bijections.Sandwich(
-                inner_permute,
-                flowjax.bijections.Sandwich(hh, coupling),
-            )
-
-            inner = bijections.Concatenate([identity, coupling])
-        else:
+        if True:
             scale = Parameterize(
                 lambda x: x + jnp.sqrt(1 + x**2),
                 jnp.array(0.0),
@@ -543,41 +938,12 @@ def make_transform_adapter(
                 replace=theta,
             )
 
-            """
-            scale = Parameterize(
-                lambda x: x + jnp.sqrt(1 + x**2),
-                jnp.array(0.0),
-            )
-            affine2 = eqx.tree_at(
-                where=lambda aff: aff.scale,
-                pytree=flowjax.bijections.Affine(),
-                replace=scale,
-            )
-            pre = []
-            if layer % 2 == 0:
-                pre.append(bijections.Neg(shape=()))
-
-            nonlin_affine = bijections.Chain([
-                bijections.Sandwich(
-                    bijections.Chain([
-                        *pre,
-                        bijections.SoftPlusX(),
-                    ]),
-                    affine,
-                ),
-                affine2,
-            ])
-            """
-
             do_flip = layer % 2 == 0
 
             if nn_width is None:
                 width = 16
             else:
                 width = nn_width
-
-            #if untransformed_dim is None:
-            #    untransformed_dim = extension_var_count // 2
 
             if do_flip:
                 coupling = flowjax.bijections.coupling.Coupling(
@@ -646,9 +1012,6 @@ def make_transform_adapter(
                 else:
                     width = nn_width
 
-                #if untransformed_dim is None:
-                #    untransformed_dim = extension_var_count // 2
-
                 coupling = flowjax.bijections.coupling.Coupling(
                     key,
                     transformer=affine,
@@ -667,15 +1030,6 @@ def make_transform_adapter(
 
                 if verbose:
                     print(costs[permute.permutation][inner.outer.permutation])
-
-                """
-                params = jnp.ones(n_dim) * 1e-5
-                params = params.at[-1].set(0.)
-
-                hh = flowjax.bijections.Householder(params)
-
-                coupling = bijections.Sandwich(hh, coupling)
-                """
 
                 inner = bijections.Sandwich(
                     inner.outer,
@@ -793,7 +1147,7 @@ def make_transform_adapter(
     def _inv_transform(bijection, untransformed_position, untransformed_gradient):
         bijection = unwrap(bijection)
         transformed_position, transformed_gradient, logdet = (
-            bijection.inverse_gradient_and_val(
+            bijection.inverse_gradient_and_val_(
                 untransformed_position, untransformed_gradient, 0.0
             )
         )
@@ -837,7 +1191,9 @@ def make_transform_adapter(
             self._initial_skip = initial_skip
             if make_optimizer is None:
                 self._make_optimizer = lambda: optax.apply_if_finite(
+                    #optax.adamw(learning_rate), 50
                     optax.adabelief(learning_rate), 50
+                    #optax.adam(learning_rate), 50
                 )
             else:
                 self._make_optimizer = make_optimizer
