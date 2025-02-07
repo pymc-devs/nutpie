@@ -9,6 +9,11 @@ version = "0.1.0"
 [tasks]
 test = "pytest"
 develop = "maturin develop --release"
+get-posteriordb = "git clone 'https://github.com/stan-dev/posteriordb'"
+
+[tasks.bench]
+depends-on = ["develop", "get-posteriordb"]
+cmd = "python -m samplerlab -m posteriordb-fast --posteriordb posteriordb/posterior_database --save-traces --seed 12345"
 
 [dependencies]
 python = ">=3.12.7,<3.13"
@@ -29,10 +34,9 @@ ipywidgets = ">=8.1.5,<9"
 #jaxlib = { version = "*", build = "*cuda12*" }
 
 [pypi-dependencies]
-bridgestan = ">=2.5.0, <3"
-#flowjax = { git = "https://github.com/aseyboldt/flowjax.git", rev = "1c282f2ded78e81c7ce6a96f61523a9f18bf8edc" }
-flowjax = { path = "../flowjax/", editable = true }
-samplerlab = { path = "../pymc-labs/benchmark-pymc", editable = true }
+bridgestan = ">=2.6.0, <3"
+flowjax = { git = "https://github.com/aseyboldt/flowjax.git", rev = "07e7e32217bcfcaa7d68a304f332c925d26ab76f" }
+samplerlab = { git = "https://github.com/aseyboldt/samplerlab/" }
 posteriordb = ">=0.2.0, <0.3"
 jax = { version = "<0.4.37, <0.5", extras = ["cuda12"] }
 watermark = ">=2.5.0, <3"
