@@ -520,14 +520,14 @@ def make_transform_adapter(
     show_progress=False,
     nn_depth=1,
     nn_width=16,
-    num_layers=3,
+    num_layers=9,
     num_diag_windows=10,
-    learning_rate=1e-3,
-    untransformed_dim=[1, None, -1],
+    learning_rate=5e-4,
+    untransformed_dim=None,
     zero_init=True,
     batch_size=128,
     reuse_opt_state=False,
-    max_patience=60,
+    max_patience=20,
     householder_layer=True,
     dct_layer=False,
     gamma=None,
@@ -778,7 +778,7 @@ def make_transform_adapter(
         ])
         mlp1 = lambda out_size: FactoredMLP(
             n_untransformed,
-            (32, out_size),
+            (128, out_size),
             kwargs["nn_width"],
             depth=len(kwargs["nn_width"]),
             key=key,
@@ -928,7 +928,8 @@ def make_transform_adapter(
         keys = jax.random.split(key, n_layers)
 
         if untransformed_dim is None:
-            rng = np.random.default_rng(int(jax.random.randint(key, (), 0, 2**32)))
+            # TODO better rng?
+            rng = np.random.default_rng(int(jax.random.randint(key, (), 0, 2**30)))
             permutation, lengths = generate_permutations(rng, n_dim, n_layers)
             layers = []
             for i, (key, p, length) in enumerate(zip(keys, permutation, lengths)):
