@@ -1530,6 +1530,15 @@ def make_transform_adapter(
                         (self.index, fit, (positions, gradients, logps))
                     )
 
+
+                def valid_new_logp():
+                    logdet, pos, grad = _inv_transform(
+                        fit,
+                        jnp.array(positions[-1]),
+                        jnp.array(gradients[-1]),
+                    )
+                    return np.isfinite(logdet) and np.isfinite(pos[0]).all() and np.isfinite(grad[0]).all()
+
                 if (not np.isfinite(old_loss)) and (not np.isfinite(new_loss)):
                     self._bijection = self._make_flow_fn(
                         seed, positions, gradients, n_layers=0
@@ -1537,7 +1546,14 @@ def make_transform_adapter(
                     self._opt_state = None
                     return
 
+                if not valid_new_logp():
+                    if self._verbose:
+                        print("Invalid new logp. Skipping update.")
+                    return
+
                 if not np.isfinite(new_loss):
+                    if self._verbose:
+                        print("Invalid new loss. Skipping update.")
                     return
 
                 if new_loss > old_loss:
