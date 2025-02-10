@@ -528,7 +528,7 @@ def make_transform_adapter(
     batch_size=128,
     reuse_opt_state=False,
     max_patience=20,
-    householder_layer=True,
+    householder_layer=False,
     dct_layer=False,
     gamma=None,
     log_inside_batch=False,
