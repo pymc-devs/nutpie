@@ -2,6 +2,48 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.13.3] - 2025-02-11
+
+### Bug Fixes
+
+- Use arrow list with i64 offsets to store trace (Adrian Seyboldt)
+
+- Use i64 offsets in numba backend (Adrian Seyboldt)
+
+- Avoid numpy compatibility warning (Adrian Seyboldt)
+
+- Specify that we currently don't support py313 due to pyo3 (Adrian Seyboldt)
+
+
+### Features
+
+- Add support for pymc sampler initialization (jessegrabowski)
+
+- Use support_point as default init for pymc (Adrian Seyboldt)
+
+- Add option not to store some deterministics (Adrian Seyboldt)
+
+- Add option to freeze pymc models (Adrian Seyboldt)
+
+
+### Miscellaneous Tasks
+
+- Bump uraimo/run-on-arch-action from 2.7.2 to 2.8.1 (dependabot[bot])
+
+- Specify version as dynamic in pyproject (Adrian Seyboldt)
+
+- Update bridgestan (Adrian Seyboldt)
+
+- Update pre-commit versions (Adrian Seyboldt)
+
+- Update version and changelog (Adrian Seyboldt)
+
+
+### Styling
+
+- Reformat some code (Adrian Seyboldt)
+
+
 ## [0.13.2] - 2024-07-26
 
 ### Features
@@ -145,7 +187,7 @@ All notable changes to this project will be documented in this file.
 
 ### Documentation
 
-- Mention non-blocking sampling in readme  (Adrian Seyboldt)
+- Mention non-blocking sampling in readme (Adrian Seyboldt)
 
 
 ### Features
@@ -171,7 +213,7 @@ All notable changes to this project will be documented in this file.
 
 - Bump the cargo group across 1 directory with 2 updates (dependabot[bot])
 
-- Some major version bumps in rust deps  (Adrian Seyboldt)
+- Some major version bumps in rust deps (Adrian Seyboldt)
 
 - Bump dependency versions (Adrian Seyboldt)
 
