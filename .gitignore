@@ -17,3 +17,4 @@ wheels
 .cargo
 *traces*
 .pyrightconfig.json
+*.zarr
