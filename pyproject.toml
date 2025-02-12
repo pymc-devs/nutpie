@@ -23,19 +23,19 @@ classifiers = [
 dependencies = [
   "pyarrow >= 12.0.0",
   "pandas >= 2.0",
-  "xarray >= 2023.06.0",
-  "arviz >= 0.15.0",
+  "xarray >= 2025.01.2",
+  "arviz >= 0.20.0",
 ]
 dynamic = ["version"]
 
 [project.optional-dependencies]
-stan = ["bridgestan >= 2.4.1"]
-pymc = ["pymc >= 5.15.0", "numba >= 0.59.1"]
-pymc-jax = ["pymc >= 5.15.0", "jax >= 0.4.27"]
+stan = ["bridgestan >= 2.6.1"]
+pymc = ["pymc >= 5.20.1", "numba >= 0.60.0"]
+pymc-jax = ["pymc >= 5.20.1", "jax >= 0.4.27"]
 all = [
-  "bridgestan >= 2.4.1",
-  "pymc >= 5.15.0",
-  "numba >= 0.59.1",
+  "bridgestan >= 2.6.1",
+  "pymc >= 5.20.1",
+  "numba >= 0.60.0",
   "jax >= 0.4.27",
 ]
 
