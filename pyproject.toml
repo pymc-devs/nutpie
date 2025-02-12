@@ -28,11 +28,21 @@ dynamic = ["version"]
 stan = ["bridgestan >= 2.6.1"]
 pymc = ["pymc >= 5.20.1", "numba >= 0.60.0"]
 pymc-jax = ["pymc >= 5.20.1", "jax >= 0.4.27"]
+nnflow = ["flowjax >= 17.0.2"]
+dev = [
+  "bridgestan >= 2.6.1",
+  "pymc >= 5.20.1",
+  "numba >= 0.60.0",
+  "jax >= 0.4.27",
+  "flowjax >= 17.0.2",
+  "pytest",
+]
 all = [
   "bridgestan >= 2.6.1",
   "pymc >= 5.20.1",
   "numba >= 0.60.0",
   "jax >= 0.4.27",
+  "flowjax >= 17.0.2",
 ]
 
 [tool.ruff]

@@ -12,7 +12,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 use pyo3::{exceptions::PyValueError, pyclass, pymethods, PyResult};
 use rand::prelude::Distribution;
-use rand::{thread_rng, RngCore};
+use rand::{rng, RngCore};
 use rand_distr::StandardNormal;
 use smallvec::{SmallVec, ToSmallVec};
 
@@ -149,7 +149,7 @@ impl StanModel {
     ) -> anyhow::Result<Self> {
         let seed = match seed {
             Some(seed) => seed,
-            None => thread_rng().next_u32(),
+            None => rng().next_u32(),
         };
         let data: Option<CString> = data.map(CString::new).transpose()?;
         let model = Arc::new(

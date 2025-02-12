@@ -26,7 +26,7 @@ use pyo3::{
     prelude::*,
     types::{PyList, PyTuple},
 };
-use rand::{thread_rng, RngCore};
+use rand::{rng, RngCore};
 
 #[pyclass]
 struct PyChainProgress(ChainProgress);
@@ -85,7 +85,7 @@ enum Settings {
 impl PyNutsSettings {
     fn new_diag(seed: Option<u64>) -> Self {
         let seed = seed.unwrap_or_else(|| {
-            let mut rng = thread_rng();
+            let mut rng = rng();
             rng.next_u64()
         });
         let settings = DiagGradNutsSettings {
@@ -100,7 +100,7 @@ impl PyNutsSettings {
 
     fn new_low_rank(seed: Option<u64>) -> Self {
         let seed = seed.unwrap_or_else(|| {
-            let mut rng = thread_rng();
+            let mut rng = rng();
             rng.next_u64()
         });
         let settings = LowRankNutsSettings {
@@ -115,7 +115,7 @@ impl PyNutsSettings {
 
     fn new_tranform_adapt(seed: Option<u64>) -> Self {
         let seed = seed.unwrap_or_else(|| {
-            let mut rng = thread_rng();
+            let mut rng = rng();
             rng.next_u64()
         });
         let settings = TransformedNutsSettings {

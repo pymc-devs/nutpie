@@ -641,7 +641,7 @@ impl Model for PyModel {
         position: &mut [f64],
     ) -> Result<()> {
         let Some(init_func) = self.init_point_func.as_ref() else {
-            let dist = Uniform::new(-2f64, 2f64);
+            let dist = Uniform::new(-2f64, 2f64).expect("Could not create uniform distribution");
             position.iter_mut().for_each(|x| *x = dist.sample(rng));
             return Ok(());
         };
