@@ -1,6 +1,7 @@
 import dataclasses
 import itertools
 import warnings
+from collections.abc import Iterable
 from dataclasses import dataclass
 from functools import wraps
 from importlib.util import find_spec
@@ -70,7 +71,7 @@ def _rv_dict_to_flat_array_wrapper(
         for name, shape in zip(names, shapes, strict=True):
             initial_value = initial_value_dict[name]
             n = int(np.prod(initial_value.shape))
-            if initial_value.shape != tuple(shape):
+            if tuple(initial_value.shape) != tuple(shape):
                 raise ValueError(
                     f"Size of initial value for {name} is {initial_value.shape}, "
                     f"expected {shape}"
@@ -219,6 +220,7 @@ def make_user_data(shared_vars, shared_data):
 def _compile_pymc_model_numba(
     model: "pm.Model",
     pymc_initial_point_fn: Callable[[SeedType], dict[str, np.ndarray]],
+    var_names: Iterable[str] | None = None,
     **kwargs,
 ) -> CompiledPyMCModel:
     if find_spec("numba") is None:
@@ -243,6 +245,7 @@ def _compile_pymc_model_numba(
         compute_grad=True,
         join_expanded=True,
         pymc_initial_point_fn=pymc_initial_point_fn,
+        var_names=var_names,
     )
 
     expand_fn = expand_fn_pt.vm.jit_fn
@@ -338,6 +341,7 @@ def _compile_pymc_model_jax(
     *,
     gradient_backend=None,
     pymc_initial_point_fn: Callable[[SeedType], dict[str, np.ndarray]],
+    var_names: Iterable[str] | None = None,
     **kwargs,
 ):
     if find_spec("jax") is None:
@@ -367,6 +371,7 @@ def _compile_pymc_model_jax(
         compute_grad=gradient_backend == "pytensor",
         join_expanded=False,
         pymc_initial_point_fn=pymc_initial_point_fn,
+        var_names=var_names,
     )
 
     logp_fn = logp_fn_pt.vm.jit_fn
@@ -451,6 +456,7 @@ def compile_pymc_model(
     default_initialization_strategy: Literal[
         "support_point", "prior"
     ] = "support_point",
+    var_names: Iterable[str] | None = None,
     freeze_model: bool | None = None,
     **kwargs,
 ) -> CompiledModel:
@@ -475,6 +481,11 @@ def compile_pymc_model(
     initial_points : dict
         Initial value (strategies) to use instead of what's specified in
         `Model.initial_values`.
+    var_names : list[str] | None
+        A list of variables to store in the trace. If None, store all variables.
+    freeze_model : bool | None
+        Freeze all dimensions and shared variables to treat them as compile time
+        constants.
     Returns
     -------
     compiled_model : CompiledPyMCModel
@@ -514,13 +525,17 @@ def compile_pymc_model(
         if gradient_backend == "jax":
             raise ValueError("Gradient backend cannot be jax when using numba backend")
         return _compile_pymc_model_numba(
-            model=model, pymc_initial_point_fn=initial_point_fn, **kwargs
+            model=model,
+            pymc_initial_point_fn=initial_point_fn,
+            var_names=var_names,
+            **kwargs,
         )
     elif backend.lower() == "jax":
         return _compile_pymc_model_jax(
             model=model,
             gradient_backend=gradient_backend,
             pymc_initial_point_fn=initial_point_fn,
+            var_names=var_names,
             **kwargs,
         )
     else:
@@ -574,6 +589,7 @@ def _make_functions(
     compute_grad: bool,
     join_expanded: bool,
     pymc_initial_point_fn: Callable[[SeedType], dict[str, np.ndarray]],
+    var_names: Iterable[str] | None = None,
 ) -> tuple[
     int,
     int,
@@ -600,6 +616,8 @@ def _make_functions(
     pymc_initial_point_fn: Callable
         Initial point function created by
         pymc.initial_point.make_initial_point_fn
+    var_names:
+        Names of variables to store in the trace. Defaults to all variables.
 
     Returns
     -------
@@ -704,6 +722,10 @@ def _make_functions(
     remaining_rvs = [
         var for var in model.unobserved_value_vars if var.name not in joined_names
     ]
+
+    if var_names is not None:
+        names = set(var_names)
+        remaining_rvs = [var for var in remaining_rvs if var.name in names]
 
     all_names = joined_names + remaining_rvs
 

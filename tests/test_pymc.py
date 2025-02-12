@@ -179,7 +179,10 @@ def test_pymc_model_shared(backend, gradient_backend):
         pm.Normal("a", mu=mu, sigma=sigma, shape=3)
 
     compiled = nutpie.compile_pymc_model(
-        model, backend=backend, gradient_backend=gradient_backend
+        model,
+        backend=backend,
+        gradient_backend=gradient_backend,
+        freeze_model=False,
     )
     trace = nutpie.sample(compiled, chains=1, seed=1)
     np.testing.assert_allclose(trace.posterior.a.mean().values, -0.1, atol=0.05)
@@ -191,6 +194,53 @@ def test_pymc_model_shared(backend, gradient_backend):
     compiled3 = compiled.with_data(mu=0.5, sigma=3 * np.ones(4))
     with pytest.raises(RuntimeError):
         nutpie.sample(compiled3, chains=1)
+
+
+@parameterize_backends
+def test_pymc_var_names(backend, gradient_backend):
+    with pm.Model() as model:
+        mu = pm.Data("mu", -0.1)
+        sigma = pm.Data("sigma", np.ones(3))
+        a = pm.Normal("a", mu=mu, sigma=sigma, shape=3)
+
+        b = pm.Deterministic("b", mu * a)
+        pm.Deterministic("c", mu * b)
+
+    compiled = nutpie.compile_pymc_model(
+        model,
+        backend=backend,
+        gradient_backend=gradient_backend,
+        var_names=None,
+    )
+    trace = nutpie.sample(compiled, chains=1, seed=1)
+
+    # Check that variables are stored
+    assert hasattr(trace.posterior, "b")
+    assert hasattr(trace.posterior, "c")
+
+    compiled = nutpie.compile_pymc_model(
+        model,
+        backend=backend,
+        gradient_backend=gradient_backend,
+        var_names=[],
+    )
+    trace = nutpie.sample(compiled, chains=1, seed=1)
+
+    # Check that variables are stored
+    assert not hasattr(trace.posterior, "b")
+    assert not hasattr(trace.posterior, "c")
+
+    compiled = nutpie.compile_pymc_model(
+        model,
+        backend=backend,
+        gradient_backend=gradient_backend,
+        var_names=["b"],
+    )
+    trace = nutpie.sample(compiled, chains=1, seed=1)
+
+    # Check that variables are stored
+    assert hasattr(trace.posterior, "b")
+    assert not hasattr(trace.posterior, "c")
 
 
 @pytest.mark.parametrize(

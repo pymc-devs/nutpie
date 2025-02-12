@@ -1,9 +1,9 @@
 [package]
 name = "nutpie"
-#version = "0.14.0"
+version = "0.14.0"
 authors = [
-  "Adrian Seyboldt <adrian.seyboldt@gmail.com>",
-  "PyMC Developers <pymc.devs@gmail.com>",
+    "Adrian Seyboldt <adrian.seyboldt@gmail.com>",
+    "PyMC Developers <pymc.devs@gmail.com>",
 ]
 edition = "2021"
 license = "MIT"
@@ -31,8 +31,8 @@ rayon = "1.10.0"
 # Keep arrow in sync with nuts-rs requirements
 arrow = { version = "53.1.0", default-features = false, features = ["ffi"] }
 anyhow = "1.0.72"
-itertools = "0.13.0"
-bridgestan = "2.6.0"
+itertools = "0.14.0"
+bridgestan = "2.6.1"
 rand_distr = "0.4.3"
 smallvec = "1.13.0"
 upon = { version = "0.8.1", default-features = false, features = [] }

@@ -3,8 +3,8 @@ use std::sync::Arc;
 use anyhow::{anyhow, bail, Context, Result};
 use arrow::{
     array::{
-        Array, ArrayBuilder, BooleanBuilder, FixedSizeListBuilder, Float32Builder, Float64Builder,
-        Int64Builder, LargeListBuilder, ListBuilder, PrimitiveBuilder, StructBuilder,
+        Array, ArrayBuilder, BooleanBuilder, Float32Builder, Float64Builder, Int64Builder,
+        LargeListBuilder, PrimitiveBuilder, StructBuilder,
     },
     datatypes::{DataType, Field, Float32Type, Float64Type, Int64Type},
 };

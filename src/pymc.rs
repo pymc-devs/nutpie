@@ -2,7 +2,8 @@ use std::{ffi::c_void, fmt::Display, sync::Arc};
 
 use anyhow::{bail, Context, Result};
 use arrow::{
-    array::{Array, FixedSizeListArray, Float64Array, StructArray},
+    array::{Array, Float64Array, LargeListArray, StructArray},
+    buffer::OffsetBuffer,
     datatypes::{DataType, Field, Fields},
 };
 use itertools::{izip, Itertools};
@@ -170,11 +171,13 @@ impl<'model> DrawStorage for PyMcTrace<'model> {
     fn finalize(self) -> Result<Arc<dyn Array>> {
         let (fields, arrays): (Vec<_>, _) = izip!(self.data, self.var_names, self.var_sizes)
             .map(|(data, name, size)| {
+                assert!(data.len() % size == 0);
+                let num_arrays = data.len() / size;
                 let data = Float64Array::from(data);
                 let item_field = Arc::new(Field::new("item", DataType::Float64, false));
-                let array =
-                    FixedSizeListArray::new(item_field.clone(), size as _, Arc::new(data), None);
-                let field = Field::new(name, DataType::FixedSizeList(item_field, size as _), false);
+                let offsets = OffsetBuffer::from_lengths((0..num_arrays).into_iter().map(|_| size));
+                let array = LargeListArray::new(item_field.clone(), offsets, Arc::new(data), None);
+                let field = Field::new(name, DataType::LargeList(item_field), false);
                 (Arc::new(field), Arc::new(array) as Arc<dyn Array>)
             })
             .unzip();
