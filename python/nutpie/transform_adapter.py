@@ -1,5 +1,3 @@
-from typing import Callable, Literal, Union, cast
-import math
 from functools import partial
 
 import numpy as np
@@ -10,9 +8,8 @@ import traceback
 import flowjax
 import flowjax.flows
 import flowjax.train
-from flowjax import bijections
 import optax
-from paramax import Parameterize, unwrap
+from paramax import unwrap
 
 from nutpie.normalizing_flow import extend_flow, make_flow
 
@@ -66,9 +63,7 @@ class FisherLoss:
         if self._gamma is None:
 
             def compute_loss(bijection, draw, grad, logp):
-                draw, grad, logp = bijection.inverse_gradient_and_val_(
-                    draw, grad, logp
-                )
+                draw, grad, logp = bijection.inverse_gradient_and_val_(draw, grad, logp)
                 cost = ((draw + grad) ** 2).sum()
                 return cost
 
@@ -138,6 +133,7 @@ def _init_from_transformed_position(logp_fn, bijection, transformed_position):
         transformed_gradient,
     )
 
+
 @eqx.filter_jit
 def _init_from_transformed_position_part1(logp_fn, bijection, transformed_position):
     bijection = unwrap(bijection)
@@ -146,6 +142,7 @@ def _init_from_transformed_position_part1(logp_fn, bijection, transformed_positi
     )
 
     return (logdet, untransformed_position)
+
 
 @eqx.filter_jit
 def _init_from_transformed_position_part2(
@@ -161,6 +158,7 @@ def _init_from_transformed_position_part2(
         logdet,
         transformed_gradient,
     )
+
 
 @eqx.filter_jit
 def _init_from_untransformed_position(logp_fn, bijection, untransformed_position):
@@ -178,6 +176,7 @@ def _init_from_untransformed_position(logp_fn, bijection, untransformed_position
         transformed_gradient,
     )
 
+
 @eqx.filter_jit
 def _inv_transform(bijection, untransformed_position, untransformed_gradient):
     bijection = unwrap(bijection)
@@ -187,6 +186,7 @@ def _inv_transform(bijection, untransformed_position, untransformed_gradient):
         )
     )
     return logdet, transformed_position, transformed_gradient
+
 
 class TransformAdapter:
     def __init__(
@@ -228,9 +228,7 @@ class TransformAdapter:
         self._num_layers = num_layers
         if make_optimizer is None:
             self._make_optimizer = lambda: optax.apply_if_finite(
-                #optax.adamw(learning_rate), 50
-                optax.adabelief(learning_rate), 50
-                #optax.adam(learning_rate), 50
+                optax.adamw(learning_rate), 50
             )
         else:
             self._make_optimizer = make_optimizer
@@ -303,9 +301,7 @@ class TransformAdapter:
                     flowjax.distributions.StandardNormal(fit.shape), fit
                 )
                 params, static = eqx.partition(flow, eqx.is_inexact_array)
-                new_loss = self._loss_fn(
-                    params, static, positions, gradients, logps
-                )
+                new_loss = self._loss_fn(params, static, positions, gradients, logps)
 
                 if self._verbose:
                     print("loss from diag:", new_loss)
@@ -316,12 +312,8 @@ class TransformAdapter:
 
                 return
 
-            positions = np.array(
-                positions[self._initial_skip :][-self._window_size :]
-            )
-            gradients = np.array(
-                gradients[self._initial_skip :][-self._window_size :]
-            )
+            positions = np.array(positions[self._initial_skip :][-self._window_size :])
+            gradients = np.array(gradients[self._initial_skip :][-self._window_size :])
             logps = np.array(logps[self._initial_skip :][-self._window_size :])
 
             if len(positions) < 10:
@@ -431,9 +423,7 @@ class TransformAdapter:
             )
 
             if self._verbose:
-                print(
-                    f"Chain {self._chain}: New loss {new_loss}, old loss {old_loss}"
-                )
+                print(f"Chain {self._chain}: New loss {new_loss}, old loss {old_loss}")
 
             if not np.isfinite(old_loss):
                 flow = flowjax.flows.Transformed(
@@ -473,14 +463,17 @@ class TransformAdapter:
                     (self.index, fit, (positions, gradients, logps))
                 )
 
-
             def valid_new_logp():
                 logdet, pos, grad = _inv_transform(
                     fit,
                     jnp.array(positions[-1]),
                     jnp.array(gradients[-1]),
                 )
-                return np.isfinite(logdet) and np.isfinite(pos[0]).all() and np.isfinite(grad[0]).all()
+                return (
+                    np.isfinite(logdet)
+                    and np.isfinite(pos[0]).all()
+                    and np.isfinite(grad[0]).all()
+                )
 
             if (not np.isfinite(old_loss)) and (not np.isfinite(new_loss)):
                 self._bijection = self._make_flow_fn(
@@ -555,9 +548,7 @@ class TransformAdapter:
                 part1,
                 untransformed_gradient,
             )
-            return float(logdet), *[
-                np.array(val, dtype="float64") for val in arrays
-            ]
+            return float(logdet), *[np.array(val, dtype="float64") for val in arrays]
         except Exception as e:
             print(e)
             print(traceback.format_exc())
@@ -587,6 +578,7 @@ class TransformAdapter:
             print(e)
             print(traceback.format_exc())
             raise
+
 
 def make_transform_adapter(
     *,
