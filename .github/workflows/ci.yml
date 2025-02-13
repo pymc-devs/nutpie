@@ -40,11 +40,23 @@ jobs:
             3.11
             3.12
             3.13
+      # Leave out 3.13 on aarch due to an issue in pyo3/rust-numpy 0.23.4
       - name: Build wheels
         uses: PyO3/maturin-action@v1
+        if: ${{ matrix.platform.target == 'aarch64' }}
         with:
           target: ${{ matrix.platform.target }}
-          args: --release --out dist --find-interpreter --zig
+          args: --release --out dist --interpreter 3.10 3.11 3.12 --zig
+          sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
+          manylinux: auto
+          before-script-linux: |
+            dnf install -y clang-libs clang || sudo apt install llvm-dev libclang-dev clang
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        if: ${{ matrix.platform.target == 'x86_64' }}
+        with:
+          target: ${{ matrix.platform.target }}
+          args: --release --out dist --interpreter 3.10 3.11 3.12 3.13 --zig
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
           manylinux: auto
           before-script-linux: |
@@ -168,7 +180,7 @@ jobs:
             3.10
             3.11
             3.12
-            3.13
+          # 3.13 leave out 3.13 due to a segfault
           architecture: ${{ matrix.platform.target }}
       - name: Install uv
         uses: astral-sh/setup-uv@v5
