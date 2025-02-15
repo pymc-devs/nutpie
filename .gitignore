@@ -18,3 +18,8 @@ wheels
 *traces*
 .pyrightconfig.json
 *.zarr
+book
+docs/_site
+.quarto
+example-iree
+posteriordb

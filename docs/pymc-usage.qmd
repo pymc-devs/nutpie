@@ -50,7 +50,7 @@ We will define a simple Bayesian model using `pymc` and sample from it using
 
 In your `model.ipypy` file or Jupyter notebook, add the following code:
 
-```python
+```{python}
 import pymc as pm
 import nutpie
 import pandas as pd
@@ -66,15 +66,14 @@ with pm.Model(coords=coords) as model:
     x = [1, 2, 3]
 
     mu = intercept + slope * x
-    sigma = pm.HalfNormal("sigma", sigma=1)
-    y = pm.Normal("y", mu=mu, sigma=sigma, observed=[1, 2, 3], dims="observation")
+    y = pm.Normal("y", mu=mu, sigma=0.1, observed=[1, 2, 3], dims="observation")
 ```
 
 ### Sampling
 
 We can now compile the model using the numba backend:
 
-```python
+```{python}
 compiled = nutpie.compile_pymc_model(model)
 trace = nutpie.sample(compiled)
 ```
@@ -96,15 +95,15 @@ analyze the trace.
 
 For example, we should check the effective sample size:
 
-```python
+```{python}
 import arviz as az
 az.ess(trace)
 ```
 
-and have a look at a trace plot:
+and take a look at a trace plot:
 
-```python
-az.plot_trace(trace)
+```{python}
+az.plot_trace(trace);
 ```
 
 ### Choosing the backend
@@ -154,26 +153,25 @@ only recommended with the numba backend.
 
 First, we define the model, but put our dataset in a `pm.Data` structure:
 
-```python
-with pm.Model():
+```{python}
+with pm.Model() as model:
     x = pm.Data("x", [1, 2, 3])
     intercept = pm.Normal("intercept", mu=0, sigma=1)
     slope = pm.Normal("slope", mu=0, sigma=1)
     mu = intercept + slope * x
-    sigma = pm.HalfNormal("sigma", sigma=1)
-    y = pm.Normal("y", mu=mu, sigma=sigma, observed=[1, 2, 3])
+    y = pm.Normal("y", mu=mu, sigma=0.1, observed=[1, 2, 3])
 ```
 
 We can now compile the model:
 
-```python
+```{python}
 compiled = nutpie.compile_pymc_model(model)
 trace = nutpie.sample(compiled)
 ```
 
 After compilation, we can change the dataset:
 
-```python
-compiled2 = compiled.with_data({"x": [4, 5, 6]})
+```{python}
+compiled2 = compiled.with_data(x=[4, 5, 6])
 trace2 = nutpie.sample(compiled2)
 ```

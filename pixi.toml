@@ -29,6 +29,12 @@ zarr = ">=2.18.3,<3"
 polars = ">=1.16.0,<2"
 viztracer = ">=1.0.0,<2"
 ipywidgets = ">=8.1.5,<9"
+quarto = ">=1.6.40,<2"
+yaml = ">=0.2.5,<0.3"
+pyyaml = ">=6.0.2,<7"
+nbformat = ">=5.10.4,<6"
+nbclient = ">=0.10.2,<0.11"
+cmdstanpy = ">=1.2.5,<2"
 # The jaxlib cuda build seems to be broken around version 0.4.34
 #jax = ">=0.4.35,<0.5"
 #jaxlib = { version = "*", build = "*cuda12*" }

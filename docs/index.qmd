@@ -30,7 +30,7 @@ conda install -c conda-forge nutpie pymc numba
 
 And then sample with
 
-```python
+```{python}
 import nutpie
 import pymc as pm
 
@@ -52,13 +52,19 @@ pip install "nutpie[stan]"
 uv add "nutpie[stan]"
 ```
 
-```python
+```{python}
+#| echo: false
+import os
+os.environ["TBB_CXX_TYPE"] = "clang"
+```
+
+```{python}
 import nutpie
 
 model = """
 data {
     int<lower=0> N;
-    real y[N];
+    vector[N] y;
 }
 parameters {
     real mu;
@@ -72,7 +78,7 @@ model {
 compiled = (
     nutpie
     .compile_stan_model(code=model)
-    .with_data({"N": 3, "y": [1, 2, 3]})
+    .with_data(N=3, y=[1, 2, 3])
 )
 trace = nutpie.sample(compiled)
 ```
