@@ -8,9 +8,10 @@ use arrow::{
     },
     datatypes::{DataType, Field, Float32Type, Float64Type, Int64Type},
 };
-use numpy::{PyArray1, PyReadonlyArray1};
+use numpy::{NotContiguousError, PyArray1, PyReadonlyArray1};
 use nuts_rs::{CpuLogpFunc, CpuMath, DrawStorage, LogpError, Model};
 use pyo3::{
+    exceptions::PyRuntimeError,
     pyclass, pymethods,
     types::{PyAnyMethods, PyDict, PyDictMethods},
     Bound, Py, PyAny, PyErr, Python,
@@ -19,6 +20,8 @@ use rand::Rng;
 use rand_distr::{Distribution, Uniform};
 use smallvec::SmallVec;
 use thiserror::Error;
+
+use crate::wrapper::PyTransformAdapt;
 
 #[pyclass]
 #[derive(Debug, Clone)]
@@ -71,29 +74,33 @@ impl PyVariable {
 #[pyclass]
 #[derive(Debug, Clone)]
 pub struct PyModel {
-    make_logp_func: Py<PyAny>,
-    make_expand_func: Py<PyAny>,
-    init_point_func: Option<Py<PyAny>>,
-    variables: Vec<PyVariable>,
+    make_logp_func: Arc<Py<PyAny>>,
+    make_expand_func: Arc<Py<PyAny>>,
+    init_point_func: Option<Arc<Py<PyAny>>>,
+    variables: Arc<Vec<PyVariable>>,
+    transform_adapter: Option<PyTransformAdapt>,
     ndim: usize,
 }
 
 #[pymethods]
 impl PyModel {
     #[new]
+    #[pyo3(signature = (make_logp_func, make_expand_func, variables, ndim, *, init_point_func=None, transform_adapter=None))]
     fn new<'py>(
         make_logp_func: Py<PyAny>,
         make_expand_func: Py<PyAny>,
         variables: Vec<PyVariable>,
         ndim: usize,
         init_point_func: Option<Py<PyAny>>,
+        transform_adapter: Option<Py<PyAny>>,
     ) -> Self {
         Self {
-            make_logp_func,
-            make_expand_func,
-            init_point_func,
-            variables,
+            make_logp_func: Arc::new(make_logp_func),
+            make_expand_func: Arc::new(make_expand_func),
+            init_point_func: init_point_func.map(|x| x.into()),
+            variables: Arc::new(variables),
             ndim,
+            transform_adapter: transform_adapter.map(PyTransformAdapt::new),
         }
     }
 }
@@ -103,9 +110,13 @@ pub enum PyLogpError {
     #[error("Bad logp value: {0}")]
     BadLogp(f64),
     #[error("Python error: {0}")]
-    PyError(PyErr),
+    PyError(#[from] PyErr),
     #[error("logp function must return float.")]
     ReturnTypeError(),
+    #[error("Python retured a non-contigous array")]
+    NotContiguousError(#[from] NotContiguousError),
+    #[error("Unknown error: {0}")]
+    Anyhow(#[from] anyhow::Error),
 }
 
 impl LogpError for PyLogpError {
@@ -113,7 +124,7 @@ impl LogpError for PyLogpError {
         match self {
             Self::BadLogp(_) => true,
             Self::PyError(err) => Python::with_gil(|py| {
-                let Ok(attr) = err.value_bound(py).getattr("is_recoverable") else {
+                let Ok(attr) = err.value(py).getattr("is_recoverable") else {
                     return false;
                 };
                 return attr
@@ -121,20 +132,29 @@ impl LogpError for PyLogpError {
                     .expect("Could not access is_recoverable in error check");
             }),
             Self::ReturnTypeError() => false,
+            Self::NotContiguousError(_) => false,
+            Self::Anyhow(_) => false,
         }
     }
 }
 
 pub struct PyDensity {
     logp: Py<PyAny>,
+    transform_adapter: Option<PyTransformAdapt>,
     dim: usize,
 }
 
 impl PyDensity {
-    fn new(logp_clone_func: &Py<PyAny>, dim: usize) -> Result<Self> {
+    fn new(
+        logp_clone_func: &Py<PyAny>,
+        dim: usize,
+        transform_adapter: Option<&PyTransformAdapt>,
+    ) -> Result<Self> {
         let logp_func = Python::with_gil(|py| logp_clone_func.call0(py))?;
+        let transform_adapter = transform_adapter.map(|val| val.clone());
         Ok(Self {
             logp: logp_func,
+            transform_adapter,
             dim,
         })
     }
@@ -142,10 +162,11 @@ impl PyDensity {
 
 impl CpuLogpFunc for PyDensity {
     type LogpError = PyLogpError;
+    type TransformParams = Py<PyAny>;
 
     fn logp(&mut self, position: &[f64], grad: &mut [f64]) -> Result<f64, Self::LogpError> {
         Python::with_gil(|py| {
-            let pos_array = PyArray1::from_slice_bound(py, position);
+            let pos_array = PyArray1::from_slice(py, position);
             let result = self.logp.call1(py, (pos_array,));
             match result {
                 Ok(val) => {
@@ -172,11 +193,122 @@ impl CpuLogpFunc for PyDensity {
     fn dim(&self) -> usize {
         self.dim
     }
+
+    fn inv_transform_normalize(
+        &mut self,
+        params: &Py<PyAny>,
+        untransformed_position: &[f64],
+        untransformed_gradient: &[f64],
+        transformed_position: &mut [f64],
+        transformed_gradient: &mut [f64],
+    ) -> std::result::Result<f64, Self::LogpError> {
+        let logdet = self
+            .transform_adapter
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?
+            .inv_transform_normalize(
+                params,
+                untransformed_position,
+                untransformed_gradient,
+                transformed_position,
+                transformed_gradient,
+            )?;
+        Ok(logdet)
+    }
+
+    fn init_from_transformed_position(
+        &mut self,
+        params: &Py<PyAny>,
+        untransformed_position: &mut [f64],
+        untransformed_gradient: &mut [f64],
+        transformed_position: &[f64],
+        transformed_gradient: &mut [f64],
+    ) -> std::result::Result<(f64, f64), Self::LogpError> {
+        let (logp, logdet) = self
+            .transform_adapter
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?
+            .init_from_transformed_position(
+                params,
+                untransformed_position,
+                untransformed_gradient,
+                transformed_position,
+                transformed_gradient,
+            )?;
+        Ok((logp, logdet))
+    }
+
+    fn init_from_untransformed_position(
+        &mut self,
+        params: &Py<PyAny>,
+        untransformed_position: &[f64],
+        untransformed_gradient: &mut [f64],
+        transformed_position: &mut [f64],
+        transformed_gradient: &mut [f64],
+    ) -> std::result::Result<(f64, f64), Self::LogpError> {
+        let (logp, logdet) = self
+            .transform_adapter
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?
+            .init_from_untransformed_position(
+                params,
+                untransformed_position,
+                untransformed_gradient,
+                transformed_position,
+                transformed_gradient,
+            )?;
+        Ok((logp, logdet))
+    }
+
+    fn update_transformation<'a, R: rand::Rng + ?Sized>(
+        &'a mut self,
+        rng: &mut R,
+        untransformed_positions: impl ExactSizeIterator<Item = &'a [f64]>,
+        untransformed_gradients: impl ExactSizeIterator<Item = &'a [f64]>,
+        untransformed_logp: impl ExactSizeIterator<Item = &'a f64>,
+        params: &'a mut Py<PyAny>,
+    ) -> std::result::Result<(), Self::LogpError> {
+        self.transform_adapter
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?
+            .update_transformation(
+                rng,
+                untransformed_positions,
+                untransformed_gradients,
+                untransformed_logp,
+                params,
+            )?;
+        Ok(())
+    }
+
+    fn new_transformation<R: rand::Rng + ?Sized>(
+        &mut self,
+        rng: &mut R,
+        untransformed_position: &[f64],
+        untransformed_gradient: &[f64],
+        chain: u64,
+    ) -> std::result::Result<Py<PyAny>, Self::LogpError> {
+        let trafo = self
+            .transform_adapter
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?
+            .new_transformation(rng, untransformed_position, untransformed_gradient, chain)?;
+        Ok(trafo)
+    }
+
+    fn transformation_id(&self, params: &Py<PyAny>) -> std::result::Result<i64, Self::LogpError> {
+        let id = self
+            .transform_adapter
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?
+            .transformation_id(params)?;
+        Ok(id)
+    }
 }
 
 pub struct PyTrace {
     expand: Py<PyAny>,
-    variables: Vec<PyVariable>,
+    variables: Arc<Vec<PyVariable>>,
     builder: StructBuilder,
 }
 
@@ -184,7 +316,7 @@ impl PyTrace {
     pub fn new<R: Rng + ?Sized>(
         rng: &mut R,
         chain: u64,
-        variables: Vec<PyVariable>,
+        variables: Arc<Vec<PyVariable>>,
         make_expand_func: &Py<PyAny>,
         capacity: usize,
     ) -> Result<Self> {
@@ -234,6 +366,7 @@ impl TensorShape {
 #[pymethods]
 impl TensorShape {
     #[new]
+    #[pyo3(signature = (shape, dims=None))]
     fn py_new(shape: Vec<usize>, dims: Option<Vec<Option<String>>>) -> Result<Self> {
         let dims = dims.unwrap_or(shape.iter().map(|_| None).collect());
         if dims.len() != shape.len() {
@@ -318,7 +451,7 @@ impl ExpandDtype {
 impl DrawStorage for PyTrace {
     fn append_value(&mut self, point: &[f64]) -> Result<()> {
         Python::with_gil(|py| {
-            let point = PyArray1::from_slice_bound(py, point);
+            let point = PyArray1::from_slice(py, point);
             let full_point = self
                 .expand
                 .call1(py, (point,))
@@ -344,36 +477,51 @@ impl DrawStorage for PyTrace {
                                 self.builder.field_builder(i).context(
                                     "Builder has incorrect type",
                                 )?;
-                            builder.append_value(value.extract().expect("Return value from expand function could not be converted to boolean"))
+                            let value = value
+                                .extract()
+                                .expect("Return value from expand function could not be converted to boolean");
+                            builder.append_value(value)
                         },
                         ExpandDtype::Float64 {} => {
                             let builder: &mut Float64Builder =
                                 self.builder.field_builder(i).context(
                                     "Builder has incorrect type",
                                 )?;
-                            builder.append_value(value.extract().expect("Return value from expand function could not be converted to float64"))
+                            builder.append_value(
+                                value
+                                .extract()
+                                .expect("Return value from expand function could not be converted to float64")
+                            )
                         },
                         ExpandDtype::Float32 {} => {
                             let builder: &mut Float32Builder =
                                 self.builder.field_builder(i).context(
                                     "Builder has incorrect type",
                                 )?;
-                            builder.append_value(value.extract().expect("Return value from expand function could not be converted to float32"))
-
+                            builder.append_value(
+                                value
+                                .extract()
+                                .expect("Return value from expand function could not be converted to float32")
+                            )
                         },
                         ExpandDtype::Int64 {} => {
                             let builder: &mut Int64Builder =
                                 self.builder.field_builder(i).context(
                                     "Builder has incorrect type",
                                 )?;
-                            builder.append_value(value.extract().expect("Return value from expand function could not be converted to int64"))
+                            let value = value.extract().expect("Return value from expand function could not be converted to int64");
+                            builder.append_value(value)
                         },
                         ExpandDtype::BooleanArray { tensor_type } => {
                             let builder: &mut LargeListBuilder<Box<dyn ArrayBuilder>> =
                                 self.builder.field_builder(i).context(
                                     "Builder has incorrect type. Expected LargeListBuilder of Bool",
                                 )?;
-                            let value_builder = builder.values().as_any_mut().downcast_mut::<BooleanBuilder>().context("Could not downcast builder to boolean type")?;
+                            let value_builder = builder
+                                .values()
+                                .as_any_mut()
+                                .downcast_mut::<BooleanBuilder>()
+                                .context("Could not downcast builder to boolean type")?;
                             let values: PyReadonlyArray1<bool> = value.extract().context("Could not convert object to array")?;
                             if values.len()? != tensor_type.size() {
                                 bail!("Extracted array has incorrect shape");
@@ -387,7 +535,11 @@ impl DrawStorage for PyTrace {
                                 self.builder.field_builder(i).context(
                                     "Builder has incorrect type. Expected LargeListBuilder of Float64",
                                 )?;
-                            let value_builder = builder.values().as_any_mut().downcast_mut::<PrimitiveBuilder<Float64Type>>().context("Could not downcast builder to float64 type")?;
+                            let value_builder = builder
+                                .values()
+                                .as_any_mut()
+                                .downcast_mut::<PrimitiveBuilder<Float64Type>>()
+                                .context("Could not downcast builder to float64 type")?;
                             let values: PyReadonlyArray1<f64> = value.extract().context("Could not convert object to array")?;
                             if values.len()? != tensor_type.size() {
                                 bail!("Extracted array has incorrect shape");
@@ -400,7 +552,11 @@ impl DrawStorage for PyTrace {
                                 self.builder.field_builder(i).context(
                                     "Builder has incorrect type. Expected LargeListBuilder of Float32",
                                 )?;
-                            let value_builder = builder.values().as_any_mut().downcast_mut::<PrimitiveBuilder<Float32Type>>().context("Could not downcast builder to float32 type")?;
+                            let value_builder = builder
+                                .values()
+                                .as_any_mut()
+                                .downcast_mut::<PrimitiveBuilder<Float32Type>>()
+                                .context("Could not downcast builder to float32 type")?;
                             let values: PyReadonlyArray1<f32> = value.extract().context("Could not convert object to array")?;
                             if values.len()? != tensor_type.size() {
                                 bail!("Extracted array has incorrect shape");
@@ -413,7 +569,11 @@ impl DrawStorage for PyTrace {
                                 self.builder.field_builder(i).context(
                                     "Builder has incorrect type. Expected LargeListBuilder of Int64",
                                 )?;
-                            let value_builder = builder.values().as_any_mut().downcast_mut::<PrimitiveBuilder<Int64Type>>().context("Could not downcast builder to i64 type")?;
+                            let value_builder = builder
+                                .values()
+                                .as_any_mut()
+                                .downcast_mut::<PrimitiveBuilder<Int64Type>>()
+                                .context("Could not downcast builder to i64 type")?;
                             let values: PyReadonlyArray1<i64> = value.extract().context("Could not convert object to array")?;
                             if values.len()? != tensor_type.size() {
                                 bail!("Extracted array has incorrect shape");
@@ -471,6 +631,7 @@ impl Model for PyModel {
         Ok(CpuMath::new(PyDensity::new(
             &self.make_logp_func,
             self.ndim,
+            self.transform_adapter.as_ref(),
         )?))
     }
 
@@ -480,7 +641,7 @@ impl Model for PyModel {
         position: &mut [f64],
     ) -> Result<()> {
         let Some(init_func) = self.init_point_func.as_ref() else {
-            let dist = Uniform::new(-2f64, 2f64);
+            let dist = Uniform::new(-2f64, 2f64).expect("Could not create uniform distribution");
             position.iter_mut().for_each(|x| *x = dist.sample(rng));
             return Ok(());
         };

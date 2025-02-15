@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from functools import wraps
 from importlib.util import find_spec
 from math import prod
-from typing import TYPE_CHECKING, Any, Callable, Literal, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Literal, Optional, Union, cast
+import threading
 
 import numpy as np
 import pandas as pd
@@ -31,7 +32,7 @@ if TYPE_CHECKING:
     from pytensor.tensor import TensorVariable, Variable
 
 
-def rv_dict_to_flat_array_wrapper(
+def _rv_dict_to_flat_array_wrapper(
     fn: Callable[[SeedType], dict[str, np.ndarray]],
     names: list[str],
     shapes: list[tuple[int]],
@@ -273,7 +274,7 @@ def _compile_pymc_model_numba(
         warnings.filterwarnings(
             "ignore",
             message="Cannot cache compiled function .* as it uses dynamic globals",
-            category=numba.NumbaWarning,
+            category=numba.NumbaWarning,  # type: ignore
         )
 
         logp_numba = numba.cfunc(c_sig, **kwargs)(logp_numba_raw)
@@ -286,7 +287,7 @@ def _compile_pymc_model_numba(
         warnings.filterwarnings(
             "ignore",
             message="Cannot cache compiled function .* as it uses dynamic globals",
-            category=numba.NumbaWarning,
+            category=numba.NumbaWarning,  # type: ignore
         )
 
         expand_numba = numba.cfunc(c_sig_expand, **kwargs)(expand_numba_raw)
@@ -376,14 +377,24 @@ def _compile_pymc_model_jax(
     logp_fn = logp_fn_pt.vm.jit_fn
     expand_fn = expand_fn_pt.vm.jit_fn
 
+    logp_shared_names = [var.name for var in logp_fn_pt.get_shared()]
+    expand_shared_names = [var.name for var in expand_fn_pt.get_shared()]
+
     if gradient_backend == "jax":
         orig_logp_fn = logp_fn._fun
 
-        @jax.jit
         def logp_fn_jax_grad(x, *shared):
             return jax.value_and_grad(lambda x: orig_logp_fn(x, *shared)[0])(x)
 
+        # static_argnums = list(range(1, len(logp_shared_names) + 1))
+        logp_fn_jax_grad = jax.jit(
+            logp_fn_jax_grad,
+            # static_argnums=static_argnums,
+        )
+
         logp_fn = logp_fn_jax_grad
+    else:
+        orig_logp_fn = None
 
     shared_data = {}
     shared_vars = {}
@@ -395,9 +406,6 @@ def _compile_pymc_model_jax(
         shared_vars[val.name] = val
         seen.add(val)
 
-    logp_shared_names = [var.name for var in logp_fn_pt.get_shared()]
-    expand_shared_names = [var.name for var in expand_fn_pt.get_shared()]
-
     def make_logp_func():
         def logp(x, **shared):
             logp, grad = logp_fn(x, *[shared[name] for name in logp_shared_names])
@@ -406,7 +414,8 @@ def _compile_pymc_model_jax(
         return logp
 
     names, slices, shapes = shape_info
-    dtypes = [np.float64] * len(names)
+    # TODO do not cast to float64
+    dtypes = [np.dtype("float64")] * len(names)
 
     def make_expand_func(seed1, seed2, chain):
         # TODO handle seeds
@@ -432,6 +441,7 @@ def _compile_pymc_model_jax(
         shared_data=shared_data,
         dims=dims,
         coords=coords,
+        raw_logp_fn=orig_logp_fn,
     )
 
 
@@ -509,6 +519,8 @@ def compile_pymc_model(
         return_transformed=True,
     )
 
+    initial_point_fn = _wrap_with_lock(initial_point_fn)
+
     if backend.lower() == "numba":
         if gradient_backend == "jax":
             raise ValueError("Gradient backend cannot be jax when using numba backend")
@@ -530,7 +542,18 @@ def compile_pymc_model(
         raise ValueError(f"Backend must be one of numba and jax. Got {backend}")
 
 
-def _compute_shapes(model):
+def _wrap_with_lock(func: Callable) -> Callable:
+    lock = threading.Lock()
+
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        with lock:
+            return func(*args, **kwargs)
+
+    return wrapper
+
+
+def _compute_shapes(model) -> dict[str, tuple[int, ...]]:
     import pytensor
     from pymc.initial_point import make_initial_point_fn
 
@@ -663,7 +686,7 @@ def _make_functions(
 
     num_free_vars = count
 
-    initial_point_fn = rv_dict_to_flat_array_wrapper(
+    initial_point_fn = _rv_dict_to_flat_array_wrapper(
         pymc_initial_point_fn, names=joined_names, shapes=joined_shapes
     )
 
@@ -712,7 +735,7 @@ def _make_functions(
 
     for var in remaining_rvs:
         all_names.append(var.name)
-        shape = shapes[var.name]
+        shape = cast(tuple[int, ...], shapes[var.name])
         all_shapes.append(shape)
         length = prod(shape)
         all_slices.append(slice(count, count + length))
