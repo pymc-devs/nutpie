@@ -2,7 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.13.3] - 2025-02-11
+## [0.13.4] - 2025-02-18
+
+### Bug Fixes
+
+- Add lock for pymc init point func (Adrian Seyboldt)
+
+
+### Ci
+
+- Make sure all python versions are available in the builds (Adrian Seyboldt)
+
+
+## [0.13.3] - 2025-02-12
 
 ### Bug Fixes
 
@@ -42,6 +54,18 @@ All notable changes to this project will be documented in this file.
 ### Styling
 
 - Reformat some code (Adrian Seyboldt)
+
+
+### Build
+
+- Bump some dependency versions (Adrian Seyboldt)
+
+
+### Ci
+
+- Use ubuntu_latest on aarch64 (Adrian Seyboldt)
+
+- Update CI script using maturin (Adrian Seyboldt)
 
 
 ## [0.13.2] - 2024-07-26
@@ -178,8 +202,6 @@ All notable changes to this project will be documented in this file.
 
 ### Ci
 
-- Fix uploads of releases (Adrian Seyboldt)
-
 - Fix architectures in CI (Adrian Seyboldt)
 
 
@@ -225,6 +247,11 @@ All notable changes to this project will be documented in this file.
 ### Performance
 
 - Set the number of parallel chains dynamically (Adrian Seyboldt)
+
+
+### Ci
+
+- Fix uploads of releases (Adrian Seyboldt)
 
 
 ## [0.9.2] - 2024-02-19
