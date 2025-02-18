@@ -34,7 +34,6 @@ jobs:
             3.10
             3.11
             3.12
-            3.13
       # Leave out 3.13 on aarch due to an issue in pyo3/rust-numpy 0.23.4
       - name: Build wheels
         uses: PyO3/maturin-action@v1
@@ -51,7 +50,8 @@ jobs:
         if: ${{ matrix.platform.target == 'x86_64' }}
         with:
           target: ${{ matrix.platform.target }}
-          args: --release --out dist --interpreter 3.10 3.11 3.12 3.13 --zig
+          # No py3.13 yet...
+          args: --release --out dist --interpreter 3.10 3.11 3.12 --zig
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
           manylinux: auto
           before-script-linux: |
@@ -230,7 +230,6 @@ jobs:
             3.10
             3.11
             3.12
-            3.13
       - name: Install uv
         uses: astral-sh/setup-uv@v5
       - uses: maxim-lobanov/setup-xcode@v1
