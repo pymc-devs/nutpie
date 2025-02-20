@@ -54,7 +54,7 @@ class FisherLoss:
                 return cost
 
             costs = jax.vmap(compute_loss, [None, 0, 0, 0])(
-                flow.bijection,
+                flow,
                 draws,
                 grads,
                 logps,
@@ -69,7 +69,7 @@ class FisherLoss:
                 return cost
 
             costs = jax.vmap(compute_loss, [None, 0, 0, 0])(
-                flow.bijection,
+                flow,
                 draws,
                 grads,
                 logps,
@@ -86,7 +86,7 @@ class FisherLoss:
         else:
 
             def transform(draw, grad, logp):
-                return flow.bijection.inverse_gradient_and_val_(draw, grad, logp)
+                return flow.inverse_gradient_and_val_(draw, grad, logp)
 
             draws, grads, logps = jax.vmap(transform, [0, 0, 0], (0, 0, 0))(
                 draws, grads, logps
@@ -98,9 +98,7 @@ class FisherLoss:
 
 
 def fit_flow(key, bijection, loss_fn, draws, grads, logps, **kwargs):
-    flow = flowjax.flows.Transformed(
-        flowjax.distributions.StandardNormal(bijection.shape), bijection
-    )
+    flow = bijection
 
     key, train_key = jax.random.split(key)
 
@@ -113,7 +111,7 @@ def fit_flow(key, bijection, loss_fn, draws, grads, logps, **kwargs):
         return_best=True,
         **kwargs,
     )
-    return fit.bijection, losses, losses["opt_state"]
+    return fit, losses, losses["opt_state"]
 
 
 @eqx.filter_jit
@@ -298,9 +296,7 @@ class TransformAdapter:
 
                 fit = self._make_flow_fn(seed, positions, gradients, n_layers=0)
 
-                flow = flowjax.flows.Transformed(
-                    flowjax.distributions.StandardNormal(fit.shape), fit
-                )
+                flow = fit
                 params, static = eqx.partition(flow, eqx.is_inexact_array)
                 new_loss = self._loss_fn(params, static, positions, gradients, logps)
 
@@ -341,9 +337,7 @@ class TransformAdapter:
                     untransformed_dim=self._untransformed_dim,
                     zero_init=self._zero_init,
                 )
-                flow = flowjax.flows.Transformed(
-                    flowjax.distributions.StandardNormal(base.shape), base
-                )
+                flow = base
                 params, static = eqx.partition(flow, eqx.is_inexact_array)
                 if self._verbose:
                     print(
@@ -356,9 +350,9 @@ class TransformAdapter:
                         self._loss_fn(
                             params,
                             static,
-                            positions[-100:],
-                            gradients[-100:],
-                            logps[-100:],
+                            positions[-128:],
+                            gradients[-128:],
+                            logps[-128:],
                         ),
                     )
             else:
@@ -392,10 +386,7 @@ class TransformAdapter:
                 self._opt_state = None
                 return
 
-            flow = flowjax.flows.Transformed(
-                flowjax.distributions.StandardNormal(self._bijection.shape),
-                self._bijection,
-            )
+            flow = self._bijection
             params, static = eqx.partition(flow, eqx.is_inexact_array)
             old_loss = self._loss_fn(
                 params, static, positions[-128:], gradients[-128:], logps[-128:]
@@ -420,9 +411,7 @@ class TransformAdapter:
                 max_patience=self._max_patience,
             )
 
-            flow = flowjax.flows.Transformed(
-                flowjax.distributions.StandardNormal(fit.shape), fit
-            )
+            flow = fit
             params, static = eqx.partition(flow, eqx.is_inexact_array)
             new_loss = self._loss_fn(
                 params, static, positions[-128:], gradients[-128:], logps[-128:]
@@ -432,10 +421,7 @@ class TransformAdapter:
                 print(f"Chain {self._chain}: New loss {new_loss}, old loss {old_loss}")
 
             if not np.isfinite(old_loss):
-                flow = flowjax.flows.Transformed(
-                    flowjax.distributions.StandardNormal(self._bijection.shape),
-                    self._bijection,
-                )
+                flow = self._bijection
                 params, static = eqx.partition(flow, eqx.is_inexact_array)
                 print(
                     self._loss_fn(
@@ -449,9 +435,7 @@ class TransformAdapter:
                 )
 
             if not np.isfinite(new_loss):
-                flow = flowjax.flows.Transformed(
-                    flowjax.distributions.StandardNormal(fit.shape), fit
-                )
+                flow = fit
                 params, static = eqx.partition(flow, eqx.is_inexact_array)
                 print(
                     self._loss_fn(
