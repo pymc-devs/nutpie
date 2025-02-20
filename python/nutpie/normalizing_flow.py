@@ -514,7 +514,7 @@ def make_coupling(key, dim, n_untransformed, **kwargs):
     transformer = bijections.Chain(
         [
             make_elemwise_trafo(key, n_transformed, count=3),
-            mvscale,
+            #mvscale,
         ]
     )
 
