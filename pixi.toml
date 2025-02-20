@@ -37,15 +37,16 @@ nbclient = ">=0.10.2,<0.11"
 cmdstanpy = ">=1.2.5,<2"
 # The jaxlib cuda build seems to be broken around version 0.4.34
 #jax = ">=0.4.35,<0.5"
-#jaxlib = { version = "*", build = "*cuda12*" }
 
 [pypi-dependencies]
 bridgestan = ">=2.6.0, <3"
 flowjax = { git = "https://github.com/aseyboldt/flowjax.git", rev = "07e7e32217bcfcaa7d68a304f332c925d26ab76f" }
 samplerlab = { git = "https://github.com/aseyboldt/samplerlab/" }
 posteriordb = ">=0.2.0, <0.3"
-jax = { version = "<0.4.37, <0.5", extras = ["cuda12"] }
+#jax = { version = ">=0.5" }
 watermark = ">=2.5.0, <3"
+equinox = "*"
+jaxlib = { version = "*", extras = ["cuda12"] }
 
 [system-requirements]
 #cuda = "12"

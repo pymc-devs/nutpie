@@ -519,15 +519,19 @@ def make_coupling(key, dim, n_untransformed, **kwargs):
     )
 
     def make_mlp(out_size):
-        if isinstance(nn_width, tuple):
-            out = (nn_width[0], out_size)
+        if isinstance(nn_width, int):
+            width = [nn_width]
+        else:
+            width = nn_width
+        if isinstance(width[0], tuple):
+            out = (width[0][0], out_size)
         else:
             out = out_size
 
         return FactoredMLP(
             n_untransformed,
             out,
-            nn_width,
+            width,
             depth=1,
             key=key,
             dtype=jnp.float32,

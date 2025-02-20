@@ -1,4 +1,5 @@
 from functools import partial
+import math
 
 import numpy as np
 import equinox as eqx
@@ -346,6 +347,11 @@ class TransformAdapter:
                 params, static = eqx.partition(flow, eqx.is_inexact_array)
                 if self._verbose:
                     print(
+                        "number of parameters in flow:",
+                        sum([math.prod(val.shape) for val in jax.tree.leaves(params)]),
+                    )
+
+                    print(
                         "loss before optimization: ",
                         self._loss_fn(
                             params,
@@ -615,6 +621,7 @@ def make_transform_adapter(
             make_flow,
             householder_layer=householder_layer,
             dct_layer=dct_layer,
+            nn_width=nn_width,
         ),
         show_progress=show_progress,
         num_diag_windows=num_diag_windows,
