@@ -627,6 +627,11 @@ class TransformAdapter:
             if len(base.bijections) == 1:
                 self._bijection = base
                 self._opt_state = None
+
+                if self._debug_save_bijection:
+                    _BIJECTION_TRACE.append(
+                        (self.index, fit, (positions, gradients, logps))
+                    )
                 return
 
             flow = flowjax.flows.Transformed(
@@ -858,6 +863,7 @@ def make_transform_adapter(
             make_flow,
             householder_layer=householder_layer,
             dct_layer=dct_layer,
+            nn_width=nn_width,
         ),
         show_progress=show_progress,
         num_diag_windows=num_diag_windows,
