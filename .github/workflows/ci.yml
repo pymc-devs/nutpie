@@ -297,7 +297,7 @@ jobs:
           command: upload
           args: --non-interactive --skip-existing wheels-*/*
       - name: Upload to GitHub Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           files: |
             wasm-wheels/*.whl
