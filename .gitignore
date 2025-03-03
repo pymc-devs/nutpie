@@ -23,3 +23,5 @@ docs/_site
 .quarto
 example-iree
 posteriordb
+.quarto
+docs/.quarto
