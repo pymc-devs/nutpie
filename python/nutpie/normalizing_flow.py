@@ -504,12 +504,16 @@ def make_coupling(key, dim, n_untransformed, **kwargs):
     mvscale = make_mvscale(key, n_transformed, 1, randomize_base=True)
 
     nn_width = kwargs.get("nn_width", None)
+    nn_depth = kwargs.get("nn_depth", None)
 
     if nn_width is None:
         if dim > 128:
             nn_width = (64, 2 * dim)
         else:
             nn_width = 2 * dim
+
+    if nn_depth is None:
+        nn_depth = len(nn_width)
 
     transformer = bijections.Chain(
         [
@@ -528,7 +532,7 @@ def make_coupling(key, dim, n_untransformed, **kwargs):
             n_untransformed,
             out,
             nn_width,
-            depth=1,
+            depth=nn_depth,
             key=key,
             dtype=jnp.float32,
             activation=jax.nn.gelu,
@@ -540,7 +544,6 @@ def make_coupling(key, dim, n_untransformed, **kwargs):
         untransformed_dim=n_untransformed,
         dim=dim,
         conditioner=make_mlp,
-        nn_depth=1,
         **kwargs,
     )
 
@@ -556,6 +559,7 @@ def make_flow(
     untransformed_dim: int | list[int | None] | None = None,
     n_layers,
     nn_width=None,
+    nn_depth=None,
 ):
     from flowjax import bijections
 
@@ -620,6 +624,7 @@ def make_flow(
             untransformed_dim,
             nn_activation=jax.nn.gelu,
             nn_width=nn_width,
+            nn_depth=nn_depth,
         )
 
         if zero_init:
