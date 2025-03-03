@@ -14,7 +14,7 @@ likelihoods with gradient are coming soon).
 - *Experimental* normalizing flow adaptation for more efficient sampling of
   difficult posteriors.
 
-## Quickstart
+## Quickstart: PyMC
 
 Install `nutpie` with pip, uv, pixi, or conda:
 
@@ -41,6 +41,10 @@ with pm.Model() as model:
 compiled = nutpie.compile_pymc_model(model)
 trace = nutpie.sample(compiled)
 ```
+
+For more information, see the detailed [PyMC usage guide](pymc-usage.qmd).
+
+## Quickstart: Stan
 
 Stan needs access to a compiler toolchain, you can find instructions for those
 [here](https://mc-stan.org/docs/cmdstan-guide/installation.html#cpp-toolchain).
@@ -82,3 +86,5 @@ compiled = (
 )
 trace = nutpie.sample(compiled)
 ```
+
+For more information, see the detailed [Stan usage guide](stan-usage.qmd).

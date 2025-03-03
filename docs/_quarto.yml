@@ -18,6 +18,9 @@ website:
       - href: sample-stats.qmd
         text: Diagnostic information
       - about.qmd
+    tools:
+      - icon: github
+        href: https://github.com/pymc-devs/nutpie
 
 format:
   html:
