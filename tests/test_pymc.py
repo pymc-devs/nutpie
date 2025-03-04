@@ -243,6 +243,21 @@ def test_pymc_var_names(backend, gradient_backend):
     assert not hasattr(trace.posterior, "c")
 
 
+def test_normalizing_flow():
+    with pm.Model() as model:
+        a = pm.Uniform("a/b", shape=2)
+        with pm.Model("foo"):
+            c = pm.Data("c", np.array([2.0, 3.0]))
+            pm.Deterministic("b", c * a)
+
+    compiled = nutpie.compile_pymc_model(
+        model, backend="jax", gradient_backend="jax"
+    ).with_transform_adapt()
+    trace = nutpie.sample(compiled, chains=1, transform_adapt=True)
+    assert trace.posterior["a/b"].shape[-1] == 2
+    assert trace.posterior["foo::b"].shape[-1] == 2
+
+
 @pytest.mark.parametrize(
     ("backend", "gradient_backend"),
     [

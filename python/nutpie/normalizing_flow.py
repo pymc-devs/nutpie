@@ -1,17 +1,23 @@
-from typing import Union, Literal, Callable
+from typing import ClassVar, Union, Literal, Callable
 import math
 import itertools
 
+from flowjax.bijections.coupling import get_ravelled_pytree_constructor
+from flowjax.utils import arraylike_to_array
 import jax
 import jax.numpy as jnp
 import equinox as eqx
 from flowjax import bijections
 import flowjax.distributions
 import flowjax.flows
+from jaxtyping import Array, ArrayLike
 import numpy as np
-from paramax import Parameterize
+from paramax import NonTrainable, Parameterize
 from equinox.nn import Linear
+from paramax.wrappers import AbstractUnwrappable
 
+
+_NN_ACTIVATION = jax.nn.leaky_relu
 
 def _generate_sequences(k, r_vals):
     """
@@ -287,12 +293,268 @@ class FactoredMLP(eqx.Module, strict=True):
         return x
 
 
+class AsymmetricAffine(bijections.AbstractBijection):
+    """An asymmetric bijection that applies different scaling factors for
+    positive and negative inputs.
+
+    This bijection implements a continuous, differentiable transformation that
+    scales positive and negative inputs differently while maintaining smoothness
+    at zero. It's particularly useful for modeling data with different variances
+    in positive and negative regions.
+
+    The forward transformation is defined as:
+        y = σ θ x     for x ≥ 0
+        y = σ x/θ     for x < 0
+    where:
+        - σ (scale) controls the overall scaling
+        - θ (theta) controls the asymmetry between positive and negative regions
+        - μ (loc) controls the location shift
+
+    The transformation uses a smooth transition between the two regions to
+    maintain differentiability.
+
+    For θ = 0, this is exactly an affine function with the specified location
+    and scale.
+
+    Attributes:
+        shape: The shape of the transformation parameters
+        cond_shape: Shape of conditional inputs (None as this bijection is
+            unconditional)
+        loc: Location parameter μ for shifting the distribution
+        scale: Scale parameter σ (positive)
+        theta: Asymmetry parameter θ (positive)
+    """
+    shape: tuple[int, ...] = ()
+    cond_shape: ClassVar[None] = None
+    loc: Array
+    scale: Array | AbstractUnwrappable[Array]
+    theta: Array | AbstractUnwrappable[Array]
+
+    def __init__(
+        self,
+        loc: ArrayLike = 0,
+        scale: ArrayLike = 1,
+        theta: ArrayLike = 1,
+    ):
+        self.loc, scale, theta = jnp.broadcast_arrays(
+            *(arraylike_to_array(a, dtype=float) for a in (loc, scale, theta)),
+        )
+        self.shape = scale.shape
+        self.scale = Parameterize(lambda x: x + jnp.sqrt(1 + x**2), jnp.zeros(()))
+        self.theta = Parameterize(lambda x: x + jnp.sqrt(1 + x**2), jnp.zeros(()))
+
+    def _log_derivative_f(self, x, mu, sigma, theta):
+        abs_x = jnp.abs(x)
+        theta = jnp.log(theta)
+
+        sinh_theta = jnp.sinh(theta)
+        #sinh_theta = (theta - 1 / theta) / 2
+        cosh_theta = jnp.cosh(theta)
+        #cosh_theta = (theta + 1 / theta) / 2
+        numerator = sinh_theta * x * (abs_x + 2.0)
+        denominator = (abs_x + 1.0)**2
+        term = numerator / denominator
+        dy_dx = sigma * (cosh_theta + term)
+        return jnp.log(dy_dx)
+
+    def transform_and_log_det(self, x: ArrayLike, condition: ArrayLike | None = None) -> tuple[Array, Array]:
+
+        def transform(x, mu, sigma, theta):
+            weight = (jax.nn.soft_sign(x) + 1) / 2
+            z = x * sigma
+            y_pos = z * theta
+            y_neg = z / theta
+            y = weight * y_pos + (1.0 - weight) * y_neg + mu
+            return y
+
+        mu, sigma, theta = self.loc, self.scale, self.theta
+
+        y = transform(x, mu, sigma, theta)
+        logjac = self._log_derivative_f(x, mu, sigma, theta)
+        return y, logjac.sum()
+
+    def inverse_and_log_det(self, y: ArrayLike, condition: ArrayLike | None = None) -> tuple[Array, Array]:
+
+        def inverse(y, mu, sigma, theta):
+            delta = y - mu
+            inv_theta = 1 / theta
+
+            # Case 1: y >= mu (delta >= 0)
+            a = sigma * (theta + inv_theta)
+            discriminant_pos = jnp.square(a - 2.0 * delta) + 16.0 * sigma * theta * delta
+            discriminant_pos = jnp.where(discriminant_pos < 0, 1., discriminant_pos)
+            sqrt_pos = jnp.sqrt(discriminant_pos)
+            numerator_pos = 2.0 * delta - a + sqrt_pos
+            denominator_pos = 4.0 * sigma * theta
+            x_pos = numerator_pos / denominator_pos
+
+            # Case 2: y < mu (delta < 0)
+            sigma_part = sigma * (1.0 + theta * theta)
+            term2 = 2.0 * delta * theta
+            inside_sqrt_neg = jnp.square(sigma_part + term2) - 16.0 * sigma * delta * theta
+            inside_sqrt_neg = jnp.where(inside_sqrt_neg < 0, 1., inside_sqrt_neg)
+            sqrt_neg = jnp.sqrt(inside_sqrt_neg)
+            numerator_neg = sigma_part + term2 - sqrt_neg
+            denominator_neg = 4.0 * sigma
+            x_neg = numerator_neg / denominator_neg
+
+            # Combine cases based on delta
+            x = jnp.where(delta >= 0.0, x_pos, x_neg)
+            return x
+
+        mu, sigma, theta = self.loc, self.scale, self.theta
+
+        x = inverse(y, mu, sigma, theta)
+        logjac = self._log_derivative_f(x, mu, sigma, theta)
+        return x, -logjac.sum()
+
+
+class MvScale(bijections.AbstractBijection):
+    shape: tuple[int, ...]
+    params: Array
+    cond_shape = None
+    base_index: int
+
+    def __init__(self, params: Array, base_index: int = 0):
+        self.shape = (params.shape[-1],)
+        self.params = params
+        self.base_index = base_index
+
+    def transform_and_log_det(self, x: jnp.ndarray, condition: Array | None = None):
+        scale = jnp.linalg.norm(self.params)
+        v = self.params / scale
+        y = x + ((v @ x) * (scale - 1)) * v
+        return y, jnp.log(scale)
+
+    def inverse_and_log_det(self, y: Array, condition: Array | None = None):
+        scale = jnp.linalg.norm(self.params)
+        v = self.params / scale
+        x = y + ((v @ y) * (1 / scale - 1)) * v
+        return x, -jnp.log(scale)
+
+
+class Coupling(bijections.AbstractBijection):
+    """Coupling layer implementation (https://arxiv.org/abs/1605.08803).
+
+    Args:
+        key: Jax key
+        transformer: Unconditional bijection with shape () to be parameterised by the
+            conditioner neural netork. Parameters wrapped with ``NonTrainable``
+            are excluded from being parameterized.
+        untransformed_dim: Number of untransformed conditioning variables (e.g. dim//2).
+        dim: Total dimension.
+        cond_dim: Dimension of additional conditioning variables. Defaults to None.
+        nn_width: Neural network hidden layer width.
+        nn_depth: Neural network hidden layer size.
+        nn_activation: Neural network activation function. Defaults to jnn.relu.
+    """
+
+    shape: tuple[int, ...]
+    cond_shape: tuple[int, ...] | None
+    untransformed_dim: int
+    dim: int
+    transformer_constructor: Callable
+    requires_vmap: bool
+    conditioner: eqx.nn.MLP | eqx.Module
+
+    def __init__(
+        self,
+        key,
+        *,
+        transformer: bijections.AbstractBijection,
+        untransformed_dim: int,
+        dim: int,
+        cond_dim: int | None = None,
+        nn_width: int,
+        nn_depth: int,
+        nn_activation: Callable = jax.nn.relu,
+        conditioner: eqx.Module | None = None,
+    ):
+        if transformer.cond_shape is not None:
+            raise ValueError(
+                "Only unconditional transformers are supported.",
+            )
+        n_transformed = dim - untransformed_dim
+        if n_transformed < 0:
+            raise ValueError(
+                "The number of untransformed variables must be less than the total "
+                "dimension.",
+            )
+        if transformer.shape != () and transformer.shape != (n_transformed,):
+            raise ValueError(
+                "The transformer must have shape () or (n_transformed,), "
+                f"got {transformer.shape}.",
+            )
+
+        constructor, num_params = get_ravelled_pytree_constructor(
+            transformer,
+            filter_spec=eqx.is_inexact_array,
+            is_leaf=lambda leaf: isinstance(leaf, NonTrainable),
+        )
+
+        if transformer.shape == ():
+            self.requires_vmap = True
+            conditioner_output_size = num_params * n_transformed
+        else:
+            self.requires_vmap = False
+            conditioner_output_size = num_params
+
+
+        self.transformer_constructor = constructor
+        self.untransformed_dim = untransformed_dim
+        self.dim = dim
+        self.shape = (dim,)
+        self.cond_shape = (cond_dim,) if cond_dim is not None else None
+
+        if conditioner is None:
+            conditioner = eqx.nn.MLP(
+                in_size=(
+                    untransformed_dim if cond_dim is None else untransformed_dim + cond_dim
+                ),
+                out_size=conditioner_output_size,
+                width_size=nn_width,
+                depth=nn_depth,
+                activation=nn_activation,
+                key=key,
+            )
+        self.conditioner = conditioner(conditioner_output_size)
+
+    def transform_and_log_det(self, x, condition=None):
+        x_cond, x_trans = x[: self.untransformed_dim], x[self.untransformed_dim :]
+        nn_input = x_cond if condition is None else jnp.hstack((x_cond, condition))
+        transformer_params = self.conditioner(nn_input)
+        transformer = self._flat_params_to_transformer(transformer_params)
+        y_trans, log_det = transformer.transform_and_log_det(x_trans)
+        y = jnp.hstack((x_cond, y_trans))
+        return y, log_det
+
+    def inverse_and_log_det(self, y, condition=None):
+        x_cond, y_trans = y[: self.untransformed_dim], y[self.untransformed_dim :]
+        nn_input = x_cond if condition is None else jnp.concatenate((x_cond, condition))
+        transformer_params = self.conditioner(nn_input)
+        transformer = self._flat_params_to_transformer(transformer_params)
+        x_trans, log_det = transformer.inverse_and_log_det(y_trans)
+        x = jnp.hstack((x_cond, x_trans))
+        return x, log_det
+
+    def _flat_params_to_transformer(self, params: Array):
+        """Reshape to dim X params_per_dim, then vmap."""
+        if self.requires_vmap:
+            dim = self.dim - self.untransformed_dim
+            transformer_params = jnp.reshape(params, (dim, -1))
+            transformer = eqx.filter_vmap(self.transformer_constructor)(transformer_params)
+            return bijections.Vmap(transformer, in_axes=eqx.if_array(0))
+        else:
+            transformer = self.transformer_constructor(params)
+            return transformer
+
+
 def make_mvscale(key, n_dim, size, randomize_base=False):
     def make_single_hh(key, idx):
         key1, key2 = jax.random.split(key)
         params = jax.random.normal(key1, (n_dim,))
         params = params / jnp.linalg.norm(params)
-        mvscale = bijections.MvScale(params)
+        mvscale = MvScale(params)
         return mvscale
 
     keys = jax.random.split(key, size)
@@ -333,7 +595,7 @@ def make_elemwise_trafo(key, n_dim, *, count=1):
         scale = Parameterize(lambda x: x + jnp.sqrt(1 + x**2), jnp.zeros(()))
         theta = Parameterize(lambda x: x + jnp.sqrt(1 + x**2), jnp.zeros(()))
 
-        affine = bijections.AsymmetricAffine(
+        affine = AsymmetricAffine(
             loc,
             jnp.ones(()),
             jnp.ones(()),
@@ -364,45 +626,6 @@ def make_elemwise_trafo(key, n_dim, *, count=1):
     return bijections.Vmap(make_affine, in_axes=eqx.if_array(0))
 
 
-def make_elemwise_trafo_(key, n_dim, *, count=1):
-    def make_elemwise(key):
-        scale = Parameterize(
-            lambda x: x + jnp.sqrt(1 + x**2),
-            jax.random.normal(key=key) / 5,
-        )
-        theta = Parameterize(
-            lambda x: x + jnp.sqrt(1 + x**2),
-            jax.random.normal(key=key) / 5,
-        )
-
-        affine = bijections.AsymmetricAffine(
-            jax.random.normal(key=key) * 2,
-            jnp.ones(()),
-            jnp.ones(()),
-        )
-
-        affine = eqx.tree_at(
-            where=lambda aff: aff.scale,
-            pytree=affine,
-            replace=scale,
-        )
-        affine = eqx.tree_at(
-            where=lambda aff: aff.theta,
-            pytree=affine,
-            replace=theta,
-        )
-
-        return affine
-
-    def make(key):
-        keys = jax.random.split(key, count)
-        return bijections.Scan(eqx.filter_vmap(make_elemwise)(keys))
-
-    keys = jax.random.split(key, n_dim)
-    make_affine = eqx.filter_vmap(make)(keys)
-    return bijections.Vmap(make_affine())
-
-
 def make_coupling(key, dim, n_untransformed, **kwargs):
     n_transformed = dim - n_untransformed
 
@@ -418,12 +641,15 @@ def make_coupling(key, dim, n_untransformed, **kwargs):
             nn_width = 2 * dim
 
     if nn_depth is None:
-        nn_depth = len(nn_width)
+        if isinstance(nn_width, int):
+            nn_depth = 1
+        else:
+            nn_depth = len(nn_width)
 
     transformer = bijections.Chain(
         [
             make_elemwise_trafo(key, n_transformed, count=3),
-            mvscale,
+            #mvscale,
         ]
     )
 
@@ -440,10 +666,10 @@ def make_coupling(key, dim, n_untransformed, **kwargs):
             depth=nn_depth,
             key=key,
             dtype=jnp.float32,
-            activation=jax.nn.gelu,
+            activation=_NN_ACTIVATION,
         )
 
-    return bijections.Coupling(
+    return Coupling(
         key,
         transformer=transformer,
         untransformed_dim=n_untransformed,
@@ -527,7 +753,7 @@ def make_flow(
             key_couple,
             n_dim,
             untransformed_dim,
-            nn_activation=jax.nn.gelu,
+            nn_activation=_NN_ACTIVATION,
             nn_width=nn_width,
             nn_depth=nn_depth,
         )
@@ -542,7 +768,7 @@ def make_flow(
 
         if householder_layer:
             hh = make_hh(key_hh, n_dim, 1, randomize_base=False)
-            flow = bijections.Sandwich(hh, flow)
+            flow = bijections.Sandwich(flow, hh)
 
         def add_default_permute(bijection, dim, key):
             if dim == 1:
@@ -552,12 +778,12 @@ def make_flow(
             else:
                 outer = bijections.Permute(jax.random.permutation(key, jnp.arange(dim)))
 
-            return bijections.Sandwich(outer, bijection)
+            return bijections.Sandwich(bijection, outer)
 
         if permutation is None:
             flow = add_default_permute(flow, n_dim, key_permute)
         else:
-            flow = bijections.Sandwich(bijections.Permute(permutation), flow)
+            flow = bijections.Sandwich(flow, bijections.Permute(permutation))
 
         mvscale = make_mvscale(key, n_dim, 1, randomize_base=True)
 
@@ -594,7 +820,7 @@ def make_flow(
                 inner = make_layer(key, num_untrafo)
                 outer = bijections.DCT(inner.shape)
 
-                layers.append(bijections.Sandwich(outer, inner))
+                layers.append(bijections.Sandwich(inner, outer))
 
         bijection = bijections.Chain(layers)
 
@@ -692,7 +918,7 @@ def extend_flow(
                 transformer=affine,
                 untransformed_dim=n_dim - extension_var_trafo_count,
                 dim=n_dim,
-                nn_activation=jax.nn.gelu,
+                nn_activation=_NN_ACTIVATION,
                 nn_width=width,
                 nn_depth=nn_depth,
             )
@@ -713,7 +939,7 @@ def extend_flow(
                 transformer=affine,
                 untransformed_dim=extension_var_trafo_count,
                 dim=n_dim,
-                nn_activation=jax.nn.gelu,
+                nn_activation=_NN_ACTIVATION,
                 nn_width=width,
                 nn_depth=nn_depth,
             )
@@ -735,7 +961,7 @@ def extend_flow(
                 coupling,
             )
 
-        inner = bijections.Sandwich(inner_permute, coupling)
+        inner = bijections.Sandwich(coupling, inner_permute)
 
         if False:
             scale = Parameterize(
@@ -758,7 +984,7 @@ def extend_flow(
                 transformer=affine,
                 untransformed_dim=extension_var_trafo_count,
                 dim=n_dim,
-                nn_activation=jax.nn.gelu,
+                nn_activation=_NN_ACTIVATION,
                 nn_width=width,
                 nn_depth=nn_depth,
             )
@@ -773,22 +999,22 @@ def extend_flow(
                 print(costs[permute.permutation][inner.outer.permutation])
 
             inner = bijections.Sandwich(
-                inner.outer,
                 bijections.Chain(
                     [
-                        bijections.Sandwich(bijections.Flip(shape=(n_dim,)), coupling),
+                        bijections.Sandwich(coupling, bijections.Flip(shape=(n_dim,))),
                         inner.inner,
                     ]
                 ),
+                inner.outer,
             )
 
     if dct:
         new_layer = bijections.Sandwich(
+            bijections.Sandwich(inner, permute),
             bijections.DCT(shape=(n_dim,)),
-            bijections.Sandwich(permute, inner),
         )
     else:
-        new_layer = bijections.Sandwich(permute, inner)
+        new_layer = bijections.Sandwich(inner, permute)
 
     scale = Parameterize(
         lambda x: x + jnp.sqrt(1 + x**2),
@@ -805,13 +1031,13 @@ def extend_flow(
         pre.append(bijections.Neg(shape=(n_dim,)))
 
     nonlin_layer = bijections.Sandwich(
+        affine,
         bijections.Chain(
             [
                 *pre,
                 bijections.Vmap(bijections.SoftPlusX(), axis_size=n_dim),
             ]
         ),
-        affine,
     )
     scale = Parameterize(
         lambda x: x + jnp.sqrt(1 + x**2),

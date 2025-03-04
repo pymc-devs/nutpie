@@ -1,19 +1,274 @@
 from functools import partial
+from typing import Callable
 
+from flowjax import bijections
+from jaxtyping import ArrayLike, PyTree
 import numpy as np
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+import jax.random as jr
 import traceback
 import flowjax
 import flowjax.flows
 import flowjax.train
+from flowjax.train.losses import MaximumLikelihoodLoss, PRNGKeyArray
+from flowjax.train.train_utils import (
+    count_fruitless,
+    get_batches,
+    step,
+    train_val_split,
+)
 import optax
-from paramax import unwrap
+from paramax import unwrap, NonTrainable
 
-from nutpie.normalizing_flow import extend_flow, make_flow
+from nutpie.normalizing_flow import Coupling, extend_flow, make_flow
+import tqdm
 
 _BIJECTION_TRACE = []
+
+
+def fit_to_data(
+    key: PRNGKeyArray,
+    dist: PyTree,  # Custom losses may support broader types than AbstractDistribution
+    x,
+    *,
+    condition: ArrayLike | None = None,
+    loss_fn: Callable | None = None,
+    max_epochs: int = 100,
+    max_patience: int = 5,
+    batch_size: int = 100,
+    val_prop: float = 0.1,
+    learning_rate: float = 5e-4,
+    optimizer: optax.GradientTransformation | None = None,
+    return_best: bool = True,
+    show_progress: bool = True,
+    opt_state=None,
+):
+    r"""Train a distribution (e.g. a flow) to samples from the target distribution.
+
+    The distribution can be unconditional :math:`p(x)` or conditional
+    :math:`p(x|\text{condition})`. Note that the last batch in each epoch is dropped
+    if truncated (to avoid recompilation). This function can also be used to fit
+    non-distribution pytrees as long as a compatible loss function is provided.
+
+    Args:
+        key: Jax random seed.
+        dist: The distribution to train.
+        x: Samples from target distribution.
+        condition: Conditioning variables. Defaults to None.
+        loss_fn: Loss function. Defaults to MaximumLikelihoodLoss.
+        max_epochs: Maximum number of epochs. Defaults to 100.
+        max_patience: Number of consecutive epochs with no validation loss improvement
+            after which training is terminated. Defaults to 5.
+        batch_size: Batch size. Defaults to 100.
+        val_prop: Proportion of data to use in validation set. Defaults to 0.1.
+        learning_rate: Adam learning rate. Defaults to 5e-4.
+        optimizer: Optax optimizer. If provided, this overrides the default Adam
+            optimizer, and the learning_rate is ignored. Defaults to None.
+        return_best: Whether the result should use the parameters where the minimum loss
+            was reached (when True), or the parameters after the last update (when
+            False). Defaults to True.
+        show_progress: Whether to show progress bar. Defaults to True.
+
+    Returns:
+        A tuple containing the trained distribution and the losses.
+    """
+    if not isinstance(x, tuple):
+        x = (x,)
+    data = x if condition is None else (*x, condition)
+    data = tuple(jnp.asarray(a) for a in data)
+
+    if optimizer is None:
+        optimizer = optax.adam(learning_rate)
+
+    if loss_fn is None:
+        loss_fn = MaximumLikelihoodLoss()
+
+    params, static = eqx.partition(
+        dist,
+        eqx.is_inexact_array,
+        is_leaf=lambda leaf: isinstance(leaf, NonTrainable),
+    )
+    best_params = params
+
+    if opt_state is None:
+        opt_state = optimizer.init(params)
+
+    # train val split
+    key, subkey = jr.split(key)
+    train_data, val_data = train_val_split(subkey, data, val_prop=val_prop)
+    losses = {"train": [], "val": []}
+
+    loop = tqdm.tqdm(range(max_epochs), disable=not show_progress)
+
+    for _ in loop:
+        # Shuffle data
+        key, *subkeys = jr.split(key, 3)
+        train_data = [jr.permutation(subkeys[0], a) for a in train_data]
+        val_data = [jr.permutation(subkeys[1], a) for a in val_data]
+
+        key, subkey = jr.split(key)
+        batches = get_batches(train_data, batch_size)
+        batch_losses = []
+
+        for batch in zip(*batches, strict=True):
+            key, subkey = jr.split(key)
+            params, opt_state, batch_loss = step(
+                params,
+                static,
+                *batch,
+                optimizer=optimizer,
+                opt_state=opt_state,
+                loss_fn=loss_fn,
+                key=subkey,
+            )
+            batch_losses.append(batch_loss)
+        #params, opt_state, batch_losses = _step_batch_loop(
+        #    params,
+        #    static,
+        #    opt_state,
+        #    optimizer,
+        #    loss_fn,
+        #    subkey,
+        #    *batches,
+        #)
+        losses["train"].append((sum(batch_losses) / len(batch_losses)).item())
+
+        # Val epoch
+        batch_losses = []
+        for batch in zip(*get_batches(val_data, batch_size), strict=True):
+            key, subkey = jr.split(key)
+            loss_i = loss_fn(params, static, *batch, key=subkey)
+            batch_losses.append(loss_i)
+        losses["val"].append(sum(batch_losses) / len(batch_losses))
+
+        loop.set_postfix({k: v[-1] for k, v in losses.items()})
+        if losses["val"][-1] == min(losses["val"]):
+            best_params = params
+
+        elif count_fruitless(losses["val"]) > max_patience:
+            loop.set_postfix_str(f"{loop.postfix} (Max patience reached)")
+            break
+
+    params = best_params if return_best else params
+    dist = eqx.combine(params, static)
+    return dist, losses, opt_state
+
+
+@eqx.filter_jit
+def _step_batch_loop(params, static, opt_state, optimizer, loss_fn, key, *batches):
+    def scan_fn(carry, batch):
+        params, opt_state, key = carry
+        key, subkey = jr.split(key)
+        params, opt_state, loss_i = step(
+            params,
+            static,
+            *batch,
+            optimizer=optimizer,
+            opt_state=opt_state,
+            loss_fn=loss_fn,
+            key=subkey,
+        )
+        return (params, opt_state, key), loss_i
+
+    (params, opt_state, _), batch_losses = jax.lax.scan(
+        scan_fn, (params, opt_state, key), batches
+    )
+
+    return params, opt_state, batch_losses
+
+
+@eqx.filter_jit
+def inverse_gradient_and_val(bijection, draw, grad, logp):
+    if False:
+        x = bijection.inverse(draw)
+        (_, fwd_log_det), pull_grad_fn = jax.vjp(
+            lambda x: bijection.transform_and_log_det(x), x
+        )
+        (x_grad,) = pull_grad_fn((grad, jnp.ones(())))
+        return (x, x_grad, logp + fwd_log_det)
+    if isinstance(bijection, bijections.Chain):
+        for b in bijection.bijections[::-1]:
+            draw, grad, logp = inverse_gradient_and_val(b, draw, grad, logp)
+        return draw, grad, logp
+    elif isinstance(bijection, bijections.Permute):
+        return (
+            draw[bijection.inverse_permutation],
+            grad[bijection.inverse_permutation],
+            logp,
+        )
+    elif isinstance(bijection, bijections.Affine):
+        draw, logdet = bijection.inverse_and_log_det(draw)
+        grad = grad * bijection.scale
+        return (draw, grad, logp - logdet)
+    elif isinstance(bijection, bijections.Vmap):
+
+        def inner(bijection, y, y_grad, y_logp):
+            return inverse_gradient_and_val(bijection, y, y_grad, y_logp)
+
+        y, y_grad, log_det = eqx.filter_vmap(
+            inner,
+            in_axes=(bijection.in_axes[0], 0, 0, None),
+            axis_size=bijection.axis_size,
+        )(bijection.bijection, draw, grad, jnp.zeros(()))
+        return y, y_grad, jnp.sum(log_det) + logp
+    elif isinstance(bijection, bijections.Sandwich):
+        draw, grad, logp = inverse_gradient_and_val(bijections.Invert(bijection.outer), draw, grad, logp)
+        draw, grad, logp = inverse_gradient_and_val(bijection.inner, draw, grad, logp)
+        draw, grad, logp = inverse_gradient_and_val(bijection.outer, draw, grad, logp)
+        return draw, grad, logp
+    # Disabeling the Coupling case for now, it slows down compile time for some reason?
+    elif False and isinstance(bijection, Coupling):
+        y, y_grad, y_logp = draw, grad, logp
+        y_cond, y_trans = y[: bijection.untransformed_dim], y[bijection.untransformed_dim :]
+        x_cond = y_cond
+
+        y_grad_cond, y_grad_trans = (
+            y_grad[: bijection.untransformed_dim],
+            y_grad[bijection.untransformed_dim :],
+        )
+
+        def conditioner(x_cond):
+            return bijection.conditioner(x_cond)
+
+        transformer_params, nn_pull = jax.vjp(conditioner, x_cond)
+
+        def pull_transformer_grad(transformer_params):
+            transformer = bijection._flat_params_to_transformer(transformer_params)
+
+            x_trans, x_grad_trans, x_logp = inverse_gradient_and_val(
+                transformer, y_trans, y_grad_trans, y_logp
+            )
+
+            return (x_logp, x_trans), x_grad_trans
+
+        ((x_logp, x_trans), pull_pull_transformer_grad, x_grad_trans) = jax.vjp(
+            pull_transformer_grad, transformer_params, has_aux=True
+        )
+
+        (co_transformer_params,) = pull_pull_transformer_grad((1.0, -x_grad_trans))
+        (co_x_cond,) = nn_pull(co_transformer_params)
+
+        x = jnp.hstack((x_cond, x_trans))
+        x_grad = jnp.hstack((y_grad_cond + co_x_cond, x_grad_trans))
+        return x, x_grad, x_logp
+
+    elif isinstance(bijection, bijections.Invert):
+        inner = bijection.bijection
+        x = inner.transform(draw)
+        (_, fwd_log_det), pull_grad_fn = jax.vjp(
+            lambda x: inner.inverse_and_log_det(x), x
+        )
+        (x_grad,) = pull_grad_fn((grad, jnp.ones(())))
+        return (x, x_grad, logp + fwd_log_det)
+    else:
+        x = bijection.inverse(draw)
+        (_, fwd_log_det), pull_grad_fn = jax.vjp(
+            lambda x: bijection.transform_and_log_det(x), x
+        )
+        (x_grad,) = pull_grad_fn((grad, jnp.ones(())))
+        return (x, x_grad, logp + fwd_log_det)
 
 
 class FisherLoss:
@@ -39,16 +294,7 @@ class FisherLoss:
         if return_elemwise_costs:
 
             def compute_loss(bijection, draw, grad, logp):
-                if True:
-                    draw, grad, logp = bijection.inverse_gradient_and_val_(
-                        draw, grad, logp
-                    )
-                else:
-                    draw, grad, logp = (
-                        flowjax.bijections.AbstractBijection.inverse_gradient_and_val_(
-                            bijection, draw, grad, logp
-                        )
-                    )
+                draw, grad, logp = inverse_gradient_and_val(bijection, draw, grad, logp)
                 cost = (draw + grad) ** 2
                 return cost
 
@@ -63,7 +309,7 @@ class FisherLoss:
         if self._gamma is None:
 
             def compute_loss(bijection, draw, grad, logp):
-                draw, grad, logp = bijection.inverse_gradient_and_val_(draw, grad, logp)
+                draw, grad, logp = inverse_gradient_and_val(bijection, draw, grad, logp)
                 cost = ((draw + grad) ** 2).sum()
                 return cost
 
@@ -83,9 +329,8 @@ class FisherLoss:
                 return jnp.log(costs.mean())
 
         else:
-
             def transform(draw, grad, logp):
-                return flow.bijection.inverse_gradient_and_val_(draw, grad, logp)
+                return inverse_gradient_and_val(flow.bijection, draw, grad, logp)
 
             draws, grads, logps = jax.vmap(transform, [0, 0, 0], (0, 0, 0))(
                 draws, grads, logps
@@ -103,16 +348,16 @@ def fit_flow(key, bijection, loss_fn, draws, grads, logps, **kwargs):
 
     key, train_key = jax.random.split(key)
 
-    fit, losses = flowjax.train.fit_to_data(
+    fit, losses, opt_state = fit_to_data(
         key=train_key,
         dist=flow,
         x=(draws, grads, logps),
         loss_fn=loss_fn,
-        max_epochs=1000,
+        max_epochs=500,
         return_best=True,
         **kwargs,
     )
-    return fit.bijection, losses, losses["opt_state"]
+    return fit.bijection, losses, opt_state
 
 
 @eqx.filter_jit
@@ -181,9 +426,7 @@ def _init_from_untransformed_position(logp_fn, bijection, untransformed_position
 def _inv_transform(bijection, untransformed_position, untransformed_gradient):
     bijection = unwrap(bijection)
     transformed_position, transformed_gradient, logdet = (
-        bijection.inverse_gradient_and_val_(
-            untransformed_position, untransformed_gradient, 0.0
-        )
+        inverse_gradient_and_val(bijection, untransformed_position, untransformed_gradient, 0.0)
     )
     return logdet, transformed_position, transformed_gradient
 
@@ -270,7 +513,7 @@ class TransformAdapter:
     def update(self, seed, positions, gradients, logps):
         self.index += 1
         if self._verbose:
-            print(f"Chain {self._chain}: Total available points: {len(positions)}")
+            print(f"Chain {self._chain}: Total available points: {len(positions)}, seed {seed}")
         n_draws = len(positions)
         assert n_draws == len(positions)
         assert n_draws == len(gradients)
