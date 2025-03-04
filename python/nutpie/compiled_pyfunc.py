@@ -98,7 +98,7 @@ def from_pyfunc(
     coords: dict[str, Any] | None = None,
     dims: dict[str, tuple[str, ...]] | None = None,
     shared_data: dict[str, Any] | None = None,
-    make_initial_point_fn: Callable[[SeedType], np.ndarray] | None,
+    make_initial_point_fn: Callable[[SeedType], np.ndarray] | None = None,
     make_transform_adapter=None,
     raw_logp_fn=None,
 ):

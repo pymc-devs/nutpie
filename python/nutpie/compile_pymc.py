@@ -1,5 +1,6 @@
 import dataclasses
 import itertools
+import threading
 import warnings
 from collections.abc import Iterable
 from dataclasses import dataclass
