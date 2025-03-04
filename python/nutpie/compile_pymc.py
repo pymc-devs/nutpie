@@ -8,7 +8,6 @@ from functools import wraps
 from importlib.util import find_spec
 from math import prod
 from typing import TYPE_CHECKING, Any, Callable, Literal, Optional, Union, cast
-import threading
 
 import numpy as np
 import pandas as pd
@@ -645,7 +644,7 @@ def _make_functions(
     """
     import pytensor
     import pytensor.tensor as pt
-    from pymc.pytensorf import compile_pymc
+    from pymc.pytensorf import compile as compile_pymc
 
     shapes = _compute_shapes(model)
 

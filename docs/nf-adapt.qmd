@@ -85,8 +85,8 @@ compiled = compiled.with_transform_adapt(
 
 # Sample with normalizing flow adaptation
 trace_nf = nutpie.sample(compiled, transform_adapt=True, seed=1, chains=2, cores=1)
-assert trace_no_nf.sample_stats.diverging.sum() == 0
-assert (arviz.ess(trace_no_nf) > 500).all().to_array().all()
+assert trace_nf.sample_stats.diverging.sum() == 0
+assert (arviz.ess(trace_nf) > 500).all().to_array().all()
 ```
 
 The flow adaptation occurs during warmup, so the number of warmup draws should

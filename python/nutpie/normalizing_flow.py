@@ -17,7 +17,8 @@ from equinox.nn import Linear
 from paramax.wrappers import AbstractUnwrappable
 
 
-_NN_ACTIVATION = jax.nn.leaky_relu
+_NN_ACTIVATION = jax.nn.gelu
+
 
 def _generate_sequences(k, r_vals):
     """
@@ -324,6 +325,7 @@ class AsymmetricAffine(bijections.AbstractBijection):
         scale: Scale parameter σ (positive)
         theta: Asymmetry parameter θ (positive)
     """
+
     shape: tuple[int, ...] = ()
     cond_shape: ClassVar[None] = None
     loc: Array
@@ -340,6 +342,7 @@ class AsymmetricAffine(bijections.AbstractBijection):
             *(arraylike_to_array(a, dtype=float) for a in (loc, scale, theta)),
         )
         self.shape = scale.shape
+        assert self.shape == ()
         self.scale = Parameterize(lambda x: x + jnp.sqrt(1 + x**2), jnp.zeros(()))
         self.theta = Parameterize(lambda x: x + jnp.sqrt(1 + x**2), jnp.zeros(()))
 
@@ -348,17 +351,18 @@ class AsymmetricAffine(bijections.AbstractBijection):
         theta = jnp.log(theta)
 
         sinh_theta = jnp.sinh(theta)
-        #sinh_theta = (theta - 1 / theta) / 2
+        # sinh_theta = (theta - 1 / theta) / 2
         cosh_theta = jnp.cosh(theta)
-        #cosh_theta = (theta + 1 / theta) / 2
+        # cosh_theta = (theta + 1 / theta) / 2
         numerator = sinh_theta * x * (abs_x + 2.0)
-        denominator = (abs_x + 1.0)**2
+        denominator = (abs_x + 1.0) ** 2
         term = numerator / denominator
         dy_dx = sigma * (cosh_theta + term)
         return jnp.log(dy_dx)
 
-    def transform_and_log_det(self, x: ArrayLike, condition: ArrayLike | None = None) -> tuple[Array, Array]:
-
+    def transform_and_log_det(
+        self, x: ArrayLike, condition: ArrayLike | None = None
+    ) -> tuple[Array, Array]:
         def transform(x, mu, sigma, theta):
             weight = (jax.nn.soft_sign(x) + 1) / 2
             z = x * sigma
@@ -372,17 +376,22 @@ class AsymmetricAffine(bijections.AbstractBijection):
         y = transform(x, mu, sigma, theta)
         logjac = self._log_derivative_f(x, mu, sigma, theta)
         return y, logjac.sum()
+        # y, jac = jax.value_and_grad(transform, argnums=0)(x, mu, sigma, theta)
+        # return y, jnp.log(jac)
 
-    def inverse_and_log_det(self, y: ArrayLike, condition: ArrayLike | None = None) -> tuple[Array, Array]:
-
+    def inverse_and_log_det(
+        self, y: ArrayLike, condition: ArrayLike | None = None
+    ) -> tuple[Array, Array]:
         def inverse(y, mu, sigma, theta):
             delta = y - mu
             inv_theta = 1 / theta
 
             # Case 1: y >= mu (delta >= 0)
             a = sigma * (theta + inv_theta)
-            discriminant_pos = jnp.square(a - 2.0 * delta) + 16.0 * sigma * theta * delta
-            discriminant_pos = jnp.where(discriminant_pos < 0, 1., discriminant_pos)
+            discriminant_pos = (
+                jnp.square(a - 2.0 * delta) + 16.0 * sigma * theta * delta
+            )
+            discriminant_pos = jnp.where(discriminant_pos < 0, 1.0, discriminant_pos)
             sqrt_pos = jnp.sqrt(discriminant_pos)
             numerator_pos = 2.0 * delta - a + sqrt_pos
             denominator_pos = 4.0 * sigma * theta
@@ -391,8 +400,10 @@ class AsymmetricAffine(bijections.AbstractBijection):
             # Case 2: y < mu (delta < 0)
             sigma_part = sigma * (1.0 + theta * theta)
             term2 = 2.0 * delta * theta
-            inside_sqrt_neg = jnp.square(sigma_part + term2) - 16.0 * sigma * delta * theta
-            inside_sqrt_neg = jnp.where(inside_sqrt_neg < 0, 1., inside_sqrt_neg)
+            inside_sqrt_neg = (
+                jnp.square(sigma_part + term2) - 16.0 * sigma * delta * theta
+            )
+            inside_sqrt_neg = jnp.where(inside_sqrt_neg < 0, 1.0, inside_sqrt_neg)
             sqrt_neg = jnp.sqrt(inside_sqrt_neg)
             numerator_neg = sigma_part + term2 - sqrt_neg
             denominator_neg = 4.0 * sigma
@@ -407,6 +418,8 @@ class AsymmetricAffine(bijections.AbstractBijection):
         x = inverse(y, mu, sigma, theta)
         logjac = self._log_derivative_f(x, mu, sigma, theta)
         return x, -logjac.sum()
+        # x, jac = jax.value_and_grad(inverse, argnums=0)(y, mu, sigma, theta)
+        # return x, jnp.log(jac)
 
 
 class MvScale(bijections.AbstractBijection):
@@ -499,7 +512,6 @@ class Coupling(bijections.AbstractBijection):
             self.requires_vmap = False
             conditioner_output_size = num_params
 
-
         self.transformer_constructor = constructor
         self.untransformed_dim = untransformed_dim
         self.dim = dim
@@ -509,7 +521,9 @@ class Coupling(bijections.AbstractBijection):
         if conditioner is None:
             conditioner = eqx.nn.MLP(
                 in_size=(
-                    untransformed_dim if cond_dim is None else untransformed_dim + cond_dim
+                    untransformed_dim
+                    if cond_dim is None
+                    else untransformed_dim + cond_dim
                 ),
                 out_size=conditioner_output_size,
                 width_size=nn_width,
@@ -542,7 +556,9 @@ class Coupling(bijections.AbstractBijection):
         if self.requires_vmap:
             dim = self.dim - self.untransformed_dim
             transformer_params = jnp.reshape(params, (dim, -1))
-            transformer = eqx.filter_vmap(self.transformer_constructor)(transformer_params)
+            transformer = eqx.filter_vmap(self.transformer_constructor)(
+                transformer_params
+            )
             return bijections.Vmap(transformer, in_axes=eqx.if_array(0))
         else:
             transformer = self.transformer_constructor(params)
@@ -612,7 +628,7 @@ def make_elemwise_trafo(key, n_dim, *, count=1):
             replace=theta,
         )
 
-        return affine
+        return bijections.Invert(affine)
 
     def make(key):
         keys = jax.random.split(key, count + 1)
@@ -626,10 +642,8 @@ def make_elemwise_trafo(key, n_dim, *, count=1):
     return bijections.Vmap(make_affine, in_axes=eqx.if_array(0))
 
 
-def make_coupling(key, dim, n_untransformed, **kwargs):
+def make_coupling(key, dim, n_untransformed, *, inner_mvscale=False, **kwargs):
     n_transformed = dim - n_untransformed
-
-    mvscale = make_mvscale(key, n_transformed, 1, randomize_base=True)
 
     nn_width = kwargs.get("nn_width", None)
     nn_depth = kwargs.get("nn_depth", None)
@@ -646,12 +660,11 @@ def make_coupling(key, dim, n_untransformed, **kwargs):
         else:
             nn_depth = len(nn_width)
 
-    transformer = bijections.Chain(
-        [
-            make_elemwise_trafo(key, n_transformed, count=3),
-            #mvscale,
-        ]
-    )
+    transformer = make_elemwise_trafo(key, n_transformed, count=3)
+
+    if inner_mvscale:
+        mvscale = make_mvscale(key, n_transformed, 1, randomize_base=True)
+        transformer = bijections.Chain([transformer, mvscale])
 
     def make_mlp(out_size):
         if isinstance(nn_width, tuple):

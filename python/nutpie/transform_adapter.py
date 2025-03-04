@@ -1,5 +1,6 @@
 from functools import partial
 from typing import Callable
+import time
 
 from flowjax import bijections
 from jaxtyping import ArrayLike, PyTree
@@ -44,6 +45,7 @@ def fit_to_data(
     return_best: bool = True,
     show_progress: bool = True,
     opt_state=None,
+    verbose: bool = False,
 ):
     r"""Train a distribution (e.g. a flow) to samples from the target distribution.
 
@@ -102,39 +104,56 @@ def fit_to_data(
 
     loop = tqdm.tqdm(range(max_epochs), disable=not show_progress)
 
-    for _ in loop:
+    for i in loop:
         # Shuffle data
+        start = time.time()
         key, *subkeys = jr.split(key, 3)
         train_data = [jr.permutation(subkeys[0], a) for a in train_data]
         val_data = [jr.permutation(subkeys[1], a) for a in val_data]
+        if verbose and i == 0:
+            print("shuffle timing:", time.time() - start)
+
+        start = time.time()
 
         key, subkey = jr.split(key)
         batches = get_batches(train_data, batch_size)
         batch_losses = []
 
-        for batch in zip(*batches, strict=True):
-            key, subkey = jr.split(key)
-            params, opt_state, batch_loss = step(
+        if verbose and i == 0:
+            print("batch timing:", time.time() - start)
+
+        start = time.time()
+
+        if True:
+            for batch in zip(*batches, strict=True):
+                key, subkey = jr.split(key)
+                params, opt_state, batch_loss = step(
+                    params,
+                    static,
+                    *batch,
+                    optimizer=optimizer,
+                    opt_state=opt_state,
+                    loss_fn=loss_fn,
+                    key=subkey,
+                )
+                batch_losses.append(batch_loss)
+        else:
+            params, opt_state, batch_losses = _step_batch_loop(
                 params,
                 static,
-                *batch,
-                optimizer=optimizer,
-                opt_state=opt_state,
-                loss_fn=loss_fn,
-                key=subkey,
+                opt_state,
+                optimizer,
+                loss_fn,
+                subkey,
+                *batches,
             )
-            batch_losses.append(batch_loss)
-        #params, opt_state, batch_losses = _step_batch_loop(
-        #    params,
-        #    static,
-        #    opt_state,
-        #    optimizer,
-        #    loss_fn,
-        #    subkey,
-        #    *batches,
-        #)
+
         losses["train"].append((sum(batch_losses) / len(batch_losses)).item())
 
+        if verbose and i == 0:
+            print("step timing:", time.time() - start)
+
+        start = time.time()
         # Val epoch
         batch_losses = []
         for batch in zip(*get_batches(val_data, batch_size), strict=True):
@@ -142,6 +161,9 @@ def fit_to_data(
             loss_i = loss_fn(params, static, *batch, key=subkey)
             batch_losses.append(loss_i)
         losses["val"].append(sum(batch_losses) / len(batch_losses))
+
+        if verbose and i == 0:
+            print("val timing:", time.time() - start)
 
         loop.set_postfix({k: v[-1] for k, v in losses.items()})
         if losses["val"][-1] == min(losses["val"]):
@@ -214,14 +236,19 @@ def inverse_gradient_and_val(bijection, draw, grad, logp):
         )(bijection.bijection, draw, grad, jnp.zeros(()))
         return y, y_grad, jnp.sum(log_det) + logp
     elif isinstance(bijection, bijections.Sandwich):
-        draw, grad, logp = inverse_gradient_and_val(bijections.Invert(bijection.outer), draw, grad, logp)
+        draw, grad, logp = inverse_gradient_and_val(
+            bijections.Invert(bijection.outer), draw, grad, logp
+        )
         draw, grad, logp = inverse_gradient_and_val(bijection.inner, draw, grad, logp)
         draw, grad, logp = inverse_gradient_and_val(bijection.outer, draw, grad, logp)
         return draw, grad, logp
     # Disabeling the Coupling case for now, it slows down compile time for some reason?
     elif False and isinstance(bijection, Coupling):
         y, y_grad, y_logp = draw, grad, logp
-        y_cond, y_trans = y[: bijection.untransformed_dim], y[bijection.untransformed_dim :]
+        y_cond, y_trans = (
+            y[: bijection.untransformed_dim],
+            y[bijection.untransformed_dim :],
+        )
         x_cond = y_cond
 
         y_grad_cond, y_grad_trans = (
@@ -256,14 +283,14 @@ def inverse_gradient_and_val(bijection, draw, grad, logp):
 
     elif isinstance(bijection, bijections.Invert):
         inner = bijection.bijection
-        x = inner.transform(draw)
+        x, _ = inner.transform_and_log_det(draw)
         (_, fwd_log_det), pull_grad_fn = jax.vjp(
             lambda x: inner.inverse_and_log_det(x), x
         )
         (x_grad,) = pull_grad_fn((grad, jnp.ones(())))
         return (x, x_grad, logp + fwd_log_det)
     else:
-        x = bijection.inverse(draw)
+        x, _ = bijection.inverse_and_log_det(draw)
         (_, fwd_log_det), pull_grad_fn = jax.vjp(
             lambda x: bijection.transform_and_log_det(x), x
         )
@@ -329,6 +356,7 @@ class FisherLoss:
                 return jnp.log(costs.mean())
 
         else:
+
             def transform(draw, grad, logp):
                 return inverse_gradient_and_val(flow.bijection, draw, grad, logp)
 
@@ -425,8 +453,8 @@ def _init_from_untransformed_position(logp_fn, bijection, untransformed_position
 @eqx.filter_jit
 def _inv_transform(bijection, untransformed_position, untransformed_gradient):
     bijection = unwrap(bijection)
-    transformed_position, transformed_gradient, logdet = (
-        inverse_gradient_and_val(bijection, untransformed_position, untransformed_gradient, 0.0)
+    transformed_position, transformed_gradient, logdet = inverse_gradient_and_val(
+        bijection, untransformed_position, untransformed_gradient, 0.0
     )
     return logdet, transformed_position, transformed_gradient
 
@@ -513,7 +541,9 @@ class TransformAdapter:
     def update(self, seed, positions, gradients, logps):
         self.index += 1
         if self._verbose:
-            print(f"Chain {self._chain}: Total available points: {len(positions)}, seed {seed}")
+            print(
+                f"Chain {self._chain}: Total available points: {len(positions)}, seed {seed}"
+            )
         n_draws = len(positions)
         assert n_draws == len(positions)
         assert n_draws == len(gradients)
@@ -593,9 +623,9 @@ class TransformAdapter:
                         self._loss_fn(
                             params,
                             static,
-                            positions[-100:],
-                            gradients[-100:],
-                            logps[-100:],
+                            positions[-128:],
+                            gradients[-128:],
+                            logps[-128:],
                         ),
                     )
             else:
@@ -639,9 +669,13 @@ class TransformAdapter:
                 self._bijection,
             )
             params, static = eqx.partition(flow, eqx.is_inexact_array)
+
+            start = time.time()
             old_loss = self._loss_fn(
                 params, static, positions[-128:], gradients[-128:], logps[-128:]
             )
+            if self._verbose:
+                print("loss function time: ", time.time() - start)
 
             if np.isfinite(old_loss) and old_loss < -5 and self.index > 10:
                 if self._verbose:
@@ -656,6 +690,7 @@ class TransformAdapter:
                 gradients,
                 logps,
                 show_progress=self._show_progress,
+                verbose=self._verbose,
                 optimizer=self._optimizer,
                 batch_size=self._batch_size,
                 opt_state=self._opt_state if self._reuse_opt_state else None,
@@ -666,9 +701,13 @@ class TransformAdapter:
                 flowjax.distributions.StandardNormal(fit.shape), fit
             )
             params, static = eqx.partition(flow, eqx.is_inexact_array)
+
+            start = time.time()
             new_loss = self._loss_fn(
                 params, static, positions[-128:], gradients[-128:], logps[-128:]
             )
+            if self._verbose:
+                print("new loss function time: ", time.time() - start)
 
             if self._verbose:
                 print(f"Chain {self._chain}: New loss {new_loss}, old loss {old_loss}")
