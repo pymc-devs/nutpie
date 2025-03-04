@@ -17,12 +17,16 @@ normal distribution. The flow is trained during warmup.
 
 For more information about the algorithm, see the paper todo
 
+Currently, a lot of time is spent on compiling various parts of the normalizing
+flow, and for small models this can take a large amount of the total time.
+Hopefully, we will be able to reduce this overhead in the future.
+
 ## Requirements
 
 Install the optional dependencies for normalizing flow adaptation:
 
 ```
-pip install 'nutpie[flow]'
+pip install 'nutpie[nnflow]'
 ```
 
 If you use with PyMC, this will only work if the model is compiled using the jax
@@ -50,11 +54,12 @@ it to sample from a difficult posterior:
 import pymc as pm
 import nutpie
 import numpy as np
+import arviz
 
 # Define a 100-dimensional funnel model
 with pm.Model() as model:
     log_sigma = pm.Normal("log_sigma")
-    x = pm.Normal("x", mu=0, sigma=pm.math.exp(y / 2), shape=100)
+    pm.Normal("x", mu=0, sigma=pm.math.exp(log_sigma / 2), shape=100)
 
 # Compile the model with the jax backend
 compiled = nutpie.compile_pymc_model(
@@ -62,22 +67,26 @@ compiled = nutpie.compile_pymc_model(
 )
 ```
 
-If we sample this model without normalizing flow adaptation, we may encounter
-divergences and don't recover the actual posterior distribution:
+If we sample this model without normalizing flow adaptation, we will encounter
+convergence issues, often divergences and always low effective sample sizes:
 
 ```{python}
 # Sample without normalizing flow adaptation
-trace_no_nf = nutpie.sample(compiled_no_nf, seed=1)
-assert trace_no_nf.sample_stats.diverging.sum() > 0
+trace_no_nf = nutpie.sample(compiled, seed=1)
+assert (arviz.ess(trace_no_nf) < 100).any().to_array().any()
 ```
 
 ```{python}
 # We can add further arguments for the normalizing flow:
-compiled = compiled.with_transform_adapt(num_layers=9)
+compiled = compiled.with_transform_adapt(
+    num_layers=5,  # Use 5 layers in the normalizing flow
+    nn_width=32,   # Use neural networks with 32 hidden units
+)
 
 # Sample with normalizing flow adaptation
-trace_nf = nutpie.sample(compiled, transform_adapt=True, seed=1)
+trace_nf = nutpie.sample(compiled, transform_adapt=True, seed=1, chains=2, cores=1)
 assert trace_no_nf.sample_stats.diverging.sum() == 0
+assert (arviz.ess(trace_no_nf) > 500).all().to_array().all()
 ```
 
 The flow adaptation occurs during warmup, so the number of warmup draws should
