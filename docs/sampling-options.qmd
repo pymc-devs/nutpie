@@ -68,8 +68,9 @@ For each of the `store_*` arguments, additional arrays will be availbale in the
 ```python
 trace = nutpie.sample(
     model,
-    target_accept=0.8,  # Target acceptance rate
-    maxdepth=10         # Maximum tree depth
+    target_accept=0.8,     # Target acceptance rate
+    maxdepth=10            # Maximum tree depth
+    max_energy_error=1000  # Error at witch to count the trajectory as a divergent transition
 )
 ```
 
@@ -82,6 +83,11 @@ The default is 0.8. Larger values will increase the computational cost, but
 might avoid divergences during sampling. In many diverging models increasing
 `target_accept` will only make divergences less frequent however, and not solve
 the underlying problem.
+
+Lowering the maximum energy error to for instance 10 will often increase the
+number of divergences, and make it easier to diagnose their cause. With lower
+value the divergences often are reported closer to the critical points in the
+parameter space, where the model is most likely to diverge.
 
 ## Mass Matrix Adaptation
 
