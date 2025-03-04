@@ -5,7 +5,6 @@ build-backend = "maturin"
 [project]
 name = "nutpie"
 description = "Sample Stan or PyMC models"
-version = "0.14.0"
 authors = [{ name = "PyMC Developers", email = "pymc.devs@gmail.com" }]
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
@@ -28,7 +27,7 @@ dynamic = ["version"]
 stan = ["bridgestan >= 2.6.1"]
 pymc = ["pymc >= 5.20.1", "numba >= 0.60.0"]
 pymc-jax = ["pymc >= 5.20.1", "jax >= 0.4.27"]
-nnflow = ["flowjax >= 17.0.2"]
+nnflow = ["flowjax >= 17.1.0", "equinox >= 0.11.12"]
 dev = [
   "bridgestan >= 2.6.1",
   "pymc >= 5.20.1",
@@ -42,7 +41,8 @@ all = [
   "pymc >= 5.20.1",
   "numba >= 0.60.0",
   "jax >= 0.4.27",
-  "flowjax >= 17.0.2",
+  "flowjax >= 17.1.0",
+  "equinox >= 0.11.12",
 ]
 
 [tool.ruff]

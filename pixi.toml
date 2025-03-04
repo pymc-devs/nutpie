@@ -18,7 +18,7 @@ cmd = "python -m samplerlab -m posteriordb-fast --posteriordb posteriordb/poster
 [dependencies]
 python = ">=3.12.7,<3.13"
 pymc = ">=5.19.0,<6"
-numba = ">=0.60.0,<0.61"
+numba = ">=0.61.0,<0.62"
 pytest = ">=8.3.4,<9"
 maturin = ">=1.7.7,<2"
 pip = ">=24.3.1,<25"
@@ -41,11 +41,12 @@ cmdstanpy = ">=1.2.5,<2"
 
 [pypi-dependencies]
 bridgestan = ">=2.6.0, <3"
-flowjax = { git = "https://github.com/aseyboldt/flowjax.git", rev = "07e7e32217bcfcaa7d68a304f332c925d26ab76f" }
-samplerlab = { git = "https://github.com/aseyboldt/samplerlab/" }
+#flowjax = { git = "https://github.com/aseyboldt/flowjax.git", rev = "07e7e32217bcfcaa7d68a304f332c925d26ab76f" }
+#samplerlab = { git = "https://github.com/aseyboldt/samplerlab/" }
 posteriordb = ">=0.2.0, <0.3"
-jax = { version = "<0.4.37, <0.5", extras = ["cuda12"] }
+jax = { version = ">=0.5, <0.5.1", extras = ["cuda12"] }
 watermark = ">=2.5.0, <3"
+flowjax = { git = "https://github.com/danielward27/flowjax.git" }
 
 [system-requirements]
 #cuda = "12"
