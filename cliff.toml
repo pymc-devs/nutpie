@@ -45,7 +45,6 @@ split_commits = false
 commit_preprocessors = [
   # { pattern = '\((\w+\s)?#([0-9]+)\)', replace = "([#${2}](https://github.com/orhun/git-cliff/issues/${2}))"}, # replace issue numbers
 ]
-# regex for parsing and grouping commits
 commit_parsers = [
   { message = "^feat", group = "Features" },
   { message = "^fix", group = "Bug Fixes" },
@@ -55,9 +54,10 @@ commit_parsers = [
   { message = "^style", group = "Styling" },
   { message = "^test", group = "Testing" },
   { message = "^chore: Prepare", skip = true },
+  { message = "^chore\\(release\\)", skip = true },
   { message = "^chore", group = "Miscellaneous Tasks" },
   { body = ".*security", group = "Security" },
-]
+] # regex for parsing and grouping commits
 # protect breaking changes from being skipped due to matching a skipping commit_parser
 protect_breaking_commits = false
 # filter out the commits that are not matched by commit parsers
