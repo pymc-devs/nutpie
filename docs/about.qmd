@@ -1,0 +1,17 @@
+---
+title: "About"
+---
+
+Nutpie is part of the PyMC organization. The PyMC organization develops and
+maintains tools for Bayesian statistical modeling and probabilistic machine
+learning.
+
+Nutpie provides a high-performance implementation of the No-U-Turn Sampler
+(NUTS) that can be used with models defined in PyMC, Stan and other frameworks.
+It was created to enable faster and more efficient Bayesian inference while
+maintaining compatibility with existing probabilistic programming tools.
+
+For more information about the PyMC organization, visit the following links:
+
+- [PyMC Website](https://www.pymc.io)
+- [PyMC GitHub Organization](https://github.com/pymc-devs)

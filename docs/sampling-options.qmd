@@ -1,0 +1,156 @@
+# Sampling Configuration Guide
+
+This guide covers the configuration options for `nutpie.sample` and provides
+practical advice for tuning your sampler. We'll start with basic usage and move
+to advanced topics like mass matrix adaptation.
+
+## Quick Start
+
+For most models, don't think too much about the options of the sampler, and just
+use the defaults. Most sampling problems can't easily be solved by changing the
+sampler, most of the time they require model changes. So in most cases, simply use
+
+```python
+trace = nutpie.sample(compiled_model)
+```
+
+## Core Sampling Parameters
+
+### Drawing Samples
+
+```python
+trace = nutpie.sample(
+    model,
+    draws=1000,          # Number of post-warmup draws per chain
+    tune=500,            # Number of warmup draws for adaptation
+    chains=6,            # Number of independent chains
+    cores=None,          # Number chains that are allowed to run simultainiously
+    seed=12345          # Random seed for reproducibility
+)
+```
+
+The number of draws affects both accuracy and computational cost:
+- Too few draws (< 500) may not capture the posterior well
+- Too many draws (> 10000) may waste computation time
+
+If a model is sampling without divergences, but with effective sample sizes that
+are not as large as necessary to accieve the markov-error for your estimates,
+you can increase the number of chains and/or draws.
+
+If the effective sample size is much smaller than the number of draws, you might
+want to consider reparameterizing the model instead, to for instance remove
+posterior correlations.
+
+## Sampler Diagnostics
+
+You can enable more detailed diagnostics when troubleshooting:
+
+```python
+trace = nutpie.sample(
+    model,
+    save_warmup=True,          # Keep warmup draws, default is True
+    store_divergences=True,    # Track divergent transitions
+    store_unconstrained=True,  # Store transformed parameters
+    store_gradient=True,       # Store gradient information
+    store_mass_matrix=True     # Track mass matrix adaptation
+)
+```
+
+For each of the `store_*` arguments, additional arrays will be availbale in the
+`trace.sample_stats`.
+
+## Non-blocking sampling
+
+
+
+### Settings for HMC and NUTS
+
+```python
+trace = nutpie.sample(
+    model,
+    target_accept=0.8,     # Target acceptance rate
+    maxdepth=10            # Maximum tree depth
+    max_energy_error=1000  # Error at witch to count the trajectory as a divergent transition
+)
+```
+
+The `target_accept` parameter implicitly controls the step size of the leapfrog
+steps in the HMC sampler. During tuning, the sampler will try to choose a step
+size, such that the acceptance statistic is `target_accept`. It has to be
+between 0 and 1.
+
+The default is 0.8. Larger values will increase the computational cost, but
+might avoid divergences during sampling. In many diverging models increasing
+`target_accept` will only make divergences less frequent however, and not solve
+the underlying problem.
+
+Lowering the maximum energy error to for instance 10 will often increase the
+number of divergences, and make it easier to diagnose their cause. With lower
+value the divergences often are reported closer to the critical points in the
+parameter space, where the model is most likely to diverge.
+
+## Mass Matrix Adaptation
+
+Nutpie offers several strategies for adapting the mass matrix, which determines
+how the sampler navigates the parameter space.
+
+### Standard Adaptation
+
+By setting `use_grad_based_mass_matrix=False`, the sampling algorithm will more
+closely resemble the algorithm in Stan and PyMC. Usually, this will result in
+less efficient sampling, but the total number of effective samples is sometimes
+higher. If this is set to `True` (the default), nutpie will use diagonal mass
+matrix estimates that are based on the posterior draws and the scores at those
+positions.
+
+```python
+trace = nutpie.sample(
+    model,
+    use_grad_based_mass_matrix=False
+)
+```
+
+### Low-Rank Updates
+
+For models with strong parameter correlations you can enable a low rank modified
+mass matrix. The `mass_matrix_gamma` parameter is a regularization parameter.
+More regularization will lead to a smaller effect of the low-rank components,
+but might work better for hiegher dimensional problems.
+
+`mass_matrix_eigval_cutoff` should be greater than one, and controls how large
+an eigenvalue of the full mass matrix has to be, to be included into the
+low-rank mass matirx.
+
+```python
+trace = nutpie.sample(
+    model,
+    low_rank_modified_mass_matrix=True,
+    mass_matrix_eigval_cutoff=3,
+    mass_matrix_gamma=1e-5
+)
+```
+
+### Experimental Features
+
+`trasform_adapt` is an experimental feature that allows sampling from many
+posteriors, where current methods diverge. It is described in more detail
+[here](nf-adapt.qmd).
+
+```python
+trace = nutpie.sample(
+    model,
+    transform_adapt=True  # Experimental reparameterization
+)
+```
+
+## Progress Monitoring
+
+Customize the sampling progress display:
+
+```python
+trace = nutpie.sample(
+    model,
+    progress_bar=True,
+    progress_rate=500,  # Update every 500ms
+)
+```
