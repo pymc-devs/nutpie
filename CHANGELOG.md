@@ -2,6 +2,39 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.14.0] - 2025-03-05
+
+### Bug Fixes
+
+- Set 'make_initial_point_fn' in 'from_pyfunc' to None by default (#175) (Tomás Capretto)
+
+
+### Documentation
+
+- Add nutpie website source (Adrian Seyboldt)
+
+- Include frozen cell output in docs (Adrian Seyboldt)
+
+
+### Features
+
+- Add normalizing flow adaptation (Adrian Seyboldt)
+
+
+### Miscellaneous Tasks
+
+- Bump actions/attest-build-provenance from 1 to 2 (dependabot[bot])
+
+- Bump softprops/action-gh-release from 1 to 2 (dependabot[bot])
+
+- Bump uraimo/run-on-arch-action from 2 to 3 (dependabot[bot])
+
+
+### Ci
+
+- Run python 3.13 in ci (Adrian Seyboldt)
+
+
 ## [0.13.4] - 2025-02-18
 
 ### Bug Fixes
@@ -12,6 +45,8 @@ All notable changes to this project will be documented in this file.
 ### Ci
 
 - Make sure all python versions are available in the builds (Adrian Seyboldt)
+
+- Skip python 3.13 for now (Adrian Seyboldt)
 
 
 ## [0.13.3] - 2025-02-12
@@ -47,8 +82,6 @@ All notable changes to this project will be documented in this file.
 - Update bridgestan (Adrian Seyboldt)
 
 - Update pre-commit versions (Adrian Seyboldt)
-
-- Update version and changelog (Adrian Seyboldt)
 
 
 ### Styling
@@ -202,6 +235,8 @@ All notable changes to this project will be documented in this file.
 
 ### Ci
 
+- Fix uploads of releases (Adrian Seyboldt)
+
 - Fix architectures in CI (Adrian Seyboldt)
 
 
@@ -247,11 +282,6 @@ All notable changes to this project will be documented in this file.
 ### Performance
 
 - Set the number of parallel chains dynamically (Adrian Seyboldt)
-
-
-### Ci
-
-- Fix uploads of releases (Adrian Seyboldt)
 
 
 ## [0.9.2] - 2024-02-19
