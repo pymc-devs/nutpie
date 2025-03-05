@@ -2,11 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.14.2] - 2025-03-06
+
+### Bug Fixes
+
+- Handle missing flowjax correctly (Adrian Seyboldt)
+
+
+### Testing
+
+- Mark tests as pymc or stan and select in ci (Adrian Seyboldt)
+
+
+### Ci
+
+- Use native arm github action runner (Adrian Seyboldt)
+
+
 ## [0.14.1] - 2025-03-05
 
 ### Ci
 
 - Update run-on-arch to avoid segfault (Adrian Seyboldt)
+
+- Repare 0.14.1 (Adrian Seyboldt)
 
 
 ## [0.14.0] - 2025-03-05
