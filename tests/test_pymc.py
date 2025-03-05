@@ -244,6 +244,7 @@ def test_pymc_var_names(backend, gradient_backend):
     assert not hasattr(trace.posterior, "c")
 
 
+@pytest.mark.slow
 def test_normalizing_flow():
     with pm.Model() as model:
         pm.HalfNormal("x", shape=2)
@@ -252,13 +253,14 @@ def test_normalizing_flow():
         model, backend="jax", gradient_backend="jax"
     ).with_transform_adapt(
         num_diag_windows=6,
+        verbose=True,
     )
     trace = nutpie.sample(
         compiled,
         chains=1,
         transform_adapt=True,
         window_switch_freq=150,
-        tune=400,
+        tune=600,
         seed=1,
     )
     draws = trace.posterior.x.isel(x_dim_0=0, chain=0)

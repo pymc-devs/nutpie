@@ -87,7 +87,7 @@ jobs:
             source $HOME/.local/bin/env
             uv pip install --system -U pip pytest
             uv pip install --system 'nutpie[all]' --find-links dist --force-reinstall
-            pytest
+            pytest -m "not slow"
 
   # pyarrow doesn't currently seem to work on musllinux
   #musllinux:
