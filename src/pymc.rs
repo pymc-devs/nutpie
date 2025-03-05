@@ -39,7 +39,7 @@ type RawExpandFunc = unsafe extern "C" fn(
 #[derive(Clone)]
 pub(crate) struct LogpFunc {
     func: RawLogpFunc,
-    _keep_alive: PyObject,
+    _keep_alive: Arc<PyObject>,
     user_data_ptr: UserData,
     dim: usize,
 }
@@ -55,7 +55,7 @@ impl LogpFunc {
             unsafe { std::mem::transmute::<*const c_void, RawLogpFunc>(ptr as *const c_void) };
         Self {
             func,
-            _keep_alive: keep_alive,
+            _keep_alive: Arc::new(keep_alive),
             user_data_ptr: user_data_ptr as UserData,
             dim,
         }
@@ -66,7 +66,7 @@ impl LogpFunc {
 #[derive(Clone)]
 pub(crate) struct ExpandFunc {
     func: RawExpandFunc,
-    _keep_alive: PyObject,
+    _keep_alive: Arc<PyObject>,
     user_data_ptr: UserData,
     dim: usize,
     expanded_dim: usize,
@@ -87,7 +87,7 @@ impl ExpandFunc {
         Self {
             dim,
             expanded_dim,
-            _keep_alive: keep_alive,
+            _keep_alive: Arc::new(keep_alive),
             user_data_ptr: user_data_ptr as UserData,
             func,
         }
@@ -114,6 +114,7 @@ impl LogpError for ErrorCode {
 
 impl<'a> CpuLogpFunc for &'a LogpFunc {
     type LogpError = ErrorCode;
+    type TransformParams = ();
 
     fn dim(&self) -> usize {
         self.dim
@@ -233,7 +234,7 @@ pub(crate) struct PyMcModel {
     dim: usize,
     density: LogpFunc,
     expand: ExpandFunc,
-    init_func: Py<PyAny>,
+    init_func: Arc<Py<PyAny>>,
     var_sizes: Vec<usize>,
     var_names: Vec<String>,
 }
@@ -253,7 +254,7 @@ impl PyMcModel {
             dim,
             density,
             expand,
-            init_func,
+            init_func: init_func.into(),
             var_names: var_names.extract()?,
             var_sizes: var_sizes.extract()?,
         })

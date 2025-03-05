@@ -5,8 +5,9 @@ from typing import Any, Callable
 
 import numpy as np
 
-from nutpie import _lib
+from nutpie import _lib  # type: ignore
 from nutpie.sample import CompiledModel
+from nutpie.transform_adapter import make_transform_adapter
 
 SeedType = int
 
@@ -20,6 +21,8 @@ class PyFuncModel(CompiledModel):
     _n_dim: int
     _variables: list[_lib.PyVariable]
     _coords: dict[str, Any]
+    _raw_logp_fn: Callable | None
+    _transform_adapt_args: dict | None = None
 
     @property
     def shapes(self) -> dict[str, tuple[int, ...]]:
@@ -42,6 +45,9 @@ class PyFuncModel(CompiledModel):
         updated.update(**updates)
         return dataclasses.replace(self, _shared_data=updated)
 
+    def with_transform_adapt(self, **kwargs):
+        return dataclasses.replace(self, _transform_adapt_args=kwargs)
+
     def _make_sampler(self, settings, init_mean, cores, progress_type):
         model = self._make_model(init_mean)
         return _lib.PySampler.from_pyfunc(
@@ -60,12 +66,24 @@ class PyFuncModel(CompiledModel):
             expand_fn = self._make_expand_func(seed1, seed2, chain)
             return partial(expand_fn, **self._shared_data)
 
+        if self._raw_logp_fn is not None:
+            kwargs = self._transform_adapt_args
+            if kwargs is None:
+                kwargs = {}
+            make_adapter = partial(
+                make_transform_adapter(**kwargs),
+                logp_fn=self._raw_logp_fn,
+            )
+        else:
+            make_adapter = None
+
         return _lib.PyModel(
             make_logp_func,
             make_expand_func,
             self._variables,
             self.n_dim,
-            self._make_initial_points,
+            init_point_func=self._make_initial_points,
+            transform_adapter=make_adapter,
         )
 
 
@@ -81,6 +99,8 @@ def from_pyfunc(
     dims: dict[str, tuple[str, ...]] | None = None,
     shared_data: dict[str, Any] | None = None,
     make_initial_point_fn: Callable[[SeedType], np.ndarray] | None = None,
+    make_transform_adapter=None,
+    raw_logp_fn=None,
 ):
     variables = []
     for name, shape, dtype in zip(
@@ -111,4 +131,5 @@ def from_pyfunc(
         _make_initial_points=make_initial_point_fn,
         _variables=variables,
         _shared_data=shared_data,
+        _raw_logp_fn=raw_logp_fn,
     )

@@ -1,13 +1,13 @@
 import os
 from dataclasses import dataclass
-from typing import Any, Literal, Optional, overload
+from typing import Any, Literal, Optional, cast, overload
 
 import arviz
 import numpy as np
 import pandas as pd
 import pyarrow
 
-from nutpie import _lib
+from nutpie import _lib  # type: ignore
 
 
 @dataclass(frozen=True)
@@ -281,7 +281,7 @@ def in_notebook():
     if in_colab():
         return True
     try:
-        shell = get_ipython().__class__.__name__
+        shell = get_ipython().__class__.__name__  # type: ignore
         if shell == "ZMQInteractiveShell":  # Jupyter notebook, Spyder or qtconsole
             try:
                 from IPython.display import (
@@ -398,6 +398,8 @@ class _BackgroundSampler:
         dims["divergence_start_gradient"] = ["unconstrained_parameter"]
         dims["divergence_end"] = ["unconstrained_parameter"]
         dims["divergence_momentum"] = ["unconstrained_parameter"]
+        dims["transformed_gradient"] = ["unconstrained_parameter"]
+        dims["transformed_position"] = ["unconstrained_parameter"]
 
         if self._return_raw_trace:
             return results
@@ -453,14 +455,15 @@ class _BackgroundSampler:
 def sample(
     compiled_model: CompiledModel,
     *,
-    draws: int,
-    tune: int,
+    draws: int | None,
+    tune: int | None,
     chains: int,
     cores: Optional[int],
     seed: Optional[int],
     save_warmup: bool,
     progress_bar: bool,
     low_rank_modified_mass_matrix: bool = False,
+    transform_adapt: bool = False,
     init_mean: Optional[np.ndarray],
     return_raw_trace: bool,
     blocking: Literal[True],
@@ -472,14 +475,15 @@ def sample(
 def sample(
     compiled_model: CompiledModel,
     *,
-    draws: int,
-    tune: int,
+    draws: int | None,
+    tune: int | None,
     chains: int,
     cores: Optional[int],
     seed: Optional[int],
     save_warmup: bool,
     progress_bar: bool,
     low_rank_modified_mass_matrix: bool = False,
+    transform_adapt: bool = False,
     init_mean: Optional[np.ndarray],
     return_raw_trace: bool,
     blocking: Literal[False],
@@ -490,14 +494,15 @@ def sample(
 def sample(
     compiled_model: CompiledModel,
     *,
-    draws: int = 1000,
-    tune: int = 300,
+    draws: int | None = None,
+    tune: int | None = None,
     chains: int = 6,
     cores: Optional[int] = None,
     seed: Optional[int] = None,
     save_warmup: bool = True,
     progress_bar: bool = True,
     low_rank_modified_mass_matrix: bool = False,
+    transform_adapt: bool = False,
     init_mean: Optional[np.ndarray] = None,
     return_raw_trace: bool = False,
     blocking: bool = True,
@@ -510,9 +515,9 @@ def sample(
 
     Parameters
     ----------
-    draws: int
+    draws: int | None
         The number of draws after tuning in each chain.
-    tune: int
+    tune: int | None
         The number of tuning (warmup) draws in each chain.
     chains: int
         The number of chains to sample.
@@ -585,6 +590,9 @@ def sample(
     mass_matrix_gamma: float > 0, default=1e-5
         Regularisation parameter for the eigenvalues. Only
         applicable with low_rank_modified_mass_matrix=True.
+    transform_adapt: bool, default=False
+        Use the experimental transform adaptation algorithm
+        during tuning.
     **kwargs
         Pass additional arguments to nutpie._lib.PySamplerArgs
 
@@ -594,12 +602,22 @@ def sample(
         An ArviZ ``InferenceData`` object that contains the samples.
     """
 
+    if low_rank_modified_mass_matrix and transform_adapt:
+        raise ValueError(
+            "Specify only one of `low_rank_modified_mass_matrix` and `transform_adapt`"
+        )
+
     if low_rank_modified_mass_matrix:
         settings = _lib.PyNutsSettings.LowRank(seed)
+    elif transform_adapt:
+        settings = _lib.PyNutsSettings.Transform(seed)
     else:
         settings = _lib.PyNutsSettings.Diag(seed)
-    settings.num_tune = tune
-    settings.num_draws = draws
+
+    if tune is not None:
+        settings.num_tune = tune
+    if draws is not None:
+        settings.num_draws = draws
     settings.num_chains = chains
 
     for name, val in kwargs.items():
@@ -608,10 +626,10 @@ def sample(
     if cores is None:
         try:
             # Only available in python>=3.13
-            available = os.process_cpu_count()
+            available = os.process_cpu_count()  # type: ignore
         except AttributeError:
             available = os.cpu_count()
-        cores = min(chains, available)
+        cores = min(chains, cast(int, available))
 
     if init_mean is None:
         init_mean = np.zeros(compiled_model.n_dim)
