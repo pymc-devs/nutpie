@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.14.1] - 2025-03-05
+
+### Ci
+
+- Update run-on-arch to avoid segfault (Adrian Seyboldt)
+
+
 ## [0.14.0] - 2025-03-05
 
 ### Bug Fixes
@@ -29,10 +36,14 @@ All notable changes to this project will be documented in this file.
 
 - Bump uraimo/run-on-arch-action from 2 to 3 (dependabot[bot])
 
+- Update pre-commit config (Adrian Seyboldt)
+
 
 ### Ci
 
 - Run python 3.13 in ci (Adrian Seyboldt)
+
+- Skip slow test on ci if emulating architecture (Adrian Seyboldt)
 
 
 ## [0.13.4] - 2025-02-18
