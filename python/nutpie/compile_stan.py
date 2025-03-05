@@ -1,7 +1,6 @@
 import json
 import tempfile
 from dataclasses import dataclass, replace
-from functools import partial
 from importlib.util import find_spec
 from pathlib import Path
 from typing import Any, Optional
@@ -12,7 +11,6 @@ from numpy.typing import NDArray
 
 from nutpie import _lib
 from nutpie.sample import CompiledModel
-from nutpie.transform_adapter import make_transform_adapter
 
 
 class _NumpyArrayEncoder(json.JSONEncoder):
@@ -45,13 +43,14 @@ class CompiledStanModel(CompiledModel):
         else:
             data_json = None
 
-        kwargs = self._transform_adapt_args
-        if kwargs is None:
-            kwargs = {}
-        make_adapter = partial(
-            make_transform_adapter(**kwargs),
-            logp_fn=None,
-        )
+        outer_kwargs = self._transform_adapt_args
+        if outer_kwargs is None:
+            outer_kwargs = {}
+
+        def make_adapter(*args, **kwargs):
+            from nutpie.transform_adapter import make_transform_adapter
+
+            return make_transform_adapter(**outer_kwargs)(*args, **kwargs, logp_fn=None)
 
         model = _lib.StanModel(self.library, seed, data_json, make_adapter)
         coords = self._coords
