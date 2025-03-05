@@ -78,6 +78,13 @@ compiled = nutpie.compile_pymc_model(model)
 trace = nutpie.sample(compiled)
 ```
 
+Alternatively, we can also sample through the `pymc` API:
+
+```python
+with model:
+    trace = pm.sample(model, nuts_sampler="nutpie")
+```
+
 While sampling, nutpie shows a progress bar for each chain. It also includes
 information about how each chain is doing:
 
@@ -124,6 +131,17 @@ We can select the backend by passing the `backend` argument to the `compile_pymc
 ```python
 compiled_jax = nutpie.compiled_pymc_model(model, backend="jax")
 trace = nutpie.sample(compiled_jax)
+```
+
+Or through the pymc API:
+
+```python
+with model:
+    trace = pm.sample(
+        model,
+        nuts_sampler="nutpie",
+        nuts_sampler_kwargs={"backend": "jax"},
+    )
 ```
 
 If you have an nvidia GPU, you can also use the `jax` backend with the `gpu`. We
