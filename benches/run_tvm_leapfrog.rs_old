@@ -1,0 +1,131 @@
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
+
+use tvm::runtime::graph_rt::GraphRt;
+use tvm::runtime::vm::{Executable, VirtualMachine, VirtualMachineBuilder};
+use tvm::runtime::{Context, Module};
+use tvm::{DataType, NDArray};
+
+use ndarray::{Array, Array0, Array1, ArrayD};
+
+use std::path::Path;
+
+fn make_vm<P: AsRef<Path>>(exe: P, code: P) -> VirtualMachine {
+    let code = std::fs::read(code).expect("Could not read code.");
+    let lib = Module::load(&exe).expect("Could not read executable module.");
+    let exe = Executable::new((&code).into(), lib).expect("Could not build executable");
+    let ctx = Context::cpu(0);
+    VirtualMachineBuilder::new(exe)
+        .context(ctx)
+        .build()
+        .expect("Error building vm")
+}
+
+fn make_graph_rt<P: AsRef<Path>>(factory: P, ctx: Context) -> GraphRt {
+    let lib = Module::load(&factory).expect("Could not load graph factory module.");
+    let ctxs = vec![ctx];
+    GraphRt::create_from_factory(lib, "default", ctxs).expect("Could not create graph runtime.")
+}
+
+fn criterion_benchmark(c: &mut Criterion) {
+    let code_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tvm_libs/leapfrog_10.code");
+    let lib_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tvm_libs/leapfrog_10.so");
+
+    let ctx = Context::cpu(0);
+    const N: usize = 10;
+    let dt = DataType::float(32, 1);
+
+    /*
+    let mut vm = make_vm(&lib_path, &code_path);
+
+
+    let pos: ArrayD<f32> = Array::ones((N,)).into_dyn();
+    let diag_mass: ArrayD<f32> = Array::ones((N,)).into_dyn();
+    let momentum: ArrayD<f32> = Array::ones((N,)).into_dyn();
+    let epsilon: ArrayD<f32> = Array::ones(()).into_dyn();
+    let grad: ArrayD<f32> = Array::ones((N,)).into_dyn();
+
+
+    let pos = NDArray::from_rust_ndarray(&pos, ctx, dt).unwrap();
+    let diag_mass = NDArray::from_rust_ndarray(&diag_mass, ctx, dt).unwrap();
+    let momentum = NDArray::from_rust_ndarray(&momentum, ctx, dt).unwrap();
+    let epsilon = NDArray::from_rust_ndarray(&epsilon, ctx, dt).unwrap();
+    let grad = NDArray::from_rust_ndarray(&grad, ctx, dt).unwrap();
+
+    let func = "main";
+
+    vm.set_input(func, vec![pos.into(), momentum.into(), grad.into(), epsilon.into(), diag_mass.into()]).unwrap();
+
+    c.bench_function("run leafprog 10", |b| b.iter(|| {
+        vm.invoke(&func).unwrap();
+    }));
+
+    */
+
+    let lib_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tvm_libs/leapfrog_10.so");
+    let mut graph_rt = make_graph_rt(&lib_path, ctx);
+
+    let pos: ArrayD<f32> = Array::ones((N,)).into_dyn();
+    let diag_mass: ArrayD<f32> = Array::ones((N,)).into_dyn();
+    let momentum: ArrayD<f32> = Array::ones((N,)).into_dyn();
+    let epsilon: ArrayD<f32> = Array::ones(()).into_dyn();
+    let grad: ArrayD<f32> = Array::ones((N,)).into_dyn();
+
+    let pos = NDArray::from_rust_ndarray(&pos, ctx, dt).unwrap();
+    let diag_mass = NDArray::from_rust_ndarray(&diag_mass, ctx, dt).unwrap();
+    let momentum = NDArray::from_rust_ndarray(&momentum, ctx, dt).unwrap();
+    let epsilon = NDArray::from_rust_ndarray(&epsilon, ctx, dt).unwrap();
+    let grad = NDArray::from_rust_ndarray(&grad, ctx, dt).unwrap();
+
+    c.bench_function("set graph input 10", |b| {
+        b.iter(|| {
+            graph_rt.set_input("position_in", &pos).unwrap();
+            graph_rt.set_input("momentum_in", &momentum).unwrap();
+            graph_rt.set_input("grad_in", &grad).unwrap();
+            graph_rt.set_input("epsilon", &epsilon).unwrap();
+            graph_rt.set_input("mass_diag", &diag_mass).unwrap();
+        })
+    });
+
+    c.bench_function("set graph input 10 idx", |b| {
+        b.iter(|| {
+            graph_rt.set_input_idx(0, &pos).unwrap();
+            graph_rt.set_input_idx(1, &momentum).unwrap();
+            graph_rt.set_input_idx(2, &grad).unwrap();
+            graph_rt.set_input_idx(3, &epsilon).unwrap();
+            graph_rt.set_input_idx(4, &diag_mass).unwrap();
+        })
+    });
+
+    c.bench_function("set graph input 10 idx nocopy", |b| {
+        b.iter(|| {
+            graph_rt.set_input_zero_copy_idx(0, &pos).unwrap();
+            graph_rt.set_input_zero_copy_idx(1, &momentum).unwrap();
+            graph_rt.set_input_zero_copy_idx(2, &grad).unwrap();
+            graph_rt.set_input_zero_copy_idx(3, &epsilon).unwrap();
+            graph_rt.set_input_zero_copy_idx(4, &diag_mass).unwrap();
+        })
+    });
+
+    c.bench_function("run graph 10", |b| {
+        b.iter(|| {
+            graph_rt.run().unwrap();
+        })
+    });
+
+    let out0_: ArrayD<f32> = Array::ones((N,)).into_dyn();
+    let out0 = NDArray::from_rust_ndarray(&out0_, ctx, dt).unwrap();
+    c.bench_function("run all 10", |b| {
+        b.iter(|| {
+            graph_rt.set_input_zero_copy_idx(0, &pos).unwrap();
+            graph_rt.set_input_zero_copy_idx(1, &momentum).unwrap();
+            graph_rt.set_input_zero_copy_idx(2, &grad).unwrap();
+            graph_rt.set_input_zero_copy_idx(3, &epsilon).unwrap();
+            graph_rt.set_input_zero_copy_idx(4, &diag_mass).unwrap();
+            graph_rt.run().unwrap();
+            graph_rt.get_output_into(2, out0.clone()).unwrap();
+        })
+    });
+}
+
+criterion_group!(benches, criterion_benchmark);
+criterion_main!(benches);
