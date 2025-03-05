@@ -1,6 +1,7 @@
 import numpy as np
 import pymc as pm
 import pytest
+from scipy import stats
 
 import nutpie
 import nutpie.compile_pymc
@@ -241,6 +242,32 @@ def test_pymc_var_names(backend, gradient_backend):
     # Check that variables are stored
     assert hasattr(trace.posterior, "b")
     assert not hasattr(trace.posterior, "c")
+
+
+def test_normalizing_flow():
+    with pm.Model() as model:
+        pm.HalfNormal("x", shape=2)
+
+    compiled = nutpie.compile_pymc_model(
+        model, backend="jax", gradient_backend="jax"
+    ).with_transform_adapt(
+        num_diag_windows=6,
+    )
+    trace = nutpie.sample(
+        compiled,
+        chains=1,
+        transform_adapt=True,
+        window_switch_freq=150,
+        tune=400,
+        seed=1,
+    )
+    draws = trace.posterior.x.isel(x_dim_0=0, chain=0)
+    kstest = stats.ks_1samp(draws, stats.halfnorm.cdf)
+    assert kstest.pvalue > 0.01
+
+    draws = trace.posterior.x.isel(x_dim_0=1, chain=0)
+    kstest = stats.ks_1samp(draws, stats.halfnorm.cdf)
+    assert kstest.pvalue > 0.01
 
 
 @pytest.mark.parametrize(

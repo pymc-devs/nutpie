@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from functools import wraps
 from importlib.util import find_spec
 from math import prod
-from typing import TYPE_CHECKING, Any, Callable, Literal, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Literal, Optional, Union, cast
 
 import numpy as np
 import pandas as pd
@@ -274,7 +274,7 @@ def _compile_pymc_model_numba(
         warnings.filterwarnings(
             "ignore",
             message="Cannot cache compiled function .* as it uses dynamic globals",
-            category=numba.NumbaWarning,
+            category=numba.NumbaWarning,  # type: ignore
         )
 
         logp_numba = numba.cfunc(c_sig, **kwargs)(logp_numba_raw)
@@ -287,7 +287,7 @@ def _compile_pymc_model_numba(
         warnings.filterwarnings(
             "ignore",
             message="Cannot cache compiled function .* as it uses dynamic globals",
-            category=numba.NumbaWarning,
+            category=numba.NumbaWarning,  # type: ignore
         )
 
         expand_numba = numba.cfunc(c_sig_expand, **kwargs)(expand_numba_raw)
@@ -377,14 +377,24 @@ def _compile_pymc_model_jax(
     logp_fn = logp_fn_pt.vm.jit_fn
     expand_fn = expand_fn_pt.vm.jit_fn
 
+    logp_shared_names = [var.name for var in logp_fn_pt.get_shared()]
+    expand_shared_names = [var.name for var in expand_fn_pt.get_shared()]
+
     if gradient_backend == "jax":
         orig_logp_fn = logp_fn._fun
 
-        @jax.jit
         def logp_fn_jax_grad(x, *shared):
             return jax.value_and_grad(lambda x: orig_logp_fn(x, *shared)[0])(x)
 
+        # static_argnums = list(range(1, len(logp_shared_names) + 1))
+        logp_fn_jax_grad = jax.jit(
+            logp_fn_jax_grad,
+            # static_argnums=static_argnums,
+        )
+
         logp_fn = logp_fn_jax_grad
+    else:
+        orig_logp_fn = None
 
     shared_data = {}
     shared_vars = {}
@@ -396,9 +406,6 @@ def _compile_pymc_model_jax(
         shared_vars[val.name] = val
         seen.add(val)
 
-    logp_shared_names = [var.name for var in logp_fn_pt.get_shared()]
-    expand_shared_names = [var.name for var in expand_fn_pt.get_shared()]
-
     def make_logp_func():
         def logp(x, **shared):
             logp, grad = logp_fn(x, *[shared[name] for name in logp_shared_names])
@@ -407,7 +414,8 @@ def _compile_pymc_model_jax(
         return logp
 
     names, slices, shapes = shape_info
-    dtypes = [np.float64] * len(names)
+    # TODO do not cast to float64
+    dtypes = [np.dtype("float64")] * len(names)
 
     def make_expand_func(seed1, seed2, chain):
         # TODO handle seeds
@@ -433,6 +441,7 @@ def _compile_pymc_model_jax(
         shared_data=shared_data,
         dims=dims,
         coords=coords,
+        raw_logp_fn=orig_logp_fn,
     )
 
 
@@ -635,7 +644,7 @@ def _make_functions(
     """
     import pytensor
     import pytensor.tensor as pt
-    from pymc.pytensorf import compile_pymc
+    from pymc.pytensorf import compile as compile_pymc
 
     shapes = _compute_shapes(model)
 
@@ -726,7 +735,7 @@ def _make_functions(
 
     for var in remaining_rvs:
         all_names.append(var.name)
-        shape = shapes[var.name]
+        shape = cast(tuple[int, ...], shapes[var.name])
         all_shapes.append(shape)
         length = prod(shape)
         all_slices.append(slice(count, count + length))
