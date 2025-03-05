@@ -1,0 +1,34 @@
+project:
+  type: website
+
+website:
+  title: "Nutpie"
+  navbar:
+    left:
+      - href: index.qmd
+        text: Home
+      - href: pymc-usage.qmd
+        text: Usage with PyMC
+      - href: stan-usage.qmd
+        text: Usage with Stan
+      - href: sampling-options.qmd
+        text: Sampling Options
+      - href: nf-adapt.qmd
+        text: Normalizing flow adaptation
+      - href: sample-stats.qmd
+        text: Diagnostic information
+      - about.qmd
+    tools:
+      - icon: github
+        href: https://github.com/pymc-devs/nutpie
+
+format:
+  html:
+    theme:
+      - cosmo
+      - brand
+    css: styles.css
+    toc: true
+
+execute:
+  freeze: auto

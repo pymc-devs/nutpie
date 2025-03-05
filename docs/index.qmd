@@ -1,0 +1,90 @@
+# Nutpie Documentation
+
+`nutpie` is a high-performance library designed for Bayesian inference, that
+provides efficient sampling algorithms for probabilistic models. It can sample
+models that are defined in PyMC or Stan (numpyro and custom hand-coded
+likelihoods with gradient are coming soon).
+
+- Faster sampling than either the PyMC or Stan default samplers. (An average
+  ~2x speedup on `posteriordb` compared to Stan)
+- All the diagnostic information of PyMC and Stan and some more.
+- GPU support for PyMC models through jax.
+- A more informative progress bar.
+- Access to the incomplete trace during sampling.
+- *Experimental* normalizing flow adaptation for more efficient sampling of
+  difficult posteriors.
+
+## Quickstart: PyMC
+
+Install `nutpie` with pip, uv, pixi, or conda:
+
+For usage with pymc:
+
+```bash
+# One of
+pip install "nutpie[pymc]"
+uv add "nutpie[pymc]"
+pixi add nutpie pymc numba
+conda install -c conda-forge nutpie pymc numba
+```
+
+And then sample with
+
+```{python}
+import nutpie
+import pymc as pm
+
+with pm.Model() as model:
+    mu = pm.Normal("mu", mu=0, sigma=1)
+    obs = pm.Normal("obs", mu=mu, sigma=1, observed=[1, 2, 3])
+
+compiled = nutpie.compile_pymc_model(model)
+trace = nutpie.sample(compiled)
+```
+
+For more information, see the detailed [PyMC usage guide](pymc-usage.qmd).
+
+## Quickstart: Stan
+
+Stan needs access to a compiler toolchain, you can find instructions for those
+[here](https://mc-stan.org/docs/cmdstan-guide/installation.html#cpp-toolchain).
+You can then install nutpie through pip or uv:
+
+```bash
+# One of
+pip install "nutpie[stan]"
+uv add "nutpie[stan]"
+```
+
+```{python}
+#| echo: false
+import os
+os.environ["TBB_CXX_TYPE"] = "clang"
+```
+
+```{python}
+import nutpie
+
+model = """
+data {
+    int<lower=0> N;
+    vector[N] y;
+}
+parameters {
+    real mu;
+}
+model {
+    mu ~ normal(0, 1);
+    y ~ normal(mu, 1);
+}
+"""
+
+compiled = (
+    nutpie
+    .compile_stan_model(code=model)
+    .with_data(N=3, y=[1, 2, 3])
+)
+trace = nutpie.sample(compiled)
+```
+
+For more information, see the detailed [Stan usage guide](stan-usage.qmd).
