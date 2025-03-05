@@ -1,6 +1,12 @@
 from functools import partial
+from importlib.util import find_spec
 from typing import Callable
 import time
+
+if find_spec("flowjax") is None:
+    raise ImportError(
+        "The 'flowjax' package is required to use normalizing flow adaptation."
+    )
 
 from flowjax import bijections
 from jaxtyping import ArrayLike, PyTree

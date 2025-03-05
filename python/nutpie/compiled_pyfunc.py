@@ -7,7 +7,6 @@ import numpy as np
 
 from nutpie import _lib  # type: ignore
 from nutpie.sample import CompiledModel
-from nutpie.transform_adapter import make_transform_adapter
 
 SeedType = int
 
@@ -67,13 +66,17 @@ class PyFuncModel(CompiledModel):
             return partial(expand_fn, **self._shared_data)
 
         if self._raw_logp_fn is not None:
-            kwargs = self._transform_adapt_args
-            if kwargs is None:
-                kwargs = {}
-            make_adapter = partial(
-                make_transform_adapter(**kwargs),
-                logp_fn=self._raw_logp_fn,
-            )
+            outer_kwargs = self._transform_adapt_args
+            if outer_kwargs is None:
+                outer_kwargs = {}
+
+            def make_adapter(*args, **kwargs):
+                from nutpie.transform_adapter import make_transform_adapter
+
+                return make_transform_adapter(**outer_kwargs)(
+                    *args, **kwargs, logp_fn=self._raw_logp_fn
+                )
+
         else:
             make_adapter = None
 
