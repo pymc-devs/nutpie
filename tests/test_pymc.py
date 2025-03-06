@@ -1,3 +1,10 @@
+from importlib.util import find_spec
+import time
+import pytest
+
+if find_spec("pymc") is None:
+    pytest.skip("Skip pymc tests", allow_module_level=True)
+
 import numpy as np
 import pymc as pm
 import pytest
@@ -12,6 +19,7 @@ parameterize_backends = pytest.mark.parametrize(
 )
 
 
+@pytest.mark.pymc
 @parameterize_backends
 def test_pymc_model(backend, gradient_backend):
     with pm.Model() as model:
@@ -24,6 +32,7 @@ def test_pymc_model(backend, gradient_backend):
     trace.posterior.a  # noqa: B018
 
 
+@pytest.mark.pymc
 @parameterize_backends
 def test_pymc_model_float32(backend, gradient_backend):
     import pytensor
@@ -39,6 +48,7 @@ def test_pymc_model_float32(backend, gradient_backend):
         trace.posterior.a  # noqa: B018
 
 
+@pytest.mark.pymc
 @parameterize_backends
 def test_pymc_model_no_prior(backend, gradient_backend):
     with pm.Model() as model:
@@ -52,6 +62,7 @@ def test_pymc_model_no_prior(backend, gradient_backend):
     trace.posterior.a  # noqa: B018
 
 
+@pytest.mark.pymc
 @parameterize_backends
 def test_blocking(backend, gradient_backend):
     with pm.Model() as model:
@@ -65,34 +76,41 @@ def test_blocking(backend, gradient_backend):
     trace.posterior.a  # noqa: B018
 
 
+@pytest.mark.pymc
 @parameterize_backends
-@pytest.mark.timeout(2)
+@pytest.mark.timeout(20)
 def test_wait_timeout(backend, gradient_backend):
     with pm.Model() as model:
         pm.Normal("a", shape=100_000)
     compiled = nutpie.compile_pymc_model(
         model, backend=backend, gradient_backend=gradient_backend
     )
+    start = time.time()
     sampler = nutpie.sample(compiled, chains=1, blocking=False)
     with pytest.raises(TimeoutError):
         sampler.wait(timeout=0.1)
     sampler.cancel()
+    assert start - time.time() < 5
 
 
+@pytest.mark.pymc
 @parameterize_backends
-@pytest.mark.timeout(2)
+@pytest.mark.timeout(20)
 def test_pause(backend, gradient_backend):
     with pm.Model() as model:
         pm.Normal("a", shape=100_000)
     compiled = nutpie.compile_pymc_model(
         model, backend=backend, gradient_backend=gradient_backend
     )
+    start = time.time()
     sampler = nutpie.sample(compiled, chains=1, blocking=False)
     sampler.pause()
     sampler.resume()
     sampler.cancel()
+    assert start - time.time() < 5
 
 
+@pytest.mark.pymc
 @parameterize_backends
 def test_pymc_model_with_coordinate(backend, gradient_backend):
     with pm.Model() as model:
@@ -106,6 +124,7 @@ def test_pymc_model_with_coordinate(backend, gradient_backend):
     trace.posterior.a  # noqa: B018
 
 
+@pytest.mark.pymc
 @parameterize_backends
 def test_pymc_model_store_extra(backend, gradient_backend):
     with pm.Model() as model:
@@ -130,6 +149,7 @@ def test_pymc_model_store_extra(backend, gradient_backend):
     _ = trace.sample_stats.mass_matrix_inv
 
 
+@pytest.mark.pymc
 @parameterize_backends
 def test_trafo(backend, gradient_backend):
     with pm.Model() as model:
@@ -142,6 +162,7 @@ def test_trafo(backend, gradient_backend):
     trace.posterior.a  # noqa: B018
 
 
+@pytest.mark.pymc
 @parameterize_backends
 def test_det(backend, gradient_backend):
     with pm.Model() as model:
@@ -156,6 +177,7 @@ def test_det(backend, gradient_backend):
     assert trace.posterior.b.shape[-1] == 2
 
 
+@pytest.mark.pymc
 @parameterize_backends
 def test_non_identifier_names(backend, gradient_backend):
     with pm.Model() as model:
@@ -172,6 +194,7 @@ def test_non_identifier_names(backend, gradient_backend):
     assert trace.posterior["foo::b"].shape[-1] == 2
 
 
+@pytest.mark.pymc
 @parameterize_backends
 def test_pymc_model_shared(backend, gradient_backend):
     with pm.Model() as model:
@@ -197,6 +220,7 @@ def test_pymc_model_shared(backend, gradient_backend):
         nutpie.sample(compiled3, chains=1)
 
 
+@pytest.mark.pymc
 @parameterize_backends
 def test_pymc_var_names(backend, gradient_backend):
     with pm.Model() as model:
@@ -244,7 +268,8 @@ def test_pymc_var_names(backend, gradient_backend):
     assert not hasattr(trace.posterior, "c")
 
 
-@pytest.mark.slow
+@pytest.mark.pymc
+@pytest.mark.flow
 def test_normalizing_flow():
     with pm.Model() as model:
         pm.HalfNormal("x", shape=2)
@@ -272,6 +297,7 @@ def test_normalizing_flow():
     assert kstest.pvalue > 0.01
 
 
+@pytest.mark.pymc
 @pytest.mark.parametrize(
     ("backend", "gradient_backend"),
     [

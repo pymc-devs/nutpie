@@ -35,6 +35,7 @@ dev = [
   "jax >= 0.4.27",
   "flowjax >= 17.0.2",
   "pytest",
+  "pytest-timeout",
 ]
 all = [
   "bridgestan >= 2.6.1",
@@ -65,3 +66,10 @@ venv = "default"
 module-name = "nutpie._lib"
 python-source = "python"
 features = ["pyo3/extension-module"]
+
+[tool.pytest.ini_options]
+markers = [
+    "flow: tests for normalizing flows",
+    "stan: tests for Stan models",
+    "pymc: tests for PyMC models",
+]

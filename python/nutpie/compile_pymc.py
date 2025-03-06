@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING, Any, Callable, Literal, Optional, Union, cast
 import numpy as np
 import pandas as pd
 from numpy.typing import NDArray
-from pymc.initial_point import make_initial_point_fn
 
 from nutpie import _lib
 from nutpie.compiled_pyfunc import SeedType, from_pyfunc
@@ -501,6 +500,7 @@ def compile_pymc_model(
         )
 
     from pymc.model.transform.optimization import freeze_dims_and_data
+    from pymc.initial_point import make_initial_point_fn
 
     if freeze_model is None:
         freeze_model = backend == "jax"

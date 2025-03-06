@@ -67,9 +67,14 @@ jobs:
           set -e
           python3 -m venv .venv
           source .venv/bin/activate
+          uv pip install 'nutpie[stan]' --find-links dist --force-reinstall
+          uv pip install pytest pytest-timeout
+          pytest -m "stan and not flow"
+          uv pip install 'nutpie[pymc]' --find-links dist --force-reinstall
+          uv pip install jax
+          pytest -m "pymc and not flow"
           uv pip install 'nutpie[all]' --find-links dist --force-reinstall
-          uv pip install pytest
-          pytest
+          pytest -m flow
       - name: pytest
         if: ${{ !startsWith(matrix.platform.target, 'x86') && matrix.platform.target != 'ppc64' }}
         uses: uraimo/run-on-arch-action@v3
@@ -85,9 +90,9 @@ jobs:
           run: |
             set -e
             source $HOME/.local/bin/env
-            uv pip install --system -U pip pytest
+            uv pip install --system -U pip pytest pytest-timeout
             uv pip install --system 'nutpie[all]' --find-links dist --force-reinstall
-            pytest -m "not slow"
+            pytest -m "not flow"  # Skip flow tests, they are slow on emulated platforms
 
   # pyarrow doesn't currently seem to work on musllinux
   #musllinux:
@@ -208,7 +213,7 @@ jobs:
           python3 -m venv .venv
           source .venv/Scripts/activate
           uv pip install "nutpie[all]" --find-links dist --force-reinstall
-          uv pip install pytest
+          uv pip install pytest pytest-timeout
           pytest
 
   macos:
@@ -252,8 +257,8 @@ jobs:
           python3 -m venv .venv
           source .venv/bin/activate
           uv pip install 'nutpie[all]' --find-links dist --force-reinstall
-          uv pip install pytest
-          pytest
+          uv pip install pytest pytest-timeout
+          pytest -m "not (flow and stan)"  # The stan tests seem to run out of memory on macOS?
 
   sdist:
     runs-on: ubuntu-latest
