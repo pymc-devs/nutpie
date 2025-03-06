@@ -22,7 +22,7 @@ jobs:
         platform:
           - runner: ubuntu-22.04
             target: x86_64
-          - runner: ubuntu-22.04
+          - runner: ubuntu-22.04-arm
             target: aarch64
     steps:
       - uses: actions/checkout@v4
@@ -37,17 +37,6 @@ jobs:
             3.13
       - name: Build wheels
         uses: PyO3/maturin-action@v1
-        if: ${{ matrix.platform.target == 'aarch64' }}
-        with:
-          target: ${{ matrix.platform.target }}
-          args: --release --out dist --interpreter 3.10 3.11 3.12 --zig
-          sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
-          manylinux: auto
-          before-script-linux: |
-            dnf install -y clang-libs clang || sudo apt install llvm-dev libclang-dev clang
-      - name: Build wheels
-        uses: PyO3/maturin-action@v1
-        if: ${{ matrix.platform.target == 'x86_64' }}
         with:
           target: ${{ matrix.platform.target }}
           args: --release --out dist --interpreter 3.10 3.11 3.12 3.13 --zig
@@ -61,7 +50,6 @@ jobs:
           name: wheels-linux-${{ matrix.platform.target }}
           path: dist
       - name: pytest
-        if: ${{ startsWith(matrix.platform.target, 'x86_64') }}
         shell: bash
         run: |
           set -e
@@ -75,24 +63,6 @@ jobs:
           pytest -m "pymc and not flow"
           uv pip install 'nutpie[all]' --find-links dist --force-reinstall
           pytest -m flow
-      - name: pytest
-        if: ${{ !startsWith(matrix.platform.target, 'x86') && matrix.platform.target != 'ppc64' }}
-        uses: uraimo/run-on-arch-action@v3
-        with:
-          arch: ${{ matrix.platform.target }}
-          distro: ubuntu22.04
-          githubToken: ${{ github.token }}
-          install: |
-            apt-get update
-            apt-get install -y --no-install-recommends python3 python3-pip curl make clang build-essential python3-dev
-            curl -LsSf https://astral.sh/uv/install.sh | sh
-            source $HOME/.local/bin/env
-          run: |
-            set -e
-            source $HOME/.local/bin/env
-            uv pip install --system -U pip pytest pytest-timeout
-            uv pip install --system 'nutpie[all]' --find-links dist --force-reinstall
-            pytest -m "not flow"  # Skip flow tests, they are slow on emulated platforms
 
   # pyarrow doesn't currently seem to work on musllinux
   #musllinux:
