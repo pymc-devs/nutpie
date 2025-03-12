@@ -900,6 +900,7 @@ def make_transform_adapter(
     debug_save_bijection=False,
     make_optimizer=None,
     coupling_type="masked",
+    mvscale_layer=False,
     n_embed=None,
     n_deembed=None,
 ):
@@ -917,6 +918,7 @@ def make_transform_adapter(
             nn_width=nn_width,
             n_embed=n_embed,
             n_deembed=n_deembed,
+            mvscale=mvscale_layer,
             kind=coupling_type,
         ),
         show_progress=show_progress,
