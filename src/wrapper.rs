@@ -629,6 +629,31 @@ impl PyNutsSettings {
         }
         Ok(())
     }
+
+    #[getter]
+    fn check_turning(&self) -> Result<bool> {
+        match &self.inner {
+            Settings::LowRank(inner) => Ok(inner.check_turning),
+            Settings::Diag(inner) => Ok(inner.check_turning),
+            Settings::Transforming(inner) => Ok(inner.check_turning),
+        }
+    }
+
+    #[setter(check_turning)]
+    fn set_check_turning(&mut self, val: bool) -> Result<()> {
+        match &mut self.inner {
+            Settings::LowRank(inner) => {
+                inner.check_turning = val;
+            }
+            Settings::Diag(inner) => {
+                inner.check_turning = val;
+            }
+            Settings::Transforming(inner) => {
+                inner.check_turning = val;
+            }
+        }
+        Ok(())
+    }
 }
 
 pub(crate) enum SamplerState {
