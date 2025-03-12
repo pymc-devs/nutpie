@@ -969,6 +969,7 @@ def make_flow_scan(
     nn_depth=None,
     n_embed=None,
     n_deembed=None,
+    mvscale=False,
 ):
     dim = n_dim
 
@@ -1060,8 +1061,11 @@ def make_flow_scan(
             coupling,
         )
 
-        mvscale = make_mvscale(key4, dim)
-        return bijections.Chain([coupling, mvscale])
+        if mvscale:
+            scale = make_mvscale(key4, dim)
+            return bijections.Chain([coupling, scale])
+        else:
+            return bijections.Chain([coupling])
 
     keys = jax.random.split(key, n_layers)
 
@@ -1214,6 +1218,7 @@ def make_flow(
     n_embed=None,
     n_deembed=None,
     kind="subset",
+    mvscale=False,
 ):
     positions = np.array(positions)
     gradients = np.array(gradients)
@@ -1283,6 +1288,7 @@ def make_flow(
             nn_depth=nn_depth,
             n_embed=n_embed,
             n_deembed=n_deembed,
+            mvscale=mvscale,
         )
     else:
         raise ValueError(f"Unknown flow kind: {kind}")
