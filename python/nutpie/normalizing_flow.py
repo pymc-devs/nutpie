@@ -1,7 +1,8 @@
-from typing import ClassVar, Union, Literal, Callable
+from typing import Any, ClassVar, Union, Literal, Callable
 import math
 import itertools
 
+from flowjax.bijections.bijection import AbstractBijection
 from flowjax.bijections.coupling import get_ravelled_pytree_constructor
 from flowjax.utils import arraylike_to_array
 import jax
@@ -10,9 +11,9 @@ import equinox as eqx
 from flowjax import bijections
 import flowjax.distributions
 import flowjax.flows
-from jaxtyping import Array, ArrayLike
+from jaxtyping import Array, ArrayLike, PyTree
 import numpy as np
-from paramax import NonTrainable, Parameterize
+from paramax import NonTrainable, Parameterize, unwrap
 from equinox.nn import Linear
 from paramax.wrappers import AbstractUnwrappable
 
@@ -446,6 +447,158 @@ class MvScale(bijections.AbstractBijection):
         return x, -jnp.log(scale)
 
 
+class MaskedVmap(AbstractBijection):
+    bijection: AbstractBijection
+    in_axes: tuple
+    axis_size: int
+    cond_shape: tuple[int, ...] | None
+    mask: Array
+
+    def __init__(
+        self,
+        bijection: AbstractBijection,
+        mask: Array,
+        *,
+        in_axes: PyTree | None | int | Callable = None,
+        axis_size: int | None = None,
+        in_axes_condition: int | None = None,
+    ):
+        if in_axes is not None and axis_size is not None:
+            raise ValueError("Cannot specify both in_axes and axis_size.")
+
+        if axis_size is None:
+            if in_axes is None:
+                raise ValueError("Either axis_size or in_axes must be provided.")
+            # _check_no_unwrappables(in_axes)
+            from flowjax.bijections.jax_transforms import _infer_axis_size_from_params
+
+            axis_size = _infer_axis_size_from_params(unwrap(bijection), in_axes)
+
+        self.in_axes = (0, in_axes, 0, in_axes_condition)
+        self.bijection = bijection
+        self.axis_size = axis_size
+        self.cond_shape = self.get_cond_shape(in_axes_condition)
+        self.mask = mask
+
+    def vmap(self, f: Callable):
+        return eqx.filter_vmap(f, in_axes=self.in_axes, axis_size=self.axis_size)
+
+    def transform_and_log_det(self, x, condition=None):
+        def _transform_and_log_det(mask, bijection, x, condition):
+            y, det = bijection.transform_and_log_det(x, condition)
+            return jnp.where(mask, y, x), jnp.where(mask, det, jnp.zeros(()))
+
+        y, log_det = self.vmap(_transform_and_log_det)(
+            self.mask, self.bijection, x, condition
+        )
+        return y, jnp.sum(log_det)
+
+    def inverse_and_log_det(self, y, condition=None):
+        def _inverse_and_log_det(mask, bijection, y, condition):
+            x, det = bijection.inverse_and_log_det(y, condition)
+            return jnp.where(mask, x, y), jnp.where(mask, det, jnp.zeros(()))
+
+        x, log_det = self.vmap(_inverse_and_log_det)(
+            self.mask, self.bijection, y, condition
+        )
+        return x, jnp.sum(log_det)
+
+    @property
+    def shape(self):
+        return (self.axis_size, *self.bijection.shape)
+
+    def get_cond_shape(self, cond_ax):
+        if self.bijection.cond_shape is None or cond_ax is None:
+            return self.bijection.cond_shape
+        return (
+            *self.bijection.cond_shape[:cond_ax],
+            self.axis_size,
+            *self.bijection.cond_shape[cond_ax:],
+        )
+
+
+class Mask(eqx.Module):
+    mask: Array
+
+    def __init__(self, mask: Array):
+        assert mask.dtype == jnp.bool_
+        self.mask = mask
+
+    def __call__(self, x: Array, *, key=None) -> Array:
+        return x * self.mask
+
+
+class Scan(AbstractBijection):
+    """Repeatedly apply the same bijection with different parameter values.
+
+    Internally, uses `jax.lax.scan` to reduce compilation time. Often it is convenient
+    to construct these using ``equinox.filter_vmap``.
+
+    Args:
+        bijection: A bijection, in which the arrays leaves have an additional leading
+            axis to scan over. It is often can convenient to create compatible
+            bijections with ``equinox.filter_vmap``.
+
+    Example:
+        Below is equivilent to ``Chain([Affine(p) for p in params])``.
+
+        .. doctest::
+
+            >>> from flowjax.bijections import Scan, Affine
+            >>> import jax.numpy as jnp
+            >>> import equinox as eqx
+            >>> params = jnp.ones((3, 2))
+            >>> affine = eqx.filter_vmap(Affine)(params)
+            >>> affine = Scan(affine)
+    """
+
+    bijection: AbstractBijection
+    filter_spec: Any = None
+
+    def transform_and_log_det(self, x, condition=None):
+        def step(carry, bijection):
+            x, log_det = carry
+            y, log_det_i = bijection.transform_and_log_det(x, condition)
+            return ((y, log_det + log_det_i.sum()), None)
+
+        (y, log_det), _ = _filter_scan(
+            step, (x, 0), self.bijection, filter_spec=self.filter_spec
+        )
+        return y, log_det
+
+    def inverse_and_log_det(self, y, condition=None):
+        def step(carry, bijection):
+            y, log_det = carry
+            x, log_det_i = bijection.inverse_and_log_det(y, condition)
+            return ((x, log_det + log_det_i.sum()), None)
+
+        (y, log_det), _ = _filter_scan(
+            step, (y, 0), self.bijection, reverse=True, filter_spec=self.filter_spec
+        )
+        return y, log_det
+
+    @property
+    def shape(self):
+        return self.bijection.shape
+
+    @property
+    def cond_shape(self):
+        return self.bijection.cond_shape
+
+
+def _filter_scan(f, init, xs, *, reverse=False, filter_spec=None):
+    if filter_spec is None:
+        filter_spec = eqx.is_array
+    params, static = eqx.partition(xs, filter_spec=filter_spec)
+
+    def _scan_fn(carry, x):
+        module = eqx.combine(x, static)
+        carry, y = f(carry, module)
+        return carry, y
+
+    return jax.lax.scan(_scan_fn, init, params, reverse=reverse)
+
+
 class Coupling(bijections.AbstractBijection):
     """Coupling layer implementation (https://arxiv.org/abs/1605.08803).
 
@@ -565,6 +718,115 @@ class Coupling(bijections.AbstractBijection):
             return transformer
 
 
+class MaskedCoupling(bijections.AbstractBijection):
+    """Coupling layer implementation (https://arxiv.org/abs/1605.08803).
+
+    Args:
+        key: Jax key
+        transformer: Unconditional bijection with shape () to be parameterised by the
+            conditioner neural netork. Parameters wrapped with ``NonTrainable``
+            are excluded from being parameterized.
+        untransformed_dim: Number of untransformed conditioning variables (e.g. dim//2).
+        dim: Total dimension.
+        cond_dim: Dimension of additional conditioning variables. Defaults to None.
+        nn_width: Neural network hidden layer width.
+        nn_depth: Neural network hidden layer size.
+        nn_activation: Neural network activation function. Defaults to jnn.relu.
+    """
+
+    shape: tuple[int, ...]
+    cond_shape: tuple[int, ...] | None
+    untransformed_mask: Array
+    dim: int
+    transformer_constructor: Callable
+    requires_vmap: bool
+    conditioner: eqx.nn.MLP | eqx.Module
+
+    @classmethod
+    def conditioner_output_size(cls, dim, transformer):
+        constructor, num_params = get_ravelled_pytree_constructor(
+            transformer,
+            filter_spec=eqx.is_inexact_array,
+            is_leaf=lambda leaf: isinstance(leaf, NonTrainable),
+        )
+        return num_params * dim
+
+    def __init__(
+        self,
+        key,
+        *,
+        transformer: bijections.AbstractBijection,
+        untransformed_mask: Array,
+        dim: int,
+        nn_width: int,
+        nn_depth: int,
+        nn_activation: Callable = jax.nn.relu,
+        conditioner: eqx.Module | None = None,
+    ):
+        if transformer.cond_shape is not None:
+            raise ValueError(
+                "Only unconditional transformers are supported.",
+            )
+
+        constructor, num_params = get_ravelled_pytree_constructor(
+            transformer,
+            filter_spec=eqx.is_inexact_array,
+            is_leaf=lambda leaf: isinstance(leaf, NonTrainable),
+        )
+
+        assert transformer.shape == ()
+        self.requires_vmap = True
+        conditioner_output_size = num_params * dim
+
+        self.transformer_constructor = constructor
+        self.dim = dim
+        self.shape = (dim,)
+        self.cond_shape = None
+        self.untransformed_mask = untransformed_mask
+
+        if conditioner is None:
+            self.conditioner = eqx.nn.Sequential(
+                [
+                    Mask(untransformed_mask),
+                    eqx.nn.MLP(
+                        in_size=dim,
+                        out_size=conditioner_output_size,
+                        width_size=nn_width,
+                        depth=nn_depth,
+                        activation=nn_activation,
+                        key=key,
+                    ),
+                ]
+            )
+        else:
+            self.conditioner = eqx.nn.Sequential(
+                [
+                    Mask(untransformed_mask),
+                    conditioner,
+                ]
+            )
+
+    def transform_and_log_det(self, x, condition=None):
+        transformer_params = self.conditioner(x)
+        transformer = self._flat_params_to_transformer(transformer_params)
+        return transformer.transform_and_log_det(x)
+
+    def inverse_and_log_det(self, y, condition=None):
+        transformer_params = self.conditioner(y)
+        transformer = self._flat_params_to_transformer(transformer_params)
+        return transformer.inverse_and_log_det(y)
+
+    def _flat_params_to_transformer(self, params: Array):
+        """Reshape to dim X params_per_dim, then vmap."""
+        assert self.requires_vmap
+
+        transformer_params = jnp.reshape(params, (self.dim, -1))
+        transformer = eqx.filter_vmap(self.transformer_constructor)(transformer_params)
+        return MaskedVmap(
+            transformer, ~self.untransformed_mask, in_axes=eqx.if_array(0)
+        )
+
+
 def make_mvscale(key, n_dim, size, randomize_base=False):
     def make_single_hh(key, idx):
         key1, key2 = jax.random.split(key)
@@ -605,7 +867,7 @@ def make_hh(key, n_dim, size, randomize_base=False):
     )
 
 
-def make_elemwise_trafo(key, n_dim, *, count=1):
+def make_elemwise_trafo(key, n_dim, *, count=1, vmap=True):
     def make_elemwise(key, loc):
         key1, key2 = jax.random.split(key)
         scale = Parameterize(lambda x: x + jnp.sqrt(1 + x**2), jnp.zeros(()))
@@ -635,11 +897,16 @@ def make_elemwise_trafo(key, n_dim, *, count=1):
         key, keys = keys[0], keys[1:]
         loc = jax.random.normal(key=key, shape=(count,)) * 2
         loc = loc - loc.mean()
+        if count == 1:
+            return make_elemwise(key, loc[0])
         return bijections.Chain([make_elemwise(key, mu) for key, mu in zip(keys, loc)])
 
-    keys = jax.random.split(key, n_dim)
-    make_affine = eqx.filter_vmap(make, axis_size=n_dim)(keys)
-    return bijections.Vmap(make_affine, in_axes=eqx.if_array(0))
+    if vmap:
+        keys = jax.random.split(key, n_dim)
+        make_affine = eqx.filter_vmap(make, axis_size=n_dim)(keys)
+        return bijections.Vmap(make_affine, in_axes=eqx.if_array(0))
+    else:
+        return make(key)
 
 
 def make_coupling(key, dim, n_untransformed, *, inner_mvscale=False, **kwargs):
@@ -692,10 +959,150 @@ def make_coupling(key, dim, n_untransformed, *, inner_mvscale=False, **kwargs):
     )
 
 
-def make_flow(
-    seed,
-    positions,
-    gradients,
+def make_flow_scan(
+    key,
+    n_dim,
+    *,
+    zero_init=False,
+    n_layers,
+    nn_width=None,
+    nn_depth=None,
+    n_embed=None,
+    n_deembed=None,
+):
+    dim = n_dim
+
+    if nn_width is None:
+        nn_width = 32
+    if n_embed is None:
+        n_embed = 2 * nn_width
+    if n_deembed is None:
+        n_deembed = 2 * nn_width
+    if nn_depth is None:
+        nn_depth = 1
+
+    # Just to get at the size
+    transformer = AsymmetricAffine()
+    size = MaskedCoupling.conditioner_output_size(dim, transformer)
+
+    key, key1 = jax.random.split(key)
+    embed = eqx.nn.Linear(dim, n_embed, key=key1, dtype=jnp.float32)
+    key, key1 = jax.random.split(key)
+    embed_back = eqx.nn.Linear(n_deembed, size, key=key1, dtype=jnp.float32)
+
+    rng = np.random.default_rng(42)  # TODO
+    order, counts = _generate_permutations(rng, dim, n_layers)
+    mask = order == 0
+    mask[...] = False
+    for i in range(len(mask)):
+        mask[i, order[i, : counts[i]]] = True
+
+    def make_transformer():
+        scale = Parameterize(lambda x: x + jnp.sqrt(1 + x**2), jnp.zeros(()))
+        theta = Parameterize(lambda x: x + jnp.sqrt(1 + x**2), jnp.zeros(()))
+
+        affine = AsymmetricAffine(
+            jnp.zeros(()),
+            jnp.ones(()),
+            jnp.ones(()),
+        )
+
+        affine = eqx.tree_at(
+            where=lambda aff: aff.scale,
+            pytree=affine,
+            replace=scale,
+        )
+        affine = eqx.tree_at(
+            where=lambda aff: aff.theta,
+            pytree=affine,
+            replace=theta,
+        )
+
+        return bijections.Invert(affine)
+
+    def make_mvscale(key, n_dim):
+        params = jax.random.normal(key, (n_dim,))
+        params = params / jnp.linalg.norm(params)
+        return MvScale(params)
+
+    def make_layer(key, mask, embed, embed_back):
+        key1, key2, key3, key4 = jax.random.split(key, 4)
+        transformer = make_transformer()
+
+        conditioner = eqx.nn.Sequential(
+            [
+                embed,
+                eqx.nn.MLP(
+                    n_embed,
+                    n_deembed,
+                    width_size=nn_width,
+                    depth=nn_depth,
+                    key=key2,
+                    dtype=jnp.float32,
+                    activation=_NN_ACTIVATION,
+                ),
+                embed_back,
+            ]
+        )
+
+        coupling = MaskedCoupling(
+            key=key3,
+            transformer=transformer,
+            untransformed_mask=mask,
+            dim=dim,
+            conditioner=conditioner,
+            nn_width=nn_width,
+            nn_depth=nn_depth,
+        )
+
+        coupling = jax.tree_util.tree_map(
+            lambda x: x * 1e-3 if eqx.is_inexact_array(x) else x,
+            coupling,
+        )
+
+        mvscale = make_mvscale(key4, dim)
+        return bijections.Chain([coupling, mvscale])
+
+    keys = jax.random.split(key, n_layers)
+
+    base = make_layer(key, mask[0], embed, embed_back)
+    out_axes = eqx.tree_at(
+        lambda tree: tree.bijections[0].conditioner.layers[1].layers[0],
+        pytree=base,
+        replace=None,
+    )
+    out_axes = eqx.tree_at(
+        lambda tree: tree.bijections[0].conditioner.layers[1].layers[-1],
+        pytree=out_axes,
+        replace=None,
+    )
+    out_axes = jax.tree.map(lambda leaf: eqx.if_array(0)(leaf), out_axes)
+
+    vectorized = eqx.filter_vmap(
+        make_layer, in_axes=(0, 0, None, None), out_axes=out_axes
+    )
+
+    vectorize = jax.tree.map(lambda leaf: eqx.is_array(leaf), base)
+    vectorize = eqx.tree_at(
+        lambda tree: tree.bijections[0].conditioner.layers[1].layers[0],
+        pytree=vectorize,
+        replace=False,
+    )
+    vectorize = eqx.tree_at(
+        lambda tree: tree.bijections[0].conditioner.layers[1].layers[-1],
+        pytree=vectorize,
+        replace=False,
+    )
+
+    return Scan(
+        vectorized(keys, mask, embed, embed_back),
+        filter_spec=vectorize,
+    )
+
+
+def make_flow_loop(
+    key,
+    n_dim,
     *,
     zero_init=False,
     householder_layer=False,
@@ -705,54 +1112,6 @@ def make_flow(
     nn_width=None,
     nn_depth=None,
 ):
-    from flowjax import bijections
-
-    positions = np.array(positions)
-    gradients = np.array(gradients)
-
-    if len(positions) == 0:
-        return
-
-    n_draws, n_dim = positions.shape
-
-    if n_dim < 2:
-        n_layers = 0
-
-    assert positions.shape == gradients.shape
-
-    if n_draws == 0:
-        raise ValueError("No draws")
-    elif n_draws == 1:
-        assert np.all(gradients != 0)
-        diag = np.clip(1 / jnp.sqrt(jnp.abs(gradients[0])), 1e-5, 1e5)
-        assert np.isfinite(diag).all()
-        mean = jnp.zeros_like(diag)
-    else:
-        pos_std = np.clip(positions.std(0), 1e-8, 1e8)
-        grad_std = np.clip(gradients.std(0), 1e-8, 1e8)
-        diag = jnp.sqrt(pos_std / grad_std)
-        mean = positions.mean(0) + gradients.mean(0) * diag * diag
-
-    key = jax.random.PRNGKey(seed % (2**63))
-
-    diag_param = Parameterize(
-        lambda x: x + jnp.sqrt(1 + x**2),
-        (diag**2 - 1) / (2 * diag),
-    )
-    diag_affine = bijections.Affine(mean, diag)
-    diag_affine = eqx.tree_at(
-        where=lambda aff: aff.scale,
-        pytree=diag_affine,
-        replace=diag_param,
-    )
-
-    flows = [
-        diag_affine,
-    ]
-
-    if n_layers == 0:
-        return bijections.Chain(flows)
-
     def make_layer(key, untransformed_dim: int | None, permutation=None):
         key, key_couple, key_permute, key_hh = jax.random.split(key, 4)
 
@@ -837,7 +1196,97 @@ def make_flow(
 
         bijection = bijections.Chain(layers)
 
-    return bijections.Chain([bijection, *flows])
+    return bijection
+
+
+def make_flow(
+    seed,
+    positions,
+    gradients,
+    *,
+    zero_init=False,
+    householder_layer=False,
+    dct_layer=False,
+    untransformed_dim: int | list[int | None] | None = None,
+    n_layers,
+    nn_width=None,
+    nn_depth=None,
+    n_embed=None,
+    n_deembed=None,
+    kind="subset",
+):
+    positions = np.array(positions)
+    gradients = np.array(gradients)
+
+    if len(positions) == 0:
+        return
+
+    n_draws, n_dim = positions.shape
+
+    if n_dim < 2:
+        n_layers = 0
+
+    assert positions.shape == gradients.shape
+
+    if n_draws == 0:
+        raise ValueError("No draws")
+    elif n_draws == 1:
+        assert np.all(gradients != 0)
+        diag = np.clip(1 / jnp.sqrt(jnp.abs(gradients[0])), 1e-5, 1e5)
+        assert np.isfinite(diag).all()
+        mean = jnp.zeros_like(diag)
+    else:
+        pos_std = np.clip(positions.std(0), 1e-8, 1e8)
+        grad_std = np.clip(gradients.std(0), 1e-8, 1e8)
+        diag = jnp.sqrt(pos_std / grad_std)
+        mean = positions.mean(0) + gradients.mean(0) * diag * diag
+
+    key = jax.random.PRNGKey(seed % (2**63))
+
+    diag_param = Parameterize(
+        lambda x: x + jnp.sqrt(1 + x**2),
+        (diag**2 - 1) / (2 * diag),
+    )
+    diag_affine = bijections.Affine(mean, diag)
+    diag_affine = eqx.tree_at(
+        where=lambda aff: aff.scale,
+        pytree=diag_affine,
+        replace=diag_param,
+    )
+
+    flows = [
+        diag_affine,
+    ]
+
+    if n_layers == 0:
+        return bijections.Chain(flows)
+
+    if kind == "subset":
+        inner = make_flow_loop(
+            key,
+            n_dim,
+            zero_init=zero_init,
+            householder_layer=householder_layer,
+            dct_layer=dct_layer,
+            untransformed_dim=untransformed_dim,
+            n_layers=n_layers,
+            nn_width=nn_width,
+            nn_depth=nn_depth,
+        )
+    elif kind == "masked":
+        inner = make_flow_scan(
+            key,
+            n_dim,
+            zero_init=zero_init,
+            n_layers=n_layers,
+            nn_width=nn_width,
+            nn_depth=nn_depth,
+            n_embed=n_embed,
+            n_deembed=n_deembed,
+        )
+    else:
+        raise ValueError(f"Unknown flow kind: {kind}")
+    return bijections.Chain([inner, *flows])
 
 
 def extend_flow(

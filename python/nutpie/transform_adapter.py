@@ -893,13 +893,18 @@ def make_transform_adapter(
     gamma=None,
     log_inside_batch=False,
     initial_skip=120,
-    extension_windows=[],
+    extension_windows=None,
     extend_dct=False,
     extension_var_count=4,
     extension_var_trafo_count=2,
     debug_save_bijection=False,
     make_optimizer=None,
+    coupling_type="masked",
+    n_embed=None,
+    n_deembed=None,
 ):
+    if extension_windows is None:
+        extension_windows = []
     return partial(
         TransformAdapter,
         verbose=verbose,
@@ -908,7 +913,11 @@ def make_transform_adapter(
             make_flow,
             householder_layer=householder_layer,
             dct_layer=dct_layer,
+            nn_depth=nn_depth,
             nn_width=nn_width,
+            n_embed=n_embed,
+            n_deembed=n_deembed,
+            kind=coupling_type,
         ),
         show_progress=show_progress,
         num_diag_windows=num_diag_windows,
@@ -927,4 +936,5 @@ def make_transform_adapter(
         extension_var_trafo_count=extension_var_trafo_count,
         debug_save_bijection=debug_save_bijection,
         make_optimizer=make_optimizer,
+        num_layers=num_layers,
     )

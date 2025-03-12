@@ -270,7 +270,8 @@ def test_pymc_var_names(backend, gradient_backend):
 
 @pytest.mark.pymc
 @pytest.mark.flow
-def test_normalizing_flow():
+@pytest.mark.parametrize("kind", ["masked", "subset"])
+def test_normalizing_flow(kind):
     with pm.Model() as model:
         pm.HalfNormal("x", shape=2)
 
@@ -279,6 +280,7 @@ def test_normalizing_flow():
     ).with_transform_adapt(
         num_diag_windows=6,
         verbose=True,
+        coupling_type=kind,
     )
     trace = nutpie.sample(
         compiled,
