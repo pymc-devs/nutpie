@@ -878,7 +878,7 @@ def make_transform_adapter(
     verbose=False,
     window_size=600,
     show_progress=False,
-    nn_depth=1,
+    nn_depth=None,
     nn_width=None,
     num_layers=9,
     num_diag_windows=9,

@@ -34,6 +34,8 @@ def _generate_sequences(k, r_vals):
     Returns:
         A NumPy boolean array of shape (comb(k, r), k) containing all sequences.
     """
+    if k > 30:
+        raise ValueError("Too many sequences to enumerate.")
     all_sequences = []
     for r in r_vals:
         N = math.comb(k, r)  # number of sequences
@@ -807,12 +809,12 @@ class MaskedCoupling(bijections.AbstractBijection):
             )
 
     def transform_and_log_det(self, x, condition=None):
-        transformer_params = self.conditioner(x)
+        transformer_params = self.conditioner(x.astype(jnp.float32))
         transformer = self._flat_params_to_transformer(transformer_params)
         return transformer.transform_and_log_det(x)
 
     def inverse_and_log_det(self, y, condition=None):
-        transformer_params = self.conditioner(y)
+        transformer_params = self.conditioner(y.astype(jnp.float32))
         transformer = self._flat_params_to_transformer(transformer_params)
         return transformer.inverse_and_log_det(y)
 
@@ -987,7 +989,12 @@ def make_flow_scan(
     size = MaskedCoupling.conditioner_output_size(dim, transformer)
 
     key, key1 = jax.random.split(key)
-    embed = eqx.nn.Linear(dim, n_embed, key=key1, dtype=jnp.float32)
+    embed = eqx.nn.Sequential(
+        [
+            eqx.nn.Linear(dim, n_embed, key=key1, dtype=jnp.float32),
+            eqx.nn.LayerNorm(shape=(n_embed,), dtype=jnp.float32),
+        ]
+    )
     key, key1 = jax.random.split(key)
     embed_back = eqx.nn.Linear(n_deembed, size, key=key1, dtype=jnp.float32)
 
