@@ -666,7 +666,7 @@ class TransformAdapter:
 
                 if self._debug_save_bijection:
                     _BIJECTION_TRACE.append(
-                        (self.index, fit, (positions, gradients, logps))
+                        (self.index, base, (positions, gradients, logps))
                     )
                 return
 

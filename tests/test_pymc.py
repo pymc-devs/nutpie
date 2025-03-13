@@ -300,6 +300,33 @@ def test_normalizing_flow(kind):
 
 
 @pytest.mark.pymc
+@pytest.mark.flow
+@pytest.mark.parametrize("kind", ["masked", "subset"])
+def test_normalizing_flow_1d(kind):
+    with pm.Model() as model:
+        pm.HalfNormal("x")
+
+    compiled = nutpie.compile_pymc_model(
+        model, backend="jax", gradient_backend="jax"
+    ).with_transform_adapt(
+        num_diag_windows=6,
+        verbose=True,
+        coupling_type=kind,
+    )
+    trace = nutpie.sample(
+        compiled,
+        chains=1,
+        transform_adapt=True,
+        window_switch_freq=150,
+        tune=600,
+        seed=1,
+    )
+    draws = trace.posterior.x.isel(chain=0)
+    kstest = stats.ks_1samp(draws, stats.halfnorm.cdf)
+    assert kstest.pvalue > 0.01
+
+
+@pytest.mark.pymc
 @pytest.mark.parametrize(
     ("backend", "gradient_backend"),
     [
