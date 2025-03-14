@@ -182,9 +182,14 @@ jobs:
           set -e
           python3 -m venv .venv
           source .venv/Scripts/activate
-          uv pip install "nutpie[all]" --find-links dist --force-reinstall
+          uv pip install "nutpie[stan]" --find-links dist --force-reinstall
           uv pip install pytest pytest-timeout
-          pytest
+          pytest -m "stan and not flow"
+          uv pip install "nutpie[pymc]" --find-links dist --force-reinstall
+          uv pip install jax
+          pytest -m "pymc and not flow"
+          uv pip install "nutpie[all]" --find-links dist --force-reinstall
+          pytest -m flow
 
   macos:
     runs-on: ${{ matrix.platform.runner }}
@@ -226,10 +231,14 @@ jobs:
           set -e
           python3 -m venv .venv
           source .venv/bin/activate
-          uv pip install 'nutpie[all]' --find-links dist --force-reinstall
+          uv pip install 'nutpie[stan]' --find-links dist --force-reinstall
           uv pip install pytest pytest-timeout
-          pytest -m "not (flow and stan)"  # The stan tests seem to run out of memory on macOS?
-
+          pytest -m "stan and not flow"
+          uv pip install 'nutpie[pymc]' --find-links dist --force-reinstall
+          uv pip install jax
+          pytest -m "pymc and not flow"
+          uv pip install 'nutpie[all]' --find-links dist --force-reinstall
+          pytest -m flow
   sdist:
     runs-on: ubuntu-latest
     steps:
