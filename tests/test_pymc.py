@@ -280,7 +280,7 @@ def test_normalizing_flow(kind):
     ).with_transform_adapt(
         verbose=True,
         coupling_type=kind,
-        num_layers=2,
+        num_layers=4,
     )
     trace = nutpie.sample(
         compiled,
@@ -311,7 +311,7 @@ def test_normalizing_flow_1d(kind):
     ).with_transform_adapt(
         verbose=True,
         coupling_type=kind,
-        num_layers=2,
+        num_layers=4,
     )
     trace = nutpie.sample(
         compiled,
