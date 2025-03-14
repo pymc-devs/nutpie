@@ -579,6 +579,28 @@ class Scan(AbstractBijection):
         )
         return y, log_det
 
+    def inverse_gradient_and_val(
+        self,
+        y: Array,
+        y_grad: Array,
+        y_logp: Array,
+        condition: Array | None = None,
+    ) -> tuple[Array, Array, Array]:
+        def step(carry, bijection):
+            from nutpie.transform_adapter import inverse_gradient_and_val
+
+            carry = inverse_gradient_and_val(bijection, *carry)
+            return (carry, None)
+
+        (y, y_grad, y_logp), _ = _filter_scan(
+            step,
+            (y, y_grad, y_logp),
+            self.bijection,
+            reverse=True,
+            filter_spec=self.filter_spec,
+        )
+        return y, y_grad, y_logp
+
     @property
     def shape(self):
         return self.bijection.shape
@@ -961,6 +983,16 @@ def make_coupling(key, dim, n_untransformed, *, inner_mvscale=False, **kwargs):
     )
 
 
+class Add(eqx.Module):
+    bias: Array
+
+    def __init__(self, bias):
+        self.bias = bias
+
+    def __call__(self, x: Array, *, key=None) -> Array:
+        return x + self.bias
+
+
 def make_flow_scan(
     key,
     n_dim,
@@ -984,15 +1016,47 @@ def make_flow_scan(
     if nn_depth is None:
         nn_depth = 1
 
+    def make_transformer():
+        elemwises = []
+        # loc = bijections.Loc(jnp.zeros(()))
+        # elemwises.append(loc)
+
+        for loc in [0.0]:
+            scale = Parameterize(lambda x: x + jnp.sqrt(1 + x**2), jnp.zeros(()))
+            theta = Parameterize(lambda x: x + jnp.sqrt(1 + x**2), jnp.zeros(()))
+
+            affine = AsymmetricAffine(
+                jnp.zeros(()) + loc,
+                jnp.ones(()),
+                jnp.ones(()),
+            )
+
+            affine = eqx.tree_at(
+                where=lambda aff: aff.scale,
+                pytree=affine,
+                replace=scale,
+            )
+            affine = eqx.tree_at(
+                where=lambda aff: aff.theta,
+                pytree=affine,
+                replace=theta,
+            )
+            elemwises.append(bijections.Invert(affine))
+
+        if len(elemwises) == 1:
+            return elemwises[0]
+        return bijections.Chain(elemwises)
+
     # Just to get at the size
-    transformer = AsymmetricAffine()
+    transformer = make_transformer()
     size = MaskedCoupling.conditioner_output_size(dim, transformer)
 
     key, key1 = jax.random.split(key)
     embed = eqx.nn.Sequential(
         [
             eqx.nn.Linear(dim, n_embed, key=key1, dtype=jnp.float32),
-            eqx.nn.LayerNorm(shape=(n_embed,), dtype=jnp.float32),
+            # Activation(_NN_ACTIVATION),
+            # eqx.nn.LayerNorm(shape=(n_embed,), dtype=jnp.float32),
         ]
     )
     key, key1 = jax.random.split(key)
@@ -1005,37 +1069,15 @@ def make_flow_scan(
     for i in range(len(mask)):
         mask[i, order[i, : counts[i]]] = True
 
-    def make_transformer():
-        scale = Parameterize(lambda x: x + jnp.sqrt(1 + x**2), jnp.zeros(()))
-        theta = Parameterize(lambda x: x + jnp.sqrt(1 + x**2), jnp.zeros(()))
-
-        affine = AsymmetricAffine(
-            jnp.zeros(()),
-            jnp.ones(()),
-            jnp.ones(()),
-        )
-
-        affine = eqx.tree_at(
-            where=lambda aff: aff.scale,
-            pytree=affine,
-            replace=scale,
-        )
-        affine = eqx.tree_at(
-            where=lambda aff: aff.theta,
-            pytree=affine,
-            replace=theta,
-        )
-
-        return bijections.Invert(affine)
-
     def make_mvscale(key, n_dim):
         params = jax.random.normal(key, (n_dim,))
         params = params / jnp.linalg.norm(params)
         return MvScale(params)
 
     def make_layer(key, mask, embed, embed_back):
-        key1, key2, key3, key4 = jax.random.split(key, 4)
+        key1, key2, key3, key4, key5 = jax.random.split(key, 5)
         transformer = make_transformer()
+        bias = Add(jax.random.normal(key5, (size,)) * 0.01)
 
         conditioner = eqx.nn.Sequential(
             [
@@ -1049,7 +1091,12 @@ def make_flow_scan(
                     dtype=jnp.float32,
                     activation=_NN_ACTIVATION,
                 ),
-                embed_back,
+                eqx.nn.Sequential(
+                    [
+                        embed_back,
+                        bias,
+                    ]
+                ),
             ]
         )
 
@@ -1083,7 +1130,7 @@ def make_flow_scan(
         replace=None,
     )
     out_axes = eqx.tree_at(
-        lambda tree: tree.bijections[0].conditioner.layers[1].layers[-1],
+        lambda tree: tree.bijections[0].conditioner.layers[1].layers[-1].layers[0],
         pytree=out_axes,
         replace=None,
     )
@@ -1100,7 +1147,7 @@ def make_flow_scan(
         replace=False,
     )
     vectorize = eqx.tree_at(
-        lambda tree: tree.bijections[0].conditioner.layers[1].layers[-1],
+        lambda tree: tree.bijections[0].conditioner.layers[1].layers[-1].layers[0],
         pytree=vectorize,
         replace=False,
     )
@@ -1234,10 +1281,6 @@ def make_flow(
         return
 
     n_draws, n_dim = positions.shape
-
-    if n_dim < 2:
-        n_layers = 0
-
     assert positions.shape == gradients.shape
 
     if n_draws == 0:

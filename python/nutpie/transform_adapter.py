@@ -29,7 +29,7 @@ from flowjax.train.train_utils import (
 import optax
 from paramax import unwrap, NonTrainable
 
-from nutpie.normalizing_flow import Coupling, extend_flow, make_flow
+from nutpie.normalizing_flow import Coupling, Scan, extend_flow, make_flow
 import tqdm
 
 _BIJECTION_TRACE = []
@@ -241,6 +241,8 @@ def inverse_gradient_and_val(bijection, draw, grad, logp):
             axis_size=bijection.axis_size,
         )(bijection.bijection, draw, grad, jnp.zeros(()))
         return y, y_grad, jnp.sum(log_det) + logp
+    elif isinstance(bijection, Scan):
+        return bijection.inverse_gradient_and_val(draw, grad, logp)
     elif isinstance(bijection, bijections.Sandwich):
         draw, grad, logp = inverse_gradient_and_val(
             bijections.Invert(bijection.outer), draw, grad, logp
@@ -880,8 +882,8 @@ def make_transform_adapter(
     show_progress=False,
     nn_depth=None,
     nn_width=None,
-    num_layers=9,
-    num_diag_windows=9,
+    num_layers=20,
+    num_diag_windows=6,
     learning_rate=5e-4,
     untransformed_dim=None,
     zero_init=True,

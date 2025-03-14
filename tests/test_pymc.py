@@ -278,17 +278,17 @@ def test_normalizing_flow(kind):
     compiled = nutpie.compile_pymc_model(
         model, backend="jax", gradient_backend="jax"
     ).with_transform_adapt(
-        num_diag_windows=6,
         verbose=True,
         coupling_type=kind,
+        num_layers=2,
     )
     trace = nutpie.sample(
         compiled,
         chains=1,
         transform_adapt=True,
-        window_switch_freq=150,
-        tune=600,
+        window_switch_freq=128,
         seed=1,
+        draws=2000,
     )
     draws = trace.posterior.x.isel(x_dim_0=0, chain=0)
     kstest = stats.ks_1samp(draws, stats.halfnorm.cdf)
@@ -309,17 +309,17 @@ def test_normalizing_flow_1d(kind):
     compiled = nutpie.compile_pymc_model(
         model, backend="jax", gradient_backend="jax"
     ).with_transform_adapt(
-        num_diag_windows=6,
         verbose=True,
         coupling_type=kind,
+        num_layers=2,
     )
     trace = nutpie.sample(
         compiled,
         chains=1,
         transform_adapt=True,
-        window_switch_freq=150,
-        tune=600,
+        window_switch_freq=128,
         seed=1,
+        draws=2000,
     )
     draws = trace.posterior.x.isel(chain=0)
     kstest = stats.ks_1samp(draws, stats.halfnorm.cdf)
