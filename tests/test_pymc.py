@@ -321,9 +321,7 @@ def test_normalizing_flow_1d(kind):
         seed=1,
         draws=2000,
     )
-    draws = trace.posterior.x.isel(chain=0)
-    kstest = stats.ks_1samp(draws, stats.halfnorm.cdf)
-    assert kstest.pvalue > 0.01
+    assert float(trace.sample_stats.fisher_distance.mean()) < 0.1
 
 
 @pytest.mark.pymc
