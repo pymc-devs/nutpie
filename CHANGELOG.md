@@ -2,6 +2,38 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.14.3] - 2025-03-18
+
+### Bug Fixes
+
+- Fix normalizing flows for 1d posteriors (Adrian Seyboldt)
+
+- Better initialization of masked flows (Adrian Seyboldt)
+
+
+### Features
+
+- Add masked coupling flow (Adrian Seyboldt)
+
+- Expose static trajectory length in nuts (Adrian Seyboldt)
+
+- Make mvscale layer optional (Adrian Seyboldt)
+
+- Add layer norm in normalizing flow (Adrian Seyboldt)
+
+- Small improvements to the masked normalizing flow (Adrian Seyboldt)
+
+
+### Miscellaneous Tasks
+
+- Update dependencies (Adrian Seyboldt)
+
+
+### Ci
+
+- Split some test into sections with optional deps (Adrian Seyboldt)
+
+
 ## [0.14.2] - 2025-03-06
 
 ### Bug Fixes
