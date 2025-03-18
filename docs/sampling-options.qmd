@@ -34,11 +34,11 @@ The number of draws affects both accuracy and computational cost:
 - Too many draws (> 10000) may waste computation time
 
 If a model is sampling without divergences, but with effective sample sizes that
-are not as large as necessary to accieve the markov-error for your estimates,
+are not as large as necessary to achieve the markov-error for your estimates,
 you can increase the number of chains and/or draws.
 
 If the effective sample size is much smaller than the number of draws, you might
-want to consider reparameterizing the model instead, to for instance remove
+want to consider reparameterizing the model instead, to, for instance, remove
 posterior correlations.
 
 ## Sampler Diagnostics
@@ -56,7 +56,7 @@ trace = nutpie.sample(
 )
 ```
 
-For each of the `store_*` arguments, additional arrays will be availbale in the
+For each of the `store_*` arguments, additional arrays will be available in the
 `trace.sample_stats`.
 
 ## Non-blocking sampling
@@ -84,7 +84,7 @@ might avoid divergences during sampling. In many diverging models increasing
 `target_accept` will only make divergences less frequent however, and not solve
 the underlying problem.
 
-Lowering the maximum energy error to for instance 10 will often increase the
+Lowering the maximum energy error to, for instance, 10 will often increase the
 number of divergences, and make it easier to diagnose their cause. With lower
 value the divergences often are reported closer to the critical points in the
 parameter space, where the model is most likely to diverge.
@@ -115,7 +115,7 @@ trace = nutpie.sample(
 For models with strong parameter correlations you can enable a low rank modified
 mass matrix. The `mass_matrix_gamma` parameter is a regularization parameter.
 More regularization will lead to a smaller effect of the low-rank components,
-but might work better for hiegher dimensional problems.
+but might work better for higher dimensional problems.
 
 `mass_matrix_eigval_cutoff` should be greater than one, and controls how large
 an eigenvalue of the full mass matrix has to be, to be included into the

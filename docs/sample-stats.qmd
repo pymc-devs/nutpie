@@ -101,9 +101,9 @@ detailed_stats = [
 ]
 ```
 
-#### Idintify Divergences
+#### Identify Divergences
 
-We can for instance use this to identify the sources of divergences:
+We can, for instance, use this to identify the sources of divergences:
 
 ```{python}
 import xarray as xr
@@ -190,7 +190,7 @@ grads_eigs.plot.line(x="eigenvalue", yscale="log")
 We can see one very large and one very small eigenvalue in both covariances.
 Large eigenvalues for the draws, and small eigenvalues for the gradients prevent
 the sampler from taking larger steps. Small eigenvalues in the draws, and large
-eigenvalues in the grads mean, that the sampler has to move far in parameter
+eigenvalues in the grads, mean that the sampler has to move far in parameter
 space to get independent draws. So both lead to problems during sampling. For
 models with many parameters, typically only the large eigenvalues of each are
 meaningful, because of estimation issues with the small eigenvalues.
