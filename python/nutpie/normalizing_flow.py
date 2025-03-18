@@ -1054,13 +1054,19 @@ def make_flow_scan(
     key, key1 = jax.random.split(key)
     embed = eqx.nn.Sequential(
         [
-            eqx.nn.Linear(dim, n_embed, key=key1, dtype=jnp.float32),
+            eqx.nn.Linear(dim, n_embed, key=key1, dtype=jnp.float32, use_bias=True),
             # Activation(_NN_ACTIVATION),
             # eqx.nn.LayerNorm(shape=(n_embed,), dtype=jnp.float32),
         ]
     )
     key, key1 = jax.random.split(key)
-    embed_back = eqx.nn.Linear(n_deembed, size, key=key1, dtype=jnp.float32)
+    embed_back = eqx.nn.Linear(
+        n_deembed, size, key=key1, dtype=jnp.float32, use_bias=True
+    )
+    embed_back = jax.tree_util.tree_map(
+        lambda x: x * 1e-3 if eqx.is_inexact_array(x) else x,
+        embed_back,
+    )
 
     rng = np.random.default_rng(42)  # TODO
     order, counts = _generate_permutations(rng, dim, n_layers)
@@ -1077,20 +1083,25 @@ def make_flow_scan(
     def make_layer(key, mask, embed, embed_back):
         key1, key2, key3, key4, key5 = jax.random.split(key, 5)
         transformer = make_transformer()
-        bias = Add(jax.random.normal(key5, (size,)) * 0.01)
+        bias = Add(jax.random.normal(key5, (size,)) * 0.001)
+        inner = eqx.nn.MLP(
+            n_embed,
+            n_deembed,
+            width_size=nn_width,
+            depth=nn_depth,
+            key=key2,
+            dtype=jnp.float32,
+            activation=_NN_ACTIVATION,
+        )
+        inner = jax.tree_util.tree_map(
+            lambda x: x * 1e-3 if eqx.is_inexact_array(x) else x,
+            inner,
+        )
 
         conditioner = eqx.nn.Sequential(
             [
                 embed,
-                eqx.nn.MLP(
-                    n_embed,
-                    n_deembed,
-                    width_size=nn_width,
-                    depth=nn_depth,
-                    key=key2,
-                    dtype=jnp.float32,
-                    activation=_NN_ACTIVATION,
-                ),
+                inner,
                 eqx.nn.Sequential(
                     [
                         embed_back,
@@ -1108,11 +1119,6 @@ def make_flow_scan(
             conditioner=conditioner,
             nn_width=nn_width,
             nn_depth=nn_depth,
-        )
-
-        coupling = jax.tree_util.tree_map(
-            lambda x: x * 1e-3 if eqx.is_inexact_array(x) else x,
-            coupling,
         )
 
         if mvscale:

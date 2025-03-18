@@ -112,23 +112,13 @@ def fit_to_data(
 
     for i in loop:
         # Shuffle data
-        start = time.time()
         key, *subkeys = jr.split(key, 3)
         train_data = [jr.permutation(subkeys[0], a) for a in train_data]
         val_data = [jr.permutation(subkeys[1], a) for a in val_data]
-        if verbose and i == 0:
-            print("shuffle timing:", time.time() - start)
-
-        start = time.time()
 
         key, subkey = jr.split(key)
         batches = get_batches(train_data, batch_size)
         batch_losses = []
-
-        if verbose and i == 0:
-            print("batch timing:", time.time() - start)
-
-        start = time.time()
 
         if True:
             for batch in zip(*batches, strict=True):
@@ -156,10 +146,6 @@ def fit_to_data(
 
         losses["train"].append((sum(batch_losses) / len(batch_losses)).item())
 
-        if verbose and i == 0:
-            print("step timing:", time.time() - start)
-
-        start = time.time()
         # Val epoch
         batch_losses = []
         for batch in zip(*get_batches(val_data, batch_size), strict=True):
@@ -167,9 +153,6 @@ def fit_to_data(
             loss_i = loss_fn(params, static, *batch, key=subkey)
             batch_losses.append(loss_i)
         losses["val"].append(sum(batch_losses) / len(batch_losses))
-
-        if verbose and i == 0:
-            print("val timing:", time.time() - start)
 
         loop.set_postfix({k: v[-1] for k, v in losses.items()})
         if losses["val"][-1] == min(losses["val"]):
@@ -228,7 +211,7 @@ def inverse_gradient_and_val(bijection, draw, grad, logp):
         )
     elif isinstance(bijection, bijections.Affine):
         draw, logdet = bijection.inverse_and_log_det(draw)
-        grad = grad * bijection.scale
+        grad = grad * unwrap(bijection.scale)
         return (draw, grad, logp - logdet)
     elif isinstance(bijection, bijections.Vmap):
 
@@ -710,12 +693,9 @@ class TransformAdapter:
             )
             params, static = eqx.partition(flow, eqx.is_inexact_array)
 
-            start = time.time()
             new_loss = self._loss_fn(
                 params, static, positions[-128:], gradients[-128:], logps[-128:]
             )
-            if self._verbose:
-                print("new loss function time: ", time.time() - start)
 
             if self._verbose:
                 print(f"Chain {self._chain}: New loss {new_loss}, old loss {old_loss}")
@@ -903,8 +883,8 @@ def make_transform_adapter(
     make_optimizer=None,
     coupling_type="masked",
     mvscale_layer=False,
-    n_embed=None,
-    n_deembed=None,
+    num_project=None,
+    num_embed=None,
 ):
     if extension_windows is None:
         extension_windows = []
@@ -918,8 +898,8 @@ def make_transform_adapter(
             dct_layer=dct_layer,
             nn_depth=nn_depth,
             nn_width=nn_width,
-            n_embed=n_embed,
-            n_deembed=n_deembed,
+            n_embed=num_project,
+            n_deembed=num_embed,
             mvscale=mvscale_layer,
             kind=coupling_type,
         ),
