@@ -134,7 +134,7 @@ pip install 'nutpie[stan]'
 ```
 
 In addition, a C++ compiler needs to be available. For details see
-[the Stan docs](https://mc-stan.org/docs/cmdstan-guide/cmdstan-installation.html#cpp-toolchain).
+[the Stan docs](https://mc-stan.org/docs/cmdstan-guide/installation.html#cpp-toolchain).
 
 We can then compile a Stan model, and sample using nutpie:
 
