@@ -1,7 +1,6 @@
 from functools import partial
 from importlib.util import find_spec
 from typing import Callable
-import time
 
 if find_spec("flowjax") is None:
     raise ImportError(
@@ -29,7 +28,7 @@ from flowjax.train.train_utils import (
 import optax
 from paramax import unwrap, NonTrainable
 
-from nutpie.normalizing_flow import Coupling, Scan, extend_flow, make_flow
+from nutpie.normalizing_flow import Coupling, Householder, Scan, extend_flow, make_flow
 import tqdm
 
 _BIJECTION_TRACE = []
@@ -44,7 +43,7 @@ def fit_to_data(
     loss_fn: Callable | None = None,
     max_epochs: int = 100,
     max_patience: int = 5,
-    batch_size: int = 100,
+    batch_size: int = 128,
     val_prop: float = 0.1,
     learning_rate: float = 5e-4,
     optimizer: optax.GradientTransformation | None = None,
@@ -52,6 +51,7 @@ def fit_to_data(
     show_progress: bool = True,
     opt_state=None,
     verbose: bool = False,
+    stop_value: float | None = None,
 ):
     r"""Train a distribution (e.g. a flow) to samples from the target distribution.
 
@@ -88,7 +88,7 @@ def fit_to_data(
     data = tuple(jnp.asarray(a) for a in data)
 
     if optimizer is None:
-        optimizer = optax.adam(learning_rate)
+        optimizer = optax.apply_if_finite(optax.adamw(learning_rate), 10)
 
     if loss_fn is None:
         loss_fn = MaximumLikelihoodLoss()
@@ -152,7 +152,9 @@ def fit_to_data(
             key, subkey = jr.split(key)
             loss_i = loss_fn(params, static, *batch, key=subkey)
             batch_losses.append(loss_i)
-        losses["val"].append(sum(batch_losses) / len(batch_losses))
+
+        loss = sum(batch_losses) / len(batch_losses)
+        losses["val"].append(loss)
 
         loop.set_postfix({k: v[-1] for k, v in losses.items()})
         if losses["val"][-1] == min(losses["val"]):
@@ -160,6 +162,10 @@ def fit_to_data(
 
         elif count_fruitless(losses["val"]) > max_patience:
             loop.set_postfix_str(f"{loop.postfix} (Max patience reached)")
+            break
+
+        elif stop_value is not None and loss < stop_value:
+            loop.set_postfix_str(f"{loop.postfix} (Stop value reached)")
             break
 
     params = best_params if return_best else params
@@ -213,6 +219,12 @@ def inverse_gradient_and_val(bijection, draw, grad, logp):
         draw, logdet = bijection.inverse_and_log_det(draw)
         grad = grad * unwrap(bijection.scale)
         return (draw, grad, logp - logdet)
+    elif isinstance(bijection, Householder):
+        params = unwrap(bijection.params)
+        params = params / jnp.linalg.norm(params)
+        draw = draw - 2 * params * (draw @ params)
+        grad = grad - 2 * params * (grad @ params)
+        return (draw, grad, logp)
     elif isinstance(bijection, bijections.Vmap):
 
         def inner(bijection, y, y_grad, y_logp):
@@ -372,8 +384,8 @@ def fit_flow(key, bijection, loss_fn, draws, grads, logps, **kwargs):
         dist=flow,
         x=(draws, grads, logps),
         loss_fn=loss_fn,
-        max_epochs=500,
         return_best=True,
+        stop_value=-5,
         **kwargs,
     )
     return fit.bijection, losses, opt_state
@@ -480,6 +492,7 @@ class TransformAdapter:
         debug_save_bijection=False,
         make_optimizer=None,
         num_layers=9,
+        max_epochs=200,
     ):
         self._logp_fn = logp_fn
         self._make_flow_fn = make_flow_fn
@@ -490,7 +503,7 @@ class TransformAdapter:
         self._num_layers = num_layers
         if make_optimizer is None:
             self._make_optimizer = lambda: optax.apply_if_finite(
-                optax.adamw(learning_rate), 50
+                optax.adamw(learning_rate), 10
             )
         else:
             self._make_optimizer = make_optimizer
@@ -511,6 +524,7 @@ class TransformAdapter:
         self._extension_var_trafo_count = extension_var_trafo_count
         self._debug_save_bijection = debug_save_bijection
         self._layers = 0
+        self._max_epochs = max_epochs
 
         if extension_windows is None:
             self._extension_windows = []
@@ -661,14 +675,11 @@ class TransformAdapter:
             )
             params, static = eqx.partition(flow, eqx.is_inexact_array)
 
-            start = time.time()
             old_loss = self._loss_fn(
                 params, static, positions[-128:], gradients[-128:], logps[-128:]
             )
-            if self._verbose:
-                print("loss function time: ", time.time() - start)
 
-            if np.isfinite(old_loss) and old_loss < -5 and self.index > 10:
+            if np.isfinite(old_loss) and old_loss < -4 and self.index > 10:
                 if self._verbose:
                     print(f"Loss is low ({old_loss}), skipping training")
                 return
@@ -686,6 +697,7 @@ class TransformAdapter:
                 batch_size=self._batch_size,
                 opt_state=self._opt_state if self._reuse_opt_state else None,
                 max_patience=self._max_patience,
+                max_epochs=self._max_epochs,
             )
 
             flow = flowjax.flows.Transformed(
@@ -862,7 +874,7 @@ def make_transform_adapter(
     show_progress=False,
     nn_depth=None,
     nn_width=None,
-    num_layers=20,
+    num_layers=8,
     num_diag_windows=6,
     learning_rate=5e-4,
     untransformed_dim=None,
@@ -885,9 +897,18 @@ def make_transform_adapter(
     mvscale_layer=False,
     num_project=None,
     num_embed=None,
+    num_householder=8,
+    twin_layers=False,
+    activation=None,
+    max_epochs=200,
+    affine_transformer=False,
+    contract_transformer=True,
+    asymmetric_transformer=False,
+    reuse_embed=True,
 ):
     if extension_windows is None:
         extension_windows = []
+
     return partial(
         TransformAdapter,
         verbose=verbose,
@@ -902,6 +923,13 @@ def make_transform_adapter(
             n_deembed=num_embed,
             mvscale=mvscale_layer,
             kind=coupling_type,
+            num_householder=num_householder,
+            twin_layers=twin_layers,
+            activation=activation,
+            affine_transformer=affine_transformer,
+            contract_transformer=contract_transformer,
+            asymmetric_transformer=asymmetric_transformer,
+            reuse_embed=reuse_embed,
         ),
         show_progress=show_progress,
         num_diag_windows=num_diag_windows,
@@ -921,4 +949,5 @@ def make_transform_adapter(
         debug_save_bijection=debug_save_bijection,
         make_optimizer=make_optimizer,
         num_layers=num_layers,
+        max_epochs=max_epochs,
     )
