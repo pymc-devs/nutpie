@@ -1079,8 +1079,144 @@ class UnconstrainedAffine(bijections.AbstractBijection):
         return x, -jnp.sum(jnp.log(scale))
 
 
+def pairwise_rotation(x, thetas):
+    """
+    Applies a rotation to each consecutive pair in x.
+
+    Parameters:
+      x (jnp.ndarray): 1D array containing the values to be rotated.
+      thetas (jnp.ndarray): 1D array of angles (in radians) for each pair.
+                            Length must equal x.shape[0] // 2.
+
+    Returns:
+      jnp.ndarray: The rotated vector where each pair (x[2*i], x[2*i+1])
+                   is rotated by the corresponding angle thetas[i]. If x has
+                   an odd length, the last element is unchanged.
+    """
+    n = x.shape[0]
+    num_pairs = n // 2
+
+    # Reshape the first 2*num_pairs elements into pairs
+    x_pairs = x[: num_pairs * 2].reshape(num_pairs, 2)
+
+    # Compute cosine and sine of each rotation angle for the pairs
+    cos_thetas = jnp.cos(thetas)
+    sin_thetas = jnp.sin(thetas)
+
+    # Apply the rotation to each pair without forming a 2x2 matrix:
+    # rotated_x = x * cos(theta) - y * sin(theta)
+    # rotated_y = x * sin(theta) + y * cos(theta)
+    rotated_x = x_pairs[:, 0] * cos_thetas - x_pairs[:, 1] * sin_thetas
+    rotated_y = x_pairs[:, 0] * sin_thetas + x_pairs[:, 1] * cos_thetas
+
+    # Stack the rotated coordinates and flatten back into a 1D array
+    rotated_pairs = jnp.stack([rotated_x, rotated_y], axis=1)
+    y_rotated = rotated_pairs.reshape(-1)
+
+    # If x has an odd length, append the last unchanged element.
+    if n % 2 == 1:
+        y = jnp.concatenate([y_rotated, x[num_pairs * 2 :]])
+    else:
+        y = y_rotated
+
+    return y
+
+
+class Rotations(bijections.AbstractBijection):
+    theta: Array
+    shape: tuple[int, ...]
+    cond_shape: tuple[int, ...] | None = None
+
+    def __init__(self, key, ndim):
+        n_rotations = ndim // 2
+        self.theta = jax.random.normal(key, (n_rotations,)) / 10
+        self.shape = (ndim,)
+
+    def transform_and_log_det(
+        self, x: ArrayLike, condition: ArrayLike | None = None
+    ) -> tuple[Array, Array]:
+        return pairwise_rotation(x, self.theta), jnp.zeros(())
+
+    def inverse_and_log_det(
+        self, y: ArrayLike, condition: ArrayLike | None = None
+    ) -> tuple[Array, Array]:
+        return pairwise_rotation(y, -self.theta), jnp.zeros(())
+
+
+class Orthogonal(bijections.AbstractBijection):
+    theta: Array
+    shape: tuple[int, ...]
+    cond_shape: tuple[int, ...] | None = None
+
+    def __init__(self, key, ndim, k):
+        self.theta = jax.random.normal(key, (ndim, k))
+        self.shape = (ndim,)
+
+    def transform_and_log_det(
+        self, x: ArrayLike, condition: ArrayLike | None = None
+    ) -> tuple[Array, Array]:
+        q, _ = jnp.linalg.qr(self.theta, mode="reduced")
+        q = q.T
+        qx = q @ x
+        return x - 2 * q.T @ qx, jnp.zeros(())
+
+    def inverse_and_log_det(
+        self, y: ArrayLike, condition: ArrayLike | None = None
+    ) -> tuple[Array, Array]:
+        q, _ = jnp.linalg.qr(self.theta, mode="reduced")
+        q = q.T
+        qy = q @ y
+        return y - 2 * q.T @ qy, jnp.zeros(())
+
+
+class Planar(bijections.AbstractBijection):
+    u: Array
+
+    # One dimensional transformation (assumed to operate on shape (..., 1))
+    inner: bijections.AbstractBijection
+
+    # The full input shape (e.g. (ndim,))
+    shape: tuple[int, ...]
+    cond_shape: tuple[int, ...] | None = None
+
+    def __init__(self, key, inner, ndim: int):
+        self.inner = inner
+        self.shape = (ndim,)
+        # Initialize u as a random vector of shape (ndim,)
+        self.u = jax.random.normal(key, (ndim,))
+
+    def transform_and_log_det(
+        self, x: ArrayLike, condition: ArrayLike | None = None
+    ) -> tuple[Array, Array]:
+        # Normalize u to have unit norm.
+        u = self.u / jnp.linalg.norm(self.u)
+        # Compute the scalar projection d = <x, u>.
+        d = x @ u
+        # Apply the one-dimensional bijection to d.
+        f_d, logdet_inner = self.inner.transform_and_log_det(d, condition)
+        # Lift the 1D transformation to the full space:
+        # y = x + (f(d) - d) * u
+        y = x + (f_d - d) * u
+        return y, logdet_inner
+
+    def inverse_and_log_det(
+        self, y: ArrayLike, condition: ArrayLike | None = None
+    ) -> tuple[Array, Array]:
+        # Normalize u.
+        u = self.u / jnp.linalg.norm(self.u)
+        # Compute the projected coordinate from y.
+        d_y = y @ u
+        # Invert the inner bijection to get d.
+        d, logdet_inner = self.inner.inverse_and_log_det(d_y, condition)
+        # Invert the full transformation:
+        # x = y + (d - f(d)) * u, but note that f(d)=d_y.
+        x = y + (d - d_y) * u
+        # The log–determinant of the inverse is the negative of the forward.
+        return x, -logdet_inner
+
+
 class Contract2(bijections.AbstractBijection):
-    alpha: Array
+    alpha: Array | None
     beta: Array
     sigma: Array
     mu: Array
@@ -1089,12 +1225,15 @@ class Contract2(bijections.AbstractBijection):
     cond_shape: tuple[int, ...] | None = None
 
     def __init__(self, alpha, beta, sigma, mu, nu):
-        self.alpha = jnp.array(alpha)
+        if alpha is not None:
+            self.alpha = jnp.array(alpha)
+        else:
+            self.alpha = None
         self.beta = jnp.array(beta)
         self.sigma = jnp.array(sigma)
         self.mu = jnp.array(mu)
         self.nu = jnp.array(nu)
-        self.shape = alpha.shape
+        self.shape = beta.shape
         assert self.shape == ()
 
     def transform_and_log_det(
@@ -1113,7 +1252,10 @@ class Contract2(bijections.AbstractBijection):
           (note: z = exp(asinh(x/2))).
 
         """
-        gamma = jnp.exp(self.alpha)
+        if self.alpha is not None:
+            gamma = jnp.exp(self.alpha)
+        else:
+            gamma = 1
         delta = jnp.exp(self.beta)
         sigma_mod = self.sigma + jnp.sqrt(1 + self.sigma * self.sigma)
         mu = self.mu
@@ -1151,7 +1293,10 @@ class Contract2(bijections.AbstractBijection):
               4. Recover z = w^(1/gamma).
               5. Then, x = z - 1/z.
         """
-        gamma = jnp.exp(self.alpha)
+        if self.alpha is not None:
+            gamma = jnp.exp(self.alpha)
+        else:
+            gamma = 1
         delta = jnp.exp(self.beta)
         sigma_mod = self.sigma + jnp.sqrt(1 + self.sigma * self.sigma)
         mu = self.mu
@@ -1166,6 +1311,66 @@ class Contract2(bijections.AbstractBijection):
 
         x, det = jax.jvp(inv_trafo, [y], [jnp.ones(())])
         return x, jnp.log(det)
+
+
+class DipBij(bijections.AbstractBijection):
+    b: jnp.ndarray  # raw parameter (scalar)
+    shape: tuple[int, ...]
+    cond_shape: tuple[int, ...] | None = None
+
+    def __init__(self):
+        # Store the parameter b (a scalar). Then a = sigmoid(b) ∈ (0,1).
+        self.b = jnp.zeros(())
+        self.shape = self.b.shape
+        # We expect b to be scalar.
+        assert self.shape == (), "Parameter b must be a scalar."
+
+    def transform_and_log_det(
+        self, x: ArrayLike, condition: ArrayLike | None = None
+    ) -> tuple[Array, Array]:
+        # Compute a = sigmoid(b)
+        a = jnp.tanh(self.b)
+
+        # Define the forward transformation.
+        def f(x):
+            return x - (a * x) / (1 + x**2)
+
+        # Use jax.jvp to compute the derivative of f at x.
+        y, tangent = jax.jvp(f, (x,), (jnp.ones_like(x),))
+        # For a 1d transformation the log-det is just the log of the absolute derivative.
+        logdet = jnp.sum(jnp.log(jnp.abs(tangent)))
+        return y, logdet
+
+    def inverse_and_log_det(
+        self, y: ArrayLike, condition: ArrayLike | None = None
+    ) -> tuple[Array, Array]:
+        # Compute a = sigmoid(b)
+        a = jnp.tanh(self.b)
+
+        # The forward map is: f(x) = x - (a*x)/(1+x**2).
+        # Its inverse is given by solving for x in
+        #   x - (a*x)/(1+x^2) = y,
+        # which can be rearranged to:
+        #   x^3 - y*x^2 + (1 - a)*x - y = 0.
+        # We solve this cubic by first shifting: let x = z + y/3.
+        m = y / 3
+        # The depressed cubic is: z^3 + P*z + Q = 0, with
+        P = (1 - a) - y**2 / 3
+        Q = -2 * y**3 / 27 - (a + 2) * y / 3
+        # Compute the discriminant:
+        delta = (Q / 2) ** 2 + (P / 3) ** 3
+        # Cardano's formula for the real solution:
+        z = jnp.cbrt(-Q / 2 + jnp.sqrt(delta)) + jnp.cbrt(-Q / 2 - jnp.sqrt(delta))
+        x = z + m
+
+        # To compute the log-det for the inverse, note that it is the negative of
+        # the forward log-det. We compute f'(x) via jax.jvp.
+        def f(x):
+            return x - (a * x) / (1 + x**2)
+
+        _, fprime = jax.jvp(f, (x,), (jnp.ones_like(x),))
+        logdet = -jnp.sum(jnp.log(jnp.abs(fprime)))
+        return x, logdet
 
 
 class Contract(bijections.AbstractBijection):
@@ -1210,6 +1415,139 @@ class Activation(eqx.Module):
         return self.fn(*args)
 
 
+def make_transformer(
+    affine_transformer=False, contract_transformer=True, asymmetric_transformer=True
+):
+    elemwises = []
+
+    if affine_transformer:
+        affine = bijections.Affine(jnp.zeros(()), jnp.ones(()))
+        scale = Parameterize(lambda x: x + jnp.sqrt(1 + x**2), jnp.zeros(()))
+        affine = eqx.tree_at(
+            where=lambda aff: aff.scale,
+            pytree=affine,
+            replace=scale,
+        )
+        elemwises.append(affine)
+
+    if asymmetric_transformer:
+        for loc in [0.0]:
+            scale = Parameterize(lambda x: x + jnp.sqrt(1 + x**2), jnp.zeros(()))
+            theta = Parameterize(lambda x: x + jnp.sqrt(1 + x**2), jnp.zeros(()))
+
+            affine = AsymmetricAffine(
+                jnp.zeros(()) + loc,
+                jnp.ones(()),
+                jnp.ones(()),
+            )
+
+            affine = eqx.tree_at(
+                where=lambda aff: aff.scale,
+                pytree=affine,
+                replace=scale,
+            )
+            affine = eqx.tree_at(
+                where=lambda aff: aff.theta,
+                pytree=affine,
+                replace=theta,
+            )
+            elemwises.append(bijections.Invert(affine))
+
+    if contract_transformer:
+        elemwises.append(
+            Contract2(
+                None,
+                jnp.zeros(()),
+                jnp.zeros(()),
+                jnp.zeros(()),
+                jnp.zeros(()),
+            )
+        )
+
+    if len(elemwises) == 1:
+        return elemwises[0]
+    return bijections.Chain(elemwises)
+
+
+def make_twin_flow_scan(
+    key,
+    n_dim,
+    *,
+    zero_init=False,
+    n_layers,
+    nn_width=None,
+    nn_depth=None,
+    num_householder=1,
+    affine_transformer=False,
+    contract_transformer=True,
+    asymmetric_transformer=True,
+    activation,
+):
+    if nn_width is None:
+        nn_width = 32
+    if nn_depth is None:
+        nn_depth = 1
+
+    def make_layer(key):
+        keys = jax.random.split(key, 4)
+
+        def make_coupling(key):
+            transformer = make_transformer(
+                affine_transformer=affine_transformer,
+                contract_transformer=contract_transformer,
+                asymmetric_transformer=asymmetric_transformer,
+            )
+
+            coupling = bijections.Coupling(
+                key=key,
+                transformer=transformer,
+                untransformed_dim=n_dim // 2,
+                dim=n_dim,
+                nn_width=nn_width,
+                nn_depth=nn_depth,
+                nn_activation=activation,
+            )
+
+            if zero_init:
+                coupling = jax.tree_util.tree_map(
+                    lambda x: x * 1e-3 if eqx.is_inexact_array(x) else x,
+                    coupling,
+                )
+            return coupling
+
+        layers = []
+
+        if num_householder > 0:
+            layers.append(make_hh(keys[0], n_dim, num_householder, randomize_base=True))
+
+        # layers.append(Rotations(keys[0], n_dim))
+
+        # layers.append(Orthogonal(keys[0], n_dim, 8))
+
+        inner = Contract2(
+            jnp.zeros(()),
+            jnp.zeros(()),
+            jnp.zeros(()),
+            jnp.zeros(()),
+            jnp.zeros(()),
+        )
+        layers.append(Planar(keys[0], inner, n_dim))
+
+        layers.append(make_coupling(keys[1]))
+
+        # layers.append(bijections.Flip((n_dim,)))
+        # layers.append(make_coupling(keys[2]))
+
+        permutation = jax.random.permutation(keys[3], n_dim)
+        layers.append(bijections.Permute(permutation))
+
+        return bijections.Chain(layers)
+
+    keys = jax.random.split(key, n_layers)
+    layers = eqx.filter_vmap(make_layer)(keys)
+    return bijections.Scan(layers)
+
+
 def make_flow_scan(
     key,
     n_dim,
@@ -1241,60 +1579,12 @@ def make_flow_scan(
     if nn_depth is None:
         nn_depth = 1
 
-    def make_transformer():
-        elemwises = []
-
-        if affine_transformer:
-            affine = bijections.Affine(jnp.zeros(()), jnp.ones(()))
-            scale = Parameterize(lambda x: x + jnp.sqrt(1 + x**2), jnp.zeros(()))
-            affine = eqx.tree_at(
-                where=lambda aff: aff.scale,
-                pytree=affine,
-                replace=scale,
-            )
-            elemwises.append(affine)
-
-        if asymmetric_transformer:
-            for loc in [0.0]:
-                scale = Parameterize(lambda x: x + jnp.sqrt(1 + x**2), jnp.zeros(()))
-                theta = Parameterize(lambda x: x + jnp.sqrt(1 + x**2), jnp.zeros(()))
-
-                affine = AsymmetricAffine(
-                    jnp.zeros(()) + loc,
-                    jnp.ones(()),
-                    jnp.ones(()),
-                )
-
-                affine = eqx.tree_at(
-                    where=lambda aff: aff.scale,
-                    pytree=affine,
-                    replace=scale,
-                )
-                affine = eqx.tree_at(
-                    where=lambda aff: aff.theta,
-                    pytree=affine,
-                    replace=theta,
-                )
-                elemwises.append(bijections.Invert(affine))
-
-        if contract_transformer:
-            # elemwises.append(Contract(jnp.zeros(())))
-            elemwises.append(
-                Contract2(
-                    jnp.zeros(()),
-                    jnp.zeros(()),
-                    jnp.zeros(()),
-                    jnp.zeros(()),
-                    jnp.zeros(()),
-                )
-            )
-
-        if len(elemwises) == 1:
-            return elemwises[0]
-        return bijections.Chain(elemwises)
-
     # Just to get at the size
-    transformer = make_transformer()
+    transformer = make_transformer(
+        affine_transformer=affine_transformer,
+        contract_transformer=contract_transformer,
+        asymmetric_transformer=asymmetric_transformer,
+    )
     size = MaskedCoupling.conditioner_output_size(dim, transformer)
 
     key, key1 = jax.random.split(key)
@@ -1314,7 +1604,7 @@ def make_flow_scan(
     )
 
     key, key1 = jax.random.split(key)
-    seeds = jax.random.randint(key1, (4,), 0, 1 << 32)
+    seeds = jax.random.randint(key1, (4,), 0, 1 << 31 - 1)
     rng = np.random.default_rng([int(seed) for seed in seeds])
     order, counts = _generate_permutations(rng, dim, n_layers)
     mask = order == 0
@@ -1347,7 +1637,11 @@ def make_flow_scan(
 
     def make_layer(key, mask, embed, embed_back):
         key1, key2, key3, key4, key5 = jax.random.split(key, 5)
-        transformer = make_transformer()
+        transformer = make_transformer(
+            affine_transformer=affine_transformer,
+            contract_transformer=contract_transformer,
+            asymmetric_transformer=asymmetric_transformer,
+        )
         inner = eqx.nn.MLP(
             n_embed,
             n_deembed,
@@ -1358,7 +1652,7 @@ def make_flow_scan(
             activation=activation,
         )
         inner = jax.tree_util.tree_map(
-            lambda x: x * 1e-3 if eqx.is_inexact_array(x) else x,
+            lambda x: x * 1e-2 if eqx.is_inexact_array(x) else x,
             inner,
         )
 
@@ -1391,7 +1685,16 @@ def make_flow_scan(
             return bijections.Sandwich(coupling, hh)
         else:
             hh = make_hh(key4, dim, num_householder, randomize_base=True)
-            return bijections.Chain([coupling, hh])
+            inner = Contract2(
+                jnp.zeros(()),
+                jnp.zeros(()),
+                jnp.zeros(()),
+                jnp.zeros(()),
+                jnp.zeros(()),
+            )
+            inner = bijections.Chain([inner, DipBij()])
+            planar = Planar(key4, inner, n_dim)
+            return bijections.Chain([coupling, hh, planar])
 
     keys = jax.random.split(key, n_layers)
 
@@ -1694,6 +1997,19 @@ def make_flow(
             nn_activation=activation,
         )
         inner = inner.bijection
+    elif kind == "twin":
+        inner = make_twin_flow_scan(
+            key,
+            n_dim,
+            zero_init=zero_init,
+            n_layers=n_layers,
+            nn_width=nn_width,
+            nn_depth=nn_depth,
+            num_householder=num_householder,
+            affine_transformer=affine_transformer,
+            contract_transformer=contract_transformer,
+            activation=activation,
+        )
     else:
         raise ValueError(f"Unknown flow kind: {kind}")
     return bijections.Chain([inner, *flows])
