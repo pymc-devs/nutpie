@@ -23,6 +23,10 @@ dependencies = [
 ]
 dynamic = ["version"]
 
+[project.urls]
+Homepage = "https://pymc-devs.github.io/nutpie/"
+Repository = "https://github.com/pymc-devs/nutpie"
+
 [project.optional-dependencies]
 stan = ["bridgestan >= 2.6.1"]
 pymc = ["pymc >= 5.20.1", "numba >= 0.60.0"]

@@ -1,5 +1,9 @@
 # nutpie: A fast sampler for Bayesian posteriors
 
+The `nutpie` package provides a fast NUTS sampler for PyMC and Stan models.
+
+See the [documentation](https://pymc-devs.github.io/nutpie/) for more details.
+
 ## Installation
 
 nutpie can be installed using Conda or Mamba from conda-forge with
