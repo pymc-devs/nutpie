@@ -1,23 +1,14 @@
-import json
 import tempfile
 from dataclasses import dataclass, replace
 from importlib.util import find_spec
 from pathlib import Path
 from typing import Any, Optional
 
-import numpy as np
 import pandas as pd
 from numpy.typing import NDArray
 
 from nutpie import _lib
 from nutpie.sample import CompiledModel
-
-
-class _NumpyArrayEncoder(json.JSONEncoder):
-    def default(self, obj):
-        if isinstance(obj, np.ndarray):
-            return obj.tolist()
-        return json.JSONEncoder.default(self, obj)
 
 
 @dataclass(frozen=True)
@@ -39,7 +30,16 @@ class CompiledStanModel(CompiledModel):
         data.update(updates)
 
         if data is not None:
-            data_json = json.dumps(data, cls=_NumpyArrayEncoder)
+            if find_spec("stanio") is None:
+                raise ImportError(
+                    "stanio is not installed in the current environment. "
+                    "Please install it with something like "
+                    "'pip install stanio' or 'pip install nutpie[stan]'."
+                )
+
+            import stanio
+
+            data_json = stanio.dump_stan_json(data)
         else:
             data_json = None
 
@@ -136,7 +136,7 @@ def compile_stan_model(
         raise ImportError(
             "BridgeStan is not installed in the current environment. "
             "Please install it with something like "
-            "'pip install bridgestan'."
+            "'pip install bridgestan' or 'pip install nutpie[stan]'."
         )
 
     import bridgestan
