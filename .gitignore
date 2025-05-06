@@ -25,3 +25,11 @@ example-iree
 posteriordb
 .quarto
 docs/.quarto
+Untitled*
+notebooks-local
+pixi.lock
+pixi.toml
+reports
+benchmarks*
+reports*
+results*
