@@ -31,7 +31,7 @@ def test_stan_model():
 def test_stan_model_data():
     model = """
     data {
-        real x;
+        complex x;
     }
     parameters {
         real a;
@@ -44,7 +44,7 @@ def test_stan_model_data():
     compiled_model = nutpie.compile_stan_model(code=model)
     with pytest.raises(RuntimeError):
         trace = nutpie.sample(compiled_model)
-    trace = nutpie.sample(compiled_model.with_data(x=np.array(3.0)))
+    trace = nutpie.sample(compiled_model.with_data(x=np.array(3.0j)))
     trace.posterior.a  # noqa: B018
 
 

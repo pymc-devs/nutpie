@@ -28,12 +28,13 @@ Homepage = "https://pymc-devs.github.io/nutpie/"
 Repository = "https://github.com/pymc-devs/nutpie"
 
 [project.optional-dependencies]
-stan = ["bridgestan >= 2.6.1"]
+stan = ["bridgestan >= 2.6.1", "stanio >= 0.5.1"]
 pymc = ["pymc >= 5.20.1", "numba >= 0.60.0"]
 pymc-jax = ["pymc >= 5.20.1", "jax >= 0.4.27"]
 nnflow = ["flowjax >= 17.1.0", "equinox >= 0.11.12"]
 dev = [
   "bridgestan >= 2.6.1",
+  "stanio >= 0.5.1",
   "pymc >= 5.20.1",
   "numba >= 0.60.0",
   "jax >= 0.4.27",
@@ -43,6 +44,7 @@ dev = [
 ]
 all = [
   "bridgestan >= 2.6.1",
+  "stanio >= 0.5.1",
   "pymc >= 5.20.1",
   "numba >= 0.60.0",
   "jax >= 0.4.27",
