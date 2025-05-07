@@ -49,7 +49,7 @@ impl ProgressHandler {
             let progress =
                 progress_to_value(progress_update_count, self.n_cores, time_sampling, progress);
             let rendered = template.render_from(&self.engine, &progress).to_string();
-            let rendered = rendered.unwrap_or_else(|err| format!("{}", err));
+            let rendered = rendered.unwrap_or_else(|err| format!("{err}"));
             let _ = Python::with_gil(|py| self.callback.call1(py, (rendered,)));
             progress_update_count += 1;
         };

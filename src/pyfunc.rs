@@ -127,9 +127,8 @@ impl LogpError for PyLogpError {
                 let Ok(attr) = err.value(py).getattr("is_recoverable") else {
                     return false;
                 };
-                return attr
-                    .is_truthy()
-                    .expect("Could not access is_recoverable in error check");
+                attr.is_truthy()
+                    .expect("Could not access is_recoverable in error check")
             }),
             Self::ReturnTypeError() => false,
             Self::NotContiguousError(_) => false,
@@ -151,7 +150,7 @@ impl PyDensity {
         transform_adapter: Option<&PyTransformAdapt>,
     ) -> Result<Self> {
         let logp_func = Python::with_gil(|py| logp_clone_func.call0(py))?;
-        let transform_adapter = transform_adapter.map(|val| val.clone());
+        let transform_adapter = transform_adapter.cloned();
         Ok(Self {
             logp: logp_func,
             transform_adapter,
@@ -185,7 +184,7 @@ impl CpuLogpFunc for PyDensity {
                     );
                     Ok(logp_val)
                 }
-                Err(err) => return Err(PyLogpError::PyError(err)),
+                Err(err) => Err(PyLogpError::PyError(err)),
             }
         })
     }
@@ -359,7 +358,7 @@ impl TensorShape {
         Self { shape, dims, size }
     }
     pub fn size(&self) -> usize {
-        return self.size;
+        self.size
     }
 }
 
@@ -617,14 +616,14 @@ impl Model for PyModel {
         settings: &'model S,
     ) -> Result<Self::DrawStorage<'model, S>> {
         let draws = settings.hint_num_tune() + settings.hint_num_draws();
-        Ok(PyTrace::new(
+        PyTrace::new(
             rng,
             chain_id,
             self.variables.clone(),
             &self.make_expand_func,
             draws,
         )
-        .context("Could not create PyTrace object")?)
+        .context("Could not create PyTrace object")
     }
 
     fn math(&self) -> Result<Self::Math<'_>> {
