@@ -137,7 +137,7 @@ fn params(var_string: &str) -> anyhow::Result<Vec<Parameter>> {
     for (name, group) in &parsed_variables?.iter().chunk_by(|(name, _, _)| name) {
         // Find maximum shape and check if this is a complex variable
         let (shape, is_complex) = determine_variable_shape(group)
-            .context(format!("Error while parsing stan variable {}", name))?;
+            .context(format!("Error while parsing stan variable {name}"))?;
 
         // Calculate total size of this variable
         let size = shape.iter().product();
@@ -146,7 +146,7 @@ fn params(var_string: &str) -> anyhow::Result<Vec<Parameter>> {
         // Create Parameter objects (one for real and one for imag if complex)
         if is_complex {
             variables.push(Parameter {
-                name: format!("{}.real", name),
+                name: format!("{name}.real"),
                 shape: shape.clone(),
                 size,
                 start_idx,
@@ -155,7 +155,7 @@ fn params(var_string: &str) -> anyhow::Result<Vec<Parameter>> {
             start_idx = end_idx;
             end_idx = start_idx + size;
             variables.push(Parameter {
-                name: format!("{}.imag", name),
+                name: format!("{name}.imag"),
                 shape,
                 size,
                 start_idx,

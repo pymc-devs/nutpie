@@ -112,7 +112,7 @@ impl LogpError for ErrorCode {
     }
 }
 
-impl<'a> CpuLogpFunc for &'a LogpFunc {
+impl CpuLogpFunc for &LogpFunc {
     type LogpError = ErrorCode;
     type TransformParams = ();
 
@@ -175,7 +175,7 @@ impl<'model> DrawStorage for PyMcTrace<'model> {
                 let num_arrays = data.len() / size;
                 let data = Float64Array::from(data);
                 let item_field = Arc::new(Field::new("item", DataType::Float64, false));
-                let offsets = OffsetBuffer::from_lengths((0..num_arrays).into_iter().map(|_| size));
+                let offsets = OffsetBuffer::from_lengths((0..num_arrays).map(|_| size));
                 let array = LargeListArray::new(item_field.clone(), offsets, Arc::new(data), None);
                 let field = Field::new(name, DataType::LargeList(item_field), false);
                 (Arc::new(field), Arc::new(array) as Arc<dyn Array>)
