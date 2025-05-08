@@ -28,6 +28,43 @@ def test_stan_model():
 
 
 @pytest.mark.stan
+def test_seed():
+    model = """
+    data {}
+    parameters {
+        real a;
+    }
+    model {
+        a ~ normal(0, 1);
+    }
+    generated quantities {
+        real b = normal_rng(0, 1);
+    }
+    """
+
+    compiled_model = nutpie.compile_stan_model(code=model)
+    trace = nutpie.sample(compiled_model, seed=42)
+    trace2 = nutpie.sample(compiled_model, seed=42)
+    trace3 = nutpie.sample(compiled_model, seed=43)
+
+    assert np.allclose(trace.posterior.a, trace2.posterior.a)
+    assert np.allclose(trace.posterior.b, trace2.posterior.b)
+
+    assert not np.allclose(trace.posterior.a, trace3.posterior.a)
+    assert not np.allclose(trace.posterior.b, trace3.posterior.b)
+    # Check that all chains are pairwise different
+    for i in range(len(trace.posterior.a)):
+        for j in range(i + 1, len(trace.posterior.a)):
+            assert not np.allclose(trace.posterior.a[i], trace.posterior.a[j])
+            assert not np.allclose(trace.posterior.b[i], trace.posterior.b[j])
+    # Check that all chains are pairwise different between seeds
+    for i in range(len(trace.posterior.a)):
+        for j in range(len(trace3.posterior.a)):
+            assert not np.allclose(trace.posterior.a[i], trace3.posterior.a[j])
+            assert not np.allclose(trace.posterior.b[i], trace3.posterior.b[j])
+
+
+@pytest.mark.stan
 def test_stan_model_data():
     model = """
     data {

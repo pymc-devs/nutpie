@@ -531,8 +531,8 @@ impl Model for StanModel {
 
     fn new_trace<'a, S: Settings, R: rand::Rng + ?Sized>(
         &'a self,
-        _rng: &mut R,
-        chain: u64,
+        rng: &mut R,
+        _chain: u64,
         settings: &S,
     ) -> anyhow::Result<Self::DrawStorage<'a, S>> {
         let draws = settings.hint_num_tune() + settings.hint_num_draws();
@@ -541,7 +541,8 @@ impl Model for StanModel {
             .iter()
             .map(|var| Vec::with_capacity(var.size * draws))
             .collect();
-        let rng = self.model.new_rng(chain as u32)?;
+        let seed = rng.next_u32();
+        let rng = self.model.new_rng(seed)?;
         let buffer = vec![0f64; self.model.param_num(true, true)];
         Ok(StanTrace {
             model: self,
