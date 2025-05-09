@@ -28,6 +28,25 @@ def test_stan_model():
 
 
 @pytest.mark.stan
+def test_empty():
+    model = """
+    data {}
+    parameters {
+        array[0] real a;
+    }
+    model {
+        a ~ normal(0, 1);
+    }
+    """
+
+    compiled_model = nutpie.compile_stan_model(code=model)
+    trace = nutpie.sample(compiled_model)  # noqa: F841
+    # TODO: Variable `a` is missing because of this bridgestan issue:
+    # https://github.com/roualdes/bridgestan/issues/278
+    # assert trace.posterior.a.shape == (0, 1000)
+
+
+@pytest.mark.stan
 def test_seed():
     model = """
     data {}
