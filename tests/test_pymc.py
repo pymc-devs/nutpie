@@ -33,6 +33,23 @@ def test_pymc_model(backend, gradient_backend):
 
 @pytest.mark.pymc
 @parameterize_backends
+def test_zero_size(backend, gradient_backend):
+    import pytensor.tensor as pt
+
+    with pm.Model() as model:
+        a = pm.Normal("a", shape=(0, 0, 10))
+        pm.Deterministic("b", pt.exp(a))
+
+    compiled = nutpie.compile_pymc_model(
+        model, backend=backend, gradient_backend=gradient_backend
+    )
+    trace = nutpie.sample(compiled, chains=1, draws=17, tune=100)
+    assert trace.posterior.a.shape == (1, 17, 0, 0, 10)
+    assert trace.posterior.b.shape == (1, 17, 0, 0, 10)
+
+
+@pytest.mark.pymc
+@parameterize_backends
 def test_pymc_model_float32(backend, gradient_backend):
     import pytensor
 

@@ -15,6 +15,7 @@ use pyo3::{
     Bound, Py, PyAny, PyObject, PyResult, Python,
 };
 
+use rand_distr::num_traits::CheckedEuclid;
 use thiserror::Error;
 
 type UserData = *const std::ffi::c_void;
@@ -128,8 +129,8 @@ impl CpuLogpFunc for &LogpFunc {
         let retcode = unsafe {
             (self.func)(
                 self.dim,
-                &position[0] as *const f64,
-                &mut gradient[0] as *mut f64,
+                position.as_ptr(),
+                gradient.as_mut_ptr(),
                 logp_ptr,
                 self.user_data_ptr,
             )
@@ -148,6 +149,7 @@ pub(crate) struct PyMcTrace<'model> {
     var_sizes: Vec<usize>,
     var_names: Vec<String>,
     expand: &'model ExpandFunc,
+    count: usize,
 }
 
 impl<'model> DrawStorage for PyMcTrace<'model> {
@@ -165,14 +167,20 @@ impl<'model> DrawStorage for PyMcTrace<'model> {
             data.extend_from_slice(vals);
             start = end;
         }
+        self.count += 1;
+
         Ok(())
     }
 
     fn finalize(self) -> Result<Arc<dyn Array>> {
         let (fields, arrays): (Vec<_>, _) = izip!(self.data, self.var_names, self.var_sizes)
             .map(|(data, name, size)| {
-                assert!(data.len() % size == 0);
-                let num_arrays = data.len() / size;
+                let (num_arrays, rem) = data
+                    .len()
+                    .checked_div_rem_euclid(&size)
+                    .unwrap_or((self.count, 0));
+                assert!(rem == 0);
+                assert!(num_arrays == self.count);
                 let data = Float64Array::from(data);
                 let item_field = Arc::new(Field::new("item", DataType::Float64, false));
                 let offsets = OffsetBuffer::from_lengths((0..num_arrays).map(|_| size));
@@ -206,6 +214,7 @@ impl<'model> PyMcTrace<'model> {
             var_sizes: model.var_sizes.clone(),
             var_names: model.var_names.clone(),
             expand: &model.expand,
+            count: 0,
         }
     }
 

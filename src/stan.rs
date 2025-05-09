@@ -86,6 +86,9 @@ pub struct StanModel {
 
 /// Return meta information about the constrained parameters of the model
 fn params(var_string: &str) -> anyhow::Result<Vec<Parameter>> {
+    if var_string.is_empty() {
+        return Ok(vec![]);
+    }
     // Parse each variable string into (name, is_complex, indices)
     let parsed_variables: anyhow::Result<Vec<(String, bool, Vec<usize>)>> = var_string
         .split(',')
@@ -540,6 +543,7 @@ pub struct StanTrace<'model> {
     trace: Vec<Vec<f64>>,
     expanded_buffer: Box<[f64]>,
     rng: bridgestan::Rng<&'model bridgestan::StanLibrary>,
+    count: usize,
 }
 
 impl<'model> Clone for StanTrace<'model> {
@@ -559,6 +563,7 @@ impl<'model> Clone for StanTrace<'model> {
             trace: self.trace.clone(),
             expanded_buffer: self.expanded_buffer.clone(),
             rng,
+            count: self.count,
         }
     }
 }
@@ -591,6 +596,7 @@ impl<'model> DrawStorage for StanTrace<'model> {
             // We need to transpose
             fortran_to_c_order(slice, &var.shape, trace);
         }
+        self.count += 1;
         Ok(())
     }
 
@@ -613,7 +619,7 @@ impl<'model> DrawStorage for StanTrace<'model> {
             .unzip();
 
         Ok(Arc::new(
-            StructArray::try_new(fields.into(), arrays, None)
+            StructArray::try_new_with_length(fields.into(), arrays, None, self.count)
                 .context("Could not create arrow StructArray")?,
         ))
     }
@@ -649,6 +655,7 @@ impl Model for StanModel {
             trace,
             rng,
             expanded_buffer: buffer.into(),
+            count: 0,
         })
     }
 
@@ -734,6 +741,10 @@ mod tests {
 
     #[test]
     fn parse_vars() {
+        let vars = "";
+        let parsed = super::params(vars).unwrap();
+        assert!(parsed.len() == 0);
+
         let vars = "x.1.1,x.2.1,x.3.1,x.1.2,x.2.2,x.3.2";
         let parsed = super::params(vars).unwrap();
         assert!(parsed.len() == 1);
