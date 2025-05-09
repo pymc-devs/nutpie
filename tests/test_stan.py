@@ -225,13 +225,41 @@ def test_stan_flow():
         b ~ normal(0, 1);
     }
     """
+    import jax
 
-    compiled_model = nutpie.compile_stan_model(code=model).with_transform_adapt(
-        num_layers=2,
-        nn_width=4,
-        num_diag_windows=6,
-    )
-    trace = nutpie.sample(
-        compiled_model, transform_adapt=True, window_switch_freq=150, tune=600, chains=1
-    )
-    trace.posterior.a  # noqa: B018
+    old = jax.config.update("jax_enable_x64", True)
+    try:
+        compiled_model = nutpie.compile_stan_model(code=model).with_transform_adapt(
+            num_layers=2,
+            nn_width=4,
+        )
+        trace = nutpie.sample(compiled_model, transform_adapt=True, tune=2000, chains=1)
+        assert float(trace.sample_stats.fisher_distance.mean()) < 0.1
+        trace.posterior.a  # noqa: B018
+    finally:
+        jax.config.update("jax_enable_x64", old)
+
+
+# TODO: There are small numerical differences between linux and windows.
+# We should figure out if they originate in stan or in nutpie.
+@pytest.mark.array_compare(atol=1e-4)
+@pytest.mark.stan
+def test_deterministic_sampling_stan():
+    model = """
+    parameters {
+        real<lower=0> a;
+    }
+    model {
+        a ~ normal(0, 1);
+    }
+    generated quantities {
+        real b = normal_rng(0, 1) + a;
+    }
+    """
+
+    compiled_model = nutpie.compile_stan_model(code=model)
+    trace = nutpie.sample(compiled_model, chains=2, seed=123, draws=100, tune=100)
+    trace2 = nutpie.sample(compiled_model, chains=2, seed=123, draws=100, tune=100)
+    np.testing.assert_allclose(trace.posterior.a.values, trace2.posterior.a.values)
+    np.testing.assert_allclose(trace.posterior.b.values, trace2.posterior.b.values)
+    return trace.posterior.a.isel(draw=slice(None, 10)).values
