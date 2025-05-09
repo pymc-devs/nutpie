@@ -1916,7 +1916,7 @@ def make_flow(
         diag = jnp.sqrt(pos_std / grad_std)
         mean = positions.mean(0) + gradients.mean(0) * diag * diag
 
-    key = jax.random.PRNGKey(seed % (2**63))
+    key = jax.random.key(seed % (2**63), impl="threefry2x32")
 
     diag_param = Parameterize(
         lambda x: x + jnp.sqrt(1 + x**2),

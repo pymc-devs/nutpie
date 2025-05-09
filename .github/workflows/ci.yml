@@ -56,13 +56,13 @@ jobs:
           python3 -m venv .venv
           source .venv/bin/activate
           uv pip install 'nutpie[stan]' --find-links dist --force-reinstall
-          uv pip install pytest pytest-timeout
-          pytest -m "stan and not flow"
+          uv pip install pytest pytest-timeout pytest-arraydiff
+          pytest -m "stan and not flow" --arraydiff
           uv pip install 'nutpie[pymc]' --find-links dist --force-reinstall
           uv pip install jax
-          pytest -m "pymc and not flow"
+          pytest -m "pymc and not flow" --arraydiff
           uv pip install 'nutpie[all]' --find-links dist --force-reinstall
-          pytest -m flow
+          pytest -m flow --arraydiff
 
   # pyarrow doesn't currently seem to work on musllinux
   #musllinux:
@@ -183,13 +183,13 @@ jobs:
           python3 -m venv .venv
           source .venv/Scripts/activate
           uv pip install "nutpie[stan]" --find-links dist --force-reinstall
-          uv pip install pytest pytest-timeout
-          pytest -m "stan and not flow"
+          uv pip install pytest pytest-timeout pytest-arraydiff
+          pytest -m "stan and not flow" --arraydiff
           uv pip install "nutpie[pymc]" --find-links dist --force-reinstall
           uv pip install jax
-          pytest -m "pymc and not flow"
+          pytest -m "pymc and not flow" --arraydiff
           uv pip install "nutpie[all]" --find-links dist --force-reinstall
-          pytest -m flow
+          pytest -m flow --arraydiff
 
   macos:
     runs-on: ${{ matrix.platform.runner }}
@@ -232,13 +232,13 @@ jobs:
           python3 -m venv .venv
           source .venv/bin/activate
           uv pip install 'nutpie[stan]' --find-links dist --force-reinstall
-          uv pip install pytest pytest-timeout
-          pytest -m "stan and not flow"
+          uv pip install pytest pytest-timeout pytest-arraydiff
+          pytest -m "stan and not flow" --arraydiff
           uv pip install 'nutpie[pymc]' --find-links dist --force-reinstall
           uv pip install jax
-          pytest -m "pymc and not flow"
+          pytest -m "pymc and not flow" --arraydiff
           uv pip install 'nutpie[all]' --find-links dist --force-reinstall
-          pytest -m flow
+          pytest -m flow --arraydiff
   sdist:
     runs-on: ubuntu-latest
     steps:
