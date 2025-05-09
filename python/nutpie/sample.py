@@ -455,18 +455,42 @@ class _BackgroundSampler:
 def sample(
     compiled_model: CompiledModel,
     *,
-    draws: int | None,
-    tune: int | None,
-    chains: int,
-    cores: Optional[int],
-    seed: Optional[int],
-    save_warmup: bool,
-    progress_bar: bool,
+    draws: int | None = None,
+    tune: int | None = None,
+    chains: int | None = None,
+    cores: int | None = None,
+    seed: int | None = None,
+    save_warmup: bool = True,
+    progress_bar: bool = True,
     low_rank_modified_mass_matrix: bool = False,
     transform_adapt: bool = False,
-    init_mean: Optional[np.ndarray],
-    return_raw_trace: bool,
+    init_mean: np.ndarray | None = None,
+    return_raw_trace: bool = False,
+    progress_template: str | None = None,
+    progress_style: str | None = None,
+    progress_rate: int = 100,
+) -> arviz.InferenceData: ...
+
+
+@overload
+def sample(
+    compiled_model: CompiledModel,
+    *,
+    draws: int | None = None,
+    tune: int | None = None,
+    chains: int | None = None,
+    cores: int | None = None,
+    seed: int | None = None,
+    save_warmup: bool = True,
+    progress_bar: bool = True,
+    low_rank_modified_mass_matrix: bool = False,
+    transform_adapt: bool = False,
+    init_mean: np.ndarray | None = None,
+    return_raw_trace: bool = False,
     blocking: Literal[True],
+    progress_template: str | None = None,
+    progress_style: str | None = None,
+    progress_rate: int = 100,
     **kwargs,
 ) -> arviz.InferenceData: ...
 
@@ -475,18 +499,21 @@ def sample(
 def sample(
     compiled_model: CompiledModel,
     *,
-    draws: int | None,
-    tune: int | None,
-    chains: int,
-    cores: Optional[int],
-    seed: Optional[int],
-    save_warmup: bool,
-    progress_bar: bool,
+    draws: int | None = None,
+    tune: int | None = None,
+    chains: int | None = None,
+    cores: int | None = None,
+    seed: int | None = None,
+    save_warmup: bool = True,
+    progress_bar: bool = True,
     low_rank_modified_mass_matrix: bool = False,
     transform_adapt: bool = False,
-    init_mean: Optional[np.ndarray],
-    return_raw_trace: bool,
+    init_mean: np.ndarray | None = None,
+    return_raw_trace: bool = False,
     blocking: Literal[False],
+    progress_template: str | None = None,
+    progress_style: str | None = None,
+    progress_rate: int = 100,
     **kwargs,
 ) -> _BackgroundSampler: ...
 
@@ -496,21 +523,21 @@ def sample(
     *,
     draws: int | None = None,
     tune: int | None = None,
-    chains: int = 6,
-    cores: Optional[int] = None,
-    seed: Optional[int] = None,
+    chains: int | None = None,
+    cores: int | None = None,
+    seed: int | None = None,
     save_warmup: bool = True,
     progress_bar: bool = True,
     low_rank_modified_mass_matrix: bool = False,
     transform_adapt: bool = False,
-    init_mean: Optional[np.ndarray] = None,
+    init_mean: np.ndarray | None = None,
     return_raw_trace: bool = False,
     blocking: bool = True,
-    progress_template: Optional[str] = None,
-    progress_style: Optional[str] = None,
+    progress_template: str | None = None,
+    progress_style: str | None = None,
     progress_rate: int = 100,
     **kwargs,
-) -> arviz.InferenceData:
+) -> arviz.InferenceData | _BackgroundSampler:
     """Sample the posterior distribution for a compiled model.
 
     Parameters
@@ -618,7 +645,8 @@ def sample(
         settings.num_tune = tune
     if draws is not None:
         settings.num_draws = draws
-    settings.num_chains = chains
+    if chains is not None:
+        settings.num_chains = chains
 
     for name, val in kwargs.items():
         setattr(settings, name, val)
@@ -629,7 +657,10 @@ def sample(
             available = os.process_cpu_count()  # type: ignore
         except AttributeError:
             available = os.cpu_count()
-        cores = min(chains, cast(int, available))
+        if chains is None:
+            cores = available
+        else:
+            cores = min(chains, cast(int, available))
 
     if init_mean is None:
         init_mean = np.zeros(compiled_model.n_dim)
