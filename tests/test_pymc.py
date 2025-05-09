@@ -33,6 +33,32 @@ def test_pymc_model(backend, gradient_backend):
 
 @pytest.mark.pymc
 @parameterize_backends
+def test_low_rank(backend, gradient_backend):
+    with pm.Model() as model:
+        pm.Normal("a")
+
+    compiled = nutpie.compile_pymc_model(
+        model, backend=backend, gradient_backend=gradient_backend
+    )
+    trace = nutpie.sample(compiled, chains=1, low_rank_modified_mass_matrix=True)
+    trace.posterior.a  # noqa: B018
+
+
+@pytest.mark.pymc
+@parameterize_backends
+def test_low_rank_half_normal(backend, gradient_backend):
+    with pm.Model() as model:
+        pm.HalfNormal("a", shape=13)
+
+    compiled = nutpie.compile_pymc_model(
+        model, backend=backend, gradient_backend=gradient_backend
+    )
+    trace = nutpie.sample(compiled, chains=1, low_rank_modified_mass_matrix=True)
+    trace.posterior.a  # noqa: B018
+
+
+@pytest.mark.pymc
+@parameterize_backends
 def test_zero_size(backend, gradient_backend):
     import pytensor.tensor as pt
 

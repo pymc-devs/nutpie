@@ -28,6 +28,23 @@ def test_stan_model():
 
 
 @pytest.mark.stan
+def test_stan_model_low_rank():
+    model = """
+    data {}
+    parameters {
+        real a;
+    }
+    model {
+        a ~ normal(0, 1);
+    }
+    """
+
+    compiled_model = nutpie.compile_stan_model(code=model)
+    trace = nutpie.sample(compiled_model, low_rank_modified_mass_matrix=True)
+    trace.posterior.a  # noqa: B018
+
+
+@pytest.mark.stan
 def test_empty():
     model = """
     data {}
@@ -40,7 +57,7 @@ def test_empty():
     """
 
     compiled_model = nutpie.compile_stan_model(code=model)
-    trace = nutpie.sample(compiled_model)  # noqa: F841
+    nutpie.sample(compiled_model)
     # TODO: Variable `a` is missing because of this bridgestan issue:
     # https://github.com/roualdes/bridgestan/issues/278
     # assert trace.posterior.a.shape == (0, 1000)
