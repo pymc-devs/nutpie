@@ -7,7 +7,7 @@ name = "nutpie"
 description = "Sample Stan or PyMC models"
 authors = [{ name = "PyMC Developers", email = "pymc.devs@gmail.com" }]
 readme = "README.md"
-requires-python = ">=3.10,<3.14"
+requires-python = ">=3.10"
 license = { text = "MIT" }
 classifiers = [
   "Programming Language :: Rust",
@@ -41,6 +41,7 @@ dev = [
   "flowjax >= 17.0.2",
   "pytest",
   "pytest-timeout",
+  "pytest-arraydiff",
 ]
 all = [
   "bridgestan >= 2.6.1",

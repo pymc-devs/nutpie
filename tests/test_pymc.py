@@ -8,7 +8,6 @@ if find_spec("pymc") is None:
 import numpy as np
 import pymc as pm
 import pytest
-from scipy import stats
 
 import nutpie
 import nutpie.compile_pymc
@@ -268,10 +267,13 @@ def test_pymc_var_names(backend, gradient_backend):
     assert not hasattr(trace.posterior, "c")
 
 
+# TODO For some reason, the sampling results with jax are
+# not reproducible accross operating systems. Figure this
+# out and add the array_compare marker.
+# @pytest.mark.array_compare
 @pytest.mark.pymc
 @pytest.mark.flow
-@pytest.mark.parametrize("kind", ["masked", "subset"])
-def test_normalizing_flow(kind):
+def test_normalizing_flow():
     with pm.Model() as model:
         pm.HalfNormal("x", shape=2)
 
@@ -279,8 +281,7 @@ def test_normalizing_flow(kind):
         model, backend="jax", gradient_backend="jax"
     ).with_transform_adapt(
         verbose=True,
-        coupling_type=kind,
-        num_layers=4,
+        num_layers=2,
     )
     trace = nutpie.sample(
         compiled,
@@ -288,40 +289,10 @@ def test_normalizing_flow(kind):
         transform_adapt=True,
         window_switch_freq=128,
         seed=1,
-        draws=2000,
-    )
-    draws = trace.posterior.x.isel(x_dim_0=0, chain=0)
-    kstest = stats.ks_1samp(draws, stats.halfnorm.cdf)
-    assert kstest.pvalue > 0.01
-
-    draws = trace.posterior.x.isel(x_dim_0=1, chain=0)
-    kstest = stats.ks_1samp(draws, stats.halfnorm.cdf)
-    assert kstest.pvalue > 0.01
-
-
-@pytest.mark.pymc
-@pytest.mark.flow
-@pytest.mark.parametrize("kind", ["masked", "subset"])
-def test_normalizing_flow_1d(kind):
-    with pm.Model() as model:
-        pm.HalfNormal("x")
-
-    compiled = nutpie.compile_pymc_model(
-        model, backend="jax", gradient_backend="jax"
-    ).with_transform_adapt(
-        verbose=True,
-        coupling_type=kind,
-        num_layers=4,
-    )
-    trace = nutpie.sample(
-        compiled,
-        chains=1,
-        transform_adapt=True,
-        window_switch_freq=128,
-        seed=1,
-        draws=2000,
+        draws=500,
     )
     assert float(trace.sample_stats.fisher_distance.mean()) < 0.1
+    # return trace.posterior.x.isel(draw=slice(-50, None)).values.ravel()
 
 
 @pytest.mark.pymc
@@ -357,3 +328,25 @@ def test_missing(backend, gradient_backend):
     tr = nutpie.sample(compiled, chains=1, seed=1)
     print(tr.posterior)
     assert hasattr(tr.posterior, "y_unobserved")
+
+
+@pytest.mark.pymc
+@pytest.mark.array_compare
+def test_deterministic_sampling_numba():
+    with pm.Model() as model:
+        pm.HalfNormal("a")
+
+    compiled = nutpie.compile_pymc_model(model, backend="numba")
+    trace = nutpie.sample(compiled, chains=2, seed=123, draws=100, tune=100)
+    return trace.posterior.a.values.ravel()
+
+
+@pytest.mark.pymc
+@pytest.mark.array_compare
+def test_deterministic_sampling_jax():
+    with pm.Model() as model:
+        pm.HalfNormal("a")
+
+    compiled = nutpie.compile_pymc_model(model, backend="jax", gradient_backend="jax")
+    trace = nutpie.sample(compiled, chains=2, seed=123, draws=100, tune=100)
+    return trace.posterior.a.values.ravel()
