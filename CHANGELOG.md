@@ -2,6 +2,63 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.15.0] - 2025-05-27
+
+### Bug Fixes
+
+- Use stanio for creating Stan's data JSON (#205) (Brian Ward)
+
+- Rng for generated quantities (Adrian Seyboldt)
+
+- Correctly handle tuples in stan traces (Adrian Seyboldt)
+
+- Allow variables with zero shapes (Adrian Seyboldt)
+
+- Let rust sampler decide on default num chains (Adrian Seyboldt)
+
+
+### Documentation
+
+- Fix section links path (Guspan Tanadi)
+
+- Link to website (Adrian Seyboldt)
+
+
+### Features
+
+- Improvements to normalizing flow (Adrian Seyboldt)
+
+- Experiment with planar flows (Adrian Seyboldt)
+
+
+### Miscellaneous Tasks
+
+- Bump pyo3 in the cargo group across 1 directory (dependabot[bot])
+
+- Bump astral-sh/setup-uv from 5 to 6 (#203) (dependabot[bot])
+
+- Add entries to gitignore (Adrian Seyboldt)
+
+- Bump dependencies (Adrian Seyboldt)
+
+
+### Styling
+
+- Fix some clippy warnings (Adrian Seyboldt)
+
+
+### Testing
+
+- Check that normalizing flows are reproducible (Adrian Seyboldt)
+
+- Add low rank tests (Adrian Seyboldt)
+
+
+### Build
+
+- Increase optimization level (Adrian Seyboldt)
+
+
 ## [0.14.3] - 2025-03-18
 
 ### Bug Fixes
@@ -9,6 +66,11 @@ All notable changes to this project will be documented in this file.
 - Fix normalizing flows for 1d posteriors (Adrian Seyboldt)
 
 - Better initialization of masked flows (Adrian Seyboldt)
+
+
+### Documentation
+
+- Fix spelling and grammar (Daniel Saunders)
 
 
 ### Features
