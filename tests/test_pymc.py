@@ -32,6 +32,21 @@ def test_pymc_model(backend, gradient_backend):
 
 
 @pytest.mark.pymc
+@parameterize_backends
+def test_name_x(backend, gradient_backend):
+    with pm.Model() as model:
+        x = pm.Data("x", 1.0)
+        a = pm.Normal("a", mu=x)
+        pm.Deterministic("z", x * a)
+
+    compiled = nutpie.compile_pymc_model(
+        model, backend=backend, gradient_backend=gradient_backend, freeze_model=False
+    )
+    trace = nutpie.sample(compiled, chains=1)
+    trace.posterior.a  # noqa: B018
+
+
+@pytest.mark.pymc
 def test_order_shared():
     a_val = np.array([[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]])
     with pm.Model() as model:
