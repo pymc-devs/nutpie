@@ -499,6 +499,11 @@ def compile_pymc_model(
             "and restart your kernel in case you are in an interactive session."
         )
 
+    if gradient_backend is not None:
+        gradient_backend = gradient_backend.lower()  # type: ignore[assignment]
+    if backend is not None:
+        backend = backend.lower()  # type: ignore[assignment]
+
     from pymc.model.transform.optimization import freeze_dims_and_data
     from pymc.initial_point import make_initial_point_fn
 
