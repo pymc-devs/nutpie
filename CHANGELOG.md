@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.15.1] - 2025-05-28
+
+### Bug Fixes
+
+- Incorrect results with non-contiguous shared variable (Adrian Seyboldt)
+
+- Allow upper case backend string (Adrian Seyboldt)
+
+- Allow data named x with unfrozen model (Adrian Seyboldt)
+
+
+### Styling
+
+- Fix small typing issue (Adrian Seyboldt)
+
+
 ## [0.15.0] - 2025-05-27
 
 ### Bug Fixes
@@ -39,7 +55,9 @@ All notable changes to this project will be documented in this file.
 
 - Add entries to gitignore (Adrian Seyboldt)
 
-- Bump dependencies (Adrian Seyboldt)
+- Update dependencies (Adrian Seyboldt)
+
+- Update changelog (Adrian Seyboldt)
 
 
 ### Styling
