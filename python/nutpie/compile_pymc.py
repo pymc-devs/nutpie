@@ -32,7 +32,7 @@ if TYPE_CHECKING:
 
 
 def _rv_dict_to_flat_array_wrapper(
-    fn: Callable[[SeedType], dict[str, np.ndarray]],
+    fn: Callable[[SeedType | None], dict[str, np.ndarray]],
     names: list[str],
     shapes: list[tuple[int]],
 ) -> Callable[[SeedType], np.ndarray]:
@@ -61,7 +61,7 @@ def _rv_dict_to_flat_array_wrapper(
     """
 
     @wraps(fn)
-    def seeded_array_fn(seed: SeedType = None):
+    def seeded_array_fn(seed: SeedType | None = None):
         initial_value_dict = fn(seed)
         total_size = sum(np.prod(shape).astype(int) for shape in shapes)
         flat_array = np.empty(total_size, dtype="float64", order="C")
