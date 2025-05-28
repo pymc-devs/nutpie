@@ -82,7 +82,7 @@ Alternatively, we can also sample through the `pymc` API:
 
 ```python
 with model:
-    trace = pm.sample(model, nuts_sampler="nutpie")
+    trace = pm.sample(nuts_sampler="nutpie")
 ```
 
 While sampling, nutpie shows a progress bar for each chain. It also includes
@@ -138,7 +138,6 @@ Or through the pymc API:
 ```python
 with model:
     trace = pm.sample(
-        model,
         nuts_sampler="nutpie",
         nuts_sampler_kwargs={"backend": "jax"},
     )
