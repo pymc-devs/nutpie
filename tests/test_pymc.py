@@ -32,6 +32,38 @@ def test_pymc_model(backend, gradient_backend):
 
 
 @pytest.mark.pymc
+def test_order_shared():
+    a_val = np.array([[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]])
+    with pm.Model() as model:
+        a = pm.Data("a", np.copy(a_val, order="C"))
+        b = pm.Normal("b", shape=(2, 5))
+        pm.Deterministic("c", (a[:, None, :] * b[:, :, None]).sum(-1))
+
+    compiled = nutpie.compile_pymc_model(model, backend="numba")
+    trace = nutpie.sample(compiled)
+    np.testing.assert_allclose(
+        (
+            trace.posterior.b.values[:, :, :, :, None] * a_val[None, None, :, None, :]
+        ).sum(-1),
+        trace.posterior.c.values,
+    )
+
+    with pm.Model() as model:
+        a = pm.Data("a", np.copy(a_val, order="F"))
+        b = pm.Normal("b", shape=(2, 5))
+        pm.Deterministic("c", (a[:, None, :] * b[:, :, None]).sum(-1))
+
+    compiled = nutpie.compile_pymc_model(model, backend="numba")
+    trace = nutpie.sample(compiled)
+    np.testing.assert_allclose(
+        (
+            trace.posterior.b.values[:, :, :, :, None] * a_val[None, None, :, None, :]
+        ).sum(-1),
+        trace.posterior.c.values,
+    )
+
+
+@pytest.mark.pymc
 @parameterize_backends
 def test_low_rank(backend, gradient_backend):
     with pm.Model() as model:

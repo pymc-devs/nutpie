@@ -131,7 +131,7 @@ class CompiledPyMCModel(CompiledModel):
             if name not in shared_data:
                 raise KeyError(f"Unknown shared variable: {name}")
             old_val = shared_data[name]
-            new_val = np.asarray(new_val, dtype=old_val.dtype).copy()
+            new_val = np.array(new_val, dtype=old_val.dtype, order="C", copy=True)
             new_val.flags.writeable = False
             if old_val.ndim != new_val.ndim:
                 raise ValueError(
@@ -256,7 +256,7 @@ def _compile_pymc_model_numba(
     for val in [*logp_fn_pt.get_shared(), *expand_fn_pt.get_shared()]:
         if val.name in shared_data and val not in seen:
             raise ValueError(f"Shared variables must have unique names: {val.name}")
-        shared_data[val.name] = val.get_value()
+        shared_data[val.name] = np.array(val.get_value(), order="C", copy=True)
         shared_vars[val.name] = val
         seen.add(val)
 
