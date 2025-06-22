@@ -276,6 +276,47 @@ def in_marimo_notebook() -> bool:
         return False
 
 
+def write_internal(cell_id, stream, value: object) -> None:
+    from marimo._output import formatting
+    from marimo._messaging.ops import CellOp
+    from marimo._messaging.tracebacks import write_traceback
+    from marimo._messaging.cell_output import CellChannel
+
+    output = formatting.try_format(value)
+    if output.traceback is not None:
+        write_traceback(output.traceback)
+    CellOp.broadcast_output(
+        channel=CellChannel.OUTPUT,
+        mimetype=output.mimetype,
+        data=output.data,
+        cell_id=cell_id,
+        status=None,
+        stream=stream,
+    )
+
+
+def create_replace():
+    from marimo._runtime.context import get_context
+    from marimo._runtime.context.types import ContextNotInitializedError
+    from marimo._output import formatting
+
+    try:
+        ctx = get_context()
+    except ContextNotInitializedError:
+        return
+
+    cell_id = ctx.execution_context.cell_id
+    execution_context = ctx.execution_context
+    stream = ctx.stream
+
+    def replace(value):
+        execution_context.output = [formatting.as_html(value)]
+
+        write_internal(cell_id=cell_id, value=value, stream=stream)
+
+    return replace
+
+
 # Adapted from fastprogress
 def in_notebook():
     def in_colab():
@@ -385,12 +426,13 @@ class _BackgroundSampler:
 
             self._html = ""
 
-            mo.output.replace(mo.Html("Sampling is about to start..."))
+            mo.output.clear()
+            my_replace = create_replace()
 
             def callback(formatted):
                 self._html = formatted
                 html = mo.Html(f"{progress_style}\n{formatted}")
-                mo.output.replace(html)
+                my_replace(html)
 
             progress_type = _lib.ProgressType.template_callback(
                 progress_rate, progress_template, cores, callback
