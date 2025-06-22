@@ -276,7 +276,8 @@ def in_marimo_notebook() -> bool:
         return False
 
 
-def write_internal(cell_id, stream, value: object) -> None:
+def _mo_write_internal(cell_id, stream, value: object) -> None:
+    """Write to marimo cell given cell_id and stream."""
     from marimo._output import formatting
     from marimo._messaging.ops import CellOp
     from marimo._messaging.tracebacks import write_traceback
@@ -295,7 +296,8 @@ def write_internal(cell_id, stream, value: object) -> None:
     )
 
 
-def create_replace():
+def _mo_create_replace():
+    """Create mo.output.replace with current context pinned."""
     from marimo._runtime.context import get_context
     from marimo._runtime.context.types import ContextNotInitializedError
     from marimo._output import formatting
@@ -312,7 +314,7 @@ def create_replace():
     def replace(value):
         execution_context.output = [formatting.as_html(value)]
 
-        write_internal(cell_id=cell_id, value=value, stream=stream)
+        _mo_write_internal(cell_id=cell_id, value=value, stream=stream)
 
     return replace
 
@@ -427,12 +429,12 @@ class _BackgroundSampler:
             self._html = ""
 
             mo.output.clear()
-            my_replace = create_replace()
+            mo_output_replace = _mo_create_replace()
 
             def callback(formatted):
                 self._html = formatted
                 html = mo.Html(f"{progress_style}\n{formatted}")
-                my_replace(html)
+                mo_output_replace(html)
 
             progress_type = _lib.ProgressType.template_callback(
                 progress_rate, progress_template, cores, callback
