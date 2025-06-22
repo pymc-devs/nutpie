@@ -267,6 +267,15 @@ _progress_template = """
 """
 
 
+def in_marimo_notebook() -> bool:
+    try:
+        import marimo as mo
+
+        return mo.running_in_notebook()
+    except ImportError:
+        return False
+
+
 # Adapted from fastprogress
 def in_notebook():
     def in_colab():
@@ -361,6 +370,27 @@ class _BackgroundSampler:
             def callback(formatted):
                 self._html = formatted
                 self.display_id.update(self)
+
+            progress_type = _lib.ProgressType.template_callback(
+                progress_rate, progress_template, cores, callback
+            )
+        elif in_marimo_notebook():
+            import marimo as mo
+
+            if progress_template is None:
+                progress_template = _progress_template
+
+            if progress_style is None:
+                progress_style = _progress_style
+
+            self._html = ""
+
+            mo.output.replace(mo.Html("Sampling is about to start..."))
+
+            def callback(formatted):
+                self._html = formatted
+                html = mo.Html(f"{progress_style}\n{formatted}")
+                mo.output.replace(html)
 
             progress_type = _lib.ProgressType.template_callback(
                 progress_rate, progress_template, cores, callback
