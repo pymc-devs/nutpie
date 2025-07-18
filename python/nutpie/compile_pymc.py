@@ -275,7 +275,7 @@ def _compile_pymc_model_numba(
 
     logp_shared_names = [var.name for var in logp_fn_pt.get_shared() if var.name is not None]
     logp_numba_raw, c_sig = _make_c_logp_func(
-        n_dim, logp_fn, user_data, logp_shared_names, shared_data
+        n_dim, logp_fn, user_data, logp_shared_names, shared_data, logp_fn_pt
     )
     
     # Filter out compute_log_likelihood from kwargs for numba compilation
@@ -292,7 +292,7 @@ def _compile_pymc_model_numba(
 
     expand_shared_names = [var.name for var in expand_fn_pt.get_shared() if var.name is not None]
     expand_numba_raw, c_sig_expand = _make_c_expand_func(
-        n_dim, n_expanded, expand_fn, user_data, expand_shared_names, shared_data
+        n_dim, n_expanded, expand_fn, user_data, expand_shared_names, shared_data, expand_fn_pt
     )
     with warnings.catch_warnings():
         warnings.filterwarnings(
@@ -841,16 +841,33 @@ def _make_functions(
     )
 
 
-def make_extraction_fn(inner, shared_data, shared_vars, record_dtype):
+def make_extraction_fn(inner, shared_data, shared_vars, record_dtype, pytensor_fn=None):
     import numba
     from numba import literal_unroll
     from numba.cpython.unsafe.tuple import alloca_once, tuple_setitem
 
     if not shared_vars:
+        # Check if we have a PyTensor function to get the actual RNG shared variables
+        if pytensor_fn is not None:
+            all_shared = pytensor_fn.get_shared()
+            rng_vars = [var for var in all_shared if var.name is None]
+        else:
+            rng_vars = []
 
-        @numba.njit(inline="always")
-        def extract_shared(x, user_data_):
-            return inner(x)
+        if rng_vars:
+            # Have RNG shared variables but no named ones
+            # Get the actual values of the RNG variables
+            rng_values = tuple(var.get_value() for var in rng_vars)
+            
+            @numba.njit(inline="always")
+            def extract_shared(x, user_data_):
+                # Pass the actual RNG values
+                return inner(x, *rng_values)
+        else:
+            # No shared variables expected at all
+            @numba.njit(inline="always")
+            def extract_shared(x, user_data_):
+                return inner(x)
 
         return extract_shared
 
@@ -938,10 +955,10 @@ def make_extraction_fn(inner, shared_data, shared_vars, record_dtype):
     return extract_shared
 
 
-def _make_c_logp_func(n_dim, logp_fn, user_data, shared_logp, shared_data):
+def _make_c_logp_func(n_dim, logp_fn, user_data, shared_logp, shared_data, logp_fn_pt=None):
     import numba
 
-    extract = make_extraction_fn(logp_fn, shared_data, shared_logp, user_data.dtype)
+    extract = make_extraction_fn(logp_fn, shared_data, shared_logp, user_data.dtype, logp_fn_pt)
 
     c_sig = numba.types.int64(
         numba.types.uint64,
@@ -978,11 +995,11 @@ def _make_c_logp_func(n_dim, logp_fn, user_data, shared_logp, shared_data):
 
 
 def _make_c_expand_func(
-    n_dim, n_expanded, expand_fn, user_data, shared_vars, shared_data
+    n_dim, n_expanded, expand_fn, user_data, shared_vars, shared_data, expand_fn_pt=None
 ):
     import numba
 
-    extract = make_extraction_fn(expand_fn, shared_data, shared_vars, user_data.dtype)
+    extract = make_extraction_fn(expand_fn, shared_data, shared_vars, user_data.dtype, expand_fn_pt)
 
     c_sig = numba.types.int64(
         numba.types.uint64,
