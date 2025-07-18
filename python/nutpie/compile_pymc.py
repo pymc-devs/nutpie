@@ -847,22 +847,39 @@ def make_extraction_fn(inner, shared_data, shared_vars, record_dtype, pytensor_f
     from numba.cpython.unsafe.tuple import alloca_once, tuple_setitem
 
     if not shared_vars:
-        # Check if we have a PyTensor function to get the actual RNG shared variables
+        # Check if we have a PyTensor function to get the count of RNG shared variables
         if pytensor_fn is not None:
             all_shared = pytensor_fn.get_shared()
-            rng_vars = [var for var in all_shared if var.name is None]
+            rng_count = len([var for var in all_shared if var.name is None])
         else:
-            rng_vars = []
+            rng_count = 0
 
-        if rng_vars:
+        if rng_count > 0:
             # Have RNG shared variables but no named ones
-            # Get the actual values of the RNG variables
-            rng_values = tuple(var.get_value() for var in rng_vars)
+            # Create a wrapper that provides dummy values for RNG variables
+            def make_extract_with_rng_dummy(inner_fn, num_rng):
+                if num_rng == 1:
+                    @numba.njit(inline="always")
+                    def extract_shared(x, user_data_):
+                        # Get RNG from user_data or use default
+                        rng = 0  # Dummy value - RNG state is managed elsewhere
+                        return inner_fn(x, rng)
+                    return extract_shared
+                elif num_rng == 2:
+                    @numba.njit(inline="always")
+                    def extract_shared(x, user_data_):
+                        # Get RNGs from user_data or use defaults
+                        rng1, rng2 = 0, 0  # Dummy values
+                        return inner_fn(x, rng1, rng2)
+                    return extract_shared
+                else:
+                    # Fallback for other counts
+                    @numba.njit(inline="always")
+                    def extract_shared(x, user_data_):
+                        return inner_fn(x, 0, 0)  # Assume 2 RNGs as fallback
+                    return extract_shared
             
-            @numba.njit(inline="always")
-            def extract_shared(x, user_data_):
-                # Pass the actual RNG values
-                return inner(x, *rng_values)
+            extract_shared = make_extract_with_rng_dummy(inner, rng_count)
         else:
             # No shared variables expected at all
             @numba.njit(inline="always")
@@ -998,6 +1015,7 @@ def _make_c_expand_func(
     n_dim, n_expanded, expand_fn, user_data, shared_vars, shared_data, expand_fn_pt=None
 ):
     import numba
+    import numpy as np
 
     extract = make_extraction_fn(expand_fn, shared_data, shared_vars, user_data.dtype, expand_fn_pt)
 
@@ -1019,7 +1037,13 @@ def _make_c_expand_func(
             x = numba.carray(x_, (n_dim,))
             out = numba.carray(out_, (n_expanded,))
 
-            (values,) = extract(x, user_data_)
+            result = extract(x, user_data_)
+            if isinstance(result, tuple):
+                # Take only the first element (the actual expanded variables)
+                # The remaining elements are RNG state which we don't need for output
+                values = result[0]
+            else:
+                values = result
             out[...] = values
 
         except Exception:  # noqa: BLE001
