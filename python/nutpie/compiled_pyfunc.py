@@ -1,5 +1,5 @@
 import dataclasses
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 from typing import Any, Callable
 
@@ -22,6 +22,8 @@ class PyFuncModel(CompiledModel):
     _coords: dict[str, Any]
     _raw_logp_fn: Callable | None
     _transform_adapt_args: dict | None = None
+    log_likelihood_names: list[str] = field(default_factory=list)
+    log_likelihood_shapes: list[tuple[int, ...]] = field(default_factory=list)
 
     @property
     def shapes(self) -> dict[str, tuple[int, ...]]:
@@ -104,6 +106,8 @@ def from_pyfunc(
     make_initial_point_fn: Callable[[SeedType], np.ndarray] | None = None,
     make_transform_adapter=None,
     raw_logp_fn=None,
+    log_likelihood_names: list[str] | None = None,
+    log_likelihood_shapes: list[tuple[int, ...]] | None = None,
 ):
     variables = []
     for name, shape, dtype in zip(
@@ -124,6 +128,10 @@ def from_pyfunc(
         dims = {}
     if shared_data is None:
         shared_data = {}
+    if log_likelihood_names is None:
+        log_likelihood_names = []
+    if log_likelihood_shapes is None:
+        log_likelihood_shapes = []
 
     return PyFuncModel(
         _n_dim=ndim,
@@ -135,4 +143,6 @@ def from_pyfunc(
         _variables=variables,
         _shared_data=shared_data,
         _raw_logp_fn=raw_logp_fn,
+        log_likelihood_names=log_likelihood_names,
+        log_likelihood_shapes=log_likelihood_shapes,
     )
