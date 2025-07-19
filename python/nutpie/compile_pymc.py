@@ -291,8 +291,20 @@ def _compile_pymc_model_numba(
         logp_numba = numba.cfunc(c_sig, **numba_kwargs)(logp_numba_raw)
 
     expand_shared_names = [var.name for var in expand_fn_pt.get_shared() if var.name is not None]
+    
+    # Calculate total RNG count when compute_log_likelihood is True
+    total_rng_count = 0
+    if compute_log_likelihood:
+        # Count RNG variables from both logp and expand functions
+        all_shared = set()
+        if logp_fn_pt is not None:
+            all_shared.update(logp_fn_pt.get_shared())
+        if expand_fn_pt is not None:
+            all_shared.update(expand_fn_pt.get_shared())
+        total_rng_count = len([var for var in all_shared if var.name is None])
+    
     expand_numba_raw, c_sig_expand = _make_c_expand_func(
-        n_dim, n_expanded, expand_fn, user_data, expand_shared_names, shared_data, expand_fn_pt
+        n_dim, n_expanded, expand_fn, user_data, expand_shared_names, shared_data, expand_fn_pt, total_rng_count
     )
     with warnings.catch_warnings():
         warnings.filterwarnings(
@@ -841,14 +853,17 @@ def _make_functions(
     )
 
 
-def make_extraction_fn(inner, shared_data, shared_vars, record_dtype, pytensor_fn=None):
+def make_extraction_fn(inner, shared_data, shared_vars, record_dtype, pytensor_fn=None, total_rng_count=None):
     import numba
     from numba import literal_unroll
     from numba.cpython.unsafe.tuple import alloca_once, tuple_setitem
 
     if not shared_vars:
         # Check if we have a PyTensor function to get the count of RNG shared variables
-        if pytensor_fn is not None:
+        if total_rng_count is not None:
+            # Use provided RNG count (e.g., when handling multiple PyTensor functions)
+            rng_count = total_rng_count
+        elif pytensor_fn is not None:
             all_shared = pytensor_fn.get_shared()
             rng_count = len([var for var in all_shared if var.name is None])
         else:
@@ -861,22 +876,45 @@ def make_extraction_fn(inner, shared_data, shared_vars, record_dtype, pytensor_f
                 if num_rng == 1:
                     @numba.njit(inline="always")
                     def extract_shared(x, user_data_):
-                        # Get RNG from user_data or use default
                         rng = 0  # Dummy value - RNG state is managed elsewhere
                         return inner_fn(x, rng)
                     return extract_shared
                 elif num_rng == 2:
                     @numba.njit(inline="always")
                     def extract_shared(x, user_data_):
-                        # Get RNGs from user_data or use defaults
                         rng1, rng2 = 0, 0  # Dummy values
                         return inner_fn(x, rng1, rng2)
                     return extract_shared
-                else:
-                    # Fallback for other counts
+                elif num_rng == 3:
                     @numba.njit(inline="always")
                     def extract_shared(x, user_data_):
-                        return inner_fn(x, 0, 0)  # Assume 2 RNGs as fallback
+                        rng1, rng2, rng3 = 0, 0, 0  # Dummy values
+                        return inner_fn(x, rng1, rng2, rng3)
+                    return extract_shared
+                elif num_rng == 4:
+                    @numba.njit(inline="always")
+                    def extract_shared(x, user_data_):
+                        rng1, rng2, rng3, rng4 = 0, 0, 0, 0  # Dummy values
+                        return inner_fn(x, rng1, rng2, rng3, rng4)
+                    return extract_shared
+                elif num_rng == 5:
+                    @numba.njit(inline="always")
+                    def extract_shared(x, user_data_):
+                        rng1, rng2, rng3, rng4, rng5 = 0, 0, 0, 0, 0  # Dummy values
+                        return inner_fn(x, rng1, rng2, rng3, rng4, rng5)
+                    return extract_shared
+                elif num_rng == 6:
+                    @numba.njit(inline="always")
+                    def extract_shared(x, user_data_):
+                        rng1, rng2, rng3, rng4, rng5, rng6 = 0, 0, 0, 0, 0, 0  # Dummy values
+                        return inner_fn(x, rng1, rng2, rng3, rng4, rng5, rng6)
+                    return extract_shared
+                else:
+                    # For higher counts, create a tuple of zeros
+                    @numba.njit(inline="always")
+                    def extract_shared(x, user_data_):
+                        rng_tuple = tuple(0 for _ in range(num_rng))
+                        return inner_fn(x, *rng_tuple)
                     return extract_shared
             
             extract_shared = make_extract_with_rng_dummy(inner, rng_count)
@@ -1012,12 +1050,12 @@ def _make_c_logp_func(n_dim, logp_fn, user_data, shared_logp, shared_data, logp_
 
 
 def _make_c_expand_func(
-    n_dim, n_expanded, expand_fn, user_data, shared_vars, shared_data, expand_fn_pt=None
+    n_dim, n_expanded, expand_fn, user_data, shared_vars, shared_data, expand_fn_pt=None, total_rng_count=0
 ):
     import numba
     import numpy as np
 
-    extract = make_extraction_fn(expand_fn, shared_data, shared_vars, user_data.dtype, expand_fn_pt)
+    extract = make_extraction_fn(expand_fn, shared_data, shared_vars, user_data.dtype, expand_fn_pt, total_rng_count)
 
     c_sig = numba.types.int64(
         numba.types.uint64,
