@@ -572,6 +572,21 @@ def compile_pymc_model(
     if backend.lower() == "numba":
         if gradient_backend == "jax":
             raise ValueError("Gradient backend cannot be jax when using numba backend")
+        # WORKAROUND: Disable log likelihood computation for numba backend due to
+        # PyTensor vectorization creating input_bc_patterns that must be literals.
+        # This is a known limitation documented in CLAUDE.md
+        if compute_log_likelihood:
+            import warnings
+
+            warnings.warn(
+                "compute_log_likelihood=True is not supported with numba backend due to "
+                "PyTensor vectorization issues. Please use the JAX backend for log-likelihood "
+                "computation: backend='jax', gradient_backend='jax'",
+                UserWarning,
+                stacklevel=2,
+            )
+            # Disable log likelihood computation and continue with numba
+            compute_log_likelihood = False
         return _compile_pymc_model_numba(
             model=model,
             pymc_initial_point_fn=initial_point_fn,
