@@ -273,14 +273,16 @@ def _compile_pymc_model_numba(
 
     user_data = make_user_data(shared_vars, shared_data)
 
-    logp_shared_names = [var.name for var in logp_fn_pt.get_shared() if var.name is not None]
+    logp_shared_names = [
+        var.name for var in logp_fn_pt.get_shared() if var.name is not None
+    ]
     logp_numba_raw, c_sig = _make_c_logp_func(
         n_dim, logp_fn, user_data, logp_shared_names, shared_data, logp_fn_pt
     )
-    
+
     # Filter out compute_log_likelihood from kwargs for numba compilation
-    numba_kwargs = {k: v for k, v in kwargs.items() if k != 'compute_log_likelihood'}
-    
+    numba_kwargs = {k: v for k, v in kwargs.items() if k != "compute_log_likelihood"}
+
     with warnings.catch_warnings():
         warnings.filterwarnings(
             "ignore",
@@ -290,21 +292,17 @@ def _compile_pymc_model_numba(
 
         logp_numba = numba.cfunc(c_sig, **numba_kwargs)(logp_numba_raw)
 
-    expand_shared_names = [var.name for var in expand_fn_pt.get_shared() if var.name is not None]
-    
-    # Calculate total RNG count when compute_log_likelihood is True
-    total_rng_count = 0
-    if compute_log_likelihood:
-        # Count RNG variables from both logp and expand functions
-        all_shared = set()
-        if logp_fn_pt is not None:
-            all_shared.update(logp_fn_pt.get_shared())
-        if expand_fn_pt is not None:
-            all_shared.update(expand_fn_pt.get_shared())
-        total_rng_count = len([var for var in all_shared if var.name is None])
-    
+    expand_shared_names = [
+        var.name for var in expand_fn_pt.get_shared() if var.name is not None
+    ]
     expand_numba_raw, c_sig_expand = _make_c_expand_func(
-        n_dim, n_expanded, expand_fn, user_data, expand_shared_names, shared_data, expand_fn_pt, total_rng_count
+        n_dim,
+        n_expanded,
+        expand_fn,
+        user_data,
+        expand_shared_names,
+        shared_data,
+        expand_fn_pt,
     )
     with warnings.catch_warnings():
         warnings.filterwarnings(
@@ -318,7 +316,7 @@ def _compile_pymc_model_numba(
     dims, coords = _prepare_dims_and_coords(model, shape_info)
 
     log_likelihood_names, log_likelihood_shapes = log_likelihood_info
-    
+
     return CompiledPyMCModel(
         _n_dim=n_dim,
         dims=dims,
@@ -407,8 +405,12 @@ def _compile_pymc_model_jax(
     logp_fn = logp_fn_pt.vm.jit_fn
     expand_fn = expand_fn_pt.vm.jit_fn
 
-    logp_shared_names = [var.name for var in logp_fn_pt.get_shared() if var.name is not None]
-    expand_shared_names = [var.name for var in expand_fn_pt.get_shared() if var.name is not None]
+    logp_shared_names = [
+        var.name for var in logp_fn_pt.get_shared() if var.name is not None
+    ]
+    expand_shared_names = [
+        var.name for var in expand_fn_pt.get_shared() if var.name is not None
+    ]
 
     if gradient_backend == "jax":
         orig_logp_fn = logp_fn._fun
@@ -802,32 +804,34 @@ def _make_functions(
     log_likelihood_names = []
     log_likelihood_shapes = []
     log_likelihood_vars = []
-    
+
     if compute_log_likelihood:
         for obs in model.observed_RVs:
             obs_name = obs.name
             log_lik_name = f"log_likelihood_{obs_name}"
-            
-            # Get element-wise log-likelihood 
+
+            # Get element-wise log-likelihood
             log_lik_expr = pm.logp(obs, obs)
             log_lik_expr.name = log_lik_name
-            
+
             # Get the shape of the observed variable
             # For observed variables, we need to get the shape from the observed data
-            obs_shape = tuple(obs.shape.eval()) if hasattr(obs.shape, 'eval') else obs.shape
-            
+            obs_shape = (
+                tuple(obs.shape.eval()) if hasattr(obs.shape, "eval") else obs.shape
+            )
+
             log_likelihood_vars.append(log_lik_expr)
             log_likelihood_names.append(log_lik_name)
             log_likelihood_shapes.append(obs_shape)
-            
+
             all_names.append(log_lik_name)
             all_shapes.append(obs_shape)
             length = prod(obs_shape)
             all_slices.append(slice(count, count + length))
             count += length
-        
+
         num_expanded = count
-        
+
         remaining_rvs.extend(log_likelihood_vars)
 
     if join_expanded:
@@ -853,17 +857,14 @@ def _make_functions(
     )
 
 
-def make_extraction_fn(inner, shared_data, shared_vars, record_dtype, pytensor_fn=None, total_rng_count=None):
+def make_extraction_fn(inner, shared_data, shared_vars, record_dtype, pytensor_fn=None):
     import numba
     from numba import literal_unroll
     from numba.cpython.unsafe.tuple import alloca_once, tuple_setitem
 
     if not shared_vars:
         # Check if we have a PyTensor function to get the count of RNG shared variables
-        if total_rng_count is not None:
-            # Use provided RNG count (e.g., when handling multiple PyTensor functions)
-            rng_count = total_rng_count
-        elif pytensor_fn is not None:
+        if pytensor_fn is not None:
             all_shared = pytensor_fn.get_shared()
             rng_count = len([var for var in all_shared if var.name is None])
         else:
@@ -874,49 +875,46 @@ def make_extraction_fn(inner, shared_data, shared_vars, record_dtype, pytensor_f
             # Create a wrapper that provides dummy values for RNG variables
             def make_extract_with_rng_dummy(inner_fn, num_rng):
                 if num_rng == 1:
+
                     @numba.njit(inline="always")
                     def extract_shared(x, user_data_):
                         rng = 0  # Dummy value - RNG state is managed elsewhere
                         return inner_fn(x, rng)
+
                     return extract_shared
                 elif num_rng == 2:
+
                     @numba.njit(inline="always")
                     def extract_shared(x, user_data_):
                         rng1, rng2 = 0, 0  # Dummy values
                         return inner_fn(x, rng1, rng2)
+
                     return extract_shared
                 elif num_rng == 3:
+
                     @numba.njit(inline="always")
                     def extract_shared(x, user_data_):
                         rng1, rng2, rng3 = 0, 0, 0  # Dummy values
                         return inner_fn(x, rng1, rng2, rng3)
+
                     return extract_shared
                 elif num_rng == 4:
+
                     @numba.njit(inline="always")
                     def extract_shared(x, user_data_):
                         rng1, rng2, rng3, rng4 = 0, 0, 0, 0  # Dummy values
                         return inner_fn(x, rng1, rng2, rng3, rng4)
-                    return extract_shared
-                elif num_rng == 5:
-                    @numba.njit(inline="always")
-                    def extract_shared(x, user_data_):
-                        rng1, rng2, rng3, rng4, rng5 = 0, 0, 0, 0, 0  # Dummy values
-                        return inner_fn(x, rng1, rng2, rng3, rng4, rng5)
-                    return extract_shared
-                elif num_rng == 6:
-                    @numba.njit(inline="always")
-                    def extract_shared(x, user_data_):
-                        rng1, rng2, rng3, rng4, rng5, rng6 = 0, 0, 0, 0, 0, 0  # Dummy values
-                        return inner_fn(x, rng1, rng2, rng3, rng4, rng5, rng6)
+
                     return extract_shared
                 else:
-                    # For higher counts, create a tuple of zeros
+                    # Fallback for other counts - try 2 RNGs as default
                     @numba.njit(inline="always")
                     def extract_shared(x, user_data_):
-                        rng_tuple = tuple(0 for _ in range(num_rng))
-                        return inner_fn(x, *rng_tuple)
+                        rng1, rng2 = 0, 0  # Dummy values
+                        return inner_fn(x, rng1, rng2)
+
                     return extract_shared
-            
+
             extract_shared = make_extract_with_rng_dummy(inner, rng_count)
         else:
             # No shared variables expected at all
@@ -1010,10 +1008,14 @@ def make_extraction_fn(inner, shared_data, shared_vars, record_dtype, pytensor_f
     return extract_shared
 
 
-def _make_c_logp_func(n_dim, logp_fn, user_data, shared_logp, shared_data, logp_fn_pt=None):
+def _make_c_logp_func(
+    n_dim, logp_fn, user_data, shared_logp, shared_data, logp_fn_pt=None
+):
     import numba
 
-    extract = make_extraction_fn(logp_fn, shared_data, shared_logp, user_data.dtype, logp_fn_pt)
+    extract = make_extraction_fn(
+        logp_fn, shared_data, shared_logp, user_data.dtype, logp_fn_pt
+    )
 
     c_sig = numba.types.int64(
         numba.types.uint64,
@@ -1050,12 +1052,13 @@ def _make_c_logp_func(n_dim, logp_fn, user_data, shared_logp, shared_data, logp_
 
 
 def _make_c_expand_func(
-    n_dim, n_expanded, expand_fn, user_data, shared_vars, shared_data, expand_fn_pt=None, total_rng_count=0
+    n_dim, n_expanded, expand_fn, user_data, shared_vars, shared_data, expand_fn_pt=None
 ):
     import numba
-    import numpy as np
 
-    extract = make_extraction_fn(expand_fn, shared_data, shared_vars, user_data.dtype, expand_fn_pt, total_rng_count)
+    extract = make_extraction_fn(
+        expand_fn, shared_data, shared_vars, user_data.dtype, expand_fn_pt
+    )
 
     c_sig = numba.types.int64(
         numba.types.uint64,
