@@ -56,9 +56,6 @@ def test_log_likelihood_compilation_disabled():
 
 
 @pytest.mark.pymc
-@pytest.mark.xfail(
-    reason="Log-likelihood computation currently has RNG compatibility issues with JAX backend"
-)
 def test_log_likelihood_basic_sampling_jax():
     """Test basic sampling with log-likelihood calculation using JAX backend."""
     np.random.seed(42)
@@ -93,9 +90,6 @@ def test_log_likelihood_basic_sampling_jax():
 
 
 @pytest.mark.pymc
-@pytest.mark.xfail(
-    reason="Log-likelihood computation currently has RNG compatibility issues with JAX backend"
-)
 def test_log_likelihood_multiple_observed_jax():
     """Test log-likelihood calculation with multiple observed variables using JAX backend."""
     np.random.seed(42)
@@ -139,9 +133,6 @@ def test_log_likelihood_multiple_observed_jax():
 
 
 @pytest.mark.pymc
-@pytest.mark.xfail(
-    reason="Log-likelihood computation currently has RNG compatibility issues with JAX backend"
-)
 def test_log_likelihood_scalar_observed_jax():
     """Test log-likelihood calculation with scalar observed variable using JAX backend."""
     np.random.seed(42)

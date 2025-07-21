@@ -412,10 +412,20 @@ def _compile_pymc_model_jax(
         var.name for var in expand_fn_pt.get_shared() if var.name is not None
     ]
 
+    logp_rng_count = len([var for var in logp_fn_pt.get_shared() if var.name is None])
+    expand_rng_count = len(
+        [var for var in expand_fn_pt.get_shared() if var.name is None]
+    )
+
     if gradient_backend == "jax":
         orig_logp_fn = logp_fn._fun
 
         def logp_fn_jax_grad(x, *shared):
+            if len(shared) < logp_rng_count:
+                rng_dummies = [
+                    {"jax_state": jax.random.key(i)} for i in range(logp_rng_count)
+                ]
+                shared = shared + tuple(rng_dummies)
             return jax.value_and_grad(lambda x: orig_logp_fn(x, *shared)[0])(x)
 
         # static_argnums = list(range(1, len(logp_shared_names) + 1))
@@ -443,7 +453,9 @@ def _compile_pymc_model_jax(
 
     def make_logp_func():
         def logp(_x, **shared):
-            logp, grad = logp_fn(_x, *[shared[name] for name in logp_shared_names])
+            named_shared = [shared[name] for name in logp_shared_names]
+            rng_dummies = [{"jax_state": jax.random.key(0)}] * logp_rng_count
+            logp, grad = logp_fn(_x, *(named_shared + rng_dummies))
             return float(logp), np.asarray(grad, dtype="float64", order="C")
 
         return logp
@@ -455,7 +467,12 @@ def _compile_pymc_model_jax(
     def make_expand_func(seed1, seed2, chain):
         # TODO handle seeds
         def expand(_x, **shared):
-            values = expand_fn(_x, *[shared[name] for name in expand_shared_names])
+            named_shared = [shared[name] for name in expand_shared_names]
+            rng_dummies = [
+                {"jax_state": jax.random.key(i)} for i in range(expand_rng_count)
+            ]
+            all_outputs = expand_fn(_x, *(named_shared + rng_dummies))
+            values = all_outputs[: len(names)]
             return {
                 name: np.asarray(val, order="C", dtype=dtype).ravel()
                 for name, val, dtype in zip(names, values, dtypes, strict=True)
