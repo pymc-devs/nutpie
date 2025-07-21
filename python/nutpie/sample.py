@@ -54,13 +54,18 @@ class CompiledModel:
         return pd.concat(times)
 
 
-def _trace_to_arviz(traces, n_tune, shapes, **kwargs):
+def _trace_to_arviz(traces, n_tune, shapes, log_likelihood_names=None, **kwargs):
     n_chains = len(traces)
 
     data_dict = {}
     data_dict_tune = {}
+    log_likelihood_dict = {}
+    log_likelihood_dict_tune = {}
     stats_dict = {}
     stats_dict_tune = {}
+
+    if log_likelihood_names is None:
+        log_likelihood_names = []
 
     draw_batches = []
     stats_batches = []
@@ -85,8 +90,13 @@ def _trace_to_arviz(traces, n_tune, shapes, **kwargs):
                 (len(chunk),) + shapes[name]
             )
 
-        data_dict[name] = data[:, n_tune:]
-        data_dict_tune[name] = data[:, :n_tune]
+        # Separate log-likelihood variables from main data
+        if name in log_likelihood_names:
+            log_likelihood_dict[name] = data[:, n_tune:]
+            log_likelihood_dict_tune[name] = data[:, :n_tune]
+        else:
+            data_dict[name] = data[:, n_tune:]
+            data_dict_tune[name] = data[:, :n_tune]
 
     for name, col in zip(table_stats.column_names, table_stats.columns):
         if name in ["chain", "draw", "divergence_message"]:
@@ -116,12 +126,19 @@ def _trace_to_arviz(traces, n_tune, shapes, **kwargs):
             stats_dict[name] = data[:, n_tune:]
             stats_dict_tune[name] = data[:, :n_tune]
 
+    # Pass log_likelihood data to arviz.from_dict if present
+    kwargs_with_log_likelihood = kwargs.copy()
+    if log_likelihood_dict:
+        kwargs_with_log_likelihood["log_likelihood"] = log_likelihood_dict
+    if log_likelihood_dict_tune:
+        kwargs_with_log_likelihood["warmup_log_likelihood"] = log_likelihood_dict_tune
+
     return arviz.from_dict(
         data_dict,
         sample_stats=stats_dict,
         warmup_posterior=data_dict_tune,
         warmup_sample_stats=stats_dict_tune,
-        **kwargs,
+        **kwargs_with_log_likelihood,
     )
 
 
@@ -478,10 +495,12 @@ class _BackgroundSampler:
         if self._return_raw_trace:
             return results
         else:
+            log_likelihood_names = getattr(self._compiled_model, 'log_likelihood_names', [])
             return _trace_to_arviz(
                 results,
                 self._settings.num_tune,
                 self._compiled_model.shapes,
+                log_likelihood_names=log_likelihood_names,
                 dims=dims,
                 coords={
                     name: pd.Index(vals)
