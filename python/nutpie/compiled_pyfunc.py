@@ -1,12 +1,13 @@
 import dataclasses
 from dataclasses import dataclass
-from functools import partial
+from functools import partial, wraps
 from typing import Any, Callable
 
 import numpy as np
 
 from nutpie import _lib  # type: ignore
 from nutpie.sample import CompiledModel
+from nutpie.transform_adapter import make_transform_adapter
 
 SeedType = int
 
@@ -44,6 +45,7 @@ class PyFuncModel(CompiledModel):
         updated.update(**updates)
         return dataclasses.replace(self, _shared_data=updated)
 
+    @wraps(make_transform_adapter)
     def with_transform_adapt(self, **kwargs):
         return dataclasses.replace(self, _transform_adapt_args=kwargs)
 
@@ -71,8 +73,6 @@ class PyFuncModel(CompiledModel):
                 outer_kwargs = {}
 
             def make_adapter(*args, **kwargs):
-                from nutpie.transform_adapter import make_transform_adapter
-
                 return make_transform_adapter(**outer_kwargs)(
                     *args, **kwargs, logp_fn=self._raw_logp_fn
                 )
