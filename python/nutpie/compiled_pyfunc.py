@@ -7,7 +7,20 @@ import numpy as np
 
 from nutpie import _lib  # type: ignore
 from nutpie.sample import CompiledModel
-from nutpie.transform_adapter import make_transform_adapter
+
+from importlib.util import find_spec
+
+# importing from transform_adapter requires flowjax to be installed, which will not be the case for
+# all users. If it's not present, the user can't access the with_transform_adapt method anyway, so we can
+# use a dummy function so the docstring wrapper is always valid.
+if find_spec("flowjax") is not None:
+    from nutpie.transform_adapter import make_transform_adapter
+else:
+
+    def make_transform_adapter(*args, **kwargs):
+        """Normalizing flow adaption not available. Install flowjax to use."""
+        pass
+
 
 SeedType = int
 
