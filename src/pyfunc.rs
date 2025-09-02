@@ -123,7 +123,7 @@ impl LogpError for PyLogpError {
     fn is_recoverable(&self) -> bool {
         match self {
             Self::BadLogp(_) => true,
-            Self::PyError(err) => Python::with_gil(|py| {
+            Self::PyError(err) => Python::attach(|py| {
                 let Ok(attr) = err.value(py).getattr("is_recoverable") else {
                     return false;
                 };
@@ -149,7 +149,7 @@ impl PyDensity {
         dim: usize,
         transform_adapter: Option<&PyTransformAdapt>,
     ) -> Result<Self> {
-        let logp_func = Python::with_gil(|py| logp_clone_func.call0(py))?;
+        let logp_func = Python::attach(|py| logp_clone_func.call0(py))?;
         let transform_adapter = transform_adapter.cloned();
         Ok(Self {
             logp: logp_func,
@@ -164,7 +164,7 @@ impl CpuLogpFunc for PyDensity {
     type TransformParams = Py<PyAny>;
 
     fn logp(&mut self, position: &[f64], grad: &mut [f64]) -> Result<f64, Self::LogpError> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let pos_array = PyArray1::from_slice(py, position);
             let result = self.logp.call1(py, (pos_array,));
             match result {
@@ -321,7 +321,7 @@ impl PyTrace {
     ) -> Result<Self> {
         let seed1 = rng.next_u64();
         let seed2 = rng.next_u64();
-        let expand = Python::with_gil(|py| {
+        let expand = Python::attach(|py| {
             make_expand_func
                 .call1(py, (seed1, seed2, chain))
                 .context("Failed to call expand function factory")
@@ -449,7 +449,7 @@ impl ExpandDtype {
 
 impl DrawStorage for PyTrace {
     fn append_value(&mut self, point: &[f64]) -> Result<()> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let point = PyArray1::from_slice(py, point);
             let full_point = self
                 .expand
@@ -647,7 +647,7 @@ impl Model for PyModel {
 
         let seed = rng.next_u64();
 
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let init_point = init_func
                 .call1(py, (seed,))
                 .context("Failed to initialize point")?;
