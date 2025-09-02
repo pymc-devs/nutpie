@@ -543,7 +543,10 @@ impl PyNutsSettings {
     }
 
     #[setter(mass_matrix_eigval_cutoff)]
-    fn set_mass_matrix_eigval_cutoff(&mut self, val: f64) -> Result<()> {
+    fn set_mass_matrix_eigval_cutoff(&mut self, val: Option<f64>) -> Result<()> {
+        let Some(val) = val else {
+            return Ok(());
+        };
         match &mut self.inner {
             Settings::LowRank(inner) => inner.adapt_options.mass_matrix_options.eigval_cutoff = val,
             Settings::Diag(_) => {
@@ -570,7 +573,10 @@ impl PyNutsSettings {
     }
 
     #[setter(mass_matrix_gamma)]
-    fn set_mass_matrix_gamma(&mut self, val: f64) -> Result<()> {
+    fn set_mass_matrix_gamma(&mut self, val: Option<f64>) -> Result<()> {
+        let Some(val) = val else {
+            return Ok(());
+        };
         match &mut self.inner {
             Settings::LowRank(inner) => {
                 inner.adapt_options.mass_matrix_options.gamma = val;
