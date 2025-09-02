@@ -1392,7 +1392,7 @@ impl PyTransformAdapt {
 }
 
 /// A Python module implemented in Rust.
-#[pymodule]
+#[pymodule(gil_used = false)]
 pub fn _lib(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySampler>()?;
     m.add_class::<PyMcModel>()?;
