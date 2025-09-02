@@ -910,7 +910,7 @@ impl PySampler {
     }
 
     fn is_finished(&mut self, py: Python<'_>) -> PyResult<bool> {
-        py.allow_threads(|| {
+        py.detach(|| {
             let guard = &mut self.0.lock().expect("Poisond sampler state mutex");
             let slot = guard.deref_mut();
 
@@ -939,7 +939,7 @@ impl PySampler {
     }
 
     fn pause(&mut self, py: Python<'_>) -> PyResult<()> {
-        py.allow_threads(|| {
+        py.detach(|| {
             if let SamplerState::Running(ref mut control) = self
                 .0
                 .lock()
@@ -953,7 +953,7 @@ impl PySampler {
     }
 
     fn resume(&mut self, py: Python<'_>) -> PyResult<()> {
-        py.allow_threads(|| {
+        py.detach(|| {
             if let SamplerState::Running(ref mut control) = self
                 .0
                 .lock()
@@ -968,7 +968,7 @@ impl PySampler {
 
     #[pyo3(signature = (timeout_seconds=None))]
     fn wait(&mut self, py: Python<'_>, timeout_seconds: Option<f64>) -> PyResult<()> {
-        py.allow_threads(|| {
+        py.detach(|| {
             let guard = &mut self.0.lock().expect("Poisond sampler state mutex");
             let slot = guard.deref_mut();
 
@@ -1016,7 +1016,7 @@ impl PySampler {
                     }
                 }
 
-                if let Err(err) = Python::with_gil(|py| py.check_signals()) {
+                if let Err(err) = Python::attach(|py| py.check_signals()) {
                     break (SamplerState::Running(control), Err(err));
                 }
             };
@@ -1027,7 +1027,7 @@ impl PySampler {
     }
 
     fn abort(&mut self, py: Python<'_>) -> PyResult<()> {
-        py.allow_threads(|| {
+        py.detach(|| {
             let guard = &mut self.0.lock().expect("Poisond sampler state mutex");
             let slot = guard.deref_mut();
 
@@ -1074,7 +1074,7 @@ impl PySampler {
     }
 
     fn inspect<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        let trace = py.allow_threads(|| {
+        let trace = py.detach(|| {
             let mut guard = self.0.lock().unwrap();
             let SamplerState::Running(ref mut sampler) = guard.deref_mut() else {
                 return Err(anyhow::anyhow!("Sampler is not running"))?;
@@ -1107,7 +1107,7 @@ fn trace_to_list(trace: Trace, py: Python<'_>) -> PyResult<Bound<'_, PyList>> {
     Ok(list)
 }
 
-fn export_array(py: Python<'_>, data: Arc<dyn Array>) -> PyResult<PyObject> {
+fn export_array(py: Python<'_>, data: Arc<dyn Array>) -> PyResult<Py<PyAny>> {
     let pa = py.import("pyarrow")?;
     let array = pa.getattr("Array")?;
 
@@ -1148,7 +1148,7 @@ impl PyTransformAdapt {
         transformed_position: &mut [f64],
         transformed_gradient: &mut [f64],
     ) -> Result<f64> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let untransformed_position = PyArray1::from_slice(py, untransformed_position);
             let untransformed_gradient = PyArray1::from_slice(py, untransformed_gradient);
 
@@ -1203,7 +1203,7 @@ impl PyTransformAdapt {
         transformed_position: &[f64],
         transformed_gradient: &mut [f64],
     ) -> Result<(f64, f64)> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let transformed_position = PyArray1::from_slice(py, transformed_position);
 
             let output = params
@@ -1236,7 +1236,7 @@ impl PyTransformAdapt {
         untransformed_position: &mut [f64],
         transformed_position: &[f64],
     ) -> Result<Py<PyAny>> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let transformed_position = PyArray1::from_slice(py, transformed_position);
 
             let output = params
@@ -1257,7 +1257,7 @@ impl PyTransformAdapt {
         untransformed_gradient: &[f64],
         transformed_gradient: &mut [f64],
     ) -> Result<f64> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let untransformed_gradient = PyArray1::from_slice(py, untransformed_gradient);
 
             let output = params
@@ -1279,7 +1279,7 @@ impl PyTransformAdapt {
         transformed_position: &mut [f64],
         transformed_gradient: &mut [f64],
     ) -> Result<(f64, f64)> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let untransformed_position = PyArray1::from_slice(py, untransformed_position);
 
             let output = params
@@ -1318,7 +1318,7 @@ impl PyTransformAdapt {
         untransformed_logp: impl ExactSizeIterator<Item = &'a f64>,
         params: &'a mut Py<PyAny>,
     ) -> Result<()> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let positions = PyList::new(
                 py,
                 untransformed_positions.map(|pos| PyArray1::from_slice(py, pos)),
@@ -1345,7 +1345,7 @@ impl PyTransformAdapt {
         untransformed_gradient: &[f64],
         chain: u64,
     ) -> Result<Py<PyAny>> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let position = PyArray1::from_slice(py, untransformed_position);
             let gradient = PyArray1::from_slice(py, untransformed_gradient);
 
@@ -1358,7 +1358,7 @@ impl PyTransformAdapt {
     }
 
     pub fn transformation_id(&self, params: &Py<PyAny>) -> Result<i64> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let id: i64 = params
                 .getattr(py, intern!(py, "transformation_id"))?
                 .extract(py)?;

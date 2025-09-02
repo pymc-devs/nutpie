@@ -12,7 +12,7 @@ use nuts_rs::{CpuLogpFunc, CpuMath, DrawStorage, LogpError, Model, Settings};
 use pyo3::{
     pyclass, pymethods,
     types::{PyAnyMethods, PyList},
-    Bound, Py, PyAny, PyObject, PyResult, Python,
+    Bound, Py, PyAny, PyResult, Python,
 };
 
 use rand_distr::num_traits::CheckedEuclid;
@@ -40,7 +40,7 @@ type RawExpandFunc = unsafe extern "C" fn(
 #[derive(Clone)]
 pub(crate) struct LogpFunc {
     func: RawLogpFunc,
-    _keep_alive: Arc<PyObject>,
+    _keep_alive: Arc<Py<PyAny>>,
     user_data_ptr: UserData,
     dim: usize,
 }
@@ -51,7 +51,7 @@ unsafe impl Sync for LogpFunc {}
 #[pymethods]
 impl LogpFunc {
     #[new]
-    fn new(dim: usize, ptr: usize, user_data_ptr: usize, keep_alive: PyObject) -> Self {
+    fn new(dim: usize, ptr: usize, user_data_ptr: usize, keep_alive: Py<PyAny>) -> Self {
         let func =
             unsafe { std::mem::transmute::<*const c_void, RawLogpFunc>(ptr as *const c_void) };
         Self {
@@ -67,7 +67,7 @@ impl LogpFunc {
 #[derive(Clone)]
 pub(crate) struct ExpandFunc {
     func: RawExpandFunc,
-    _keep_alive: Arc<PyObject>,
+    _keep_alive: Arc<Py<PyAny>>,
     user_data_ptr: UserData,
     dim: usize,
     expanded_dim: usize,
@@ -81,7 +81,7 @@ impl ExpandFunc {
         expanded_dim: usize,
         ptr: usize,
         user_data_ptr: usize,
-        keep_alive: PyObject,
+        keep_alive: Py<PyAny>,
     ) -> Self {
         let func =
             unsafe { std::mem::transmute::<*const c_void, RawExpandFunc>(ptr as *const c_void) };
@@ -306,7 +306,7 @@ impl Model for PyMcModel {
     ) -> Result<()> {
         let seed = rng.next_u64();
 
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let init_point = self
                 .init_func
                 .call1(py, (seed,))
