@@ -17,7 +17,7 @@ use arrow::array::Array;
 use numpy::{PyArray1, PyReadonlyArray1};
 use nuts_rs::{
     ChainProgress, DiagGradNutsSettings, LowRankNutsSettings, ProgressCallback, Sampler,
-    SamplerWaitResult, Trace, TransformedNutsSettings,
+    SamplerWaitResult, StepSizeAdaptMethod, Trace, TransformedNutsSettings,
 };
 use pyo3::{
     exceptions::PyTimeoutError,
@@ -276,22 +276,13 @@ impl PyNutsSettings {
     fn initial_step(&self) -> f64 {
         match &self.inner {
             Settings::Diag(nuts_settings) => {
-                nuts_settings
-                    .adapt_options
-                    .dual_average_options
-                    .initial_step
+                nuts_settings.adapt_options.step_size_settings.initial_step
             }
             Settings::LowRank(nuts_settings) => {
-                nuts_settings
-                    .adapt_options
-                    .dual_average_options
-                    .initial_step
+                nuts_settings.adapt_options.step_size_settings.initial_step
             }
             Settings::Transforming(nuts_settings) => {
-                nuts_settings
-                    .adapt_options
-                    .dual_average_options
-                    .initial_step
+                nuts_settings.adapt_options.step_size_settings.initial_step
             }
         }
     }
@@ -300,22 +291,13 @@ impl PyNutsSettings {
     fn set_initial_step(&mut self, val: f64) {
         match &mut self.inner {
             Settings::Diag(nuts_settings) => {
-                nuts_settings
-                    .adapt_options
-                    .dual_average_options
-                    .initial_step = val;
+                nuts_settings.adapt_options.step_size_settings.initial_step = val;
             }
             Settings::LowRank(nuts_settings) => {
-                nuts_settings
-                    .adapt_options
-                    .dual_average_options
-                    .initial_step = val;
+                nuts_settings.adapt_options.step_size_settings.initial_step = val;
             }
             Settings::Transforming(nuts_settings) => {
-                nuts_settings
-                    .adapt_options
-                    .dual_average_options
-                    .initial_step = val;
+                nuts_settings.adapt_options.step_size_settings.initial_step = val;
             }
         }
     }
@@ -414,22 +396,13 @@ impl PyNutsSettings {
     fn set_target_accept(&self) -> f64 {
         match &self.inner {
             Settings::Diag(nuts_settings) => {
-                nuts_settings
-                    .adapt_options
-                    .dual_average_options
-                    .target_accept
+                nuts_settings.adapt_options.step_size_settings.target_accept
             }
             Settings::LowRank(nuts_settings) => {
-                nuts_settings
-                    .adapt_options
-                    .dual_average_options
-                    .target_accept
+                nuts_settings.adapt_options.step_size_settings.target_accept
             }
             Settings::Transforming(nuts_settings) => {
-                nuts_settings
-                    .adapt_options
-                    .dual_average_options
-                    .target_accept
+                nuts_settings.adapt_options.step_size_settings.target_accept
             }
         }
     }
@@ -438,22 +411,13 @@ impl PyNutsSettings {
     fn target_accept(&mut self, val: f64) {
         match &mut self.inner {
             Settings::Diag(nuts_settings) => {
-                nuts_settings
-                    .adapt_options
-                    .dual_average_options
-                    .target_accept = val
+                nuts_settings.adapt_options.step_size_settings.target_accept = val
             }
             Settings::LowRank(nuts_settings) => {
-                nuts_settings
-                    .adapt_options
-                    .dual_average_options
-                    .target_accept = val
+                nuts_settings.adapt_options.step_size_settings.target_accept = val
             }
             Settings::Transforming(nuts_settings) => {
-                nuts_settings
-                    .adapt_options
-                    .dual_average_options
-                    .target_accept = val
+                nuts_settings.adapt_options.step_size_settings.target_accept = val
             }
         }
     }
@@ -652,6 +616,146 @@ impl PyNutsSettings {
                 inner.check_turning = val;
             }
         }
+        Ok(())
+    }
+
+    #[getter]
+    fn step_size_adapt_method(&self) -> String {
+        let method = match &self.inner {
+            Settings::LowRank(inner) => inner.adapt_options.step_size_settings.adapt_options.method,
+            Settings::Diag(inner) => inner.adapt_options.step_size_settings.adapt_options.method,
+            Settings::Transforming(inner) => {
+                inner.adapt_options.step_size_settings.adapt_options.method
+            }
+        };
+
+        match method {
+            nuts_rs::StepSizeAdaptMethod::DualAverage => "dual_average",
+            nuts_rs::StepSizeAdaptMethod::Adam => "adam",
+            nuts_rs::StepSizeAdaptMethod::Fixed(_) => "fixed",
+        }
+        .to_string()
+    }
+
+    #[setter(step_size_adapt_method)]
+    fn set_step_size_adapt_method(&mut self, method: Py<PyAny>) -> Result<()> {
+        let method = Python::with_gil(|py| {
+            if let Ok(method) = method.extract::<String>(py) {
+                match method.as_str() {
+                    "dual_average" => Ok(StepSizeAdaptMethod::DualAverage),
+                    "adam" => Ok(StepSizeAdaptMethod::Adam),
+                    _ => {
+                        if let Ok(step_size) = method.parse::<f64>() {
+                            Ok(StepSizeAdaptMethod::Fixed(step_size))
+                        } else {
+                            bail!("step_size_adapt_method must be a positive float when using fixed step size");
+                        }
+                    }
+                }
+            } else {
+                bail!("step_size_adapt_method must be a string");
+            }
+        })?;
+
+        match &mut self.inner {
+            Settings::LowRank(inner) => {
+                inner.adapt_options.step_size_settings.adapt_options.method = method
+            }
+            Settings::Diag(inner) => {
+                inner.adapt_options.step_size_settings.adapt_options.method = method
+            }
+            Settings::Transforming(inner) => {
+                inner.adapt_options.step_size_settings.adapt_options.method = method
+            }
+        };
+        Ok(())
+    }
+
+    #[getter]
+    fn step_size_adam_learning_rate(&self) -> Option<f64> {
+        match &self.inner {
+            Settings::LowRank(inner) => {
+                if let StepSizeAdaptMethod::Adam =
+                    inner.adapt_options.step_size_settings.adapt_options.method
+                {
+                    Some(
+                        inner
+                            .adapt_options
+                            .step_size_settings
+                            .adapt_options
+                            .adam
+                            .learning_rate,
+                    )
+                } else {
+                    None
+                }
+            }
+            Settings::Diag(inner) => {
+                if let StepSizeAdaptMethod::Adam =
+                    inner.adapt_options.step_size_settings.adapt_options.method
+                {
+                    Some(
+                        inner
+                            .adapt_options
+                            .step_size_settings
+                            .adapt_options
+                            .adam
+                            .learning_rate,
+                    )
+                } else {
+                    None
+                }
+            }
+            Settings::Transforming(inner) => {
+                if let StepSizeAdaptMethod::Adam =
+                    inner.adapt_options.step_size_settings.adapt_options.method
+                {
+                    Some(
+                        inner
+                            .adapt_options
+                            .step_size_settings
+                            .adapt_options
+                            .adam
+                            .learning_rate,
+                    )
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    #[setter(step_size_adam_learning_rate)]
+    fn set_step_size_adam_learning_rate(&mut self, val: Option<f64>) -> Result<()> {
+        let Some(val) = val else {
+            return Ok(());
+        };
+        match &mut self.inner {
+            Settings::LowRank(inner) => {
+                inner
+                    .adapt_options
+                    .step_size_settings
+                    .adapt_options
+                    .adam
+                    .learning_rate = val
+            }
+            Settings::Diag(inner) => {
+                inner
+                    .adapt_options
+                    .step_size_settings
+                    .adapt_options
+                    .adam
+                    .learning_rate = val
+            }
+            Settings::Transforming(inner) => {
+                inner
+                    .adapt_options
+                    .step_size_settings
+                    .adapt_options
+                    .adam
+                    .learning_rate = val
+            }
+        };
         Ok(())
     }
 }
