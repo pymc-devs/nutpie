@@ -321,6 +321,24 @@ impl PyNutsSettings {
     }
 
     #[getter]
+    fn mindepth(&self) -> u64 {
+        match &self.inner {
+            Settings::Diag(nuts_settings) => nuts_settings.mindepth,
+            Settings::LowRank(nuts_settings) => nuts_settings.mindepth,
+            Settings::Transforming(nuts_settings) => nuts_settings.mindepth,
+        }
+    }
+
+    #[setter(maxdepth)]
+    fn set_mindepth(&mut self, val: u64) {
+        match &mut self.inner {
+            Settings::Diag(nuts_settings) => nuts_settings.mindepth = val,
+            Settings::LowRank(nuts_settings) => nuts_settings.mindepth = val,
+            Settings::Transforming(nuts_settings) => nuts_settings.mindepth = val,
+        }
+    }
+
+    #[getter]
     fn store_gradient(&self) -> bool {
         match &self.inner {
             Settings::Diag(nuts_settings) => nuts_settings.store_gradient,
