@@ -17,6 +17,7 @@ classifiers = [
 
 dependencies = [
   "pyarrow >= 12.0.0",
+  "arro3-core >= 0.6.0",
   "pandas >= 2.0",
   "xarray >= 2025.01.2",
   "arviz >= 0.20.0",
@@ -28,12 +29,12 @@ Homepage = "https://pymc-devs.github.io/nutpie/"
 Repository = "https://github.com/pymc-devs/nutpie"
 
 [project.optional-dependencies]
-stan = ["bridgestan >= 2.6.1", "stanio >= 0.5.1"]
+stan = ["bridgestan >= 2.7.0", "stanio >= 0.5.1"]
 pymc = ["pymc >= 5.20.1", "numba >= 0.60.0"]
 pymc-jax = ["pymc >= 5.20.1", "jax >= 0.4.27"]
 nnflow = ["flowjax >= 17.1.0", "equinox >= 0.11.12"]
 dev = [
-  "bridgestan >= 2.6.1",
+  "bridgestan >= 2.7.0",
   "stanio >= 0.5.1",
   "pymc >= 5.20.1",
   "numba >= 0.60.0",
@@ -44,7 +45,7 @@ dev = [
   "pytest-arraydiff",
 ]
 all = [
-  "bridgestan >= 2.6.1",
+  "bridgestan >= 2.7.0",
   "stanio >= 0.5.1",
   "pymc >= 5.20.1",
   "numba >= 0.60.0",
@@ -76,7 +77,7 @@ features = ["pyo3/extension-module"]
 
 [tool.pytest.ini_options]
 markers = [
-    "flow: tests for normalizing flows",
-    "stan: tests for Stan models",
-    "pymc: tests for PyMC models",
+  "flow: tests for normalizing flows",
+  "stan: tests for Stan models",
+  "pymc: tests for PyMC models",
 ]

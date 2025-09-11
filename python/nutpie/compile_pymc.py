@@ -111,6 +111,7 @@ class CompiledPyMCModel(CompiledModel):
     _n_dim: int
     _shapes: dict[str, tuple[int, ...]]
     _coords: Optional[dict[str, Any]]
+    _transform_adapt_args: dict | None = None
 
     @property
     def n_dim(self):
@@ -146,13 +147,14 @@ class CompiledPyMCModel(CompiledModel):
             user_data=user_data,
         )
 
-    def _make_sampler(self, settings, init_mean, cores, progress_type):
+    def _make_sampler(self, settings, init_mean, cores, progress_type, store):
         model = self._make_model(init_mean)
         return _lib.PySampler.from_pymc(
             settings,
             cores,
             model,
             progress_type,
+            store,
         )
 
     def _make_model(self, init_mean):
@@ -164,23 +166,45 @@ class CompiledPyMCModel(CompiledModel):
             self,
         )
         logp_fn = _lib.LogpFunc(
-            self.n_dim,
             self.compiled_logp_func.address,
             self.user_data.ctypes.data,
             self,
         )
 
-        var_sizes = [prod(shape) for shape in self.shape_info[2]]
         var_names = self.shape_info[0]
 
+        coords = self._coords.copy() if self._coords is not None else {}
+        dim_sizes = {name: len(vals) for name, vals in coords.items()}
+        dims = self.dims.copy() if self.dims is not None else {}
+        var_types = ["float64"] * len(var_names)
+        var_shapes = self.shape_info[2]
+
+        variables = _lib.PyVariable.new_variables(
+            var_names, var_types, var_shapes, dim_sizes, dims
+        )
+
+        outer_kwargs = self._transform_adapt_args
+        if outer_kwargs is None:
+            outer_kwargs = {}
+
+        def make_adapter(*args, **kwargs):
+            from nutpie.transform_adapter import make_transform_adapter
+
+            return make_transform_adapter(**outer_kwargs)(*args, **kwargs, logp_fn=None)
+
         return _lib.PyMcModel(
-            self.n_dim,
             logp_fn,
             expand_fn,
+            variables,
+            self.n_dim,
+            dim_sizes,
+            coords,
             self.initial_point_func,
-            var_sizes,
-            var_names,
+            make_adapter,
         )
+
+    def with_transform_adapt(self, **kwargs):
+        return dataclasses.replace(self, _transform_adapt_args=kwargs)
 
 
 def update_user_data(user_data, user_data_storage):

@@ -52,13 +52,25 @@ class CompiledStanModel(CompiledModel):
 
             return make_transform_adapter(**outer_kwargs)(*args, **kwargs, logp_fn=None)
 
-        model = _lib.StanModel(self.library, seed, data_json, make_adapter)
+        coords = self._coords
+        if coords is None:
+            coords = {}
+        coords = coords.copy()
+
+        dims = self.dims
+        if dims is None:
+            dims = {}
+        dims = dims.copy()
+        dim_sizes = {name: len(dim) for name, dim in coords.items()}
+
+        model = _lib.StanModel(
+            self.library, dim_sizes, dims, coords, seed, data_json, make_adapter
+        )
         coords = self._coords
         if coords is None:
             coords = {}
         else:
             coords = coords.copy()
-        coords["unconstrained_parameter"] = pd.Index(model.param_unc_names())
 
         return CompiledStanModel(
             _coords=coords,
@@ -93,13 +105,14 @@ class CompiledStanModel(CompiledModel):
             return self.with_data().model
         return self.model
 
-    def _make_sampler(self, settings, init_mean, cores, progress_type):
+    def _make_sampler(self, settings, init_mean, cores, progress_type, store):
         model = self._make_model(init_mean)
         return _lib.PySampler.from_stan(
             settings,
             cores,
             model,
             progress_type,
+            store,
         )
 
     @property

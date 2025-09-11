@@ -1,23 +1,23 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::{ffi::CString, path::PathBuf};
 
-use anyhow::{bail, Context};
-use arrow::array::{Array, FixedSizeListArray, Float64Array, StructArray};
-use arrow::datatypes::{DataType, Field};
+use anyhow::{bail, Context, Result};
 use bridgestan::open_library;
-use itertools::{izip, Itertools};
-use nuts_rs::{CpuLogpFunc, CpuMath, DrawStorage, LogpError, Model, Settings};
+use itertools::Itertools;
+use nuts_rs::{CpuLogpFunc, CpuMath, HasDims, LogpError, Model, Storable, Value};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 use pyo3::{exceptions::PyValueError, pyclass, pymethods, PyResult};
 use rand::prelude::Distribution;
-use rand::{rng, RngCore};
+use rand::{rng, Rng, RngCore};
 use rand_distr::StandardNormal;
 use smallvec::{SmallVec, ToSmallVec};
 
 use thiserror::Error;
 
+use crate::common::{ItemType, PyValue, PyVariable};
 use crate::wrapper::PyTransformAdapt;
 
 type InnerModel = bridgestan::Model<Arc<bridgestan::StanLibrary>>;
@@ -79,13 +79,22 @@ impl StanVariable {
 #[pyclass]
 #[derive(Clone)]
 pub struct StanModel {
-    model: Arc<InnerModel>,
-    variables: Vec<Parameter>,
+    inner: Arc<InnerModel>,
+    variables: Vec<PyVariable>,
     transform_adapter: Option<PyTransformAdapt>,
+    dim_sizes: HashMap<String, u64>,
+    coords: HashMap<String, Value>,
+    #[pyo3(get)]
+    dims: HashMap<String, Vec<String>>,
+    unc_names: Value,
 }
 
 /// Return meta information about the constrained parameters of the model
-fn params(var_string: &str) -> anyhow::Result<Vec<Parameter>> {
+fn params(
+    var_string: &str,
+    all_dims: &mut HashMap<String, Vec<String>>,
+    dim_sizes: &mut HashMap<String, u64>,
+) -> anyhow::Result<Vec<PyVariable>> {
     if var_string.is_empty() {
         return Ok(vec![]);
     }
@@ -143,35 +152,38 @@ fn params(var_string: &str) -> anyhow::Result<Vec<Parameter>> {
             .context(format!("Error while parsing stan variable {name}"))?;
 
         // Calculate total size of this variable
-        let size = shape.iter().product();
+        let size: usize = shape.iter().product();
         let mut end_idx = start_idx + size;
 
         // Create Parameter objects (one for real and one for imag if complex)
         if is_complex {
-            variables.push(Parameter {
-                name: format!("{name}.real"),
-                shape: shape.clone(),
-                size,
-                start_idx,
-                end_idx,
-            });
+            variables.push(PyVariable::new(
+                format!("{name}.real"),
+                ItemType(nuts_rs::ItemType::F64),
+                Some(shape.iter().map(|&d| d as u64).collect()),
+                all_dims,
+                dim_sizes,
+                Some(start_idx),
+            )?);
             start_idx = end_idx;
             end_idx = start_idx + size;
-            variables.push(Parameter {
-                name: format!("{name}.imag"),
-                shape,
-                size,
-                start_idx,
-                end_idx,
-            });
+            variables.push(PyVariable::new(
+                format!("{name}.imag"),
+                ItemType(nuts_rs::ItemType::F64),
+                Some(shape.iter().map(|&d| d as u64).collect()),
+                all_dims,
+                dim_sizes,
+                Some(start_idx),
+            )?);
         } else {
-            variables.push(Parameter {
-                name: name.to_string(),
-                shape,
-                size,
-                start_idx,
-                end_idx,
-            });
+            variables.push(PyVariable::new(
+                name.to_string(),
+                ItemType(nuts_rs::ItemType::F64),
+                Some(shape.iter().map(|&d| d as u64).collect()),
+                all_dims,
+                dim_sizes,
+                Some(start_idx),
+            )?);
         }
 
         // Move to the next variable
@@ -240,29 +252,85 @@ where
 #[pymethods]
 impl StanModel {
     #[new]
-    #[pyo3(signature = (lib, seed=None, data=None, transform_adapter=None))]
+    #[pyo3(signature = (lib, dim_sizes, dims, coords, seed=None, data=None, transform_adapter=None))]
     pub fn new(
+        py: Python<'_>,
         lib: StanLibrary,
+        dim_sizes: Py<PyDict>,
+        dims: Py<PyDict>,
+        coords: Py<PyDict>,
         seed: Option<u32>,
         data: Option<String>,
         transform_adapter: Option<Py<PyAny>>,
     ) -> anyhow::Result<Self> {
+        let mut dim_sizes = dim_sizes
+            .bind(py)
+            .iter()
+            .map(|(key, value)| {
+                let key: String = key.extract().context("Dimension key is not a string")?;
+                let value: u64 = value
+                    .extract()
+                    .context("Dimension size value is not an integer")?;
+                Ok((key, value))
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
+
+        let mut dims = dims
+            .bind(py)
+            .iter()
+            .map(|(key, value)| {
+                let key: String = key.extract().context("Dimension key is not a string")?;
+                let value: Vec<String> = value
+                    .extract()
+                    .context("Dimension value is not a list of strings")?;
+                Ok((key, value))
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
+
+        let coords = coords
+            .bind(py)
+            .iter()
+            .map(|(key, value)| {
+                let key: String = key.extract().context("Coordinate key is not a string")?;
+                let value: PyValue = value
+                    .extract()
+                    .context("Coordinate value has incorrect type")?;
+                Ok((key, value.into_value()))
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
+
         let seed = match seed {
             Some(seed) => seed,
             None => rng().next_u32(),
         };
         let data: Option<CString> = data.map(CString::new).transpose()?;
-        let model = Arc::new(
-            bridgestan::Model::new(lib.0, data.as_ref(), seed).map_err(anyhow::Error::new)?,
-        );
+        let mut model =
+            bridgestan::Model::new(lib.0, data.as_ref(), seed).map_err(anyhow::Error::new)?;
+
+        // TODO: bridgestan should not require mut self here
+        let names = model.param_unc_names();
+        let mut names: Vec<_> = names.split(',').map(|v| v.to_string()).collect();
+        if let Some(first) = names.first() {
+            if first.is_empty() {
+                names = vec![];
+            }
+        };
+        let unc_names = Value::Strings(names);
+
+        let model = Arc::new(model);
 
         let var_string = model.param_names(true, true);
-        let variables = params(var_string)?;
+        let variables = params(var_string, &mut dims, &mut dim_sizes)?;
         let transform_adapter = transform_adapter.map(PyTransformAdapt::new);
+
         Ok(StanModel {
-            model,
+            inner: model,
             variables,
             transform_adapter,
+            dim_sizes,
+            coords,
+            dims,
+            unc_names,
         })
     }
 
@@ -271,29 +339,14 @@ impl StanModel {
         let results: Result<Vec<_>, _> = self
             .variables
             .iter()
-            .map(|var| {
-                out.set_item(
-                    var.name.clone(),
-                    StanVariable(var.clone()).into_pyobject(py)?,
-                )
-            })
+            .map(|var| out.set_item(var.name.clone(), var.clone()))
             .collect();
         results?;
         Ok(out)
     }
 
     pub fn ndim(&self) -> usize {
-        self.model.param_unc_num()
-    }
-
-    pub fn param_unc_names(&mut self) -> anyhow::Result<Vec<String>> {
-        Ok(Arc::get_mut(&mut self.model)
-            .ok_or_else(|| anyhow::format_err!("Model is currently in use"))
-            .context("Failed to access the names of unconstrained parameters")?
-            .param_unc_names()
-            .split(',')
-            .map(|name| name.to_string())
-            .collect())
+        self.inner.param_unc_num()
     }
 
     /*
@@ -318,8 +371,10 @@ impl StanModel {
 }
 
 pub struct StanDensity<'model> {
-    inner: &'model InnerModel,
+    model: &'model StanModel,
+    rng: bridgestan::Rng<&'model bridgestan::StanLibrary>,
     transform_adapter: Option<PyTransformAdapt>,
+    expanded_buffer: Vec<f64>,
 }
 
 #[derive(Debug, Error)]
@@ -340,12 +395,65 @@ impl LogpError for StanLogpError {
     }
 }
 
+pub struct ExpandedVector(Vec<Option<nuts_rs::Value>>);
+
+impl<'model> Storable<StanDensity<'model>> for ExpandedVector {
+    fn names<'a>(parent: &'a StanDensity<'model>) -> Vec<&'a str> {
+        parent
+            .model
+            .variables
+            .iter()
+            .map(|var| var.name.as_str())
+            .collect()
+    }
+
+    fn item_type(parent: &StanDensity<'model>, item: &str) -> nuts_rs::ItemType {
+        parent
+            .model
+            .variables
+            .iter()
+            .find(|var| var.name == item)
+            .map(|var| var.item_type.as_inner().clone())
+            .expect("Item not found")
+    }
+
+    fn dims<'a>(parent: &'a StanDensity<'model>, item: &str) -> Vec<&'a str> {
+        parent
+            .model
+            .variables
+            .iter()
+            .find(|var| var.name == item)
+            .map(|var| var.dims.as_slice().iter().map(|s| s.as_str()).collect())
+            .expect("Item not found")
+    }
+
+    fn get_all<'a>(&'a mut self, parent: &'a StanDensity<'model>) -> Vec<(&'a str, Option<Value>)> {
+        self.0
+            .iter_mut()
+            .zip(parent.model.variables.iter())
+            .map(|(val, var)| (var.name.as_str(), val.take()))
+            .collect()
+    }
+}
+
+impl<'model> HasDims for StanDensity<'model> {
+    fn dim_sizes(&self) -> HashMap<String, u64> {
+        self.model.dim_sizes.clone()
+    }
+
+    fn coords(&self) -> HashMap<String, Value> {
+        self.model.coords.clone()
+    }
+}
+
 impl<'model> CpuLogpFunc for StanDensity<'model> {
     type LogpError = StanLogpError;
-    type TransformParams = Py<PyAny>;
+    type FlowParameters = Py<PyAny>;
+    type ExpandedVector = ExpandedVector;
 
     fn logp(&mut self, position: &[f64], grad: &mut [f64]) -> Result<f64, Self::LogpError> {
         let logp = self
+            .model
             .inner
             .log_density_gradient(position, true, true, grad)?;
         if !logp.is_finite() {
@@ -355,7 +463,60 @@ impl<'model> CpuLogpFunc for StanDensity<'model> {
     }
 
     fn dim(&self) -> usize {
-        self.inner.param_unc_num()
+        self.model.inner.param_unc_num()
+    }
+
+    fn vector_coord(&self) -> Option<Value> {
+        Some(self.model.unc_names.clone())
+    }
+
+    fn expand_vector<R>(
+        &mut self,
+        _rng: &mut R,
+        array: &[f64],
+    ) -> Result<Self::ExpandedVector, nuts_rs::CpuMathError>
+    where
+        R: rand::Rng + ?Sized,
+    {
+        self.model
+            .inner
+            .param_constrain(
+                array,
+                true,
+                true,
+                &mut self.expanded_buffer,
+                Some(&mut self.rng),
+            )
+            .context("Failed to constrain the parameters of the draw")
+            .map_err(|e| nuts_rs::CpuMathError::ExpandError(format!("{}", e)))?;
+
+        let mut vars = Vec::new();
+
+        for var in self.model.variables.iter() {
+            let mut out = Vec::with_capacity(var.num_elements);
+            let start = var.start_idx.expect("Variable start index not set");
+            let end = var.end_idx.expect("Variable end index not set");
+            let slice = &self.expanded_buffer[start..end];
+            assert!(slice.len() == var.num_elements);
+
+            if var.num_elements == 0 {
+                vars.push(Some(Value::F64(out)));
+                continue;
+            }
+
+            // The slice is in fortran order. This doesn't matter if it low dim
+            if var.shape.as_slice().len() < 2 {
+                out.extend_from_slice(slice);
+                vars.push(Some(Value::F64(out)));
+                continue;
+            }
+
+            // We need to transpose
+            fortran_to_c_order(slice, var.shape.as_slice(), &mut out);
+            vars.push(Some(Value::F64(out)));
+        }
+
+        Ok(ExpandedVector(vars))
     }
 
     fn inv_transform_normalize(
@@ -495,11 +656,11 @@ impl<'model> CpuLogpFunc for StanDensity<'model> {
     }
 }
 
-fn fortran_to_c_order(data: &[f64], shape: &[usize], out: &mut Vec<f64>) {
+fn fortran_to_c_order(data: &[f64], shape: &[u64], out: &mut Vec<f64>) {
     let rank = shape.len();
     let strides = {
-        let mut strides: SmallVec<[usize; 8]> = SmallVec::with_capacity(rank);
-        let mut current: usize = 1;
+        let mut strides: SmallVec<[u64; 8]> = SmallVec::with_capacity(rank);
+        let mut current: u64 = 1;
         for &length in shape.iter() {
             strides.push(current);
             current = current
@@ -510,33 +671,34 @@ fn fortran_to_c_order(data: &[f64], shape: &[usize], out: &mut Vec<f64>) {
         strides
     };
 
-    let mut shape: SmallVec<[usize; 8]> = shape.to_smallvec();
+    let mut shape: SmallVec<[u64; 8]> = shape.to_smallvec();
     shape.reverse();
 
-    let mut idx: SmallVec<[usize; 8]> = shape.iter().map(|_| 0usize).collect();
-    let mut position: usize = 0;
+    let mut idx: SmallVec<[u64; 8]> = shape.iter().map(|_| 0u64).collect();
+    let mut position: u64 = 0;
     'iterate: loop {
-        out.push(data[position]);
+        out.push(data[position as usize]);
 
-        let mut axis: usize = 0;
+        let mut axis: u64 = 0;
         'nextidx: loop {
-            idx[axis] += 1;
-            position += strides[axis];
+            idx[axis as usize] += 1;
+            position += strides[axis as usize];
 
-            if idx[axis] < shape[axis] {
+            if idx[axis as usize] < shape[axis as usize] {
                 break 'nextidx;
             }
 
-            idx[axis] = 0;
-            position -= shape[axis] * strides[axis];
+            idx[axis as usize] = 0;
+            position -= shape[axis as usize] * strides[axis as usize];
             axis += 1;
-            if axis == rank {
+            if axis == rank as u64 {
                 break 'iterate;
             }
         }
     }
 }
 
+/*
 pub struct StanTrace<'model> {
     inner: &'model InnerModel,
     model: &'model StanModel,
@@ -544,28 +706,6 @@ pub struct StanTrace<'model> {
     expanded_buffer: Box<[f64]>,
     rng: bridgestan::Rng<&'model bridgestan::StanLibrary>,
     count: usize,
-}
-
-impl<'model> Clone for StanTrace<'model> {
-    fn clone(&self) -> Self {
-        // TODO We should avoid this Clone implementation.
-        // We only need it for `StanTrace.inspect`, which
-        // doesn't need rng, so we could avoid this strange
-        // seed of zeros.
-        let rng = self
-            .model
-            .model
-            .new_rng(0)
-            .expect("Could not create stan rng");
-        Self {
-            inner: self.inner,
-            model: self.model,
-            trace: self.trace.clone(),
-            expanded_buffer: self.expanded_buffer.clone(),
-            rng,
-            count: self.count,
-        }
-    }
 }
 
 impl<'model> DrawStorage for StanTrace<'model> {
@@ -599,41 +739,13 @@ impl<'model> DrawStorage for StanTrace<'model> {
         self.count += 1;
         Ok(())
     }
-
-    fn finalize(self) -> anyhow::Result<Arc<dyn Array>> {
-        let (fields, arrays): (Vec<_>, Vec<_>) = izip!(self.trace, &self.model.variables)
-            .map(|(data, variable)| {
-                let data = Float64Array::from(data);
-                let item_field = Arc::new(Field::new("item", DataType::Float64, false));
-                let array = FixedSizeListArray::new(
-                    item_field.clone(),
-                    variable.size as _,
-                    Arc::new(data),
-                    None,
-                );
-                let dtype = DataType::FixedSizeList(item_field, variable.size as i32);
-                let field = Arc::new(Field::new(variable.name.clone(), dtype.clone(), false));
-                let list: Arc<dyn Array> = Arc::new(array);
-                (field, list)
-            })
-            .unzip();
-
-        Ok(Arc::new(
-            StructArray::try_new_with_length(fields.into(), arrays, None, self.count)
-                .context("Could not create arrow StructArray")?,
-        ))
-    }
-
-    fn inspect(&self) -> anyhow::Result<Arc<dyn Array>> {
-        self.clone().finalize()
-    }
 }
+*/
 
 impl Model for StanModel {
     type Math<'model> = CpuMath<StanDensity<'model>>;
 
-    type DrawStorage<'model, S: nuts_rs::Settings> = StanTrace<'model>;
-
+    /*
     fn new_trace<'a, S: Settings, R: rand::Rng + ?Sized>(
         &'a self,
         rng: &mut R,
@@ -658,11 +770,16 @@ impl Model for StanModel {
             count: 0,
         })
     }
+    */
 
-    fn math(&self) -> anyhow::Result<Self::Math<'_>> {
+    fn math<R: Rng + ?Sized>(&self, rng: &mut R) -> anyhow::Result<Self::Math<'_>> {
+        let rng = self.inner.new_rng(rng.next_u32())?;
+        let num_expanded = self.inner.param_num(true, true);
         Ok(CpuMath::new(StanDensity {
-            inner: &self.model,
+            model: &self,
+            rng,
             transform_adapter: self.transform_adapter.clone(),
+            expanded_buffer: vec![0f64; num_expanded],
         }))
     }
 
@@ -681,6 +798,8 @@ impl Model for StanModel {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use itertools::Itertools;
 
     use super::fortran_to_c_order;
@@ -741,48 +860,51 @@ mod tests {
 
     #[test]
     fn parse_vars() {
+        let mut dims = HashMap::new();
+        let mut dim_sizes = HashMap::new();
+
         let vars = "";
-        let parsed = super::params(vars).unwrap();
+        let parsed = super::params(vars, &mut dims, &mut dim_sizes).unwrap();
         assert!(parsed.len() == 0);
 
         let vars = "x.1.1,x.2.1,x.3.1,x.1.2,x.2.2,x.3.2";
-        let parsed = super::params(vars).unwrap();
+        let parsed = super::params(vars, &mut dims, &mut dim_sizes).unwrap();
         assert!(parsed.len() == 1);
         let parsed = parsed[0].clone();
         assert!(parsed.name == "x");
-        assert!(parsed.shape == vec![3, 2]);
+        assert!(parsed.shape.as_slice() == vec![3, 2]);
 
         // Incorrect order
         let vars = "x.1.2,x.1.1,x.2.1,x.2.2,x.3.1,x.3.2";
-        assert!(super::params(vars).is_err());
+        assert!(super::params(vars, &mut dims, &mut dim_sizes).is_err());
 
         // Incorrect order
         let vars = "x.1.2.real,x.1.2.imag";
-        assert!(super::params(vars).is_err());
+        assert!(super::params(vars, &mut dims, &mut dim_sizes).is_err());
 
         let vars = "x.1.1.real,x.1.1.imag,x.2.1.real,x.2.1.imag,x.3.1.real,x.3.1.imag";
-        let parsed = super::params(vars).unwrap();
+        let parsed = super::params(vars, &mut dims, &mut dim_sizes).unwrap();
         assert!(parsed.len() == 2);
         let var = parsed[0].clone();
         assert!(var.name == "x.real");
-        assert!(var.shape == vec![3, 1]);
+        assert!(var.shape.as_slice() == vec![3, 1]);
 
         let var = parsed[1].clone();
         assert!(var.name == "x.imag");
-        assert!(var.shape == vec![3, 1]);
+        assert!(var.shape.as_slice() == vec![3, 1]);
 
         // Test single variable
         let vars = "alpha";
-        let parsed = super::params(vars).unwrap();
+        let parsed = super::params(vars, &mut dims, &mut dim_sizes).unwrap();
         assert_eq!(parsed.len(), 1);
         let var = &parsed[0];
         assert_eq!(var.name, "alpha");
-        assert_eq!(var.shape, Vec::<usize>::new());
-        assert_eq!(var.size, 1);
+        assert_eq!(var.shape.as_slice(), vec![0; 0]);
+        assert_eq!(var.num_elements, 1);
 
         // Test multiple scalar variables
         let vars = "alpha,beta,gamma";
-        let parsed = super::params(vars).unwrap();
+        let parsed = super::params(vars, &mut dims, &mut dim_sizes).unwrap();
         assert_eq!(parsed.len(), 3);
         assert_eq!(parsed[0].name, "alpha");
         assert_eq!(parsed[1].name, "beta");
@@ -790,21 +912,21 @@ mod tests {
 
         // Test 1D array
         let vars = "theta.1,theta.2,theta.3,theta.4";
-        let parsed = super::params(vars).unwrap();
+        let parsed = super::params(vars, &mut dims, &mut dim_sizes).unwrap();
         assert_eq!(parsed.len(), 1);
         let var = &parsed[0];
         assert_eq!(var.name, "theta");
-        assert_eq!(var.shape, vec![4]);
-        assert_eq!(var.size, 4);
+        assert_eq!(var.shape.as_slice(), vec![4]);
+        assert_eq!(var.num_elements, 4);
 
         // Test variable name with colons and dots
         let vars = "x:1:2.4:1.1,x:1:2.4:1.2,x:1:2.4:1.3";
-        let parsed = super::params(vars).unwrap();
+        let parsed = super::params(vars, &mut dims, &mut dim_sizes).unwrap();
         assert_eq!(parsed.len(), 1);
         let var = &parsed[0];
         assert_eq!(var.name, "x:1:2.4:1");
-        assert_eq!(var.shape, vec![3]);
-        assert_eq!(var.size, 3);
+        assert_eq!(var.shape.as_slice(), vec![3]);
+        assert_eq!(var.num_elements, 3);
 
         let vars = "
             a,
@@ -1009,89 +1131,89 @@ mod tests {
             ultimate.2.3:2.3.5,
             ultimate.2.3:2.4.5
         ";
-        let parsed = super::params(vars).unwrap();
+        let parsed = super::params(vars, &mut dims, &mut dim_sizes).unwrap();
         assert_eq!(parsed[0].name, "a");
-        assert_eq!(parsed[0].shape, vec![0usize; 0]);
+        assert_eq!(parsed[0].shape.as_slice(), vec![0; 0]);
 
         assert_eq!(parsed[1].name, "base");
-        assert_eq!(parsed[1].shape, vec![0usize; 0]);
+        assert_eq!(parsed[1].shape.as_slice(), vec![0; 0]);
 
         assert_eq!(parsed[2].name, "base_i");
-        assert_eq!(parsed[2].shape, vec![0usize; 0]);
+        assert_eq!(parsed[2].shape.as_slice(), vec![0; 0]);
 
         assert_eq!(parsed[3].name, "pair:1");
-        assert_eq!(parsed[3].shape, vec![0usize; 0]);
+        assert_eq!(parsed[3].shape.as_slice(), vec![0; 0]);
 
         assert_eq!(parsed[4].name, "pair:2");
-        assert_eq!(parsed[4].shape, vec![0usize; 0]);
+        assert_eq!(parsed[4].shape.as_slice(), vec![0; 0]);
 
         assert_eq!(parsed[5].name, "nested:1");
-        assert_eq!(parsed[5].shape, vec![0usize; 0]);
+        assert_eq!(parsed[5].shape.as_slice(), vec![0; 0]);
 
         assert_eq!(parsed[6].name, "nested:2:1");
-        assert_eq!(parsed[6].shape, vec![0usize; 0]);
+        assert_eq!(parsed[6].shape.as_slice(), vec![0; 0]);
 
         assert_eq!(parsed[7].name, "nested:2:2.real");
-        assert_eq!(parsed[7].shape, vec![0usize; 0]);
+        assert_eq!(parsed[7].shape.as_slice(), vec![0; 0]);
 
         assert_eq!(parsed[8].name, "nested:2:2.imag");
-        assert_eq!(parsed[8].shape, vec![0usize; 0]);
+        assert_eq!(parsed[8].shape.as_slice(), vec![0; 0]);
 
         assert_eq!(parsed[9].name, "arr_pair.1:1");
-        assert_eq!(parsed[9].shape, vec![0usize; 0]);
+        assert_eq!(parsed[9].shape.as_slice(), vec![0; 0]);
 
         assert_eq!(parsed[10].name, "arr_pair.1:2");
-        assert_eq!(parsed[10].shape, vec![0usize; 0]);
+        assert_eq!(parsed[10].shape.as_slice(), vec![0; 0]);
 
         assert_eq!(parsed[11].name, "arr_pair.2:1");
-        assert_eq!(parsed[11].shape, vec![0usize; 0]);
+        assert_eq!(parsed[11].shape.as_slice(), vec![0; 0]);
 
         assert_eq!(parsed[12].name, "arr_pair.2:2");
-        assert_eq!(parsed[12].shape, vec![0usize; 0]);
+        assert_eq!(parsed[12].shape.as_slice(), vec![0; 0]);
 
         assert_eq!(parsed[13].name, "arr_very_nested.1:1:1");
-        assert_eq!(parsed[13].shape, vec![0usize; 0]);
+        assert_eq!(parsed[13].shape.as_slice(), vec![0; 0]);
 
         assert_eq!(parsed[14].name, "arr_very_nested.1:1:2:1");
-        assert_eq!(parsed[14].shape, vec![0usize; 0]);
+        assert_eq!(parsed[14].shape.as_slice(), vec![0; 0]);
 
         assert_eq!(parsed[15].name, "arr_very_nested.1:1:2:2.real");
-        assert_eq!(parsed[15].shape, vec![0usize; 0]);
+        assert_eq!(parsed[15].shape.as_slice(), vec![0; 0]);
 
         assert_eq!(parsed[16].name, "arr_very_nested.1:1:2:2.imag");
-        assert_eq!(parsed[16].shape, vec![0usize; 0]);
+        assert_eq!(parsed[16].shape.as_slice(), vec![0; 0]);
 
         assert_eq!(parsed[17].name, "arr_very_nested.1:2");
-        assert_eq!(parsed[17].shape, vec![0usize; 0]);
+        assert_eq!(parsed[17].shape.as_slice(), vec![0; 0]);
 
         assert_eq!(parsed[18].name, "arr_very_nested.2:1:1");
-        assert_eq!(parsed[18].shape, vec![0usize; 0]);
+        assert_eq!(parsed[18].shape.as_slice(), vec![0; 0]);
 
         assert_eq!(parsed[19].name, "arr_very_nested.2:1:2:1");
-        assert_eq!(parsed[19].shape, vec![0usize; 0]);
+        assert_eq!(parsed[19].shape.as_slice(), vec![0; 0]);
 
         assert_eq!(parsed[20].name, "arr_very_nested.2:1:2:2.real");
-        assert_eq!(parsed[20].shape, vec![0usize; 0]);
+        assert_eq!(parsed[20].shape.as_slice(), vec![0; 0]);
 
         assert_eq!(parsed[21].name, "arr_very_nested.2:1:2:2.imag");
-        assert_eq!(parsed[21].shape, vec![0usize; 0]);
+        assert_eq!(parsed[21].shape.as_slice(), vec![0; 0]);
 
         assert_eq!(parsed[22].name, "arr_very_nested.2:2");
-        assert_eq!(parsed[22].shape, vec![0usize; 0]);
+        assert_eq!(parsed[22].shape.as_slice(), vec![0; 0]);
 
         assert_eq!(parsed[23].name, "arr_very_nested.3:1:1");
-        assert_eq!(parsed[23].shape, vec![0usize; 0]);
+        assert_eq!(parsed[23].shape.as_slice(), vec![0; 0]);
 
         assert_eq!(parsed[24].name, "arr_very_nested.3:1:2:1");
-        assert_eq!(parsed[24].shape, vec![0usize; 0]);
+        assert_eq!(parsed[24].shape.as_slice(), vec![0; 0]);
 
         assert_eq!(parsed[25].name, "arr_very_nested.3:1:2:2.real");
-        assert_eq!(parsed[25].shape, vec![0usize; 0]);
+        assert_eq!(parsed[25].shape.as_slice(), vec![0; 0]);
 
         assert_eq!(parsed[26].name, "arr_very_nested.3:1:2:2.imag");
-        assert_eq!(parsed[26].shape, vec![0usize; 0]);
+        assert_eq!(parsed[26].shape.as_slice(), vec![0; 0]);
 
         assert_eq!(parsed[27].name, "arr_very_nested.3:2");
-        assert_eq!(parsed[27].shape, vec![0usize; 0]);
+        assert_eq!(parsed[27].shape.as_slice(), vec![0; 0]);
     }
 }

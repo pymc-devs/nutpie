@@ -1,75 +1,24 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
-use anyhow::{anyhow, bail, Context, Result};
-use arrow::{
-    array::{
-        Array, ArrayBuilder, BooleanBuilder, Float32Builder, Float64Builder, Int64Builder,
-        LargeListBuilder, PrimitiveBuilder, StructBuilder,
-    },
-    datatypes::{DataType, Field, Float32Type, Float64Type, Int64Type},
+use anyhow::{bail, Context, Result};
+use numpy::{
+    NotContiguousError, PyArray1, PyReadonlyArray1, PyReadonlyArrayDyn, PyUntypedArrayMethods,
 };
-use numpy::{NotContiguousError, PyArray1, PyReadonlyArray1};
-use nuts_rs::{CpuLogpFunc, CpuMath, DrawStorage, LogpError, Model};
+use nuts_rs::{CpuLogpFunc, CpuMath, HasDims, LogpError, Model, Storable, Value};
 use pyo3::{
     exceptions::PyRuntimeError,
     pyclass, pymethods,
-    types::{PyAnyMethods, PyDict, PyDictMethods},
+    types::{PyAnyMethods, PyDict, PyDictMethods, PyList, PyListMethods},
     Bound, Py, PyAny, PyErr, Python,
 };
 use rand::Rng;
 use rand_distr::{Distribution, Uniform};
-use smallvec::SmallVec;
 use thiserror::Error;
 
-use crate::wrapper::PyTransformAdapt;
-
-#[pyclass]
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub struct PyVariable {
-    #[pyo3(get)]
-    pub name: String,
-    #[pyo3(get)]
-    pub dtype: ExpandDtype,
-}
-
-impl PyVariable {
-    fn arrow_dtype(&self) -> DataType {
-        match &self.dtype {
-            ExpandDtype::Boolean {} => DataType::Boolean,
-            ExpandDtype::Float64 {} => DataType::Float64,
-            ExpandDtype::Float32 {} => DataType::Float32,
-            ExpandDtype::Int64 {} => DataType::Int64,
-            ExpandDtype::BooleanArray { tensor_type: _ } => {
-                let field = Arc::new(Field::new("item", DataType::Boolean, false));
-                DataType::LargeList(field)
-            }
-            ExpandDtype::ArrayFloat64 { tensor_type: _ } => {
-                let field = Arc::new(Field::new("item", DataType::Float64, true));
-                DataType::LargeList(field)
-            }
-            ExpandDtype::ArrayFloat32 { tensor_type: _ } => {
-                let field = Arc::new(Field::new("item", DataType::Float32, false));
-                DataType::LargeList(field)
-            }
-            ExpandDtype::ArrayInt64 { tensor_type: _ } => {
-                let field = Arc::new(Field::new("item", DataType::Int64, false));
-                DataType::LargeList(field)
-            }
-        }
-    }
-}
-
-#[pymethods]
-impl PyVariable {
-    #[new]
-    fn new(name: String, value_type: ExpandDtype) -> Self {
-        Self {
-            name,
-            dtype: value_type,
-        }
-    }
-}
+use crate::{
+    common::{PyValue, PyVariable},
+    wrapper::PyTransformAdapt,
+};
 
 #[pyclass]
 #[derive(Debug, Clone)]
@@ -80,28 +29,59 @@ pub struct PyModel {
     variables: Arc<Vec<PyVariable>>,
     transform_adapter: Option<PyTransformAdapt>,
     ndim: usize,
+    dim_sizes: HashMap<String, u64>,
+    coords: HashMap<String, Value>,
 }
 
 #[pymethods]
 impl PyModel {
     #[new]
-    #[pyo3(signature = (make_logp_func, make_expand_func, variables, ndim, *, init_point_func=None, transform_adapter=None))]
+    #[pyo3(signature = (make_logp_func, make_expand_func, variables, ndim, dim_sizes, coords, *, init_point_func=None, transform_adapter=None))]
     fn new<'py>(
+        py: Python<'py>,
         make_logp_func: Py<PyAny>,
         make_expand_func: Py<PyAny>,
         variables: Vec<PyVariable>,
         ndim: usize,
+        dim_sizes: Py<PyDict>,
+        coords: Py<PyDict>,
         init_point_func: Option<Py<PyAny>>,
         transform_adapter: Option<Py<PyAny>>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        let dim_sizes = dim_sizes
+            .bind(py)
+            .iter()
+            .map(|(key, value)| {
+                let key: String = key.extract().context("Dimension key is not a string")?;
+                let value: u64 = value
+                    .extract()
+                    .context("Dimension size value is not an integer")?;
+                Ok((key, value))
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
+
+        let coords = coords
+            .bind(py)
+            .iter()
+            .map(|(key, value)| {
+                let key: String = key.extract().context("Coordinate key is not a string")?;
+                let value: PyValue = value
+                    .extract()
+                    .context("Coordinate value has incorrect type")?;
+                Ok((key, value.into_value()))
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
+
+        Ok(Self {
             make_logp_func: Arc::new(make_logp_func),
             make_expand_func: Arc::new(make_expand_func),
             init_point_func: init_point_func.map(|x| x.into()),
             variables: Arc::new(variables),
             ndim,
             transform_adapter: transform_adapter.map(PyTransformAdapt::new),
-        }
+            dim_sizes,
+            coords,
+        })
     }
 }
 
@@ -139,29 +119,91 @@ impl LogpError for PyLogpError {
 
 pub struct PyDensity {
     logp: Py<PyAny>,
+    expand_func: Py<PyAny>,
     transform_adapter: Option<PyTransformAdapt>,
     dim: usize,
+    variables: Arc<Vec<PyVariable>>,
+    dim_sizes: HashMap<String, u64>,
+    coords: HashMap<String, Value>,
 }
 
 impl PyDensity {
     fn new(
         logp_clone_func: &Py<PyAny>,
+        expand_clone_func: &Py<PyAny>,
         dim: usize,
         transform_adapter: Option<&PyTransformAdapt>,
+        variables: Arc<Vec<PyVariable>>,
+        dim_sizes: HashMap<String, u64>,
+        coords: HashMap<String, Value>,
     ) -> Result<Self> {
         let logp_func = Python::attach(|py| logp_clone_func.call0(py))?;
+        let expand_func = Python::attach(|py| expand_clone_func.call1(py, (0u64, 0u64, 0u64)))?;
         let transform_adapter = transform_adapter.cloned();
         Ok(Self {
             logp: logp_func,
+            expand_func,
             transform_adapter,
             dim,
+            variables,
+            dim_sizes,
+            coords,
         })
+    }
+}
+
+impl HasDims for PyDensity {
+    fn dim_sizes(&self) -> HashMap<String, u64> {
+        self.dim_sizes.clone()
+    }
+
+    fn coords(&self) -> HashMap<String, Value> {
+        self.coords.clone()
+    }
+}
+
+pub struct ExpandedVector(Vec<Option<Value>>);
+
+impl Storable<PyDensity> for ExpandedVector {
+    fn names(parent: &PyDensity) -> Vec<&str> {
+        parent
+            .variables
+            .iter()
+            .map(|var| var.name.as_str())
+            .collect()
+    }
+
+    fn item_type(parent: &PyDensity, item: &str) -> nuts_rs::ItemType {
+        parent
+            .variables
+            .iter()
+            .find(|var| var.name == item)
+            .map(|var| var.item_type.as_inner().clone())
+            .expect("Item not found")
+    }
+
+    fn dims<'a>(parent: &'a PyDensity, item: &str) -> Vec<&'a str> {
+        parent
+            .variables
+            .iter()
+            .find(|var| var.name == item)
+            .map(|var| var.dims.as_slice().iter().map(|s| s.as_str()).collect())
+            .expect("Item not found")
+    }
+
+    fn get_all<'a>(&'a mut self, parent: &'a PyDensity) -> Vec<(&'a str, Option<Value>)> {
+        self.0
+            .iter_mut()
+            .zip(parent.variables.iter())
+            .map(|(val, var)| (var.name.as_str(), val.take()))
+            .collect()
     }
 }
 
 impl CpuLogpFunc for PyDensity {
     type LogpError = PyLogpError;
-    type TransformParams = Py<PyAny>;
+    type FlowParameters = Py<PyAny>;
+    type ExpandedVector = ExpandedVector;
 
     fn logp(&mut self, position: &[f64], grad: &mut [f64]) -> Result<f64, Self::LogpError> {
         Python::attach(|py| {
@@ -191,6 +233,139 @@ impl CpuLogpFunc for PyDensity {
 
     fn dim(&self) -> usize {
         self.dim
+    }
+
+    fn expand_vector<R>(
+        &mut self,
+        _rng: &mut R,
+        array: &[f64],
+    ) -> std::result::Result<Self::ExpandedVector, nuts_rs::CpuMathError>
+    where
+        R: rand::Rng + ?Sized,
+    {
+        Python::attach(|py| {
+            let expanded = self
+                .expand_func
+                .call1(py, (PyArray1::from_slice(py, array),));
+            let Ok(expanded) = expanded else {
+                return Err(nuts_rs::CpuMathError::ExpandError(
+                    "Expanding function raised an error".into(),
+                ));
+            };
+            let expanded: Bound<PyDict> = expanded.extract(py).map_err(|_| {
+                nuts_rs::CpuMathError::ExpandError("Expand function did not return a dict".into())
+            })?;
+            let values = expanded.iter();
+            let vars = self.variables.iter();
+
+            let mut expanded = Vec::with_capacity(self.variables.len());
+            for (var, (name2, val)) in vars.zip(values) {
+                let name2 = name2.extract::<&str>().map_err(|_| {
+                    nuts_rs::CpuMathError::ExpandError("expand key was not a string".into())
+                })?;
+                if var.name != name2 {
+                    return Err(nuts_rs::CpuMathError::ExpandError(format!(
+                        "Unexpected expand key: expected {} but found {}",
+                        var.name, name2
+                    )));
+                }
+
+                if val.is_none() {
+                    expanded.push(None);
+                    continue;
+                }
+
+                fn as_value<'py, 'a, T>(
+                    var: &'a PyVariable,
+                    val: &'a Bound<'py, PyAny>,
+                ) -> Result<PyReadonlyArrayDyn<'py, T>, nuts_rs::CpuMathError>
+                where
+                    T: numpy::Element + Clone,
+                {
+                    let arr: PyReadonlyArrayDyn<T> = val.extract().map_err(|_| {
+                        nuts_rs::CpuMathError::ExpandError(format!(
+                            "variable {} had incorrect type",
+                            var.name
+                        ))
+                    })?;
+                    if !arr.is_c_contiguous() {
+                        return Err(nuts_rs::CpuMathError::ExpandError(
+                            "not c contiguous".into(),
+                        ));
+                    }
+                    if !arr
+                        .shape()
+                        .iter()
+                        .zip(var.shape.as_slice())
+                        .all(|(a, &b)| *a as u64 == b)
+                    {
+                        return Err(nuts_rs::CpuMathError::ExpandError("upected shape".into()));
+                    }
+                    Ok(arr)
+                }
+
+                let val_array = match var.item_type.as_inner() {
+                    nuts_rs::ItemType::F64 => {
+                        let arr = as_value::<f64>(var, &val)?;
+                        let slice = arr.as_slice().map_err(|_| {
+                            nuts_rs::CpuMathError::ExpandError("Could not read as slice".into())
+                        })?;
+                        Some(Value::F64(slice.to_vec()))
+                    }
+                    nuts_rs::ItemType::F32 => {
+                        let arr = as_value::<f32>(var, &val)?;
+                        let slice = arr.as_slice().map_err(|_| {
+                            nuts_rs::CpuMathError::ExpandError("Could not read as slice".into())
+                        })?;
+                        Some(Value::F32(slice.to_vec()))
+                    }
+                    nuts_rs::ItemType::I64 => {
+                        let arr = as_value::<i64>(var, &val)?;
+                        let slice = arr.as_slice().map_err(|_| {
+                            nuts_rs::CpuMathError::ExpandError("Could not read as slice".into())
+                        })?;
+                        Some(Value::I64(slice.to_vec()))
+                    }
+                    nuts_rs::ItemType::Bool => {
+                        let arr = as_value::<bool>(var, &val)?;
+                        let slice = arr.as_slice().map_err(|_| {
+                            nuts_rs::CpuMathError::ExpandError("Could not read as slice".into())
+                        })?;
+                        Some(Value::Bool(slice.to_vec()))
+                    }
+                    nuts_rs::ItemType::U64 => {
+                        let arr = as_value::<u64>(var, &val)?;
+                        let slice = arr.as_slice().map_err(|_| {
+                            nuts_rs::CpuMathError::ExpandError("Could not read as slice".into())
+                        })?;
+                        Some(Value::U64(slice.to_vec()))
+                    }
+                    nuts_rs::ItemType::String => {
+                        let list: Bound<PyList> = val.extract().map_err(|_| {
+                            nuts_rs::CpuMathError::ExpandError("did not return list".into())
+                        })?;
+                        if list.len() != var.shape.as_slice().iter().product::<u64>() as usize {
+                            return Err(nuts_rs::CpuMathError::ExpandError(
+                                "Incorrect number of items".into(),
+                            ));
+                        }
+                        let vec: Vec<String> = list
+                            .iter()
+                            .map(|item| {
+                                item.extract::<String>().map_err(|_| {
+                                    nuts_rs::CpuMathError::ExpandError(
+                                        "items were not all strings".into(),
+                                    )
+                                })
+                            })
+                            .collect::<Result<_, _>>()?;
+                        Some(Value::Strings(vec))
+                    }
+                };
+                expanded.push(val_array);
+            }
+            Ok(ExpandedVector(expanded))
+        })
     }
 
     fn inv_transform_normalize(
@@ -305,332 +480,21 @@ impl CpuLogpFunc for PyDensity {
     }
 }
 
-pub struct PyTrace {
-    expand: Py<PyAny>,
-    variables: Arc<Vec<PyVariable>>,
-    builder: StructBuilder,
-}
-
-impl PyTrace {
-    pub fn new<R: Rng + ?Sized>(
-        rng: &mut R,
-        chain: u64,
-        variables: Arc<Vec<PyVariable>>,
-        make_expand_func: &Py<PyAny>,
-        capacity: usize,
-    ) -> Result<Self> {
-        let seed1 = rng.next_u64();
-        let seed2 = rng.next_u64();
-        let expand = Python::attach(|py| {
-            make_expand_func
-                .call1(py, (seed1, seed2, chain))
-                .context("Failed to call expand function factory")
-        })?;
-
-        let fields: Vec<Field> = variables
-            .iter()
-            .map(|variable| Field::new(variable.name.clone(), variable.arrow_dtype(), false))
-            .collect();
-        let builder = StructBuilder::from_fields(fields, capacity);
-
-        Ok(Self {
-            expand,
-            variables,
-            builder,
-        })
-    }
-}
-
-pub type ShapeVec = SmallVec<[usize; 4]>;
-
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-#[pyclass]
-pub struct TensorShape {
-    pub shape: ShapeVec,
-    pub dims: Vec<Option<String>>,
-    size: usize,
-}
-
-impl TensorShape {
-    pub fn new(shape: ShapeVec, dims: Vec<Option<String>>) -> Self {
-        let size = shape.iter().product();
-        Self { shape, dims, size }
-    }
-    pub fn size(&self) -> usize {
-        self.size
-    }
-}
-
-#[pymethods]
-impl TensorShape {
-    #[new]
-    #[pyo3(signature = (shape, dims=None))]
-    fn py_new(shape: Vec<usize>, dims: Option<Vec<Option<String>>>) -> Result<Self> {
-        let dims = dims.unwrap_or(shape.iter().map(|_| None).collect());
-        if dims.len() != shape.len() {
-            bail!("Number of dimensions must be the same as the shape");
-        }
-
-        let size = shape.iter().product();
-        Ok(Self {
-            shape: shape.into(),
-            dims,
-            size,
-        })
-    }
-}
-
-#[non_exhaustive]
-#[pyclass]
-#[derive(Debug, Clone)]
-pub enum ExpandDtype {
-    Boolean {},
-    Float64 {},
-    Float32 {},
-    Int64 {},
-    BooleanArray { tensor_type: TensorShape },
-    ArrayFloat64 { tensor_type: TensorShape },
-    ArrayFloat32 { tensor_type: TensorShape },
-    ArrayInt64 { tensor_type: TensorShape },
-}
-
-#[pymethods]
-impl ExpandDtype {
-    #[staticmethod]
-    fn boolean() -> Self {
-        Self::Boolean {}
-    }
-
-    #[staticmethod]
-    fn float64() -> Self {
-        Self::Float64 {}
-    }
-
-    #[staticmethod]
-    fn float32() -> Self {
-        Self::Float32 {}
-    }
-
-    #[staticmethod]
-    fn int64() -> Self {
-        Self::Int64 {}
-    }
-
-    #[staticmethod]
-    fn boolean_array(shape: TensorShape) -> Self {
-        Self::BooleanArray { tensor_type: shape }
-    }
-
-    #[staticmethod]
-    fn float64_array(shape: TensorShape) -> Self {
-        Self::ArrayFloat64 { tensor_type: shape }
-    }
-    #[staticmethod]
-    fn float32_array(shape: TensorShape) -> Self {
-        Self::ArrayFloat32 { tensor_type: shape }
-    }
-    #[staticmethod]
-    fn int64_array(shape: TensorShape) -> Self {
-        Self::ArrayInt64 { tensor_type: shape }
-    }
-
-    #[getter]
-    fn shape(&self) -> Option<Vec<usize>> {
-        match self {
-            Self::BooleanArray { tensor_type } => Some(tensor_type.shape.iter().cloned().collect()),
-            Self::ArrayFloat64 { tensor_type } => Some(tensor_type.shape.iter().cloned().collect()),
-            Self::ArrayFloat32 { tensor_type } => Some(tensor_type.shape.iter().cloned().collect()),
-            Self::ArrayInt64 { tensor_type } => Some(tensor_type.shape.iter().cloned().collect()),
-            _ => None,
-        }
-    }
-}
-
-impl DrawStorage for PyTrace {
-    fn append_value(&mut self, point: &[f64]) -> Result<()> {
-        Python::attach(|py| {
-            let point = PyArray1::from_slice(py, point);
-            let full_point = self
-                .expand
-                .call1(py, (point,))
-                .context("Failed to call expand function")?
-                .into_bound(py);
-            let point: &Bound<PyDict> = full_point
-                .downcast()
-                .map_err(|_| anyhow!("expand function must return a dict"))
-                .context("Expand function must return dict")?;
-            point
-                .iter()
-                .zip(self.variables.iter())
-                .enumerate()
-                .try_for_each(|(i, ((key, value), variable))| {
-                    let key: &str = key.extract()?;
-                    if key != variable.name {
-                        return Err(anyhow!("Incorrectly ordered expanded point"));
-                    }
-
-                    match &variable.dtype {
-                        ExpandDtype::Boolean {} => {
-                            let builder: &mut BooleanBuilder =
-                                self.builder.field_builder(i).context(
-                                    "Builder has incorrect type",
-                                )?;
-                            let value = value
-                                .extract()
-                                .expect("Return value from expand function could not be converted to boolean");
-                            builder.append_value(value)
-                        },
-                        ExpandDtype::Float64 {} => {
-                            let builder: &mut Float64Builder =
-                                self.builder.field_builder(i).context(
-                                    "Builder has incorrect type",
-                                )?;
-                            builder.append_value(
-                                value
-                                .extract()
-                                .expect("Return value from expand function could not be converted to float64")
-                            )
-                        },
-                        ExpandDtype::Float32 {} => {
-                            let builder: &mut Float32Builder =
-                                self.builder.field_builder(i).context(
-                                    "Builder has incorrect type",
-                                )?;
-                            builder.append_value(
-                                value
-                                .extract()
-                                .expect("Return value from expand function could not be converted to float32")
-                            )
-                        },
-                        ExpandDtype::Int64 {} => {
-                            let builder: &mut Int64Builder =
-                                self.builder.field_builder(i).context(
-                                    "Builder has incorrect type",
-                                )?;
-                            let value = value.extract().expect("Return value from expand function could not be converted to int64");
-                            builder.append_value(value)
-                        },
-                        ExpandDtype::BooleanArray { tensor_type } => {
-                            let builder: &mut LargeListBuilder<Box<dyn ArrayBuilder>> =
-                                self.builder.field_builder(i).context(
-                                    "Builder has incorrect type. Expected LargeListBuilder of Bool",
-                                )?;
-                            let value_builder = builder
-                                .values()
-                                .as_any_mut()
-                                .downcast_mut::<BooleanBuilder>()
-                                .context("Could not downcast builder to boolean type")?;
-                            let values: PyReadonlyArray1<bool> = value.extract().context("Could not convert object to array")?;
-                            if values.len()? != tensor_type.size() {
-                                bail!("Extracted array has incorrect shape");
-                            }
-                            value_builder.append_slice(values.as_slice().context("Extracted array is not contiguous")?);
-                            builder.append(true);
-                        },
-                        ExpandDtype::ArrayFloat64 { tensor_type } => {
-                            //let builder: &mut FixedSizeListBuilder<Box<dyn ArrayBuilder>> =
-                            let builder: &mut LargeListBuilder<Box<dyn ArrayBuilder>> =
-                                self.builder.field_builder(i).context(
-                                    "Builder has incorrect type. Expected LargeListBuilder of Float64",
-                                )?;
-                            let value_builder = builder
-                                .values()
-                                .as_any_mut()
-                                .downcast_mut::<PrimitiveBuilder<Float64Type>>()
-                                .context("Could not downcast builder to float64 type")?;
-                            let values: PyReadonlyArray1<f64> = value.extract().context("Could not convert object to array")?;
-                            if values.len()? != tensor_type.size() {
-                                bail!("Extracted array has incorrect shape");
-                            }
-                            value_builder.append_slice(values.as_slice().context("Extracted array is not contiguous")?);
-                            builder.append(true);
-                        },
-                        ExpandDtype::ArrayFloat32 { tensor_type } => {
-                            let builder: &mut LargeListBuilder<Box<dyn ArrayBuilder>> =
-                                self.builder.field_builder(i).context(
-                                    "Builder has incorrect type. Expected LargeListBuilder of Float32",
-                                )?;
-                            let value_builder = builder
-                                .values()
-                                .as_any_mut()
-                                .downcast_mut::<PrimitiveBuilder<Float32Type>>()
-                                .context("Could not downcast builder to float32 type")?;
-                            let values: PyReadonlyArray1<f32> = value.extract().context("Could not convert object to array")?;
-                            if values.len()? != tensor_type.size() {
-                                bail!("Extracted array has incorrect shape");
-                            }
-                            value_builder.append_slice(values.as_slice().context("Extracted array is not contiguous")?);
-                            builder.append(true);
-                        },
-                        ExpandDtype::ArrayInt64 {tensor_type} => {
-                            let builder: &mut LargeListBuilder<Box<dyn ArrayBuilder>> =
-                                self.builder.field_builder(i).context(
-                                    "Builder has incorrect type. Expected LargeListBuilder of Int64",
-                                )?;
-                            let value_builder = builder
-                                .values()
-                                .as_any_mut()
-                                .downcast_mut::<PrimitiveBuilder<Int64Type>>()
-                                .context("Could not downcast builder to i64 type")?;
-                            let values: PyReadonlyArray1<i64> = value.extract().context("Could not convert object to array")?;
-                            if values.len()? != tensor_type.size() {
-                                bail!("Extracted array has incorrect shape");
-                            }
-                            value_builder.append_slice(values.as_slice().context("Extracted array is not contiguous")?);
-                            builder.append(true);
-                        },
-                    }
-
-                    Ok(())
-                }).context("Could not save output of expand function to trace")?;
-            self.builder.append(true);
-            Ok(())
-        })
-    }
-
-    fn finalize(mut self) -> Result<Arc<dyn Array>> {
-        Ok(Arc::new(self.builder.finish()))
-    }
-
-    fn inspect(&self) -> Result<Arc<dyn Array>> {
-        Ok(Arc::new(self.builder.finish_cloned()))
-    }
-}
-
 impl Model for PyModel {
     type Math<'model>
         = CpuMath<PyDensity>
     where
         Self: 'model;
 
-    type DrawStorage<'model, S: nuts_rs::Settings>
-        = PyTrace
-    where
-        Self: 'model;
-
-    fn new_trace<'model, S: nuts_rs::Settings, R: rand::prelude::Rng + ?Sized>(
-        &'model self,
-        rng: &mut R,
-        chain_id: u64,
-        settings: &'model S,
-    ) -> Result<Self::DrawStorage<'model, S>> {
-        let draws = settings.hint_num_tune() + settings.hint_num_draws();
-        PyTrace::new(
-            rng,
-            chain_id,
-            self.variables.clone(),
-            &self.make_expand_func,
-            draws,
-        )
-        .context("Could not create PyTrace object")
-    }
-
-    fn math(&self) -> Result<Self::Math<'_>> {
+    fn math<R: Rng + ?Sized>(&self, _rng: &mut R) -> Result<Self::Math<'_>> {
         Ok(CpuMath::new(PyDensity::new(
             &self.make_logp_func,
+            &self.make_expand_func,
             self.ndim,
             self.transform_adapter.as_ref(),
+            self.variables.clone(),
+            self.dim_sizes.clone(),
+            self.coords.clone(),
         )?))
     }
 
