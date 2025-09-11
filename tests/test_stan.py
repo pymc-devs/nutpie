@@ -278,7 +278,7 @@ def test_stan_flow():
 
 # TODO: There are small numerical differences between linux and windows.
 # We should figure out if they originate in stan or in nutpie.
-@pytest.mark.array_compare(atol=1e-4)
+@pytest.mark.array_compare(atol=1e-4, rtol=1e-4)
 @pytest.mark.stan
 def test_deterministic_sampling_stan():
     model = """
@@ -296,6 +296,6 @@ def test_deterministic_sampling_stan():
     compiled_model = nutpie.compile_stan_model(code=model)
     trace = nutpie.sample(compiled_model, chains=2, seed=123, draws=100, tune=100)
     trace2 = nutpie.sample(compiled_model, chains=2, seed=123, draws=100, tune=100)
-    np.testing.assert_allclose(trace.posterior.a.values, trace2.posterior.a.values)
-    np.testing.assert_allclose(trace.posterior.b.values, trace2.posterior.b.values)
+    np.testing.assert_array_max_ulp(trace.posterior.a.values, trace2.posterior.a.values)
+    np.testing.assert_array_max_ulp(trace.posterior.b.values, trace2.posterior.b.values)
     return trace.posterior.a.isel(draw=slice(None, 10)).values

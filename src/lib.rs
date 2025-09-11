@@ -1,3 +1,4 @@
+mod common;
 mod progress;
 mod pyfunc;
 mod pymc;

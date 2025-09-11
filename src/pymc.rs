@@ -1,22 +1,22 @@
-use std::{ffi::c_void, fmt::Display, sync::Arc};
+use std::{collections::HashMap, ffi::c_void, sync::Arc};
 
 use anyhow::{bail, Context, Result};
-use arrow::{
-    array::{Array, Float64Array, LargeListArray, StructArray},
-    buffer::OffsetBuffer,
-    datatypes::{DataType, Field, Fields},
-};
-use itertools::{izip, Itertools};
-use numpy::PyReadonlyArray1;
-use nuts_rs::{CpuLogpFunc, CpuMath, DrawStorage, LogpError, Model, Settings};
+use numpy::{NotContiguousError, PyReadonlyArray1};
+use nuts_rs::{CpuLogpFunc, CpuMath, HasDims, LogpError, Model, Storable, Value};
 use pyo3::{
+    exceptions::PyRuntimeError,
     pyclass, pymethods,
-    types::{PyAnyMethods, PyList},
-    Bound, Py, PyAny, PyResult, Python,
+    types::{PyAnyMethods, PyDict, PyDictMethods},
+    Py, PyAny, PyErr, PyResult, Python,
 };
 
-use rand_distr::num_traits::CheckedEuclid;
+use rand::Rng;
 use thiserror::Error;
+
+use crate::{
+    common::{PyValue, PyVariable},
+    wrapper::PyTransformAdapt,
+};
 
 type UserData = *const std::ffi::c_void;
 
@@ -42,7 +42,6 @@ pub(crate) struct LogpFunc {
     func: RawLogpFunc,
     _keep_alive: Arc<Py<PyAny>>,
     user_data_ptr: UserData,
-    dim: usize,
 }
 
 unsafe impl Send for LogpFunc {}
@@ -51,15 +50,15 @@ unsafe impl Sync for LogpFunc {}
 #[pymethods]
 impl LogpFunc {
     #[new]
-    fn new(dim: usize, ptr: usize, user_data_ptr: usize, keep_alive: Py<PyAny>) -> Self {
+    fn new(ptr: usize, user_data_ptr: usize, keep_alive: Py<PyAny>) -> Result<Self> {
         let func =
             unsafe { std::mem::transmute::<*const c_void, RawLogpFunc>(ptr as *const c_void) };
-        Self {
+
+        Ok(Self {
             func,
             _keep_alive: Arc::new(keep_alive),
             user_data_ptr: user_data_ptr as UserData,
-            dim,
-        }
+        })
     }
 }
 
@@ -98,142 +97,297 @@ impl ExpandFunc {
 unsafe impl Send for ExpandFunc {}
 unsafe impl Sync for ExpandFunc {}
 
-#[derive(Error, Debug)]
-pub(crate) struct ErrorCode(std::os::raw::c_int);
+impl HasDims for PyMcModelRef<'_> {
+    fn dim_sizes(&self) -> HashMap<String, u64> {
+        self.model.dim_sizes.clone()
+    }
 
-impl Display for ErrorCode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Logp function returned error code {}", self.0)
+    fn coords(&self) -> HashMap<String, Value> {
+        self.model.coords.clone()
     }
 }
 
-impl LogpError for ErrorCode {
+pub struct ExpandedVector(Vec<Option<nuts_rs::Value>>);
+
+impl<'f> Storable<PyMcModelRef<'f>> for ExpandedVector {
+    fn names<'a>(parent: &'a PyMcModelRef<'f>) -> Vec<&'a str> {
+        parent
+            .model
+            .variables
+            .iter()
+            .map(|var| var.name.as_str())
+            .collect()
+    }
+
+    fn item_type(parent: &PyMcModelRef<'f>, item: &str) -> nuts_rs::ItemType {
+        parent
+            .model
+            .variables
+            .iter()
+            .find(|var| var.name == item)
+            .map(|var| var.item_type.as_inner().clone())
+            .expect("Item not found")
+    }
+
+    fn dims<'a>(parent: &'a PyMcModelRef<'f>, item: &str) -> Vec<&'a str> {
+        parent
+            .model
+            .variables
+            .iter()
+            .find(|var| var.name == item)
+            .map(|var| var.dims.as_slice().iter().map(|s| s.as_str()).collect())
+            .expect("Item not found")
+    }
+
+    fn get_all<'a>(
+        &'a mut self,
+        parent: &'a PyMcModelRef<'f>,
+    ) -> Vec<(&'a str, Option<nuts_rs::Value>)> {
+        self.0
+            .iter_mut()
+            .zip(parent.model.variables.iter())
+            .map(|(val, var)| (var.name.as_str(), val.take()))
+            .collect()
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum PyMcLogpError {
+    #[error("Python error: {0}")]
+    PyError(#[from] PyErr),
+    #[error("Python retured a non-contigous array")]
+    NotContiguousError(#[from] NotContiguousError),
+    #[error("Unknown error: {0}")]
+    Anyhow(#[from] anyhow::Error),
+    #[error("Logp function returned error code: {0}")]
+    ErrorCode(std::os::raw::c_int),
+}
+
+impl LogpError for PyMcLogpError {
     fn is_recoverable(&self) -> bool {
-        self.0 > 0
+        match self {
+            Self::PyError(err) => Python::attach(|py| {
+                let Ok(attr) = err.value(py).getattr("is_recoverable") else {
+                    return false;
+                };
+                attr.is_truthy()
+                    .expect("Could not access is_recoverable in error check")
+            }),
+            Self::NotContiguousError(_) => false,
+            Self::Anyhow(_) => false,
+            Self::ErrorCode(code) => *code > (0 as std::os::raw::c_int),
+        }
     }
 }
 
-impl CpuLogpFunc for &LogpFunc {
-    type LogpError = ErrorCode;
-    type TransformParams = ();
+pub struct PyMcModelRef<'a> {
+    model: &'a PyMcModel,
+    transform_adapter: Option<PyTransformAdapt>,
+}
+
+impl CpuLogpFunc for PyMcModelRef<'_> {
+    type LogpError = PyMcLogpError;
+    type FlowParameters = Py<PyAny>;
+    type ExpandedVector = ExpandedVector;
 
     fn dim(&self) -> usize {
-        self.dim
+        self.model.dim
     }
 
     fn logp(&mut self, position: &[f64], gradient: &mut [f64]) -> Result<f64, Self::LogpError> {
         let mut logp = 0f64;
         let logp_ptr = (&mut logp) as *mut f64;
-        assert!(position.len() == self.dim);
-        assert!(gradient.len() == self.dim);
+        assert!(position.len() == self.model.dim);
+        assert!(gradient.len() == self.model.dim);
         let retcode = unsafe {
-            (self.func)(
-                self.dim,
+            (self.model.density.func)(
+                self.model.dim,
                 position.as_ptr(),
                 gradient.as_mut_ptr(),
                 logp_ptr,
-                self.user_data_ptr,
+                self.model.density.user_data_ptr,
             )
         };
         if retcode == 0 {
             return Ok(logp);
         }
-        Err(ErrorCode(retcode))
+        Err(PyMcLogpError::ErrorCode(retcode))
     }
-}
 
-#[derive(Clone)]
-pub(crate) struct PyMcTrace<'model> {
-    dim: usize,
-    data: Vec<Vec<f64>>,
-    var_sizes: Vec<usize>,
-    var_names: Vec<String>,
-    expand: &'model ExpandFunc,
-    count: usize,
-}
+    fn expand_vector<R>(
+        &mut self,
+        _rng: &mut R,
+        array: &[f64],
+    ) -> std::result::Result<Self::ExpandedVector, nuts_rs::CpuMathError>
+    where
+        R: rand::Rng + ?Sized,
+    {
+        let mut out = vec![0f64; self.model.expand.expanded_dim].into_boxed_slice();
+        let retcode = unsafe {
+            (self.model.expand.func)(
+                self.model.expand.dim,
+                self.model.expand.expanded_dim,
+                array.as_ptr(),
+                out.as_mut_ptr(),
+                self.model.expand.user_data_ptr,
+            )
+        };
 
-impl<'model> DrawStorage for PyMcTrace<'model> {
-    fn append_value(&mut self, point: &[f64]) -> Result<()> {
-        assert!(point.len() == self.dim);
+        let mut values = Vec::new();
+        for var in self.model.variables.iter() {
+            let start = var.start_idx.expect("Variable has no start index");
+            let end = var.end_idx.expect("Variable has no end index");
+            let slice = &out[start..end];
 
-        let point = self
-            .expand_draw(point)
-            .context("Could not compute deterministic variables")?;
+            let value = match var.item_type.as_inner() {
+                nuts_rs::ItemType::U64 => {
+                    let vec: Vec<u64> = slice.iter().map(|&x| x as u64).collect();
+                    nuts_rs::Value::U64(vec.into())
+                }
+                nuts_rs::ItemType::I64 => {
+                    let vec: Vec<i64> = slice.iter().map(|&x| x as i64).collect();
+                    nuts_rs::Value::I64(vec.into())
+                }
+                nuts_rs::ItemType::F64 => {
+                    let vec: Vec<f64> = slice.iter().map(|&x| x as f64).collect();
+                    nuts_rs::Value::F64(vec.into())
+                }
+                nuts_rs::ItemType::F32 => {
+                    let vec: Vec<f32> = slice.iter().map(|&x| x as f32).collect();
+                    nuts_rs::Value::F32(vec.into())
+                }
+                nuts_rs::ItemType::Bool => {
+                    let vec: Vec<bool> = slice.iter().map(|&x| x != 0.0).collect();
+                    nuts_rs::Value::Bool(vec.into())
+                }
+                nuts_rs::ItemType::String => {
+                    return Err(nuts_rs::CpuMathError::ExpandError(
+                        "String type not supported in expansion".into(),
+                    ));
+                }
+            };
 
-        let mut start: usize = 0;
-        for (&size, data) in self.var_sizes.iter().zip_eq(self.data.iter_mut()) {
-            let end = start.checked_add(size).unwrap();
-            let vals = &point[start..end];
-            data.extend_from_slice(vals);
-            start = end;
+            values.push(Some(value));
         }
-        self.count += 1;
 
+        if retcode == 0 {
+            Ok(ExpandedVector(values))
+        } else {
+            Err(nuts_rs::CpuMathError::ExpandError(format!(
+                "Expand function returned error code {}",
+                retcode
+            )))
+        }
+    }
+    fn inv_transform_normalize(
+        &mut self,
+        params: &Py<PyAny>,
+        untransformed_position: &[f64],
+        untransformed_gradient: &[f64],
+        transformed_position: &mut [f64],
+        transformed_gradient: &mut [f64],
+    ) -> std::result::Result<f64, Self::LogpError> {
+        let logdet = self
+            .transform_adapter
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?
+            .inv_transform_normalize(
+                params,
+                untransformed_position,
+                untransformed_gradient,
+                transformed_position,
+                transformed_gradient,
+            )?;
+        Ok(logdet)
+    }
+
+    fn init_from_transformed_position(
+        &mut self,
+        params: &Py<PyAny>,
+        untransformed_position: &mut [f64],
+        untransformed_gradient: &mut [f64],
+        transformed_position: &[f64],
+        transformed_gradient: &mut [f64],
+    ) -> std::result::Result<(f64, f64), Self::LogpError> {
+        let (logp, logdet) = self
+            .transform_adapter
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?
+            .init_from_transformed_position(
+                params,
+                untransformed_position,
+                untransformed_gradient,
+                transformed_position,
+                transformed_gradient,
+            )?;
+        Ok((logp, logdet))
+    }
+
+    fn init_from_untransformed_position(
+        &mut self,
+        params: &Py<PyAny>,
+        untransformed_position: &[f64],
+        untransformed_gradient: &mut [f64],
+        transformed_position: &mut [f64],
+        transformed_gradient: &mut [f64],
+    ) -> std::result::Result<(f64, f64), Self::LogpError> {
+        let (logp, logdet) = self
+            .transform_adapter
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?
+            .init_from_untransformed_position(
+                params,
+                untransformed_position,
+                untransformed_gradient,
+                transformed_position,
+                transformed_gradient,
+            )?;
+        Ok((logp, logdet))
+    }
+
+    fn update_transformation<'a, R: rand::Rng + ?Sized>(
+        &'a mut self,
+        rng: &mut R,
+        untransformed_positions: impl ExactSizeIterator<Item = &'a [f64]>,
+        untransformed_gradients: impl ExactSizeIterator<Item = &'a [f64]>,
+        untransformed_logp: impl ExactSizeIterator<Item = &'a f64>,
+        params: &'a mut Py<PyAny>,
+    ) -> std::result::Result<(), Self::LogpError> {
+        self.transform_adapter
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?
+            .update_transformation(
+                rng,
+                untransformed_positions,
+                untransformed_gradients,
+                untransformed_logp,
+                params,
+            )?;
         Ok(())
     }
 
-    fn finalize(self) -> Result<Arc<dyn Array>> {
-        let (fields, arrays): (Vec<_>, _) = izip!(self.data, self.var_names, self.var_sizes)
-            .map(|(data, name, size)| {
-                let (num_arrays, rem) = data
-                    .len()
-                    .checked_div_rem_euclid(&size)
-                    .unwrap_or((self.count, 0));
-                assert!(rem == 0);
-                assert!(num_arrays == self.count);
-                let data = Float64Array::from(data);
-                let item_field = Arc::new(Field::new("item", DataType::Float64, false));
-                let offsets = OffsetBuffer::from_lengths((0..num_arrays).map(|_| size));
-                let array = LargeListArray::new(item_field.clone(), offsets, Arc::new(data), None);
-                let field = Field::new(name, DataType::LargeList(item_field), false);
-                (Arc::new(field), Arc::new(array) as Arc<dyn Array>)
-            })
-            .unzip();
-
-        let fields = Fields::from(fields);
-        Ok(Arc::new(
-            StructArray::try_new(fields, arrays, None).context("Could not create arrow struct")?,
-        ))
+    fn new_transformation<R: rand::Rng + ?Sized>(
+        &mut self,
+        rng: &mut R,
+        untransformed_position: &[f64],
+        untransformed_gradient: &[f64],
+        chain: u64,
+    ) -> std::result::Result<Py<PyAny>, Self::LogpError> {
+        let trafo = self
+            .transform_adapter
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?
+            .new_transformation(rng, untransformed_position, untransformed_gradient, chain)?;
+        Ok(trafo)
     }
 
-    fn inspect(&self) -> Result<Arc<dyn Array>> {
-        self.clone().finalize()
-    }
-}
-
-impl<'model> PyMcTrace<'model> {
-    fn new(model: &'model PyMcModel, settings: &impl Settings) -> Self {
-        let draws = settings.hint_num_draws() + settings.hint_num_tune();
-        Self {
-            dim: model.dim,
-            data: model
-                .var_sizes
-                .iter()
-                .map(|&size| Vec::with_capacity(size * draws))
-                .collect(),
-            var_sizes: model.var_sizes.clone(),
-            var_names: model.var_names.clone(),
-            expand: &model.expand,
-            count: 0,
-        }
-    }
-
-    fn expand_draw(&mut self, point: &[f64]) -> Result<Box<[f64]>> {
-        let mut out = vec![0f64; self.expand.expanded_dim].into_boxed_slice();
-        let retcode = unsafe {
-            (self.expand.func)(
-                self.expand.dim,
-                self.expand.expanded_dim,
-                point.as_ptr(),
-                out.as_mut_ptr(),
-                self.expand.user_data_ptr,
-            )
-        };
-        if retcode == 0 {
-            Ok(out)
-        } else {
-            Err(anyhow::Error::msg("Failed to expand a draw."))
-        }
+    fn transformation_id(&self, params: &Py<PyAny>) -> std::result::Result<i64, Self::LogpError> {
+        let id = self
+            .transform_adapter
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?
+            .transformation_id(params)?;
+        Ok(id)
     }
 }
 
@@ -244,28 +398,59 @@ pub(crate) struct PyMcModel {
     density: LogpFunc,
     expand: ExpandFunc,
     init_func: Arc<Py<PyAny>>,
-    var_sizes: Vec<usize>,
-    var_names: Vec<String>,
+    transform_adapter: Option<PyTransformAdapt>,
+    variables: Arc<Vec<PyVariable>>,
+    dim_sizes: HashMap<String, u64>,
+    coords: HashMap<String, Value>,
 }
 
 #[pymethods]
 impl PyMcModel {
     #[new]
     fn new<'py>(
-        dim: usize,
+        py: Python<'py>,
         density: LogpFunc,
         expand: ExpandFunc,
+        variables: Vec<PyVariable>,
+        dim: usize,
+        dim_sizes: Py<PyDict>,
+        coords: Py<PyDict>,
         init_func: Py<PyAny>,
-        var_sizes: &Bound<'py, PyList>,
-        var_names: &Bound<'py, PyList>,
+        transform_adapter: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
+        let dim_sizes = dim_sizes
+            .bind(py)
+            .iter()
+            .map(|(key, value)| {
+                let key: String = key.extract().context("Dimension key is not a string")?;
+                let value: u64 = value
+                    .extract()
+                    .context("Dimension size value is not an integer")?;
+                Ok((key, value))
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
+
+        let coords = coords
+            .bind(py)
+            .iter()
+            .map(|(key, value)| {
+                let key: String = key.extract().context("Coordinate key is not a string")?;
+                let value: PyValue = value
+                    .extract()
+                    .context("Coordinate value has incorrect type")?;
+                Ok((key, value.into_value()))
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
+
         Ok(Self {
             dim,
             density,
             expand,
             init_func: init_func.into(),
-            var_names: var_names.extract()?,
-            var_sizes: var_sizes.extract()?,
+            coords,
+            dim_sizes,
+            transform_adapter: transform_adapter.map(PyTransformAdapt::new),
+            variables: Arc::new(variables),
         })
     }
 
@@ -291,12 +476,13 @@ impl PyMcModel {
 }
 
 impl Model for PyMcModel {
-    type Math<'model> = CpuMath<&'model LogpFunc>;
+    type Math<'model> = CpuMath<PyMcModelRef<'model>>;
 
-    type DrawStorage<'model, S: Settings> = PyMcTrace<'model>;
-
-    fn math(&self) -> Result<Self::Math<'_>> {
-        Ok(CpuMath::new(&self.density))
+    fn math<R: Rng + ?Sized>(&self, _rng: &mut R) -> Result<Self::Math<'_>> {
+        Ok(CpuMath::new(PyMcModelRef {
+            model: self,
+            transform_adapter: self.transform_adapter.clone(),
+        }))
     }
 
     fn init_position<R: rand::Rng + ?Sized>(
@@ -328,14 +514,5 @@ impl Model for PyMcModel {
             Ok(())
         })?;
         Ok(())
-    }
-
-    fn new_trace<'model, S: Settings, R: rand::prelude::Rng + ?Sized>(
-        &'model self,
-        _rng: &mut R,
-        _chain_id: u64,
-        settings: &'model S,
-    ) -> Result<Self::DrawStorage<'model, S>> {
-        Ok(PyMcTrace::new(self, settings))
     }
 }

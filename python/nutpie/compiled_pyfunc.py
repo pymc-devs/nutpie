@@ -19,6 +19,7 @@ class PyFuncModel(CompiledModel):
     _shared_data: dict[str, Any]
     _n_dim: int
     _variables: list[_lib.PyVariable]
+    _dim_sizes: dict[str, int]
     _coords: dict[str, Any]
     _raw_logp_fn: Callable | None
     _transform_adapt_args: dict | None = None
@@ -47,13 +48,14 @@ class PyFuncModel(CompiledModel):
     def with_transform_adapt(self, **kwargs):
         return dataclasses.replace(self, _transform_adapt_args=kwargs)
 
-    def _make_sampler(self, settings, init_mean, cores, progress_type):
+    def _make_sampler(self, settings, init_mean, cores, progress_type, store):
         model = self._make_model(init_mean)
         return _lib.PySampler.from_pyfunc(
             settings,
             cores,
             model,
             progress_type,
+            store,
         )
 
     def _make_model(self, init_mean):
@@ -85,6 +87,8 @@ class PyFuncModel(CompiledModel):
             make_expand_func,
             self._variables,
             self.n_dim,
+            dim_sizes=self._dim_sizes,
+            coords=self._coords,
             init_point_func=self._make_initial_points,
             transform_adapter=make_adapter,
         )
@@ -105,19 +109,6 @@ def from_pyfunc(
     make_transform_adapter=None,
     raw_logp_fn=None,
 ):
-    variables = []
-    for name, shape, dtype in zip(
-        expanded_names, expanded_shapes, expanded_dtypes, strict=True
-    ):
-        shape = _lib.TensorShape(list(shape))
-        if dtype == np.float64:
-            dtype = _lib.ExpandDtype.float64_array(shape)
-        elif dtype == np.float32:
-            dtype = _lib.ExpandDtype.float32_array(shape)
-        elif dtype == np.int64:
-            dtype = _lib.ExpandDtype.int64_array(shape)
-        variables.append(_lib.PyVariable(name, dtype))
-
     if coords is None:
         coords = {}
     if dims is None:
@@ -125,10 +116,23 @@ def from_pyfunc(
     if shared_data is None:
         shared_data = {}
 
+    coords = coords.copy()
+
+    dim_sizes = {k: len(v) for k, v in coords.items()}
+    shapes = [tuple(shape) for shape in expanded_shapes]
+    variables = _lib.PyVariable.new_variables(
+        expanded_names,
+        [str(dtype) for dtype in expanded_dtypes],
+        shapes,
+        dim_sizes,
+        dims,
+    )
+
     return PyFuncModel(
         _n_dim=ndim,
         dims=dims,
         _coords=coords,
+        _dim_sizes=dim_sizes,
         _make_logp_func=make_logp_fn,
         _make_expand_func=make_expand_fn,
         _make_initial_points=make_initial_point_fn,

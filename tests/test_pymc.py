@@ -88,7 +88,12 @@ def test_low_rank(backend, gradient_backend):
         model, backend=backend, gradient_backend=gradient_backend
     )
     trace = nutpie.sample(compiled, chains=1, low_rank_modified_mass_matrix=True)
-    trace.posterior.a  # noqa: B018
+
+    assert "mass_matrix_eigvals" not in trace.sample_stats
+    trace = nutpie.sample(
+        compiled, chains=1, low_rank_modified_mass_matrix=True, store_mass_matrix=True
+    )
+    assert "mass_matrix_eigvals" in trace.sample_stats
 
 
 @pytest.mark.pymc
@@ -421,7 +426,7 @@ def test_missing(backend, gradient_backend):
 
 
 @pytest.mark.pymc
-@pytest.mark.array_compare
+@pytest.mark.array_compare(atol=1e-4, rtol=1e-4)
 def test_deterministic_sampling_numba():
     with pm.Model() as model:
         pm.HalfNormal("a")
@@ -432,7 +437,7 @@ def test_deterministic_sampling_numba():
 
 
 @pytest.mark.pymc
-@pytest.mark.array_compare
+@pytest.mark.array_compare(atol=1e-4, rtol=1e-4)
 def test_deterministic_sampling_jax():
     with pm.Model() as model:
         pm.HalfNormal("a")

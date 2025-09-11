@@ -54,75 +54,102 @@ class CompiledModel:
         return pd.concat(times)
 
 
-def _trace_to_arviz(traces, n_tune, shapes, **kwargs):
-    n_chains = len(traces)
+def _arrow_to_arviz(draw_batches, stat_batches, skip_vars=None, **kwargs):
+    if skip_vars is None:
+        skip_vars = []
 
-    data_dict = {}
-    data_dict_tune = {}
-    stats_dict = {}
-    stats_dict_tune = {}
+    n_chains = len(draw_batches)
+    assert n_chains == len(stat_batches)
 
-    draw_batches = []
-    stats_batches = []
-    for draws, stats in traces:
-        draw_batches.append(pyarrow.RecordBatch.from_struct_array(draws))
-        stats_batches.append(pyarrow.RecordBatch.from_struct_array(stats))
+    max_tuning = 0
+    max_posterior = 0
+    num_tuning = []
 
-    table = pyarrow.Table.from_batches(draw_batches)
-    table_stats = pyarrow.Table.from_batches(stats_batches)
-    for name, col in zip(table.column_names, table.columns):
-        lengths = [len(chunk) for chunk in col.chunks]
-        length = max(lengths)
-        dtype = col.chunks[0].values.to_numpy().dtype
-        if dtype in [np.float64, np.float32]:
-            data = np.full(
-                (n_chains, length, *tuple(shapes[name])), np.nan, dtype=dtype
-            )
-        else:
-            data = np.zeros((n_chains, length, *tuple(shapes[name])), dtype=dtype)
-        for i, chunk in enumerate(col.chunks):
-            data[i, : len(chunk)] = chunk.values.to_numpy().reshape(
-                (len(chunk),) + shapes[name]
-            )
+    for draw, stat in zip(draw_batches, stat_batches):
+        tuning = stat.column("tuning")
+        _num_tuning = tuning.to_numpy().sum()
+        assert draw.num_rows == stat.num_rows
+        max_tuning = max(max_tuning, _num_tuning)
+        max_posterior = max(max_posterior, draw.num_rows - _num_tuning)
+        num_tuning.append(_num_tuning)
 
-        data_dict[name] = data[:, n_tune:]
-        data_dict_tune[name] = data[:, :n_tune]
+    data_tune = {}
+    data_posterior = {}
 
-    for name, col in zip(table_stats.column_names, table_stats.columns):
-        if name in ["chain", "draw", "divergence_message"]:
-            continue
-        col_type = col.type
-        if hasattr(col_type, "list_size"):
-            last_shape = (col_type.list_size,)
-            dtype = col_type.field(0).type.to_pandas_dtype()
-        else:
-            dtype = col_type.to_pandas_dtype()
-            last_shape = ()
+    stats_tune = {}
+    stats_posterior = {}
 
-        lengths = [len(chunk) for chunk in col.chunks]
-        length = max(lengths)
+    dims = {}
 
-        if dtype in [np.float64, np.float32]:
-            data = np.full((n_chains, length, *last_shape), np.nan, dtype=dtype)
-        else:
-            data = np.zeros((n_chains, length, *last_shape), dtype=dtype)
-
-        for i, chunk in enumerate(col.chunks):
-            if hasattr(chunk, "values"):
-                values = chunk.values.to_numpy(False)
-            else:
-                values = chunk.to_numpy(False)
-            data[i, : len(chunk)] = values.reshape((len(chunk), *last_shape))
-            stats_dict[name] = data[:, n_tune:]
-            stats_dict_tune[name] = data[:, :n_tune]
+    for i, draw in enumerate(draw_batches):
+        draw_tune = draw.slice(0, num_tuning[i])
+        _add_arrow_data(data_tune, max_tuning, draw_tune, i, n_chains, dims, [])
+        draw_posterior = draw.slice(num_tuning[i], draw.num_rows - num_tuning[i])
+        _add_arrow_data(
+            data_posterior, max_posterior, draw_posterior, i, n_chains, dims, []
+        )
+    for i, stat in enumerate(stat_batches):
+        stat_tune = stat.slice(0, num_tuning[i])
+        _add_arrow_data(stats_tune, max_tuning, stat_tune, i, n_chains, dims, skip_vars)
+        stat_posterior = stat.slice(num_tuning[i], stat.num_rows - num_tuning[i])
+        _add_arrow_data(
+            stats_posterior, max_posterior, stat_posterior, i, n_chains, dims, skip_vars
+        )
 
     return arviz.from_dict(
-        data_dict,
-        sample_stats=stats_dict,
-        warmup_posterior=data_dict_tune,
-        warmup_sample_stats=stats_dict_tune,
+        data_posterior,
+        sample_stats=stats_posterior,
+        warmup_posterior=data_tune,
+        warmup_sample_stats=stats_tune,
+        dims=dims,
         **kwargs,
     )
+
+
+def _add_arrow_data(data_dict, max_length, batch, chain, n_chains, dims, skip_vars):
+    num_draws = batch.num_rows
+
+    for name in batch.column_names:
+        if name in skip_vars:
+            continue
+        col = batch.column(name)
+        meta = col.field.metadata
+        item_dims = meta.get(b"dims", [])
+        if item_dims:
+            item_dims = item_dims.decode("utf-8").split(",")
+        item_shape = meta.get(b"shape", [])
+        if item_shape:
+            item_shape = item_shape.decode("utf-8").split(",")
+        item_shape = [int(s) for s in item_shape]
+        total_shape = [n_chains, max_length, *item_shape]
+
+        col = pyarrow.array(col)
+
+        is_null = col.is_null()
+
+        if hasattr(col, "flatten"):
+            col = col.flatten()
+        dtype = col.type.to_pandas_dtype()
+
+        if name not in data_dict:
+            if dtype in [np.float64, np.float32]:
+                data = np.full(total_shape, np.nan, dtype=dtype)
+            else:
+                data = np.zeros(total_shape, dtype=dtype)
+            data_dict[name] = data
+
+            dims[name] = item_dims
+
+        values = col.to_numpy(False)
+        if is_null.sum() == 0:
+            data_dict[name][chain, :num_draws] = values.reshape(
+                (num_draws,) + tuple(item_shape)
+            )
+        else:
+            is_null = is_null.to_numpy(False)
+            data_dict[name][chain, :num_draws][~is_null] = values.reshape(
+                ((~is_null).sum(),) + tuple(item_shape)
+            )
 
 
 _progress_style = """
@@ -360,6 +387,15 @@ def in_notebook():
         return False  # Probably standard Python interpreter
 
 
+_ZarrStoreType = (
+    _lib.store.S3Store
+    | _lib.store.LocalStore
+    | _lib.store.HTTPStore
+    | _lib.store.GCSStore
+    | _lib.store.AzureStore
+)
+
+
 class _BackgroundSampler:
     _sampler: Any
     _num_divs: int
@@ -369,6 +405,8 @@ class _BackgroundSampler:
     _chains_finished: int
     _compiled_model: CompiledModel
     _save_warmup: bool
+    _store: _lib.PyStorage
+    _zarr_store: _ZarrStoreType | None = None
 
     def __init__(
         self,
@@ -383,6 +421,7 @@ class _BackgroundSampler:
         progress_template=None,
         progress_style=None,
         progress_rate=100,
+        store=None,
     ):
         self._settings = settings
         self._compiled_model = compiled_model
@@ -390,6 +429,14 @@ class _BackgroundSampler:
         self._return_raw_trace = return_raw_trace
 
         self._html = None
+
+        if store is None:
+            store = _lib.PyStorage.arrow()
+        elif type(store).__module__ == "_lib.store":
+            self._zarr_store = store
+            store = _lib.PyStorage.zarr(store)
+
+        self._store = store
 
         if not progress_bar:
             progress_type = _lib.ProgressType.none()
@@ -411,8 +458,11 @@ class _BackgroundSampler:
             self.display_id = IPython.display.display(self, display_id=True)
 
             def callback(formatted):
-                self._html = formatted
-                self.display_id.update(self)
+                try:
+                    self._html = formatted
+                    self.display_id.update(self)
+                except Exception as e:
+                    print(f"Error updating progress display: {e}")
 
             progress_type = _lib.ProgressType.template_callback(
                 progress_rate, progress_template, cores, callback
@@ -447,6 +497,7 @@ class _BackgroundSampler:
             init_mean,
             cores,
             progress_type,
+            self._store,
         )
 
     def wait(self, *, timeout=None):
@@ -460,35 +511,64 @@ class _BackgroundSampler:
         This resumes the sampler in case it had been paused.
         """
         self._sampler.wait(timeout)
-        results = self._sampler.extract_results()
+        results = self._sampler.take_results()
         return self._extract(results)
 
     def _extract(self, results):
-        dims = {name: list(dim) for name, dim in self._compiled_model.dims.items()}
-        dims["mass_matrix_inv"] = ["unconstrained_parameter"]
-        dims["gradient"] = ["unconstrained_parameter"]
-        dims["unconstrained_draw"] = ["unconstrained_parameter"]
-        dims["divergence_start"] = ["unconstrained_parameter"]
-        dims["divergence_start_gradient"] = ["unconstrained_parameter"]
-        dims["divergence_end"] = ["unconstrained_parameter"]
-        dims["divergence_momentum"] = ["unconstrained_parameter"]
-        dims["transformed_gradient"] = ["unconstrained_parameter"]
-        dims["transformed_position"] = ["unconstrained_parameter"]
-
         if self._return_raw_trace:
             return results
         else:
-            return _trace_to_arviz(
-                results,
-                self._settings.num_tune,
-                self._compiled_model.shapes,
-                dims=dims,
-                coords={
-                    name: pd.Index(vals)
-                    for name, vals in self._compiled_model.coords.items()
-                },
-                save_warmup=self._save_warmup,
-            )
+            if results.is_zarr():
+                from zarr.storage import ObjectStore
+                import obstore
+                import xarray as xr
+
+                assert self._zarr_store is not None
+
+                args, kwargs = self._zarr_store.__getnewargs_ex__()
+                name = self._zarr_store.__class__.__name__
+                cls = getattr(obstore.store, name)
+                store = cls(*args, **kwargs)
+
+                obj_store = ObjectStore(store, read_only=True)
+                ds = xr.open_datatree(obj_store, engine="zarr", consolidated=False)
+                return arviz.from_datatree(ds)
+
+            elif results.is_arrow():
+                skip_vars = []
+                skips = {
+                    "store_gradient": ["gradient"],
+                    "store_unconstrained": ["unconstrained"],
+                    "store_mass_matrix": [
+                        "mass_matrix_inv",
+                        "mass_matrix_eigvals",
+                        "mass_matrix_stds",
+                    ],
+                    "store_divergences": [
+                        "divergence_start",
+                        "divergence_end",
+                        "divergence_momentum",
+                        "divergence_start_gradient",
+                    ],
+                }
+
+                for setting, names in skips.items():
+                    if not getattr(self._settings, setting, False):
+                        skip_vars.extend(names)
+
+                draw_batches, stat_batches = results.get_arrow_trace()
+                return _arrow_to_arviz(
+                    draw_batches,
+                    stat_batches,
+                    skip_vars=skip_vars,
+                    coords={
+                        name: pd.Index(vals)
+                        for name, vals in self._compiled_model.coords.items()
+                    },
+                    save_warmup=self._save_warmup,
+                )
+            else:
+                raise ValueError("Unknown results type")
 
     def inspect(self):
         """Get a copy of the current state of the trace"""
@@ -543,6 +623,7 @@ def sample(
     progress_template: str | None = None,
     progress_style: str | None = None,
     progress_rate: int = 100,
+    zarr_store: _ZarrStoreType | None = None,
 ) -> arviz.InferenceData: ...
 
 
@@ -565,6 +646,7 @@ def sample(
     progress_template: str | None = None,
     progress_style: str | None = None,
     progress_rate: int = 100,
+    zarr_store: _ZarrStoreType | None = None,
     **kwargs,
 ) -> arviz.InferenceData: ...
 
@@ -588,6 +670,7 @@ def sample(
     progress_template: str | None = None,
     progress_style: str | None = None,
     progress_rate: int = 100,
+    zarr_store: _ZarrStoreType | None = None,
     **kwargs,
 ) -> _BackgroundSampler: ...
 
@@ -610,6 +693,7 @@ def sample(
     progress_template: str | None = None,
     progress_style: str | None = None,
     progress_rate: int = 100,
+    zarr_store: _ZarrStoreType | None = None,
     **kwargs,
 ) -> arviz.InferenceData | _BackgroundSampler:
     """Sample the posterior distribution for a compiled model.
@@ -694,6 +778,10 @@ def sample(
     transform_adapt: bool, default=False
         Use the experimental transform adaptation algorithm
         during tuning.
+    zarr_store: nutpie.store.Store
+        A store created using nutpie.store to store the samples
+        in. If None (default), the samples will be stored in
+        memory using an arrow table.
     **kwargs
         Pass additional arguments to nutpie._lib.PySamplerArgs
 
@@ -750,6 +838,7 @@ def sample(
         progress_template=progress_template,
         progress_style=progress_style,
         progress_rate=progress_rate,
+        store=zarr_store,
     )
 
     if not blocking:

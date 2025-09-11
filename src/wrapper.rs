@@ -6,27 +6,31 @@ use std::{
 };
 
 use crate::{
+    common::PyVariable,
     progress::{IndicatifHandler, ProgressHandler},
-    pyfunc::{ExpandDtype, PyModel, PyVariable, TensorShape},
+    pyfunc::PyModel,
     pymc::{ExpandFunc, LogpFunc, PyMcModel},
     stan::{StanLibrary, StanModel},
 };
 
-use anyhow::{bail, Context, Result};
-use arrow::array::Array;
+use anyhow::{anyhow, bail, Context, Result};
 use numpy::{PyArray1, PyReadonlyArray1};
 use nuts_rs::{
-    ChainProgress, DiagGradNutsSettings, LowRankNutsSettings, ProgressCallback, Sampler,
-    SamplerWaitResult, StepSizeAdaptMethod, Trace, TransformedNutsSettings,
+    ArrowConfig, ArrowTrace, ChainProgress, DiagGradNutsSettings, LowRankNutsSettings, Model,
+    ProgressCallback, Sampler, SamplerWaitResult, StepSizeAdaptMethod, TransformedNutsSettings,
+    ZarrAsyncConfig,
 };
 use pyo3::{
-    exceptions::PyTimeoutError,
-    ffi::Py_uintptr_t,
+    exceptions::{PyTimeoutError, PyValueError},
     intern,
     prelude::*,
-    types::{PyList, PyTuple},
+    types::PyList,
 };
+use pyo3_arrow::PyRecordBatch;
+use pyo3_object_store::AnyObjectStore;
 use rand::{rng, RngCore};
+use tokio::runtime::Runtime;
+use zarrs_object_store::{object_store::limit::LimitStore, AsyncObjectStore};
 
 #[pyclass]
 struct PyChainProgress(ChainProgress);
@@ -449,9 +453,7 @@ impl PyNutsSettings {
             Settings::Diag(settings) => {
                 Ok(settings.adapt_options.mass_matrix_options.store_mass_matrix)
             }
-            Settings::Transforming(_) => {
-                bail!("Option store_mass_matrix not availbale for transformation adaptation")
-            }
+            Settings::Transforming(_) => Ok(false),
         }
     }
 
@@ -663,7 +665,7 @@ impl PyNutsSettings {
 
     #[setter(step_size_adapt_method)]
     fn set_step_size_adapt_method(&mut self, method: Py<PyAny>) -> Result<()> {
-        let method = Python::with_gil(|py| {
+        let method = Python::attach(|py| {
             if let Ok(method) = method.extract::<String>(py) {
                 match method.as_str() {
                     "dual_average" => Ok(StepSizeAdaptMethod::DualAverage),
@@ -785,8 +787,10 @@ impl PyNutsSettings {
 }
 
 pub(crate) enum SamplerState {
-    Running(Sampler),
-    Finished(Option<Trace>),
+    RunningZarr(Sampler<()>),
+    RunningArrow(Sampler<Vec<ArrowTrace>>),
+    FinishedZarr,
+    FinishedArrow(Vec<ArrowTrace>),
     Empty,
 }
 
@@ -856,8 +860,198 @@ impl ProgressType {
     }
 }
 
+enum InnerPyStorage {
+    Zarr(Option<AnyObjectStore>),
+    Arrow,
+}
+
 #[pyclass]
-struct PySampler(Mutex<SamplerState>);
+struct PyStorage(InnerPyStorage);
+
+#[pymethods]
+impl PyStorage {
+    #[staticmethod]
+    fn zarr(object_store: AnyObjectStore) -> Self {
+        Self(InnerPyStorage::Zarr(Some(object_store)))
+    }
+
+    #[staticmethod]
+    fn arrow() -> Self {
+        Self(InnerPyStorage::Arrow)
+    }
+}
+
+#[pyclass]
+struct PySampler(Mutex<(SamplerState, Runtime)>);
+
+impl PySampler {
+    fn new<M: Model>(
+        settings: PyNutsSettings,
+        cores: usize,
+        model: M,
+        progress_type: ProgressType,
+        store: &mut PyStorage,
+    ) -> PyResult<Self> {
+        let callback = progress_type.into_callback()?;
+        let tokio_rt = Runtime::new().context("Failed to create Tokio runtime")?;
+        match &mut store.0 {
+            InnerPyStorage::Arrow => {
+                let storage_config = ArrowConfig::new();
+                match settings.inner {
+                    Settings::LowRank(settings) => {
+                        let sampler =
+                            Sampler::new(model, settings, storage_config, cores, callback)?;
+                        Ok(PySampler(Mutex::new((
+                            SamplerState::RunningArrow(sampler).into(),
+                            tokio_rt,
+                        ))))
+                    }
+                    Settings::Diag(settings) => {
+                        let sampler =
+                            Sampler::new(model, settings, storage_config, cores, callback)?;
+                        Ok(PySampler(Mutex::new((
+                            SamplerState::RunningArrow(sampler).into(),
+                            tokio_rt,
+                        ))))
+                    }
+                    Settings::Transforming(settings) => {
+                        let sampler =
+                            Sampler::new(model, settings, storage_config, cores, callback)?;
+                        Ok(PySampler(Mutex::new((
+                            SamplerState::RunningArrow(sampler).into(),
+                            tokio_rt,
+                        ))))
+                    }
+                }
+            }
+            InnerPyStorage::Zarr(store) => {
+                let object_store = store
+                    .take()
+                    .ok_or_else(|| anyhow!("Can not use storage configuration twice"))?
+                    .into_dyn();
+                let object_store = LimitStore::new(object_store, 50);
+                let store = AsyncObjectStore::new(object_store);
+                let store = Arc::new(store);
+                let storage_config = ZarrAsyncConfig::new(tokio_rt.handle().clone(), store);
+                match settings.inner {
+                    Settings::LowRank(settings) => {
+                        let sampler =
+                            Sampler::new(model, settings, storage_config, cores, callback)?;
+                        Ok(PySampler(Mutex::new((
+                            SamplerState::RunningZarr(sampler).into(),
+                            tokio_rt,
+                        ))))
+                    }
+                    Settings::Diag(settings) => {
+                        let sampler =
+                            Sampler::new(model, settings, storage_config, cores, callback)?;
+                        Ok(PySampler(Mutex::new((
+                            SamplerState::RunningZarr(sampler).into(),
+                            tokio_rt,
+                        ))))
+                    }
+                    Settings::Transforming(settings) => {
+                        let sampler =
+                            Sampler::new(model, settings, storage_config, cores, callback)?;
+                        Ok(PySampler(Mutex::new((
+                            SamplerState::RunningZarr(sampler).into(),
+                            tokio_rt,
+                        ))))
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl PySampler {
+    fn wait_inner_arrow(
+        &self,
+        mut control: Sampler<Vec<ArrowTrace>>,
+        timeout: Option<Duration>,
+    ) -> (PyResult<()>, SamplerState) {
+        let start_time = Instant::now();
+        let step = Duration::from_millis(100);
+
+        loop {
+            let time_so_far = Instant::now().saturating_duration_since(start_time);
+            let next_timeout = match timeout {
+                Some(timeout) => {
+                    let Some(remaining) = timeout.checked_sub(time_so_far) else {
+                        return (
+                            Err(PyTimeoutError::new_err(
+                                "Timeout while waiting for sampler to finish",
+                            )),
+                            SamplerState::RunningArrow(control),
+                        );
+                    };
+                    remaining.min(step)
+                }
+                None => step,
+            };
+
+            match control.wait_timeout(next_timeout) {
+                SamplerWaitResult::Trace(trace) => {
+                    return (Ok(()), SamplerState::FinishedArrow(trace))
+                }
+                SamplerWaitResult::Timeout(new_control) => {
+                    control = new_control;
+                }
+                SamplerWaitResult::Err(err, trace) => {
+                    return (
+                        Err(err.into()),
+                        SamplerState::FinishedArrow(trace.unwrap_or_default()),
+                    )
+                }
+            }
+
+            if let Err(err) = Python::attach(|py| py.check_signals()) {
+                return (Err(err), SamplerState::RunningArrow(control));
+            }
+        }
+    }
+
+    fn wait_inner_zarr(
+        &self,
+        mut control: Sampler<()>,
+        timeout: Option<Duration>,
+    ) -> (PyResult<()>, SamplerState) {
+        let start_time = Instant::now();
+        let step = Duration::from_millis(100);
+
+        loop {
+            let time_so_far = Instant::now().saturating_duration_since(start_time);
+            let next_timeout = match timeout {
+                Some(timeout) => {
+                    let Some(remaining) = timeout.checked_sub(time_so_far) else {
+                        return (
+                            Err(PyTimeoutError::new_err(
+                                "Timeout while waiting for sampler to finish",
+                            )),
+                            SamplerState::RunningZarr(control),
+                        );
+                    };
+                    remaining.min(step)
+                }
+                None => step,
+            };
+
+            match control.wait_timeout(next_timeout) {
+                SamplerWaitResult::Trace(_trace) => return (Ok(()), SamplerState::FinishedZarr),
+                SamplerWaitResult::Timeout(new_control) => {
+                    control = new_control;
+                }
+                SamplerWaitResult::Err(err, _trace) => {
+                    return (Err(err.into()), SamplerState::FinishedZarr)
+                }
+            }
+
+            if let Err(err) = Python::attach(|py| py.check_signals()) {
+                return (Err(err), SamplerState::RunningZarr(control));
+            }
+        }
+    }
+}
 
 #[pymethods]
 impl PySampler {
@@ -867,22 +1061,9 @@ impl PySampler {
         cores: usize,
         model: PyMcModel,
         progress_type: ProgressType,
+        store: &mut PyStorage,
     ) -> PyResult<PySampler> {
-        let callback = progress_type.into_callback()?;
-        match settings.inner {
-            Settings::LowRank(settings) => {
-                let sampler = Sampler::new(model, settings, cores, callback)?;
-                Ok(PySampler(SamplerState::Running(sampler).into()))
-            }
-            Settings::Diag(settings) => {
-                let sampler = Sampler::new(model, settings, cores, callback)?;
-                Ok(PySampler(SamplerState::Running(sampler).into()))
-            }
-            Settings::Transforming(settings) => {
-                let sampler = Sampler::new(model, settings, cores, callback)?;
-                Ok(PySampler(SamplerState::Running(sampler).into()))
-            }
-        }
+        PySampler::new(settings, cores, model, progress_type, store)
     }
 
     #[staticmethod]
@@ -891,22 +1072,9 @@ impl PySampler {
         cores: usize,
         model: StanModel,
         progress_type: ProgressType,
+        store: &mut PyStorage,
     ) -> PyResult<PySampler> {
-        let callback = progress_type.into_callback()?;
-        match settings.inner {
-            Settings::LowRank(settings) => {
-                let sampler = Sampler::new(model, settings, cores, callback)?;
-                Ok(PySampler(SamplerState::Running(sampler).into()))
-            }
-            Settings::Diag(settings) => {
-                let sampler = Sampler::new(model, settings, cores, callback)?;
-                Ok(PySampler(SamplerState::Running(sampler).into()))
-            }
-            Settings::Transforming(settings) => {
-                let sampler = Sampler::new(model, settings, cores, callback)?;
-                Ok(PySampler(SamplerState::Running(sampler).into()))
-            }
-        }
+        PySampler::new(settings, cores, model, progress_type, store)
     }
 
     #[staticmethod]
@@ -915,78 +1083,61 @@ impl PySampler {
         cores: usize,
         model: PyModel,
         progress_type: ProgressType,
+        store: &mut PyStorage,
     ) -> PyResult<PySampler> {
-        let callback = progress_type.into_callback()?;
-        match settings.inner {
-            Settings::LowRank(settings) => {
-                let sampler = Sampler::new(model, settings, cores, callback)?;
-                Ok(PySampler(SamplerState::Running(sampler).into()))
-            }
-            Settings::Diag(settings) => {
-                let sampler = Sampler::new(model, settings, cores, callback)?;
-                Ok(PySampler(SamplerState::Running(sampler).into()))
-            }
-            Settings::Transforming(settings) => {
-                let sampler = Sampler::new(model, settings, cores, callback)?;
-                Ok(PySampler(SamplerState::Running(sampler).into()))
-            }
-        }
+        PySampler::new(settings, cores, model, progress_type, store)
     }
 
     fn is_finished(&mut self, py: Python<'_>) -> PyResult<bool> {
+        self.wait(py, Some(0.001))?;
         py.detach(|| {
             let guard = &mut self.0.lock().expect("Poisond sampler state mutex");
-            let slot = guard.deref_mut();
-
-            let state = std::mem::replace(slot, SamplerState::Empty);
-
-            let SamplerState::Running(sampler) = state else {
-                let _ = std::mem::replace(slot, state);
-                return Ok(true);
-            };
-
-            match sampler.wait_timeout(Duration::from_millis(1)) {
-                SamplerWaitResult::Trace(trace) => {
-                    let _ = std::mem::replace(slot, SamplerState::Finished(Some(trace)));
-                    Ok(true)
-                }
-                SamplerWaitResult::Timeout(sampler) => {
-                    let _ = std::mem::replace(slot, SamplerState::Running(sampler));
-                    Ok(false)
-                }
-                SamplerWaitResult::Err(err, trace) => {
-                    let _ = std::mem::replace(slot, SamplerState::Finished(trace));
-                    Err(err.into())
-                }
-            }
+            Ok(matches!(
+                guard.deref_mut().0,
+                SamplerState::FinishedZarr | SamplerState::FinishedArrow(_) | SamplerState::Empty
+            ))
         })
     }
 
     fn pause(&mut self, py: Python<'_>) -> PyResult<()> {
         py.detach(|| {
-            if let SamplerState::Running(ref mut control) = self
-                .0
-                .lock()
-                .expect("Poised sampler state mutex")
-                .deref_mut()
-            {
-                control.pause()?
-            }
-            Ok(())
-        })
-    }
-
-    fn resume(&mut self, py: Python<'_>) -> PyResult<()> {
-        py.detach(|| {
-            if let SamplerState::Running(ref mut control) = self
+            match self
                 .0
                 .lock()
                 .expect("Poisond sampler state mutex")
                 .deref_mut()
             {
-                control.resume()?
+                (SamplerState::RunningZarr(control), _) => {
+                    control.pause()?;
+                    return Ok(());
+                }
+                (SamplerState::RunningArrow(control), _) => {
+                    control.pause()?;
+                    return Ok(());
+                }
+                _ => return Ok(()),
             }
-            Ok(())
+        })
+    }
+
+    fn resume(&mut self, py: Python<'_>) -> PyResult<()> {
+        py.detach(|| {
+            match self
+                .0
+                .lock()
+                .expect("Poisond sampler state mutex")
+                .deref_mut()
+            {
+                (SamplerState::RunningZarr(control), _) => {
+                    control.resume()?;
+                    return Ok(());
+                }
+                (SamplerState::RunningArrow(control), _) => {
+                    control.resume()?;
+                    return Ok(());
+                }
+                _ => return Ok(()),
+            }
         })
     }
 
@@ -995,6 +1146,7 @@ impl PySampler {
         py.detach(|| {
             let guard = &mut self.0.lock().expect("Poisond sampler state mutex");
             let slot = guard.deref_mut();
+            let slot = &mut slot.0;
 
             let timeout = match timeout_seconds {
                 Some(val) => Some(Duration::try_from_secs_f64(val).context("Invalid timeout")?),
@@ -1003,46 +1155,12 @@ impl PySampler {
 
             let state = std::mem::replace(slot, SamplerState::Empty);
 
-            let SamplerState::Running(mut control) = state else {
-                let _ = std::mem::replace(slot, state);
-                return Ok(());
-            };
-
-            let start_time = Instant::now();
-            let step = Duration::from_millis(100);
-
-            let (final_state, retval) = loop {
-                let time_so_far = Instant::now().saturating_duration_since(start_time);
-                let next_timeout = match timeout {
-                    Some(timeout) => {
-                        let Some(remaining) = timeout.checked_sub(time_so_far) else {
-                            break (
-                                SamplerState::Running(control),
-                                Err(PyTimeoutError::new_err(
-                                    "Timeout while waiting for sampler to finish",
-                                )),
-                            );
-                        };
-                        remaining.min(step)
-                    }
-                    None => step,
-                };
-
-                match control.wait_timeout(next_timeout) {
-                    SamplerWaitResult::Trace(trace) => {
-                        break (SamplerState::Finished(Some(trace)), Ok(()))
-                    }
-                    SamplerWaitResult::Timeout(new_control) => {
-                        control = new_control;
-                    }
-                    SamplerWaitResult::Err(err, trace) => {
-                        break (SamplerState::Finished(trace), Err(err.into()))
-                    }
-                }
-
-                if let Err(err) = Python::attach(|py| py.check_signals()) {
-                    break (SamplerState::Running(control), Err(err));
-                }
+            let (retval, final_state) = match state {
+                SamplerState::FinishedZarr
+                | SamplerState::FinishedArrow(_)
+                | SamplerState::Empty => (Ok(()), state),
+                SamplerState::RunningZarr(control) => self.wait_inner_zarr(control, timeout),
+                SamplerState::RunningArrow(control) => self.wait_inner_arrow(control, timeout),
             };
 
             let _ = std::mem::replace(slot, final_state);
@@ -1054,101 +1172,160 @@ impl PySampler {
         py.detach(|| {
             let guard = &mut self.0.lock().expect("Poisond sampler state mutex");
             let slot = guard.deref_mut();
+            let slot = &mut slot.0;
 
             let state = std::mem::replace(slot, SamplerState::Empty);
 
-            let SamplerState::Running(control) = state else {
-                let _ = std::mem::replace(slot, state);
-                return Ok(());
-            };
-
-            let (result, trace) = control.abort();
-            let _ = std::mem::replace(slot, SamplerState::Finished(trace));
-            result?;
-            Ok(())
+            match state {
+                SamplerState::FinishedZarr
+                | SamplerState::FinishedArrow(_)
+                | SamplerState::Empty => {
+                    let _ = std::mem::replace(slot, state);
+                    return Ok(());
+                }
+                SamplerState::RunningZarr(control) => {
+                    let (result, _) = control.abort()?;
+                    let _ = std::mem::replace(slot, SamplerState::FinishedZarr);
+                    if let Some(err) = result {
+                        Err(err)?;
+                    }
+                    Ok(())
+                }
+                SamplerState::RunningArrow(control) => {
+                    let (result, trace) = control.abort()?;
+                    let _ = std::mem::replace(slot, SamplerState::FinishedArrow(trace));
+                    if let Some(err) = result {
+                        Err(err)?;
+                    }
+                    Ok(())
+                }
+            }
         })
     }
 
-    fn extract_results<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        let guard = &mut self.0.lock().expect("Poisond sampler state mutex");
-        let slot = guard.deref_mut();
-
-        let state = std::mem::replace(slot, SamplerState::Empty);
-
-        let SamplerState::Finished(trace) = state else {
-            let _ = std::mem::replace(slot, state);
-            return Err(anyhow::anyhow!("Sampler is not finished"))?;
-        };
-
-        let Some(trace) = trace else {
-            return Err(anyhow::anyhow!(
-                "Sampler failed and did not produce a trace"
-            ))?;
-        };
-
-        trace_to_list(trace, py)
+    fn is_empty(&self) -> bool {
+        matches!(
+            self.0.lock().expect("Poisoned sampler state lock").deref(),
+            (SamplerState::Empty, _)
+        )
     }
 
-    fn is_empty(&self) -> bool {
-        match self.0.lock().expect("Poisoned sampler state lock").deref() {
-            SamplerState::Running(_) => false,
-            SamplerState::Finished(_) => false,
-            SamplerState::Empty => true,
+    fn flush<'py>(&mut self, py: Python<'py>) -> PyResult<()> {
+        match self
+            .0
+            .lock()
+            .expect("Poisond sampler state mutex")
+            .deref_mut()
+            .0
+        {
+            SamplerState::FinishedZarr => Ok(()),
+            SamplerState::FinishedArrow(_) => Ok(()),
+            SamplerState::Empty => Ok(()),
+            SamplerState::RunningZarr(ref mut control) => {
+                py.detach(|| control.flush())?;
+                Ok(())
+            }
+            SamplerState::RunningArrow(ref mut control) => {
+                py.detach(|| control.flush())?;
+                Ok(())
+            }
         }
     }
 
-    fn inspect<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        let trace = py.detach(|| {
-            let mut guard = self.0.lock().unwrap();
-            let SamplerState::Running(ref mut sampler) = guard.deref_mut() else {
-                return Err(anyhow::anyhow!("Sampler is not running"))?;
-            };
+    fn inspect<'py>(&self, py: Python<'py>) -> PyResult<Option<PyTrace>> {
+        match &mut self
+            .0
+            .lock()
+            .expect("Poisond sampler state mutex")
+            .deref_mut()
+            .0
+        {
+            SamplerState::FinishedZarr => Ok(Some(PyTrace(InnerPyTrace::Zarr))),
+            SamplerState::FinishedArrow(trace) => {
+                Ok(Some(PyTrace(InnerPyTrace::Arrow(Some(trace.clone())))))
+            }
+            SamplerState::Empty => Ok(None),
+            SamplerState::RunningZarr(control) => {
+                let (res, _) = py.detach(|| control.inspect())?;
+                if let Some(err) = res {
+                    return Err(err.into());
+                }
+                Ok(Some(PyTrace(InnerPyTrace::Zarr)))
+            }
+            SamplerState::RunningArrow(control) => {
+                let (res, trace) = py.detach(|| control.inspect())?;
+                if let Some(err) = res {
+                    return Err(err.into());
+                }
+                Ok(Some(PyTrace(InnerPyTrace::Arrow(Some(trace)))))
+            }
+        }
+    }
 
-            sampler.inspect_trace()
-        })?;
-        trace_to_list(trace, py)
+    fn take_results(&mut self) -> PyResult<PyTrace> {
+        let state = &mut self.0.lock().expect("Poisond sampler state mutex");
+
+        match &state.0 {
+            SamplerState::FinishedZarr => {
+                let _ = std::mem::replace(&mut state.0, SamplerState::Empty);
+                Ok(PyTrace(InnerPyTrace::Zarr))
+            }
+            SamplerState::FinishedArrow(_) => {
+                let state = std::mem::replace(&mut state.0, SamplerState::Empty);
+                let SamplerState::FinishedArrow(trace) = state else {
+                    unreachable!();
+                };
+                Ok(PyTrace(InnerPyTrace::Arrow(Some(trace))))
+            }
+            SamplerState::Empty => Err(PyErr::new::<PyValueError, _>(
+                "Sampler has no results to take",
+            )),
+            SamplerState::RunningZarr(_) => Err(PyErr::new::<PyValueError, _>(
+                "Sampler is still running, can only take results after it has finished",
+            )),
+            SamplerState::RunningArrow(_) => Err(PyErr::new::<PyValueError, _>(
+                "Sampler is still running, can only take results after it has finished",
+            )),
+        }
     }
 }
 
-fn trace_to_list(trace: Trace, py: Python<'_>) -> PyResult<Bound<'_, PyList>> {
-    let list = PyList::new(
-        py,
-        trace
-            .chains
-            .into_iter()
-            .map(|chain| {
-                Ok(PyTuple::new(
-                    py,
-                    [
-                        export_array(py, chain.draws)?,
-                        export_array(py, chain.stats)?,
-                    ]
-                    .into_iter(),
-                )?)
-            })
-            .collect::<Result<Vec<_>>>()?,
-    )?;
-    Ok(list)
+enum InnerPyTrace {
+    Zarr,
+    Arrow(Option<Vec<ArrowTrace>>),
 }
 
-fn export_array(py: Python<'_>, data: Arc<dyn Array>) -> PyResult<Py<PyAny>> {
-    let pa = py.import("pyarrow")?;
-    let array = pa.getattr("Array")?;
+#[pyclass]
+pub struct PyTrace(InnerPyTrace);
 
-    let data = data.into_data();
+#[pymethods]
+impl PyTrace {
+    fn is_zarr(&self) -> bool {
+        matches!(self.0, InnerPyTrace::Zarr)
+    }
 
-    let (data, schema) = arrow::ffi::to_ffi(&data).context("Could not convert to arrow ffi")?;
+    fn is_arrow(&self) -> bool {
+        matches!(self.0, InnerPyTrace::Arrow(_))
+    }
 
-    let data = array
-        .call_method1(
-            "_import_from_c",
-            (
-                (&data as *const _ as Py_uintptr_t).into_pyobject(py)?,
-                (&schema as *const _ as Py_uintptr_t).into_pyobject(py)?,
-            ),
-        )
-        .context("Could not import arrow trace in python")?;
-    Ok(data.unbind())
+    fn get_arrow_trace(&mut self) -> PyResult<(Vec<PyRecordBatch>, Vec<PyRecordBatch>)> {
+        match &mut self.0 {
+            InnerPyTrace::Zarr => Err(PyErr::new::<PyValueError, _>(
+                "Trace is not stored in Arrow format",
+            )),
+            InnerPyTrace::Arrow(trace) => Ok(trace
+                .take()
+                .ok_or_else(|| PyValueError::new_err("The trace was already taken"))?
+                .into_iter()
+                .map(|array| {
+                    (
+                        PyRecordBatch::new(array.posterior),
+                        PyRecordBatch::new(array.sample_stats),
+                    )
+                })
+                .collect()),
+        }
+    }
 }
 
 #[pyclass]
@@ -1403,10 +1580,12 @@ pub fn _lib(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyNutsSettings>()?;
     m.add_class::<PyChainProgress>()?;
     m.add_class::<ProgressType>()?;
-    m.add_class::<TensorShape>()?;
     m.add_class::<PyModel>()?;
     m.add_class::<PyVariable>()?;
-    m.add_class::<ExpandDtype>()?;
+    m.add_class::<PyStorage>()?;
+    m.add_class::<PyTrace>()?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    pyo3_object_store::register_store_module(m.py(), m, "_lib", "store")?;
+    pyo3_object_store::register_exceptions_module(m.py(), m, "_lib", "exceptions")?;
     Ok(())
 }

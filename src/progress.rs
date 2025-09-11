@@ -30,13 +30,14 @@ impl ProgressHandler {
         let (update_tx, update_rx) = sync_channel(1);
 
         spawn(move || {
-            Python::with_gil(move |py| {
-                py.allow_threads(move || {
+            // We keep an extra gil reference alive, to ensure the
+            // python ThreadState is not destroyed.
+            // See https://github.com/PyO3/pyo3/issues/5467
+            Python::attach(move |py| {
+                py.detach(move || loop {
                     let update = update_rx.recv();
-                    let Ok(update) = update else {
-                        return;
-                    };
-                    let res = Python::with_gil(|py| callback.call1(py, (update,)));
+                    let Ok(update) = update else { break };
+                    let res = Python::attach(|py| callback.call1(py, (update,)));
                     if let Err(err) = res {
                         eprintln!("Error in progress callback: {err}");
                     }
