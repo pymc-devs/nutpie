@@ -111,6 +111,8 @@ class CompiledPyMCModel(CompiledModel):
     _n_dim: int
     _shapes: dict[str, tuple[int, ...]]
     _coords: Optional[dict[str, Any]]
+    log_likelihood_names: list[str]
+    log_likelihood_shapes: list[tuple[int, ...]]
 
     @property
     def n_dim(self):
@@ -220,6 +222,7 @@ def _compile_pymc_model_numba(
     model: "pm.Model",
     pymc_initial_point_fn: Callable[[SeedType], dict[str, np.ndarray]],
     var_names: Iterable[str] | None = None,
+    compute_log_likelihood: bool = False,
     **kwargs,
 ) -> CompiledPyMCModel:
     if find_spec("numba") is None:
@@ -238,6 +241,7 @@ def _compile_pymc_model_numba(
         expand_fn_pt,
         initial_point_fn,
         shape_info,
+        log_likelihood_info,
     ) = _make_functions(
         model,
         mode="NUMBA",
@@ -245,6 +249,7 @@ def _compile_pymc_model_numba(
         join_expanded=True,
         pymc_initial_point_fn=pymc_initial_point_fn,
         var_names=var_names,
+        compute_log_likelihood=compute_log_likelihood,
     )
 
     expand_fn = expand_fn_pt.vm.jit_fn
@@ -254,6 +259,9 @@ def _compile_pymc_model_numba(
     shared_vars = {}
     seen = set()
     for val in [*logp_fn_pt.get_shared(), *expand_fn_pt.get_shared()]:
+        # Skip RNG variables that don't have names
+        if val.name is None:
+            continue
         if val.name in shared_data and val not in seen:
             raise ValueError(f"Shared variables must have unique names: {val.name}")
         shared_data[val.name] = np.array(val.get_value(), order="C", copy=True)
@@ -265,10 +273,16 @@ def _compile_pymc_model_numba(
 
     user_data = make_user_data(shared_vars, shared_data)
 
-    logp_shared_names = [var.name for var in logp_fn_pt.get_shared()]
+    logp_shared_names = [
+        var.name for var in logp_fn_pt.get_shared() if var.name is not None
+    ]
     logp_numba_raw, c_sig = _make_c_logp_func(
-        n_dim, logp_fn, user_data, logp_shared_names, shared_data
+        n_dim, logp_fn, user_data, logp_shared_names, shared_data, logp_fn_pt
     )
+
+    # Filter out compute_log_likelihood from kwargs for numba compilation
+    numba_kwargs = {k: v for k, v in kwargs.items() if k != "compute_log_likelihood"}
+
     with warnings.catch_warnings():
         warnings.filterwarnings(
             "ignore",
@@ -276,11 +290,19 @@ def _compile_pymc_model_numba(
             category=numba.NumbaWarning,  # type: ignore
         )
 
-        logp_numba = numba.cfunc(c_sig, **kwargs)(logp_numba_raw)
+        logp_numba = numba.cfunc(c_sig, **numba_kwargs)(logp_numba_raw)
 
-    expand_shared_names = [var.name for var in expand_fn_pt.get_shared()]
+    expand_shared_names = [
+        var.name for var in expand_fn_pt.get_shared() if var.name is not None
+    ]
     expand_numba_raw, c_sig_expand = _make_c_expand_func(
-        n_dim, n_expanded, expand_fn, user_data, expand_shared_names, shared_data
+        n_dim,
+        n_expanded,
+        expand_fn,
+        user_data,
+        expand_shared_names,
+        shared_data,
+        expand_fn_pt,
     )
     with warnings.catch_warnings():
         warnings.filterwarnings(
@@ -289,9 +311,11 @@ def _compile_pymc_model_numba(
             category=numba.NumbaWarning,  # type: ignore
         )
 
-        expand_numba = numba.cfunc(c_sig_expand, **kwargs)(expand_numba_raw)
+        expand_numba = numba.cfunc(c_sig_expand, **numba_kwargs)(expand_numba_raw)
 
     dims, coords = _prepare_dims_and_coords(model, shape_info)
+
+    log_likelihood_names, log_likelihood_shapes = log_likelihood_info
 
     return CompiledPyMCModel(
         _n_dim=n_dim,
@@ -307,6 +331,8 @@ def _compile_pymc_model_numba(
         shape_info=shape_info,
         logp_func=logp_fn_pt,
         expand_func=expand_fn_pt,
+        log_likelihood_names=log_likelihood_names,
+        log_likelihood_shapes=log_likelihood_shapes,
     )
 
 
@@ -341,6 +367,7 @@ def _compile_pymc_model_jax(
     gradient_backend=None,
     pymc_initial_point_fn: Callable[[SeedType], dict[str, np.ndarray]],
     var_names: Iterable[str] | None = None,
+    compute_log_likelihood: bool = False,
     **kwargs,
 ):
     if find_spec("jax") is None:
@@ -364,6 +391,7 @@ def _compile_pymc_model_jax(
         expand_fn_pt,
         initial_point_fn,
         shape_info,
+        log_likelihood_info,
     ) = _make_functions(
         model,
         mode="JAX",
@@ -371,18 +399,33 @@ def _compile_pymc_model_jax(
         join_expanded=False,
         pymc_initial_point_fn=pymc_initial_point_fn,
         var_names=var_names,
+        compute_log_likelihood=compute_log_likelihood,
     )
 
     logp_fn = logp_fn_pt.vm.jit_fn
     expand_fn = expand_fn_pt.vm.jit_fn
 
-    logp_shared_names = [var.name for var in logp_fn_pt.get_shared()]
-    expand_shared_names = [var.name for var in expand_fn_pt.get_shared()]
+    logp_shared_names = [
+        var.name for var in logp_fn_pt.get_shared() if var.name is not None
+    ]
+    expand_shared_names = [
+        var.name for var in expand_fn_pt.get_shared() if var.name is not None
+    ]
+
+    logp_rng_count = len([var for var in logp_fn_pt.get_shared() if var.name is None])
+    expand_rng_count = len(
+        [var for var in expand_fn_pt.get_shared() if var.name is None]
+    )
 
     if gradient_backend == "jax":
         orig_logp_fn = logp_fn._fun
 
         def logp_fn_jax_grad(x, *shared):
+            if len(shared) < logp_rng_count:
+                rng_dummies = [
+                    {"jax_state": jax.random.key(i)} for i in range(logp_rng_count)
+                ]
+                shared = shared + tuple(rng_dummies)
             return jax.value_and_grad(lambda x: orig_logp_fn(x, *shared)[0])(x)
 
         # static_argnums = list(range(1, len(logp_shared_names) + 1))
@@ -399,6 +442,9 @@ def _compile_pymc_model_jax(
     shared_vars = {}
     seen = set()
     for val in [*logp_fn_pt.get_shared(), *expand_fn_pt.get_shared()]:
+        # Skip RNG variables that don't have names
+        if val.name is None:
+            continue
         if val.name in shared_data and val not in seen:
             raise ValueError(f"Shared variables must have unique names: {val.name}")
         shared_data[val.name] = jax.numpy.asarray(val.get_value())
@@ -407,7 +453,9 @@ def _compile_pymc_model_jax(
 
     def make_logp_func():
         def logp(_x, **shared):
-            logp, grad = logp_fn(_x, *[shared[name] for name in logp_shared_names])
+            named_shared = [shared[name] for name in logp_shared_names]
+            rng_dummies = [{"jax_state": jax.random.key(0)}] * logp_rng_count
+            logp, grad = logp_fn(_x, *(named_shared + rng_dummies))
             return float(logp), np.asarray(grad, dtype="float64", order="C")
 
         return logp
@@ -419,7 +467,12 @@ def _compile_pymc_model_jax(
     def make_expand_func(seed1, seed2, chain):
         # TODO handle seeds
         def expand(_x, **shared):
-            values = expand_fn(_x, *[shared[name] for name in expand_shared_names])
+            named_shared = [shared[name] for name in expand_shared_names]
+            rng_dummies = [
+                {"jax_state": jax.random.key(i)} for i in range(expand_rng_count)
+            ]
+            all_outputs = expand_fn(_x, *(named_shared + rng_dummies))
+            values = all_outputs[: len(names)]
             return {
                 name: np.asarray(val, order="C", dtype=dtype).ravel()
                 for name, val, dtype in zip(names, values, dtypes, strict=True)
@@ -428,6 +481,7 @@ def _compile_pymc_model_jax(
         return expand
 
     dims, coords = _prepare_dims_and_coords(model, shape_info)
+    log_likelihood_names, log_likelihood_shapes = log_likelihood_info
 
     return from_pyfunc(
         ndim=n_dim,
@@ -441,6 +495,8 @@ def _compile_pymc_model_jax(
         dims=dims,
         coords=coords,
         raw_logp_fn=orig_logp_fn,
+        log_likelihood_names=log_likelihood_names,
+        log_likelihood_shapes=log_likelihood_shapes,
     )
 
 
@@ -457,6 +513,7 @@ def compile_pymc_model(
     ] = "support_point",
     var_names: Iterable[str] | None = None,
     freeze_model: bool | None = None,
+    compute_log_likelihood: bool = False,
     **kwargs,
 ) -> CompiledModel:
     """Compile necessary functions for sampling a pymc model.
@@ -485,6 +542,9 @@ def compile_pymc_model(
     freeze_model : bool | None
         Freeze all dimensions and shared variables to treat them as compile time
         constants.
+    compute_log_likelihood : bool
+        Whether to compute element-wise log-likelihood values for observed variables.
+        When True, enables population of the log_likelihood group in ArviZ InferenceData.
     Returns
     -------
     compiled_model : CompiledPyMCModel
@@ -529,10 +589,26 @@ def compile_pymc_model(
     if backend.lower() == "numba":
         if gradient_backend == "jax":
             raise ValueError("Gradient backend cannot be jax when using numba backend")
+        # WORKAROUND: Disable log likelihood computation for numba backend due to
+        # PyTensor vectorization creating input_bc_patterns that must be literals.
+        # This is a known limitation documented in CLAUDE.md
+        if compute_log_likelihood:
+            import warnings
+
+            warnings.warn(
+                "compute_log_likelihood=True is not supported with numba backend due to "
+                "PyTensor vectorization issues. Please use the JAX backend for log-likelihood "
+                "computation: backend='jax', gradient_backend='jax'",
+                UserWarning,
+                stacklevel=2,
+            )
+            # Disable log likelihood computation and continue with numba
+            compute_log_likelihood = False
         return _compile_pymc_model_numba(
             model=model,
             pymc_initial_point_fn=initial_point_fn,
             var_names=var_names,
+            compute_log_likelihood=compute_log_likelihood,
             **kwargs,
         )
     elif backend.lower() == "jax":
@@ -541,6 +617,7 @@ def compile_pymc_model(
             gradient_backend=gradient_backend,
             pymc_initial_point_fn=initial_point_fn,
             var_names=var_names,
+            compute_log_likelihood=compute_log_likelihood,
             **kwargs,
         )
     else:
@@ -595,6 +672,7 @@ def _make_functions(
     join_expanded: bool,
     pymc_initial_point_fn: Callable[[SeedType], dict[str, np.ndarray]],
     var_names: Iterable[str] | None = None,
+    compute_log_likelihood: bool = False,
 ) -> tuple[
     int,
     int,
@@ -602,6 +680,7 @@ def _make_functions(
     Callable,
     Callable,
     tuple[list[str], list[slice], list[tuple[int, ...]]],
+    tuple[list[str], list[tuple[int, ...]]],
 ]:
     """
     Compile functions required by nuts-rs from a given PyMC model.
@@ -623,6 +702,8 @@ def _make_functions(
         pymc.initial_point.make_initial_point_fn
     var_names:
         Names of variables to store in the trace. Defaults to all variables.
+    compute_log_likelihood: bool
+        Whether to compute element-wise log-likelihood values for observed variables.
 
     Returns
     -------
@@ -646,10 +727,14 @@ def _make_functions(
         names of the variables, the second list contains the slices that
         correspond to the variables in the flat array, and the third list
         contains the shapes of the variables.
+    log_likelihood_data: tuple of lists
+        Tuple containing log-likelihood variable information. The first list contains
+        the names of the log-likelihood variables, the second list contains their shapes.
     """
     import pytensor
     import pytensor.tensor as pt
     from pymc.pytensorf import compile as compile_pymc
+    import pymc as pm
 
     shapes = _compute_shapes(model)
 
@@ -748,6 +833,39 @@ def _make_functions(
 
     num_expanded = count
 
+    log_likelihood_names = []
+    log_likelihood_shapes = []
+    log_likelihood_vars = []
+
+    if compute_log_likelihood:
+        for obs in model.observed_RVs:
+            obs_name = obs.name
+            log_lik_name = f"log_likelihood_{obs_name}"
+
+            # Get element-wise log-likelihood
+            log_lik_expr = pm.logp(obs, obs)
+            log_lik_expr.name = log_lik_name
+
+            # Get the shape of the observed variable
+            # For observed variables, we need to get the shape from the observed data
+            obs_shape = (
+                tuple(obs.shape.eval()) if hasattr(obs.shape, "eval") else obs.shape
+            )
+
+            log_likelihood_vars.append(log_lik_expr)
+            log_likelihood_names.append(log_lik_name)
+            log_likelihood_shapes.append(obs_shape)
+
+            all_names.append(log_lik_name)
+            all_shapes.append(obs_shape)
+            length = prod(obs_shape)
+            all_slices.append(slice(count, count + length))
+            count += length
+
+        num_expanded = count
+
+        remaining_rvs.extend(log_likelihood_vars)
+
     if join_expanded:
         allvars = [pt.concatenate([joined, *[var.ravel() for var in remaining_rvs]])]
     else:
@@ -767,19 +885,74 @@ def _make_functions(
         expand_fn_pt,
         initial_point_fn,
         (all_names, all_slices, all_shapes),
+        (log_likelihood_names, log_likelihood_shapes),
     )
 
 
-def make_extraction_fn(inner, shared_data, shared_vars, record_dtype):
+def make_extraction_fn(inner, shared_data, shared_vars, record_dtype, pytensor_fn=None):
     import numba
     from numba import literal_unroll
     from numba.cpython.unsafe.tuple import alloca_once, tuple_setitem
 
     if not shared_vars:
+        # Check if we have a PyTensor function to get the count of RNG shared variables
+        if pytensor_fn is not None:
+            all_shared = pytensor_fn.get_shared()
+            rng_count = len([var for var in all_shared if var.name is None])
+        else:
+            rng_count = 0
 
-        @numba.njit(inline="always")
-        def extract_shared(x, user_data_):
-            return inner(x)
+        if rng_count > 0:
+            # Have RNG shared variables but no named ones
+            # Create a wrapper that provides dummy values for RNG variables
+            def make_extract_with_rng_dummy(inner_fn, num_rng):
+                if num_rng == 1:
+
+                    @numba.njit(inline="always")
+                    def extract_shared(x, user_data_):
+                        rng = 0  # Dummy value - RNG state is managed elsewhere
+                        return inner_fn(x, rng)
+
+                    return extract_shared
+                elif num_rng == 2:
+
+                    @numba.njit(inline="always")
+                    def extract_shared(x, user_data_):
+                        rng1, rng2 = 0, 0  # Dummy values
+                        return inner_fn(x, rng1, rng2)
+
+                    return extract_shared
+                elif num_rng == 3:
+
+                    @numba.njit(inline="always")
+                    def extract_shared(x, user_data_):
+                        rng1, rng2, rng3 = 0, 0, 0  # Dummy values
+                        return inner_fn(x, rng1, rng2, rng3)
+
+                    return extract_shared
+                elif num_rng == 4:
+
+                    @numba.njit(inline="always")
+                    def extract_shared(x, user_data_):
+                        rng1, rng2, rng3, rng4 = 0, 0, 0, 0  # Dummy values
+                        return inner_fn(x, rng1, rng2, rng3, rng4)
+
+                    return extract_shared
+                else:
+                    # Fallback for other counts - try 2 RNGs as default
+                    @numba.njit(inline="always")
+                    def extract_shared(x, user_data_):
+                        rng1, rng2 = 0, 0  # Dummy values
+                        return inner_fn(x, rng1, rng2)
+
+                    return extract_shared
+
+            extract_shared = make_extract_with_rng_dummy(inner, rng_count)
+        else:
+            # No shared variables expected at all
+            @numba.njit(inline="always")
+            def extract_shared(x, user_data_):
+                return inner(x)
 
         return extract_shared
 
@@ -867,10 +1040,14 @@ def make_extraction_fn(inner, shared_data, shared_vars, record_dtype):
     return extract_shared
 
 
-def _make_c_logp_func(n_dim, logp_fn, user_data, shared_logp, shared_data):
+def _make_c_logp_func(
+    n_dim, logp_fn, user_data, shared_logp, shared_data, logp_fn_pt=None
+):
     import numba
 
-    extract = make_extraction_fn(logp_fn, shared_data, shared_logp, user_data.dtype)
+    extract = make_extraction_fn(
+        logp_fn, shared_data, shared_logp, user_data.dtype, logp_fn_pt
+    )
 
     c_sig = numba.types.int64(
         numba.types.uint64,
@@ -907,11 +1084,13 @@ def _make_c_logp_func(n_dim, logp_fn, user_data, shared_logp, shared_data):
 
 
 def _make_c_expand_func(
-    n_dim, n_expanded, expand_fn, user_data, shared_vars, shared_data
+    n_dim, n_expanded, expand_fn, user_data, shared_vars, shared_data, expand_fn_pt=None
 ):
     import numba
 
-    extract = make_extraction_fn(expand_fn, shared_data, shared_vars, user_data.dtype)
+    extract = make_extraction_fn(
+        expand_fn, shared_data, shared_vars, user_data.dtype, expand_fn_pt
+    )
 
     c_sig = numba.types.int64(
         numba.types.uint64,
@@ -931,7 +1110,13 @@ def _make_c_expand_func(
             x = numba.carray(x_, (n_dim,))
             out = numba.carray(out_, (n_expanded,))
 
-            (values,) = extract(x, user_data_)
+            result = extract(x, user_data_)
+            if isinstance(result, tuple):
+                # Take only the first element (the actual expanded variables)
+                # The remaining elements are RNG state which we don't need for output
+                values = result[0]
+            else:
+                values = result
             out[...] = values
 
         except Exception:  # noqa: BLE001
