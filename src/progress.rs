@@ -1,4 +1,12 @@
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        mpsc::{sync_channel, SyncSender},
+        Arc,
+    },
+    thread::spawn,
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use indicatif::ProgressBar;
@@ -10,20 +18,38 @@ use upon::{Engine, Value};
 pub struct ProgressHandler {
     engine: Engine<'static>,
     template: String,
-    callback: Arc<Py<PyAny>>,
     rate: Duration,
     n_cores: usize,
+    updates: SyncSender<String>,
 }
 
 impl ProgressHandler {
     pub fn new(callback: Arc<Py<PyAny>>, rate: Duration, template: String, n_cores: usize) -> Self {
         let engine = Engine::new();
+
+        let (update_tx, update_rx) = sync_channel(1);
+
+        spawn(move || {
+            Python::with_gil(move |py| {
+                py.allow_threads(move || {
+                    let update = update_rx.recv();
+                    let Ok(update) = update else {
+                        return;
+                    };
+                    let res = Python::with_gil(|py| callback.call1(py, (update,)));
+                    if let Err(err) = res {
+                        eprintln!("Error in progress callback: {err}");
+                    }
+                });
+            });
+        });
+
         Self {
             engine,
-            callback,
             rate,
             template,
             n_cores,
+            updates: update_tx,
         }
     }
 
@@ -50,7 +76,10 @@ impl ProgressHandler {
                 progress_to_value(progress_update_count, self.n_cores, time_sampling, progress);
             let rendered = template.render_from(&self.engine, &progress).to_string();
             let rendered = rendered.unwrap_or_else(|err| format!("{err}"));
-            let _ = Python::with_gil(|py| self.callback.call1(py, (rendered,)));
+            if let Err(e) = self.updates.send(rendered) {
+                eprintln!("Could not send progress update: {e}");
+                return;
+            }
             progress_update_count += 1;
         };
 
