@@ -2,6 +2,46 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.16.0] - 2025-10-08
+
+### Bug Fixes
+
+- Keep python thread handle alive (Adrian Seyboldt)
+
+- No errors for unused parameters (Adrian Seyboldt)
+
+
+### Documentation
+
+- Fix typo in pymc usage docs (Adrian Seyboldt)
+
+
+### Features
+
+- Support step size adaptation method (Adrian Seyboldt)
+
+- Add argument for mindepth (Adrian Seyboldt)
+
+- Support free-threaded python build (Adrian Seyboldt)
+
+- Use new nuts-rs storage interface (Adrian Seyboldt)
+
+- Add zarr_store argument to write trace while sampling (Adrian Seyboldt)
+
+
+### Miscellaneous Tasks
+
+- Bump actions/checkout from 4 to 5 (dependabot[bot])
+
+- Bump actions/download-artifact from 4 to 5 (dependabot[bot])
+
+- Bump actions/setup-python from 5 to 6 (#240) (dependabot[bot])
+
+- Bump actions/attest-build-provenance from 2 to 3 (#239) (dependabot[bot])
+
+- Update pyo3 (Adrian Seyboldt)
+
+
 ## [0.15.2] - 2025-07-16
 
 ### Features
