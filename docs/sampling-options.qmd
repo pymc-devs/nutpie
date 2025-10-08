@@ -25,7 +25,7 @@ trace = nutpie.sample(
     tune=500,            # Number of warmup draws for adaptation
     chains=6,            # Number of independent chains
     cores=None,          # Number chains that are allowed to run simultainiously
-    seed=12345          # Random seed for reproducibility
+    seed=12345           # Random seed for reproducibility
 )
 ```
 
@@ -142,6 +142,60 @@ trace = nutpie.sample(
     transform_adapt=True  # Experimental reparameterization
 )
 ```
+
+## Zarr Storage (Experimental)
+
+Nutpie includes experimental support for writing traces directly to zarr storage, which can be useful for large traces that don't fit in memory or for distributed storage scenarios. The zarr format provides efficient, chunked, compressed storage for multi-dimensional arrays.
+
+### Basic Usage
+
+You can write traces directly to zarr storage by providing a `zarr_store` parameter:
+
+```python
+import nutpie
+import pymc as pm
+
+with pm.Model() as model:
+    pm.HalfNormal("a")
+
+compiled = nutpie.compile_pymc_model(model, backend="numba")
+
+# Create a local zarr store
+path = "trace.zarr"
+store = nutpie.zarr_store.LocalStore(path)
+
+trace = nutpie.sample(
+    compiled,
+    chains=2,
+    seed=123,
+    draws=100,
+    tune=100,
+    zarr_store=store
+)
+```
+
+### Memory Considerations
+
+When using zarr storage, the trace object supports lazy loading:
+
+```python
+# The trace is not loaded into memory by default
+posterior_data = trace.posterior.a  # Lazy access
+
+# Explicitly load the entire trace into memory (optional)
+loaded_trace = trace.load()
+posterior_data = loaded_trace.posterior.a  # In-memory access
+```
+
+### Available Store Types
+
+Nutpie supports several zarr store backends:
+
+- `nutpie.zarr_store.LocalStore(path)` - Local filesystem storage
+- `nutpie.zarr_store.S3Store(...)` - Amazon S3 storage
+- `nutpie.zarr_store.GCSStore(...)` - Google Cloud Storage
+- `nutpie.zarr_store.AzureStore(...)` - Azure Blob Storage
+- `nutpie.zarr_store.HTTPStore(...)` - HTTP-based storage
 
 ## Progress Monitoring
 

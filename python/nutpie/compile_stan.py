@@ -4,7 +4,6 @@ from importlib.util import find_spec
 from pathlib import Path
 from typing import Any, Optional
 
-import pandas as pd
 from numpy.typing import NDArray
 
 from nutpie import _lib
