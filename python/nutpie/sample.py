@@ -778,10 +778,12 @@ def sample(
     transform_adapt: bool, default=False
         Use the experimental transform adaptation algorithm
         during tuning.
-    zarr_store: nutpie.store.Store
-        A store created using nutpie.store to store the samples
+    zarr_store: nutpie.zarr_store.*
+        A store created using nutpie.zarr_store to store the samples
         in. If None (default), the samples will be stored in
-        memory using an arrow table.
+        memory using an arrow table. This can be used to write
+        the trace directly into a zarr store, for instance
+        on disk or to S3 or GCS.
     **kwargs
         Pass additional arguments to nutpie._lib.PySamplerArgs
 

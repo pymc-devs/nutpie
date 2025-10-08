@@ -445,3 +445,28 @@ def test_deterministic_sampling_jax():
     compiled = nutpie.compile_pymc_model(model, backend="jax", gradient_backend="jax")
     trace = nutpie.sample(compiled, chains=2, seed=123, draws=100, tune=100)
     return trace.posterior.a.values.ravel()
+
+
+@pytest.mark.pymc
+def test_zarr_store(tmp_path):
+    with pm.Model() as model:
+        pm.HalfNormal("a")
+
+    compiled = nutpie.compile_pymc_model(model, backend="numba")
+
+    path = tmp_path / "trace.zarr"
+    path.mkdir()
+    store = nutpie.zarr_store.LocalStore(str(path))
+    trace = nutpie.sample(
+        compiled, chains=2, seed=123, draws=100, tune=100, zarr_store=store
+    )
+    trace.load().posterior.a  # noqa: B018
+
+
+@pytest.fixture
+def tmp_path():
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as tmpdirname:
+        yield Path(tmpdirname)
