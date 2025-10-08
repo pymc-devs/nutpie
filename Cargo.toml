@@ -1,6 +1,6 @@
 [package]
 name = "nutpie"
-version = "0.15.2"
+version = "0.16.0"
 authors = [
   "Adrian Seyboldt <adrian.seyboldt@gmail.com>",
   "PyMC Developers <pymc.devs@gmail.com>",
@@ -10,7 +10,7 @@ license = "MIT"
 repository = "https://github.com/pymc-devs/nutpie"
 keywords = ["statistics", "bayes"]
 description = "Python wrapper for nuts-rs -- a NUTS sampler written in Rust."
-rust-version = "1.90"
+rust-version = "1.89"
 
 [features]
 extension-module = ["pyo3/extension-module"]
