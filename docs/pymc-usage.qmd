@@ -129,7 +129,7 @@ pixi add jax
 We can select the backend by passing the `backend` argument to the `compile_pymc_model`:
 
 ```python
-compiled_jax = nutpie.compiled_pymc_model(model, backend="jax")
+compiled_jax = nutpie.compile_pymc_model(model, backend="jax")
 trace = nutpie.sample(compiled_jax)
 ```
 
