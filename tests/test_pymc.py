@@ -192,7 +192,7 @@ def test_wait_timeout(backend, gradient_backend):
 @pytest.mark.timeout(20)
 def test_pause(backend, gradient_backend):
     with pm.Model() as model:
-        pm.Normal("a", shape=100_000)
+        pm.Normal("a", shape=10_000)
     compiled = nutpie.compile_pymc_model(
         model, backend=backend, gradient_backend=gradient_backend
     )
@@ -201,6 +201,23 @@ def test_pause(backend, gradient_backend):
     sampler.pause()
     sampler.resume()
     sampler.cancel()
+    assert start - time.time() < 5
+
+
+@pytest.mark.pymc
+@parameterize_backends
+@pytest.mark.timeout(20)
+def test_abort(backend, gradient_backend):
+    with pm.Model() as model:
+        pm.Normal("a", shape=10_000)
+    compiled = nutpie.compile_pymc_model(
+        model, backend=backend, gradient_backend=gradient_backend
+    )
+    start = time.time()
+    sampler = nutpie.sample(compiled, chains=1, blocking=False)
+    sampler.pause()
+    sampler.resume()
+    sampler.abort()
     assert start - time.time() < 5
 
 
@@ -421,7 +438,6 @@ def test_missing(backend, gradient_backend):
         model, backend=backend, gradient_backend=gradient_backend
     )
     tr = nutpie.sample(compiled, chains=1, seed=1)
-    print(tr.posterior)
     assert hasattr(tr.posterior, "y_unobserved")
 
 
