@@ -590,7 +590,7 @@ class _BackgroundSampler:
     def abort(self):
         """Abort sampling and return the trace produced so far."""
         self._sampler.abort()
-        results = self._sampler.extract_results()
+        results = self._sampler.take_results()
         return self._extract(results)
 
     def cancel(self):
