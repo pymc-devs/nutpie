@@ -538,7 +538,7 @@ class _BackgroundSampler:
                 skip_vars = []
                 skips = {
                     "store_gradient": ["gradient"],
-                    "store_unconstrained": ["unconstrained"],
+                    "store_unconstrained": ["unconstrained_draw"],
                     "store_mass_matrix": [
                         "mass_matrix_inv",
                         "mass_matrix_eigvals",
