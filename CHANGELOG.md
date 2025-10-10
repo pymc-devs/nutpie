@@ -2,7 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.16.0] - 2025-10-08
+## [0.16.1] - 2025-10-10
+
+### Bug Fixes
+
+- Sampler.abort was broken in last release (Adrian Seyboldt)
+
+- Don't store unconstrained_draw if not requested (Adrian Seyboldt)
+
+
+### Features
+
+- Expose step_size_jitter option (Adrian Seyboldt)
+
+
+### Miscellaneous Tasks
+
+- Cargo update (Adrian Seyboldt)
+
+
+## [0.16.0] - 2025-10-09
 
 ### Bug Fixes
 
