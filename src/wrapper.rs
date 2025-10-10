@@ -784,6 +784,35 @@ impl PyNutsSettings {
         };
         Ok(())
     }
+
+    #[getter(step_size_jitter)]
+    fn step_size_jitter(&self) -> Option<f64> {
+        match &self.inner {
+            Settings::LowRank(inner) => inner.adapt_options.step_size_settings.jitter,
+            Settings::Diag(inner) => inner.adapt_options.step_size_settings.jitter,
+            Settings::Transforming(inner) => inner.adapt_options.step_size_settings.jitter,
+        }
+    }
+
+    #[setter(step_size_jitter)]
+    fn set_step_size_jitter(&mut self, mut val: Option<f64>) -> PyResult<()> {
+        if let Some(val) = val {
+            if val < 0.0 {
+                return Err(PyValueError::new_err("step_size_jitter must be positive"));
+            }
+        }
+        if let Some(jitter) = val {
+            if jitter == 0.0 {
+                val = None;
+            }
+        }
+        match &mut self.inner {
+            Settings::LowRank(inner) => inner.adapt_options.step_size_settings.jitter = val,
+            Settings::Diag(inner) => inner.adapt_options.step_size_settings.jitter = val,
+            Settings::Transforming(inner) => inner.adapt_options.step_size_settings.jitter = val,
+        }
+        Ok(())
+    }
 }
 
 pub(crate) enum SamplerState {
