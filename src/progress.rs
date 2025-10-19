@@ -267,20 +267,21 @@ impl IndicatifHandler {
     pub fn into_callback(self) -> Result<ProgressCallback> {
         let mut finished = false;
         let multibar = MultiProgress::new();
+        let mut last_draws: Vec<u64> = vec![];
         let mut bars = vec![];
 
         let callback = move |_time_sampling, progress: Box<[ChainProgress]>| {
             if bars.is_empty() {
                 let segment_style = "━━╸  ";
-                for (i, chain) in progress.iter().enumerate() {
+                for chain in progress.iter() {
                     let pb = multibar.add(ProgressBar::new(chain.total_draws as u64));
                     pb.set_style(
-                        ProgressStyle::with_template("{prefix:.bold} {bar:20.cyan} {pos}/{len}")
+                        ProgressStyle::with_template("{bar:50.blue} {pos}/{len}")
                             .unwrap()
                             .progress_chars(segment_style),
                     );
-                    pb.set_prefix(format!("Chain {}:", i));
                     bars.push(pb);
+                    last_draws.push(0);
                 }
             }
 
@@ -298,9 +299,21 @@ impl IndicatifHandler {
                 }
             }
 
-            for (bar, chain) in bars.iter().zip(progress.iter()) {
-                bar.set_position(chain.finished_draws as u64);
-            }
+            last_draws = bars
+                .iter()
+                .zip(progress.iter())
+                .zip(last_draws.into_iter())
+                .map(|((bar, chain), last_draws)| {
+                    let finished_draws = chain.finished_draws as u64;
+                    let delta = finished_draws.saturating_sub(last_draws);
+                    if delta > 0 {
+                        bar.set_position(finished_draws);
+                        finished_draws
+                    } else {
+                        last_draws
+                    }
+                })
+                .collect();
         };
 
         Ok(ProgressCallback {
