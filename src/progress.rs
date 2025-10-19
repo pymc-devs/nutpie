@@ -9,7 +9,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use indicatif::ProgressBar;
+use indicatif::{ProgressBar, ProgressStyle};
 use nuts_rs::{ChainProgress, ProgressCallback};
 use pyo3::{Py, PyAny, Python};
 use time_humanize::{Accuracy, Tense};
@@ -273,7 +273,14 @@ impl IndicatifHandler {
             let total: u64 = progress.iter().map(|chain| chain.total_draws as u64).sum();
 
             if bar.is_none() {
-                bar = Some(ProgressBar::new(total));
+                let segment_style = "━━╸  ";
+                let pb = ProgressBar::new(total);
+                pb.set_style(
+                    ProgressStyle::with_template("{wide_bar:.cyan} {pos}/{len}")
+                    .unwrap()
+                    .progress_chars(segment_style),
+                );
+                bar = Some(pb);
             }
 
             let Some(ref bar) = bar else { unreachable!() };
