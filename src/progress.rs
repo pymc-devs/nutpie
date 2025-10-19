@@ -9,7 +9,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use nuts_rs::{ChainProgress, ProgressCallback};
 use pyo3::{Py, PyAny, Python};
 use time_humanize::{Accuracy, Tense};
@@ -266,24 +266,23 @@ impl IndicatifHandler {
 
     pub fn into_callback(self) -> Result<ProgressCallback> {
         let mut finished = false;
-        let mut last_draws = 0;
-        let mut bar = None;
+        let multibar = MultiProgress::new();
+        let mut bars = vec![];
 
         let callback = move |_time_sampling, progress: Box<[ChainProgress]>| {
-            let total: u64 = progress.iter().map(|chain| chain.total_draws as u64).sum();
-
-            if bar.is_none() {
+            if bars.is_empty() {
                 let segment_style = "━━╸  ";
-                let pb = ProgressBar::new(total);
-                pb.set_style(
-                    ProgressStyle::with_template("{wide_bar:.cyan} {pos}/{len}")
-                    .unwrap()
-                    .progress_chars(segment_style),
-                );
-                bar = Some(pb);
+                for (i, chain) in progress.iter().enumerate() {
+                    let pb = multibar.add(ProgressBar::new(chain.total_draws as u64));
+                    pb.set_style(
+                        ProgressStyle::with_template("{prefix:.bold} {bar:20.cyan} {pos}/{len}")
+                            .unwrap()
+                            .progress_chars(segment_style),
+                    );
+                    pb.set_prefix(format!("Chain {}:", i));
+                    bars.push(pb);
+                }
             }
-
-            let Some(ref bar) = bar else { unreachable!() };
 
             if finished {
                 return;
@@ -293,19 +292,14 @@ impl IndicatifHandler {
                 .all(|chain| chain.finished_draws == chain.total_draws)
             {
                 finished = true;
-                bar.set_position(total);
-                bar.finish();
+                for (bar, chain) in bars.iter().zip(progress.iter()) {
+                    bar.set_position(chain.total_draws as u64);
+                    bar.finish();
+                }
             }
 
-            let finished_draws: u64 = progress
-                .iter()
-                .map(|chain| chain.finished_draws as u64)
-                .sum();
-
-            let delta = finished_draws.saturating_sub(last_draws);
-            if delta > 0 {
-                bar.set_position(finished_draws);
-                last_draws = finished_draws;
+            for (bar, chain) in bars.iter().zip(progress.iter()) {
+                bar.set_position(chain.finished_draws as u64);
             }
         };
 
