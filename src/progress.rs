@@ -267,6 +267,8 @@ impl IndicatifHandler {
     pub fn into_callback(self) -> Result<ProgressCallback> {
         let mut finished = false;
         let multibar = MultiProgress::new();
+
+	// TODO: finished, has_divergences, last_draws, etc should be in a TerminalBar struct
         let mut last_draws: Vec<u64> = vec![];
         let mut has_divergences: Vec<bool> = vec![];
         let mut bars = vec![];
@@ -312,13 +314,15 @@ impl IndicatifHandler {
             }
             for (bar, chain) in bars.iter().zip(progress.iter()) {
                 if !bar.is_finished() && chain.finished_draws == chain.total_draws {
-                    bar.set_style(
-                        ProgressStyle::with_template(
-                            "  {bar:35.green}   {pos:10} {msg} {elapsed:10} {eta:10}",
-                        )
-                        .unwrap()
-                        .progress_chars(segment_style),
-                    );
+                    if chain.divergences == 0 {
+                        bar.set_style(
+                            ProgressStyle::with_template(
+                                "  {bar:35.green}   {pos:10} {msg} {elapsed:10} {eta:10}",
+                            )
+                            .unwrap()
+                            .progress_chars(segment_style),
+                        );
+                    }
                     bar.set_position(chain.total_draws as u64);
                     bar.finish();
                 }
@@ -332,6 +336,22 @@ impl IndicatifHandler {
                 header.finish();
                 separator.finish();
             }
+
+            bars.iter()
+                .zip(progress.iter())
+                .enumerate()
+                .for_each(|(i, (bar, chain))| {
+                    if !has_divergences[i] && chain.divergences > 0 {
+                        bar.set_style(
+                            ProgressStyle::with_template(
+                                "  {bar:35.red}   {pos:10} {msg} {elapsed:10} {eta:10}",
+                            )
+                            .unwrap()
+                            .progress_chars(segment_style),
+                        );
+                        has_divergences[i] = true;
+                    }
+                });
 
             last_draws = bars
                 .iter()
