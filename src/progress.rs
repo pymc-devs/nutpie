@@ -270,15 +270,35 @@ impl IndicatifHandler {
         let mut last_draws: Vec<u64> = vec![];
         let mut bars = vec![];
 
+        let header = multibar.add(ProgressBar::new(0));
+        header.set_style(
+            ProgressStyle::default_bar()
+                .template("{msg:.bold}")
+                .unwrap(),
+        );
+        header.set_message(format!(
+            "  {:<35}   {:<10} {:<10} {:<10}",
+            "Progress", "Draws", "Elapsed", "Remaining"
+        ));
+
+        header.tick();
+
+        let separator = multibar.add(ProgressBar::new(0));
+        separator.set_style(ProgressStyle::default_bar().template("{msg}").unwrap());
+        separator.set_message(format!(" {}", "─".repeat(90)));
+        separator.tick();
+
+        let segment_style = "━━╸  ";
         let callback = move |_time_sampling, progress: Box<[ChainProgress]>| {
             if bars.is_empty() {
-                let segment_style = "━━╸  ";
                 for chain in progress.iter() {
                     let pb = multibar.add(ProgressBar::new(chain.total_draws as u64));
                     pb.set_style(
-                        ProgressStyle::with_template("{bar:50.blue} {pos}/{len}")
-                            .unwrap()
-                            .progress_chars(segment_style),
+                        ProgressStyle::with_template(
+                            "  {bar:35.blue}   {pos:10} {elapsed:10} {eta:10}",
+                        )
+                        .unwrap()
+                        .progress_chars(segment_style),
                     );
                     bars.push(pb);
                     last_draws.push(0);
@@ -288,29 +308,41 @@ impl IndicatifHandler {
             if finished {
                 return;
             }
-            if progress
-                .iter()
-                .all(|chain| chain.finished_draws == chain.total_draws)
-            {
-                finished = true;
-                for (bar, chain) in bars.iter().zip(progress.iter()) {
+            for (bar, chain) in bars.iter().zip(progress.iter()) {
+                if !bar.is_finished() && chain.finished_draws == chain.total_draws {
+                    bar.set_style(
+                        ProgressStyle::with_template(
+                            "  {bar:35.green}   {pos:10} {elapsed:10} {eta:10}",
+                        )
+                        .unwrap()
+                        .progress_chars(segment_style),
+                    );
                     bar.set_position(chain.total_draws as u64);
                     bar.finish();
                 }
             }
 
+            if progress
+                .iter()
+                .all(|chain| chain.finished_draws == chain.total_draws)
+            {
+                finished = true;
+                header.finish();
+                separator.finish();
+            }
+
             last_draws = bars
                 .iter()
                 .zip(progress.iter())
-                .zip(last_draws.into_iter())
+                .zip(last_draws.iter())
                 .map(|((bar, chain), last_draws)| {
                     let finished_draws = chain.finished_draws as u64;
-                    let delta = finished_draws.saturating_sub(last_draws);
+                    let delta = finished_draws.saturating_sub(*last_draws);
                     if delta > 0 {
                         bar.set_position(finished_draws);
                         finished_draws
                     } else {
-                        last_draws
+                        *last_draws
                     }
                 })
                 .collect();
