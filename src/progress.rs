@@ -9,7 +9,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressFinish, ProgressStyle};
 use nuts_rs::{ChainProgress, ProgressCallback};
 use pyo3::{Py, PyAny, Python};
 use time_humanize::{Accuracy, Tense};
@@ -255,6 +255,84 @@ fn estimate_remaining_time(
     Some(core_times.into_iter().max().unwrap_or(Duration::ZERO))
 }
 
+#[derive(PartialEq, Eq)]
+pub enum ChainState {
+    Normal,
+    Divergences,
+    Finished,
+}
+
+pub struct TerminalBar {
+    pb: ProgressBar,
+    last_position: u64,
+    mode: ChainState,
+    segment_style: String,
+}
+
+impl TerminalBar {
+    pub fn new(mb: &MultiProgress, draws: u64) -> Self {
+        let segment_style = "━━╸  ".to_string();
+        let pb = mb
+            .add(ProgressBar::new(draws))
+            .with_finish(ProgressFinish::Abandon);
+        pb.set_style(
+            ProgressStyle::with_template("  {bar:35.blue}   {pos:10} {msg} {elapsed:10} {eta:10}")
+                .unwrap()
+                .progress_chars(&segment_style),
+        );
+
+        Self {
+            pb,
+            last_position: 0,
+            mode: ChainState::Normal,
+            segment_style,
+        }
+    }
+
+    pub fn set_mode(&mut self, mode: ChainState) {
+        if self.mode != mode {
+            let color = match mode {
+                ChainState::Normal => "blue",
+                ChainState::Divergences => "red",
+                ChainState::Finished => "green",
+            };
+            self.pb.set_style(
+                ProgressStyle::with_template(&format!(
+                    "  {{bar:35.{color}}}   {{pos:10}} {{msg}} {{elapsed:10}} {{eta:10}}"
+                ))
+                .unwrap()
+                .progress_chars(&self.segment_style),
+            );
+
+            self.mode = mode
+        }
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.pb.is_finished()
+    }
+
+    pub fn finish(&mut self) {
+        if self.mode != ChainState::Divergences {
+            self.set_mode(ChainState::Finished);
+        }
+        self.pb.finish();
+    }
+
+    pub fn update_position(&mut self, chain: &ChainProgress) {
+        let position = chain.finished_draws as u64;
+        let delta = position.saturating_sub(self.last_position);
+        if delta > 0 && !self.is_finished() {
+            self.pb.set_position(position);
+            self.pb.set_message(format!(
+                "{:<12} {:<11.2} {:<12}",
+                chain.divergences, chain.step_size, chain.latest_num_steps
+            ));
+            self.last_position = position;
+        }
+    }
+}
+
 pub struct IndicatifHandler {
     rate: Duration,
 }
@@ -267,13 +345,10 @@ impl IndicatifHandler {
     pub fn into_callback(self) -> Result<ProgressCallback> {
         let mut finished = false;
         let multibar = MultiProgress::new();
-
-	// TODO: finished, has_divergences, last_draws, etc should be in a TerminalBar struct
-        let mut last_draws: Vec<u64> = vec![];
-        let mut has_divergences: Vec<bool> = vec![];
         let mut bars = vec![];
 
         let header = multibar.add(ProgressBar::new(0));
+
         header.set_style(
             ProgressStyle::default_bar()
                 .template("{msg:.bold}")
@@ -286,44 +361,26 @@ impl IndicatifHandler {
 
         header.tick();
 
-        let separator = multibar.add(ProgressBar::new(0));
+        let separator = multibar
+            .add(ProgressBar::new(0))
+            .with_finish(ProgressFinish::Abandon);
         separator.set_style(ProgressStyle::default_bar().template("{msg}").unwrap());
         separator.set_message(format!(" {}", "─".repeat(109)));
         separator.tick();
 
-        let segment_style = "━━╸  ";
         let callback = move |_time_sampling, progress: Box<[ChainProgress]>| {
             if bars.is_empty() {
                 for chain in progress.iter() {
-                    let pb = multibar.add(ProgressBar::new(chain.total_draws as u64));
-                    pb.set_style(
-                        ProgressStyle::with_template(
-                            "  {bar:35.blue}   {pos:10} {msg} {elapsed:10} {eta:10}",
-                        )
-                        .unwrap()
-                        .progress_chars(segment_style),
-                    );
-                    bars.push(pb);
-                    has_divergences.push(false);
-                    last_draws.push(0);
+                    bars.push(TerminalBar::new(&multibar, chain.total_draws as u64));
                 }
             }
 
             if finished {
                 return;
             }
-            for (bar, chain) in bars.iter().zip(progress.iter()) {
+            for (bar, chain) in bars.iter_mut().zip(progress.iter()) {
                 if !bar.is_finished() && chain.finished_draws == chain.total_draws {
-                    if chain.divergences == 0 {
-                        bar.set_style(
-                            ProgressStyle::with_template(
-                                "  {bar:35.green}   {pos:10} {msg} {elapsed:10} {eta:10}",
-                            )
-                            .unwrap()
-                            .progress_chars(segment_style),
-                        );
-                    }
-                    bar.set_position(chain.total_draws as u64);
+                    bar.pb.set_position(chain.total_draws as u64);
                     bar.finish();
                 }
             }
@@ -337,41 +394,15 @@ impl IndicatifHandler {
                 separator.finish();
             }
 
-            bars.iter()
-                .zip(progress.iter())
-                .enumerate()
-                .for_each(|(i, (bar, chain))| {
-                    if !has_divergences[i] && chain.divergences > 0 {
-                        bar.set_style(
-                            ProgressStyle::with_template(
-                                "  {bar:35.red}   {pos:10} {msg} {elapsed:10} {eta:10}",
-                            )
-                            .unwrap()
-                            .progress_chars(segment_style),
-                        );
-                        has_divergences[i] = true;
-                    }
-                });
+            for (bar, chain) in bars.iter_mut().zip(progress.iter()) {
+                if chain.divergences > 0 {
+                    bar.set_mode(ChainState::Divergences);
+                }
+            }
 
-            last_draws = bars
-                .iter()
-                .zip(progress.iter())
-                .zip(last_draws.iter())
-                .map(|((bar, chain), last_draws)| {
-                    let finished_draws = chain.finished_draws as u64;
-                    let delta = finished_draws.saturating_sub(*last_draws);
-                    if delta > 0 && !bar.is_finished() {
-                        bar.set_position(finished_draws);
-                        bar.set_message(format!(
-                            "{:<12} {:<11.2} {:<12}",
-                            chain.divergences, chain.step_size, chain.latest_num_steps
-                        ));
-                        finished_draws
-                    } else {
-                        *last_draws
-                    }
-                })
-                .collect();
+            for (bar, chain) in bars.iter_mut().zip(progress.iter()) {
+                bar.update_position(chain);
+            }
         };
 
         Ok(ProgressCallback {
