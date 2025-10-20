@@ -268,6 +268,7 @@ impl IndicatifHandler {
         let mut finished = false;
         let multibar = MultiProgress::new();
         let mut last_draws: Vec<u64> = vec![];
+        let mut has_divergences: Vec<bool> = vec![];
         let mut bars = vec![];
 
         let header = multibar.add(ProgressBar::new(0));
@@ -277,15 +278,15 @@ impl IndicatifHandler {
                 .unwrap(),
         );
         header.set_message(format!(
-            "  {:<35}   {:<10} {:<10} {:<10}",
-            "Progress", "Draws", "Elapsed", "Remaining"
+            "  {:<35}   {:<10} {:<12} {:<11} {:<12} {:<10} {:<10}",
+            "Progress", "Draws", "Divergences", "Step size", "Grad evals", "Elapsed", "Remaining"
         ));
 
         header.tick();
 
         let separator = multibar.add(ProgressBar::new(0));
         separator.set_style(ProgressStyle::default_bar().template("{msg}").unwrap());
-        separator.set_message(format!(" {}", "─".repeat(90)));
+        separator.set_message(format!(" {}", "─".repeat(109)));
         separator.tick();
 
         let segment_style = "━━╸  ";
@@ -295,12 +296,13 @@ impl IndicatifHandler {
                     let pb = multibar.add(ProgressBar::new(chain.total_draws as u64));
                     pb.set_style(
                         ProgressStyle::with_template(
-                            "  {bar:35.blue}   {pos:10} {elapsed:10} {eta:10}",
+                            "  {bar:35.blue}   {pos:10} {msg} {elapsed:10} {eta:10}",
                         )
                         .unwrap()
                         .progress_chars(segment_style),
                     );
                     bars.push(pb);
+                    has_divergences.push(false);
                     last_draws.push(0);
                 }
             }
@@ -312,7 +314,7 @@ impl IndicatifHandler {
                 if !bar.is_finished() && chain.finished_draws == chain.total_draws {
                     bar.set_style(
                         ProgressStyle::with_template(
-                            "  {bar:35.green}   {pos:10} {elapsed:10} {eta:10}",
+                            "  {bar:35.green}   {pos:10} {msg} {elapsed:10} {eta:10}",
                         )
                         .unwrap()
                         .progress_chars(segment_style),
@@ -338,8 +340,12 @@ impl IndicatifHandler {
                 .map(|((bar, chain), last_draws)| {
                     let finished_draws = chain.finished_draws as u64;
                     let delta = finished_draws.saturating_sub(*last_draws);
-                    if delta > 0 {
+                    if delta > 0 && !bar.is_finished() {
                         bar.set_position(finished_draws);
+                        bar.set_message(format!(
+                            "{:<12} {:<11.2} {:<12}",
+                            chain.divergences, chain.step_size, chain.latest_num_steps
+                        ));
                         finished_draws
                     } else {
                         *last_draws
