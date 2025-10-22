@@ -289,9 +289,16 @@ impl CpuLogpFunc for PyDensity {
                         ))
                     })?;
                     if !arr.is_c_contiguous() {
-                        return Err(nuts_rs::CpuMathError::ExpandError(
-                            "not c contiguous".into(),
-                        ));
+                        return Err(nuts_rs::CpuMathError::ExpandError(format!(
+                            "not c contiguous: {}",
+                            var.name
+                        )));
+                    }
+                    if arr.shape().len() != var.shape.as_slice().len() {
+                        return Err(nuts_rs::CpuMathError::ExpandError(format!(
+                            "unexpected number of dimensions for variable {}",
+                            var.name
+                        )));
                     }
                     if !arr
                         .shape()
@@ -299,7 +306,10 @@ impl CpuLogpFunc for PyDensity {
                         .zip(var.shape.as_slice())
                         .all(|(a, &b)| *a as u64 == b)
                     {
-                        return Err(nuts_rs::CpuMathError::ExpandError("upected shape".into()));
+                        return Err(nuts_rs::CpuMathError::ExpandError(format!(
+                            "unexpected shape for variable {}",
+                            var.name
+                        )));
                     }
                     Ok(arr)
                 }

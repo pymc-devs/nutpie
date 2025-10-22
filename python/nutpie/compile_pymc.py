@@ -445,8 +445,10 @@ def _compile_pymc_model_jax(
         def expand(_x, **shared):
             values = expand_fn(_x, *[shared[name] for name in expand_shared_names])
             return {
-                name: np.asarray(val, order="C", dtype=dtype).ravel()
-                for name, val, dtype in zip(names, values, dtypes, strict=True)
+                name: np.asarray(val, order="C", dtype=dtype).reshape(shape)
+                for name, val, dtype, shape in zip(
+                    names, values, dtypes, shapes, strict=True
+                )
             }
 
         return expand

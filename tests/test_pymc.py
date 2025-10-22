@@ -100,7 +100,9 @@ def test_low_rank(backend, gradient_backend):
 @parameterize_backends
 def test_low_rank_half_normal(backend, gradient_backend):
     with pm.Model() as model:
-        pm.HalfNormal("a", shape=13)
+        pm.HalfNormal("a", shape=(13, 3))
+        pm.HalfNormal("b", shape=())
+        pm.HalfNormal("c", shape=(5,))
 
     compiled = nutpie.compile_pymc_model(
         model, backend=backend, gradient_backend=gradient_backend
