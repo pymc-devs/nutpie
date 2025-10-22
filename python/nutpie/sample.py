@@ -457,12 +457,18 @@ class _BackgroundSampler:
 
             self.display_id = IPython.display.display(self, display_id=True)
 
+            did_print_error = False
+
             def callback(formatted):
+                nonlocal did_print_error
+
                 try:
                     self._html = formatted
                     self.display_id.update(self)
                 except Exception as e:
-                    print(f"Error updating progress display: {e}")
+                    if not did_print_error:
+                        did_print_error = True
+                        print(f"Error updating progress display: {e}")
 
             progress_type = _lib.ProgressType.template_callback(
                 progress_rate, progress_template, cores, callback
