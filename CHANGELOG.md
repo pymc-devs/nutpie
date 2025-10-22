@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.16.2] - 2025-10-22
+
+### Bug Fixes
+
+- Pymc with jax backend was broken with some shapes (Adrian Seyboldt)
+
+- Prevent error message spam on progress error (Adrian Seyboldt)
+
+
+### Miscellaneous Tasks
+
+- Bump astral-sh/setup-uv from 6 to 7 (dependabot[bot])
+
+- Update dependencies (Adrian Seyboldt)
+
+
 ## [0.16.1] - 2025-10-10
 
 ### Bug Fixes
