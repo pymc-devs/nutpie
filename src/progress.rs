@@ -398,9 +398,6 @@ impl IndicatifHandler {
                 if chain.divergences > 0 {
                     bar.set_mode(ChainState::Divergences);
                 }
-            }
-
-            for (bar, chain) in bars.iter_mut().zip(progress.iter()) {
                 bar.update_position(chain);
             }
         };
