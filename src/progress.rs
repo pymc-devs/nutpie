@@ -256,13 +256,13 @@ fn estimate_remaining_time(
 }
 
 #[derive(PartialEq, Eq)]
-pub enum ChainState {
+enum ChainState {
     Normal,
     Divergences,
     Finished,
 }
 
-pub struct TerminalBar {
+struct TerminalBar {
     pb: ProgressBar,
     last_position: u64,
     mode: ChainState,
