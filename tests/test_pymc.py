@@ -14,7 +14,13 @@ import nutpie.compile_pymc
 
 parameterize_backends = pytest.mark.parametrize(
     "backend, gradient_backend",
-    [("numba", None), ("jax", "pytensor"), ("jax", "jax")],
+    [
+        ("numba", None),
+        ("jax", "pytensor"),
+        ("jax", "jax"),
+        ("mlx", "pytensor"),
+        ("mlx", "mlx"),
+    ],
 )
 
 
@@ -461,6 +467,20 @@ def test_deterministic_sampling_jax():
         pm.HalfNormal("a")
 
     compiled = nutpie.compile_pymc_model(model, backend="jax", gradient_backend="jax")
+    trace = nutpie.sample(compiled, chains=2, seed=123, draws=100, tune=100)
+    return trace.posterior.a.values.ravel()
+
+
+@pytest.mark.pymc
+@pytest.mark.array_compare(atol=1e-4, rtol=1e-4)
+def test_deterministic_sampling_mlx():
+    if find_spec("mlx") is None:
+        pytest.skip("MLX not installed")
+
+    with pm.Model() as model:
+        pm.HalfNormal("a")
+
+    compiled = nutpie.compile_pymc_model(model, backend="mlx", gradient_backend="mlx")
     trace = nutpie.sample(compiled, chains=2, seed=123, draws=100, tune=100)
     return trace.posterior.a.values.ravel()
 
