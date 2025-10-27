@@ -236,6 +236,10 @@ jobs:
           pytest -m "stan and not flow" --arraydiff
           uv pip install 'nutpie[pymc]' --find-links dist --force-reinstall
           uv pip install jax
+          # Install MLX only on Apple Silicon (aarch64)
+          if [ "${{ matrix.platform.target }}" = "aarch64" ]; then
+            uv pip install mlx
+          fi
           pytest -m "pymc and not flow" --arraydiff
           uv pip install 'nutpie[all]' --find-links dist --force-reinstall
           pytest -m flow --arraydiff
