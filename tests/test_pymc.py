@@ -24,10 +24,12 @@ backend_params = [
 
 # Only add MLX backends if MLX is available
 if MLX_AVAILABLE:
-    backend_params.extend([
-        ("mlx", "pytensor"),
-        ("mlx", "mlx"),
-    ])
+    backend_params.extend(
+        [
+            ("mlx", "pytensor"),
+            ("mlx", "mlx"),
+        ]
+    )
 
 parameterize_backends = pytest.mark.parametrize(
     "backend, gradient_backend",
@@ -487,7 +489,7 @@ def test_deterministic_sampling_jax():
 def test_deterministic_sampling_mlx():
     if not MLX_AVAILABLE:
         pytest.skip("MLX not installed")
-    
+
     with pm.Model() as model:
         pm.HalfNormal("a")
 
