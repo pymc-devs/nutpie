@@ -520,6 +520,9 @@ def _compile_pymc_model_mlx(
         def logp_fn_mlx_grad(x, *shared):
             return mx.value_and_grad(lambda x: orig_logp_fn(x, *shared)[0])(x)
 
+        # JIT compile for performance, similar to jax.jit() in JAX backend
+        logp_fn_mlx_grad = mx.compile(logp_fn_mlx_grad)
+
         logp_fn = logp_fn_mlx_grad
     else:
         orig_logp_fn = None
