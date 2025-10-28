@@ -24,6 +24,7 @@ class PyFuncModel(CompiledModel):
     _coords: dict[str, Any]
     _raw_logp_fn: Callable | None
     _transform_adapt_args: dict | None = None
+    _force_single_core: bool = False
 
     @property
     def shapes(self) -> dict[str, tuple[int, ...]]:
@@ -43,7 +44,15 @@ class PyFuncModel(CompiledModel):
                 raise ValueError(f"Unknown data variable: {name}")
 
         updated = self._shared_data.copy()
-        updated.update(**updates)
+        
+        # Convert to MLX arrays if using MLX backend (indicated by force_single_core)
+        if self._force_single_core:
+            import mlx.core as mx
+            for name, value in updates.items():
+                updated[name] = mx.array(value)
+        else:
+            updated.update(**updates)
+        
         return dataclasses.replace(self, _shared_data=updated)
 
     def with_transform_adapt(self, **kwargs):
@@ -59,6 +68,9 @@ class PyFuncModel(CompiledModel):
         extra_callback_rate,
         store,
     ):
+        # Force single-core execution if required (e.g., for MLX backend)
+        if self._force_single_core:
+            cores = 1
         model = self._make_model(init_mean)
         return _lib.PySampler.from_pyfunc(
             settings,
@@ -121,6 +133,7 @@ def from_pyfunc(
     make_transform_adapter=None,
     raw_logp_fn=None,
     reparameterized_names=None,
+    force_single_core: bool = False,
 ):
     if coords is None:
         coords = {}
@@ -153,4 +166,5 @@ def from_pyfunc(
         _shared_data=shared_data,
         _raw_logp_fn=raw_logp_fn,
         reparameterized_names=reparameterized_names,
+        _force_single_core=force_single_core,
     )
