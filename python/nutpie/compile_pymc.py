@@ -539,7 +539,8 @@ def _compile_pymc_model_mlx(
 
     def make_logp_func():
         def logp(_x, **shared):
-            logp, grad = logp_fn(_x, *[shared[name] for name in logp_shared_names])
+            _x_mlx = mx.array(_x)
+            logp, grad = logp_fn(_x_mlx, *[shared[name] for name in logp_shared_names])
             return float(logp), np.asarray(grad, dtype="float64", order="C")
 
         return logp
@@ -575,6 +576,7 @@ def _compile_pymc_model_mlx(
         dims=dims,
         coords=coords,
         raw_logp_fn=orig_logp_fn,
+        force_single_core=(gradient_backend == "mlx")
     )
 
 
