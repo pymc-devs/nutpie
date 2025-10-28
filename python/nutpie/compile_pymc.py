@@ -576,7 +576,7 @@ def _compile_pymc_model_mlx(
         dims=dims,
         coords=coords,
         raw_logp_fn=orig_logp_fn,
-        force_single_core=(gradient_backend == "mlx")
+        force_single_core=(gradient_backend == "mlx"),
     )
 
 

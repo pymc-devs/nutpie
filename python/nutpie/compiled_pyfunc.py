@@ -43,15 +43,16 @@ class PyFuncModel(CompiledModel):
                 raise ValueError(f"Unknown data variable: {name}")
 
         updated = self._shared_data.copy()
-        
+
         # Convert to MLX arrays if using MLX backend (indicated by force_single_core)
         if self._force_single_core:
             import mlx.core as mx
+
             for name, value in updates.items():
                 updated[name] = mx.array(value)
         else:
             updated.update(**updates)
-        
+
         return dataclasses.replace(self, _shared_data=updated)
 
     def with_transform_adapt(self, **kwargs):
