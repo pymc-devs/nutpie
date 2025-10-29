@@ -485,7 +485,7 @@ def test_deterministic_sampling_jax():
 
 
 @pytest.mark.pymc
-@pytest.mark.array_compare(atol=1e-4, rtol=1e-4)
+@pytest.mark.array_compare(atol=1e-6, rtol=1e-6)
 def test_deterministic_sampling_mlx():
     if not MLX_AVAILABLE:
         pytest.skip("MLX not installed")
