@@ -305,10 +305,10 @@ def in_marimo_notebook() -> bool:
 
 def _mo_write_internal(cell_id, stream, value: object) -> None:
     """Write to marimo cell given cell_id and stream."""
-    from marimo._output import formatting
+    from marimo._messaging.cell_output import CellChannel
     from marimo._messaging.ops import CellOp
     from marimo._messaging.tracebacks import write_traceback
-    from marimo._messaging.cell_output import CellChannel
+    from marimo._output import formatting
 
     output = formatting.try_format(value)
     if output.traceback is not None:
@@ -325,9 +325,9 @@ def _mo_write_internal(cell_id, stream, value: object) -> None:
 
 def _mo_create_replace():
     """Create mo.output.replace with current context pinned."""
+    from marimo._output import formatting
     from marimo._runtime.context import get_context
     from marimo._runtime.context.types import ContextNotInitializedError
-    from marimo._output import formatting
 
     try:
         ctx = get_context()
@@ -525,9 +525,9 @@ class _BackgroundSampler:
             return results
         else:
             if results.is_zarr():
-                from zarr.storage import ObjectStore
                 import obstore
                 import xarray as xr
+                from zarr.storage import ObjectStore
 
                 assert self._zarr_store is not None
 
@@ -604,7 +604,9 @@ class _BackgroundSampler:
         self._sampler.abort()
 
     def __del__(self):
-        if not self._sampler.is_empty():
+        if not hasattr(self, "_sampler"):
+            return
+        if not self._sampler.is_empty(ignore_error=True):
             self.cancel()
 
     def _repr_html_(self):
