@@ -1232,11 +1232,16 @@ impl PySampler {
         })
     }
 
-    fn is_empty(&self) -> bool {
-        matches!(
-            self.0.lock().expect("Poisoned sampler state lock").deref(),
-            (SamplerState::Empty, _)
-        )
+    #[pyo3(signature = (ignore_error=false))]
+    fn is_empty(&self, ignore_error: bool) -> Result<bool> {
+        let out = self.0.lock();
+        match (ignore_error, out) {
+            (false, Err(e)) => return Err(anyhow!("The sampler panicked with error {}", e)),
+            (true, Err(_)) => return Ok(true),
+            (_, Ok(v)) => {
+                return Ok(matches!(v.deref(), (SamplerState::Empty, _)));
+            }
+        }
     }
 
     fn flush<'py>(&mut self, py: Python<'py>) -> PyResult<()> {
