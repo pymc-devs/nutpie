@@ -1,6 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use numpy::{
     NotContiguousError, PyArray1, PyReadonlyArray1, PyReadonlyArrayDyn, PyUntypedArrayMethods,
 };
@@ -67,7 +67,7 @@ impl PyModel {
                 let key: String = key.extract().context("Coordinate key is not a string")?;
                 let value: PyValue = value
                     .extract()
-                    .context("Coordinate value has incorrect type")?;
+                    .with_context(|| format!("Coordinate {} value has unsupported type", key))?;
                 Ok((key, value.into_value()))
             })
             .collect::<Result<HashMap<_, _>>>()?;
@@ -371,6 +371,20 @@ impl CpuLogpFunc for PyDensity {
                             .collect::<Result<_, _>>()?;
                         Some(Value::Strings(vec))
                     }
+                    nuts_rs::ItemType::DateTime64(date_time_unit) => {
+                        let arr = as_value::<i64>(var, &val)?;
+                        let slice = arr.as_slice().map_err(|_| {
+                            nuts_rs::CpuMathError::ExpandError("Could not read as slice".into())
+                        })?;
+                        Some(Value::DateTime64(*date_time_unit, slice.to_vec()))
+                    }
+                    nuts_rs::ItemType::TimeDelta64(date_time_unit) => {
+                        let arr = as_value::<i64>(var, &val)?;
+                        let slice = arr.as_slice().map_err(|_| {
+                            nuts_rs::CpuMathError::ExpandError("Could not read as slice".into())
+                        })?;
+                        Some(Value::TimeDelta64(*date_time_unit, slice.to_vec()))
+                    }
                 };
                 expanded.push(val_array);
             }
@@ -528,7 +542,7 @@ impl Model for PyModel {
 
             let init_point: PyReadonlyArray1<f64> = init_point
                 .extract(py)
-                .context("Initializition array returned incorrect argument")?;
+                .map_err(|_| anyhow!("Initialization array returned incorrect argument"))?;
 
             let init_point = init_point
                 .as_slice()

@@ -294,7 +294,7 @@ impl StanModel {
                 let key: String = key.extract().context("Coordinate key is not a string")?;
                 let value: PyValue = value
                     .extract()
-                    .context("Coordinate value has incorrect type")?;
+                    .with_context(|| format!("Coordinate {} value has unsupported type", key))?;
                 Ok((key, value.into_value()))
             })
             .collect::<Result<HashMap<_, _>>>()?;

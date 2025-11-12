@@ -1,6 +1,6 @@
 use std::{collections::HashMap, ffi::c_void, sync::Arc};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use numpy::{NotContiguousError, PyReadonlyArray1};
 use nuts_rs::{CpuLogpFunc, CpuMath, HasDims, LogpError, Model, Storable, Value};
 use pyo3::{
@@ -265,6 +265,11 @@ impl CpuLogpFunc for PyMcModelRef<'_> {
                         "String type not supported in expansion".into(),
                     ));
                 }
+                nuts_rs::ItemType::DateTime64(_) | nuts_rs::ItemType::TimeDelta64(_) => {
+                    return Err(nuts_rs::CpuMathError::ExpandError(
+                        "DateTime64 and TimeDelta64 types not supported in expansion".into(),
+                    ));
+                }
             };
 
             values.push(Some(value));
@@ -437,7 +442,7 @@ impl PyMcModel {
                 let key: String = key.extract().context("Coordinate key is not a string")?;
                 let value: PyValue = value
                     .extract()
-                    .context("Coordinate value has incorrect type")?;
+                    .with_context(|| format!("Coordinate {} value has unsupported type", key))?;
                 Ok((key, value.into_value()))
             })
             .collect::<Result<HashMap<_, _>>>()?;
@@ -500,7 +505,7 @@ impl Model for PyMcModel {
 
             let init_point: PyReadonlyArray1<f64> = init_point
                 .extract(py)
-                .context("Initializition array returned incorrect argument")?;
+                .map_err(|_| anyhow!("Initialization array returned incorrect argument"))?;
 
             let init_point = init_point
                 .as_slice()
