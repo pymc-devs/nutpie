@@ -1,11 +1,13 @@
-from importlib.util import find_spec
 import time
+from importlib.util import find_spec
+
 import pytest
 
 if find_spec("pymc") is None:
     pytest.skip("Skip pymc tests", allow_module_level=True)
 
 import numpy as np
+import pandas as pd
 import pymc as pm
 import pytest
 
@@ -467,8 +469,17 @@ def test_deterministic_sampling_jax():
 
 @pytest.mark.pymc
 def test_zarr_store(tmp_path):
-    with pm.Model() as model:
-        pm.HalfNormal("a")
+    coords = {
+        "a": np.arange(2).astype("f"),
+        "b": pd.date_range("2023-01-01", periods=1),
+        "c": ["x", "y", "z"],
+        "d": [1],
+        "e": pd.factorize(pd.Index(["foo"]))[1],
+        "f": np.arange(2).astype("d"),
+    }
+    with pm.Model(coords=coords) as model:
+        pm.HalfNormal("x")
+        pm.Normal("y", dims=("a", "b", "c", "d", "e", "f"))
 
     compiled = nutpie.compile_pymc_model(model, backend="numba")
 
@@ -478,7 +489,24 @@ def test_zarr_store(tmp_path):
     trace = nutpie.sample(
         compiled, chains=2, seed=123, draws=100, tune=100, zarr_store=store
     )
-    trace.load().posterior.a  # noqa: B018
+    trace.load().posterior.x
+
+    assert trace.posterior.coords["a"].dtype == np.float32
+    assert trace.posterior.coords["b"].dtype == "datetime64[ns]"
+    assert trace.posterior.coords["b"].values[0] == np.datetime64("2023-01-01")
+    assert list(trace.posterior.coords["c"]) == ["x", "y", "z"]
+    assert list(trace.posterior.coords["d"]) == [1]
+    assert list(trace.posterior.coords["e"]) == ["foo"]
+    assert trace.posterior.coords["f"].dtype == np.float64
+
+    trace = nutpie.sample(compiled, chains=2, seed=1234, draws=50, tune=50)
+    assert trace.posterior.coords["a"].dtype == np.float32
+    assert trace.posterior.coords["b"].dtype == "datetime64[ns]"
+    assert trace.posterior.coords["b"].values[0] == np.datetime64("2023-01-01")
+    assert list(trace.posterior.coords["c"]) == ["x", "y", "z"]
+    assert list(trace.posterior.coords["d"]) == [1]
+    assert list(trace.posterior.coords["e"]) == ["foo"]
+    assert trace.posterior.coords["f"].dtype == np.float64
 
 
 @pytest.fixture

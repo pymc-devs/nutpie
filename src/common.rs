@@ -6,8 +6,9 @@ use nuts_rs::Value;
 use pyo3::{
     exceptions::PyRuntimeError,
     pyclass, pymethods,
-    types::{PyAnyMethods, PyDict, PyDictMethods, PyList, PyListMethods, PyType},
-    Bound, FromPyObject, IntoPyObject, IntoPyObjectExt, Py, PyAny, PyErr, Python,
+    types::{PyAnyMethods, PyDict, PyDictMethods, PyList, PyListMethods, PyType, PyTypeMethods},
+    Borrowed, Bound, BoundObject, FromPyObject, IntoPyObject, IntoPyObjectExt, Py, PyAny, PyErr,
+    Python,
 };
 use smallvec::SmallVec;
 
@@ -75,6 +76,18 @@ impl<'py> IntoPyObject<'py> for &ItemType {
             nuts_rs::ItemType::F32 => "float32",
             nuts_rs::ItemType::Bool => "bool",
             nuts_rs::ItemType::String => "object",
+            nuts_rs::ItemType::DateTime64(unit) => match unit {
+                nuts_rs::DateTimeUnit::Seconds => "datetime64[s]",
+                nuts_rs::DateTimeUnit::Milliseconds => "datetime64[ms]",
+                nuts_rs::DateTimeUnit::Microseconds => "datetime64[us]",
+                nuts_rs::DateTimeUnit::Nanoseconds => "datetime64[ns]",
+            },
+            nuts_rs::ItemType::TimeDelta64(unit) => match unit {
+                nuts_rs::DateTimeUnit::Seconds => "timedelta64[s]",
+                nuts_rs::DateTimeUnit::Milliseconds => "timedelta64[ms]",
+                nuts_rs::DateTimeUnit::Microseconds => "timedelta64[us]",
+                nuts_rs::DateTimeUnit::Nanoseconds => "timedelta64[ns]",
+            },
         };
         let numpy = py.import("numpy")?;
         let dtype = numpy.getattr("dtype")?.call1((dtype_str,))?;
@@ -82,8 +95,10 @@ impl<'py> IntoPyObject<'py> for &ItemType {
     }
 }
 
-impl<'py> FromPyObject<'py> for ItemType {
-    fn extract_bound(ob: &Bound<'_, PyAny>) -> std::result::Result<Self, PyErr> {
+impl<'a, 'py> FromPyObject<'a, 'py> for ItemType {
+    type Error = PyErr;
+
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> std::result::Result<Self, PyErr> {
         let dtype_str: &str = ob.extract()?;
         let item_type = match dtype_str {
             "uint64" => nuts_rs::ItemType::U64,
@@ -106,12 +121,14 @@ impl<'py> FromPyObject<'py> for ItemType {
 #[pyclass]
 pub struct PyValue(Value);
 
-impl<'py> FromPyObject<'py> for PyValue {
-    fn extract_bound(ob: &Bound<'py, PyAny>) -> std::result::Result<Self, PyErr> {
+impl<'a, 'py> FromPyObject<'a, 'py> for PyValue {
+    type Error = PyErr;
+
+    fn extract(ob: Borrowed<'a, 'py, PyAny>) -> std::result::Result<Self, PyErr> {
         let ob = if ob.hasattr("values")? {
-            &ob.getattr("values")?
+            ob.getattr("values")?
         } else {
-            ob
+            ob.into_bound()
         };
         if let Ok(arr) = ob.extract::<PyReadonlyArray1<f64>>() {
             let vec = arr
@@ -166,9 +183,35 @@ impl<'py> FromPyObject<'py> for PyValue {
                 .collect::<Result<_, _>>()?;
             return Ok(PyValue(Value::Strings(vals_as_str)));
         }
-        Err(PyRuntimeError::new_err(
-            "Could not convert to Value. Unsupported type.",
-        ))
+
+        macro_rules! extract_time {
+            ($unit:ident, $type:ident, $value:ident) => {
+                if let Ok(arr) = ob.extract::<PyReadonlyArray1<numpy::datetime::$type<numpy::datetime::units::$unit>>>() {
+                    let vec = arr
+                        .as_slice()
+                        .map_err(|_| PyRuntimeError::new_err("Array is not contiguous"))?;
+                    let vals_as_i64 = vec.iter().map(|&dt| dt.into()).collect();
+                    return Ok(PyValue(Value::$value(
+                        nuts_rs::DateTimeUnit::$unit,
+                        vals_as_i64,
+                    )));
+                }
+            };
+        }
+
+        extract_time!(Seconds, Datetime, DateTime64);
+        extract_time!(Milliseconds, Datetime, DateTime64);
+        extract_time!(Microseconds, Datetime, DateTime64);
+        extract_time!(Nanoseconds, Datetime, DateTime64);
+        extract_time!(Seconds, Timedelta, TimeDelta64);
+        extract_time!(Milliseconds, Timedelta, TimeDelta64);
+        extract_time!(Microseconds, Timedelta, TimeDelta64);
+        extract_time!(Nanoseconds, Timedelta, TimeDelta64);
+
+        Err(PyRuntimeError::new_err(format!(
+            "Could not convert to Value. Unsupported type: {}",
+            ob.get_type().name()?
+        )))
     }
 }
 
@@ -178,6 +221,23 @@ impl PyValue {
     }
 
     pub fn into_array(self, py: Python) -> Result<Bound<PyAny>> {
+        macro_rules! from_time {
+            ($unit:ident, $items:expr, $type:ident) => {
+                Ok(
+                    PyArray1::<numpy::datetime::$type<numpy::datetime::units::$unit>>::from_vec(
+                        py,
+                        $items
+                            .into_iter()
+                            .map(|ts| {
+                                numpy::datetime::$type::<numpy::datetime::units::$unit>::from(ts)
+                            })
+                            .collect(),
+                    )
+                    .into_any(),
+                )
+            };
+        }
+
         match self.0 {
             Value::F64(vec) => Ok(PyArray1::from_vec(py, vec).into_any()),
             Value::F32(vec) => Ok(PyArray1::from_vec(py, vec).into_any()),
@@ -191,6 +251,18 @@ impl PyValue {
             Value::ScalarF64(val) => Ok(val.into_bound_py_any(py)?),
             Value::ScalarF32(val) => Ok(val.into_bound_py_any(py)?),
             Value::ScalarBool(val) => Ok(val.into_bound_py_any(py)?),
+            Value::DateTime64(date_time_unit, items) => match date_time_unit {
+                nuts_rs::DateTimeUnit::Seconds => from_time!(Seconds, items, Datetime),
+                nuts_rs::DateTimeUnit::Milliseconds => from_time!(Milliseconds, items, Datetime),
+                nuts_rs::DateTimeUnit::Microseconds => from_time!(Microseconds, items, Datetime),
+                nuts_rs::DateTimeUnit::Nanoseconds => from_time!(Nanoseconds, items, Datetime),
+            },
+            Value::TimeDelta64(date_time_unit, items) => match date_time_unit {
+                nuts_rs::DateTimeUnit::Seconds => from_time!(Seconds, items, Timedelta),
+                nuts_rs::DateTimeUnit::Milliseconds => from_time!(Milliseconds, items, Timedelta),
+                nuts_rs::DateTimeUnit::Microseconds => from_time!(Microseconds, items, Timedelta),
+                nuts_rs::DateTimeUnit::Nanoseconds => from_time!(Nanoseconds, items, Timedelta),
+            },
         }
     }
 }
