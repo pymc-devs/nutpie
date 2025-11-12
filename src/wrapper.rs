@@ -333,7 +333,7 @@ impl PyNutsSettings {
         }
     }
 
-    #[setter(maxdepth)]
+    #[setter(mindepth)]
     fn set_mindepth(&mut self, val: u64) {
         match &mut self.inner {
             Settings::Diag(nuts_settings) => nuts_settings.mindepth = val,
