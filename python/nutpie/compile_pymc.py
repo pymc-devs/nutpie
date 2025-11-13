@@ -470,11 +470,121 @@ def _compile_pymc_model_jax(
     )
 
 
+def _compile_pymc_model_mlx(
+    model,
+    *,
+    gradient_backend=None,
+    pymc_initial_point_fn: Callable[[SeedType], dict[str, np.ndarray]],
+    var_names: Iterable[str] | None = None,
+    **kwargs,
+):
+    if find_spec("mlx") is None:
+        raise ImportError(
+            "MLX is not installed in the current environment. "
+            "Please install it with something like "
+            "'pip install mlx' "
+            "and restart your kernel in case you are in an interactive session."
+        )
+    import mlx.core as mx
+
+    if gradient_backend is None:
+        gradient_backend = "pytensor"
+    elif gradient_backend not in ["mlx", "pytensor"]:
+        raise ValueError(f"Unknown gradient backend: {gradient_backend}")
+
+    (
+        n_dim,
+        _,
+        logp_fn_pt,
+        expand_fn_pt,
+        initial_point_fn,
+        shape_info,
+    ) = _make_functions(
+        model,
+        mode="MLX",
+        compute_grad=gradient_backend == "pytensor",
+        join_expanded=False,
+        pymc_initial_point_fn=pymc_initial_point_fn,
+        var_names=var_names,
+    )
+
+    logp_fn = logp_fn_pt.vm.jit_fn
+    expand_fn = expand_fn_pt.vm.jit_fn
+
+    logp_shared_names = [var.name for var in logp_fn_pt.get_shared()]
+    expand_shared_names = [var.name for var in expand_fn_pt.get_shared()]
+
+    if gradient_backend == "mlx":
+        orig_logp_fn = logp_fn
+
+        def logp_fn_mlx_grad(x, *shared):
+            return mx.value_and_grad(lambda x: orig_logp_fn(x, *shared)[0])(x)
+
+        # JIT compile for performance, similar to jax.jit() in JAX backend
+        logp_fn_mlx_grad = mx.compile(logp_fn_mlx_grad)
+
+        logp_fn = logp_fn_mlx_grad
+    else:
+        orig_logp_fn = None
+
+    shared_data = {}
+    shared_vars = {}
+    seen = set()
+    for val in [*logp_fn_pt.get_shared(), *expand_fn_pt.get_shared()]:
+        if val.name in shared_data and val not in seen:
+            raise ValueError(f"Shared variables must have unique names: {val.name}")
+        shared_data[val.name] = mx.array(val.get_value())
+        shared_vars[val.name] = val
+        seen.add(val)
+
+    def make_logp_func():
+        def logp(_x, **shared):
+            _x_mlx = mx.array(_x)
+            logp, grad = logp_fn(_x_mlx, *[shared[name] for name in logp_shared_names])
+            return float(logp), np.asarray(grad, dtype="float64", order="C")
+
+        return logp
+
+    names, slices, shapes = shape_info
+    # TODO do not cast to float64
+    dtypes = [np.dtype("float64")] * len(names)
+
+    def make_expand_func(seed1, seed2, chain):
+        # TODO handle seeds
+        def expand(_x, **shared):
+            values = expand_fn(_x, *[shared[name] for name in expand_shared_names])
+            return {
+                name: np.asarray(val, order="C", dtype=dtype).reshape(shape)
+                for name, val, dtype, shape in zip(
+                    names, values, dtypes, shapes, strict=True
+                )
+            }
+
+        return expand
+
+    dims, coords = _prepare_dims_and_coords(model, shape_info)
+
+    return from_pyfunc(
+        ndim=n_dim,
+        make_logp_fn=make_logp_func,
+        make_expand_fn=make_expand_func,
+        make_initial_point_fn=initial_point_fn,
+        expanded_dtypes=dtypes,
+        expanded_shapes=shapes,
+        expanded_names=names,
+        shared_data=shared_data,
+        dims=dims,
+        coords=coords,
+        raw_logp_fn=orig_logp_fn,
+        force_single_core=(gradient_backend == "mlx"),
+    )
+
+
 def compile_pymc_model(
     model: "pm.Model",
     *,
-    backend: Literal["numba", "jax"] = "numba",
-    gradient_backend: Literal["pytensor", "jax"] = "pytensor",
+    backend: Literal["numba", "jax", "mlx"] = "numba",
+    gradient_backend: Literal["pytensor", "jax", "mlx"] = "pytensor",
     initial_points: dict[Union["Variable", str], np.ndarray | float | int]
     | None = None,
     jitter_rvs: set["TensorVariable"] | None = None,
@@ -491,11 +601,11 @@ def compile_pymc_model(
     ----------
     model : pymc.Model
         The model to compile.
-    backend : ["jax", "numba"]
+    backend : ["jax", "numba", "mlx"]
         The pytensor backend that is used to compile the logp function.
-    gradient_backend: ["pytensor", "jax"]
+    gradient_backend: ["pytensor", "jax", "mlx"]
         Which library is used to compute the gradients. This can only be changed
-        to "jax" if the jax backend is used.
+        to "jax" if the jax backend is used, or "mlx" if the mlx backend is used.
     jitter_rvs : set
         The set (or list or tuple) of random variables for which a U(-1, +1)
         jitter should be added to the initial value. Only available for
@@ -534,7 +644,7 @@ def compile_pymc_model(
     from pymc.initial_point import make_initial_point_fn
 
     if freeze_model is None:
-        freeze_model = backend == "jax"
+        freeze_model = backend in ["jax", "mlx"]
 
     if freeze_model:
         model = freeze_dims_and_data(model)
@@ -553,8 +663,10 @@ def compile_pymc_model(
     initial_point_fn = _wrap_with_lock(initial_point_fn)
 
     if backend.lower() == "numba":
-        if gradient_backend == "jax":
-            raise ValueError("Gradient backend cannot be jax when using numba backend")
+        if gradient_backend in ["jax", "mlx"]:
+            raise ValueError(
+                f"Gradient backend cannot be {gradient_backend} when using numba backend"
+            )
         return _compile_pymc_model_numba(
             model=model,
             pymc_initial_point_fn=initial_point_fn,
@@ -569,8 +681,16 @@ def compile_pymc_model(
             var_names=var_names,
             **kwargs,
         )
+    elif backend.lower() == "mlx":
+        return _compile_pymc_model_mlx(
+            model=model,
+            gradient_backend=gradient_backend,
+            pymc_initial_point_fn=initial_point_fn,
+            var_names=var_names,
+            **kwargs,
+        )
     else:
-        raise ValueError(f"Backend must be one of numba and jax. Got {backend}")
+        raise ValueError(f"Backend must be one of numba, jax, and mlx. Got {backend}")
 
 
 def _wrap_with_lock(func: Callable) -> Callable:
@@ -616,7 +736,7 @@ def _compute_shapes(model) -> dict[str, tuple[int, ...]]:
 def _make_functions(
     model: "pm.Model",
     *,
-    mode: Literal["JAX", "NUMBA"],
+    mode: Literal["JAX", "NUMBA", "MLX"],
     compute_grad: bool,
     join_expanded: bool,
     pymc_initial_point_fn: Callable[[SeedType], dict[str, np.ndarray]],
@@ -637,7 +757,7 @@ def _make_functions(
     model: pymc.Model
         The model to compile
     mode: str
-        Pytensor compile mode. One of "NUMBA" or "JAX"
+        Pytensor compile mode. One of "NUMBA", "JAX", or "MLX"
     compute_grad: bool
         Whether to compute gradients using pytensor. Must be True if mode is
         "NUMBA", otherwise False implies Jax will be used to compute gradients
