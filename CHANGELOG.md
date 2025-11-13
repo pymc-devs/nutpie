@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.16.3] - 2025-11-13
+
+### Bug Fixes
+
+- Restore maxdepth sampler option (Adrian Seyboldt)
+
+- Silence error messages when sampler is dropped (Adrian Seyboldt)
+
+
+### Features
+
+- Support datetime coordinates (Adrian Seyboldt)
+
+
+### Miscellaneous Tasks
+
+- Bump actions/upload-artifact from 4 to 5 (dependabot[bot])
+
+- Bump actions/download-artifact from 5 to 6 (dependabot[bot])
+
+- Update nuts-rs and other deps (Adrian Seyboldt)
+
+
 ## [0.16.2] - 2025-10-22
 
 ### Bug Fixes
