@@ -1,12 +1,26 @@
 import dataclasses
 from dataclasses import dataclass
-from functools import partial
+from functools import partial, wraps
 from typing import Any, Callable
 
 import numpy as np
 
 from nutpie import _lib  # type: ignore
 from nutpie.sample import CompiledModel
+
+from importlib.util import find_spec
+
+# importing from transform_adapter requires flowjax to be installed, which will not be the case for
+# all users. If it's not present, the user can't access the with_transform_adapt method anyway, so we can
+# use a dummy function so the docstring wrapper is always valid.
+if find_spec("flowjax") is not None:
+    from nutpie.transform_adapter import make_transform_adapter
+else:
+
+    def make_transform_adapter(*args, **kwargs):
+        """Normalizing flow adaption not available. Install flowjax to use."""
+        pass
+
 
 SeedType = int
 
@@ -45,6 +59,7 @@ class PyFuncModel(CompiledModel):
         updated.update(**updates)
         return dataclasses.replace(self, _shared_data=updated)
 
+    @wraps(make_transform_adapter)
     def with_transform_adapt(self, **kwargs):
         return dataclasses.replace(self, _transform_adapt_args=kwargs)
 
@@ -73,8 +88,6 @@ class PyFuncModel(CompiledModel):
                 outer_kwargs = {}
 
             def make_adapter(*args, **kwargs):
-                from nutpie.transform_adapter import make_transform_adapter
-
                 return make_transform_adapter(**outer_kwargs)(
                     *args, **kwargs, logp_fn=self._raw_logp_fn
                 )
