@@ -954,6 +954,7 @@ impl PySampler {
                 }
             }
             InnerPyStorage::Zarr(store) => {
+                zarrs::config::global_config_mut().set_include_zarrs_metadata(false);
                 let object_store = store
                     .take()
                     .ok_or_else(|| anyhow!("Can not use storage configuration twice"))?
