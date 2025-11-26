@@ -958,10 +958,11 @@ impl PySampler {
                     .take()
                     .ok_or_else(|| anyhow!("Can not use storage configuration twice"))?
                     .into_dyn();
-                let object_store = LimitStore::new(object_store, 50);
+                let object_store = LimitStore::new(object_store, 8);
                 let store = AsyncObjectStore::new(object_store);
                 let store = Arc::new(store);
                 let storage_config = ZarrAsyncConfig::new(tokio_rt.handle().clone(), store);
+                let storage_config = storage_config.with_chunk_size(16);
                 match settings.inner {
                     Settings::LowRank(settings) => {
                         let sampler =
