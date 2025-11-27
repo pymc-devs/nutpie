@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.16.4] - 2025-11-27
+
+### Bug Fixes
+
+- Improve zarr object storage settings (Adrian Seyboldt)
+
+- Don't store zarrs attr in every trace (Adrian Seyboldt)
+
+
+### Miscellaneous Tasks
+
+- Bump actions/checkout from 5 to 6 (dependabot[bot])
+
+- Update nuts-rs to make use of zarr fix (Adrian Seyboldt)
+
+
 ## [0.16.3] - 2025-11-13
 
 ### Bug Fixes
