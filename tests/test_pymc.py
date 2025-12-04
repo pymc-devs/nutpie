@@ -14,9 +14,28 @@ import pytest
 import nutpie
 import nutpie.compile_pymc
 
+# Check if MLX is available (macOS only, optional dependency)
+MLX_AVAILABLE = find_spec("mlx") is not None
+
+# Build backend list dynamically based on availability
+backend_params = [
+    ("numba", None),
+    ("jax", "pytensor"),
+    ("jax", "jax"),
+]
+
+# Only add MLX backends if MLX is available
+if MLX_AVAILABLE:
+    backend_params.extend(
+        [
+            ("mlx", "pytensor"),
+            ("mlx", "mlx"),
+        ]
+    )
+
 parameterize_backends = pytest.mark.parametrize(
     "backend, gradient_backend",
-    [("numba", None), ("jax", "pytensor"), ("jax", "jax")],
+    backend_params,
 )
 
 
@@ -463,6 +482,20 @@ def test_deterministic_sampling_jax():
         pm.HalfNormal("a")
 
     compiled = nutpie.compile_pymc_model(model, backend="jax", gradient_backend="jax")
+    trace = nutpie.sample(compiled, chains=2, seed=123, draws=100, tune=100)
+    return trace.posterior.a.values.ravel()
+
+
+@pytest.mark.pymc
+@pytest.mark.array_compare(atol=1e-6, rtol=1e-6)
+def test_deterministic_sampling_mlx():
+    if not MLX_AVAILABLE:
+        pytest.skip("MLX not installed")
+
+    with pm.Model() as model:
+        pm.HalfNormal("a")
+
+    compiled = nutpie.compile_pymc_model(model, backend="mlx", gradient_backend="mlx")
     trace = nutpie.sample(compiled, chains=2, seed=123, draws=100, tune=100)
     return trace.posterior.a.values.ravel()
 

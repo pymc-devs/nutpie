@@ -34,6 +34,7 @@ Repository = "https://github.com/pymc-devs/nutpie"
 stan = ["bridgestan >= 2.7.0", "stanio >= 0.5.1"]
 pymc = ["pymc >= 5.20.1", "numba >= 0.60.0"]
 pymc-jax = ["pymc >= 5.20.1", "jax >= 0.4.27"]
+pymc-mlx = ["pymc >= 5.20.1", "mlx >= 0.29.0"]
 nnflow = ["flowjax >= 17.1.0", "equinox >= 0.11.12"]
 dev = [
   "bridgestan >= 2.7.0",
@@ -41,6 +42,7 @@ dev = [
   "pymc >= 5.20.1",
   "numba >= 0.60.0",
   "jax >= 0.4.27",
+  "mlx >= 0.29.0",
   "flowjax >= 17.0.2",
   "pytest",
   "pytest-timeout",
@@ -52,6 +54,7 @@ all = [
   "pymc >= 5.20.1",
   "numba >= 0.60.0",
   "jax >= 0.4.27",
+  "mlx >= 0.29.0",
   "flowjax >= 17.1.0",
   "equinox >= 0.11.12",
 ]
