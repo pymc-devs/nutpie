@@ -306,14 +306,14 @@ def in_marimo_notebook() -> bool:
 def _mo_write_internal(cell_id, stream, value: object) -> None:
     """Write to marimo cell given cell_id and stream."""
     from marimo._messaging.cell_output import CellChannel
-    from marimo._messaging.ops import CellOp
+    from marimo._messaging.notification_utils import CellNotificationUtils
     from marimo._messaging.tracebacks import write_traceback
     from marimo._output import formatting
 
     output = formatting.try_format(value)
     if output.traceback is not None:
         write_traceback(output.traceback)
-    CellOp.broadcast_output(
+    CellNotificationUtils.broadcast_output(
         channel=CellChannel.OUTPUT,
         mimetype=output.mimetype,
         data=output.data,
