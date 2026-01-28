@@ -492,7 +492,11 @@ def test_zarr_store(tmp_path):
     trace.load().posterior.x
 
     assert trace.posterior.coords["a"].dtype == np.float32
-    assert trace.posterior.coords["b"].dtype == "datetime64[ns]"
+    # pandas 3.0 changes datetime64 precision
+    assert trace.posterior.coords["b"].dtype.name in [
+        "datetime64[ns]",
+        "datetime64[us]",
+    ]
     assert trace.posterior.coords["b"].values[0] == np.datetime64("2023-01-01")
     assert list(trace.posterior.coords["c"]) == ["x", "y", "z"]
     assert list(trace.posterior.coords["d"]) == [1]
@@ -501,7 +505,11 @@ def test_zarr_store(tmp_path):
 
     trace = nutpie.sample(compiled, chains=2, seed=1234, draws=50, tune=50)
     assert trace.posterior.coords["a"].dtype == np.float32
-    assert trace.posterior.coords["b"].dtype == "datetime64[ns]"
+    # pandas 3.0 changes datetime64 precision
+    assert trace.posterior.coords["b"].dtype.name in [
+        "datetime64[ns]",
+        "datetime64[us]",
+    ]
     assert trace.posterior.coords["b"].values[0] == np.datetime64("2023-01-01")
     assert list(trace.posterior.coords["c"]) == ["x", "y", "z"]
     assert list(trace.posterior.coords["d"]) == [1]
