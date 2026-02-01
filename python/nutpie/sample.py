@@ -305,8 +305,15 @@ def in_marimo_notebook() -> bool:
 
 def _mo_write_internal(cell_id, stream, value: object) -> None:
     """Write to marimo cell given cell_id and stream."""
+    import marimo
+
+    if marimo.__version__ < "0.19.0":
+        # The old CellOp API is identical to new CellNotificationUtils
+        from marimo._messaging.ops import CellOp as CellNotificationUtils
+    else:
+        from marimo._messaging.notification_utils import CellNotificationUtils
+
     from marimo._messaging.cell_output import CellChannel
-    from marimo._messaging.notification_utils import CellNotificationUtils
     from marimo._messaging.tracebacks import write_traceback
     from marimo._output import formatting
 
