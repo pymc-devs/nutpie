@@ -2,6 +2,38 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.16.5] - 2026-02-02
+
+### Bug Fixes
+
+- Compatibility with pandas 3.0 for string coords (Adrian Seyboldt)
+
+
+### Miscellaneous Tasks
+
+- Update dependencies (Adrian Seyboldt)
+
+- Bump actions/download-artifact from 6 to 7 (dependabot[bot])
+
+- Bump actions/upload-artifact from 5 to 6 (dependabot[bot])
+
+- Require python 3.11 (Adrian Seyboldt)
+
+- Update cargo lock (Adrian Seyboldt)
+
+
+### Testing
+
+- Fix test failure due to numpy datetime representation (Adrian Seyboldt)
+
+
+### Ci
+
+- Update macos github runners (Adrian Seyboldt)
+
+- Test and build with python 3.14 (Adrian Seyboldt)
+
+
 ## [0.16.4] - 2025-11-27
 
 ### Bug Fixes
