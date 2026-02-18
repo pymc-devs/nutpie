@@ -28,7 +28,7 @@ use pyo3::{
 };
 use pyo3_arrow::PyRecordBatch;
 use pyo3_object_store::AnyObjectStore;
-use rand::{rng, RngCore};
+use rand::{rng, Rng};
 use tokio::runtime::Runtime;
 use zarrs_object_store::{object_store::limit::LimitStore, AsyncObjectStore};
 
@@ -73,7 +73,7 @@ impl PyChainProgress {
     }
 }
 
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct PyNutsSettings {
     inner: Settings,
@@ -837,7 +837,7 @@ enum InnerProgressType {
     None {},
 }
 
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct ProgressType(InnerProgressType);
 
@@ -1364,7 +1364,7 @@ impl PyTrace {
     }
 }
 
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyTransformAdapt(Arc<Py<PyAny>>);
 

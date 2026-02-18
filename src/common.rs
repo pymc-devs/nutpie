@@ -233,7 +233,7 @@ impl PyValue {
         self.0
     }
 
-    pub fn into_array(self, py: Python) -> Result<Bound<PyAny>> {
+    pub fn _into_array(self, py: Python) -> Result<Bound<PyAny>> {
         macro_rules! from_time {
             ($unit:ident, $items:expr, $type:ident) => {
                 Ok(
@@ -280,7 +280,7 @@ impl PyValue {
     }
 }
 
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct PyVariable {
