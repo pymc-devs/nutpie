@@ -472,14 +472,16 @@ def test_zarr_store(tmp_path):
     coords = {
         "a": np.arange(2).astype("f"),
         "b": pd.date_range("2023-01-01", periods=1),
-        "c": ["x", "y", "z"],
-        "d": [1],
+        "c": ["x", "y", "z", ""],
+        "d": [0],
         "e": pd.factorize(pd.Index(["foo"]))[1],
         "f": np.arange(2).astype("d"),
+        "g": pd.date_range("2023-01-01", periods=0),
     }
     with pm.Model(coords=coords) as model:
         pm.HalfNormal("x")
         pm.Normal("y", dims=("a", "b", "c", "d", "e", "f"))
+        pm.Normal("z", dims="g")
 
     compiled = nutpie.compile_pymc_model(model, backend="numba")
 
@@ -498,8 +500,8 @@ def test_zarr_store(tmp_path):
         "datetime64[us]",
     ]
     assert trace.posterior.coords["b"].values[0] == np.datetime64("2023-01-01")
-    assert list(trace.posterior.coords["c"]) == ["x", "y", "z"]
-    assert list(trace.posterior.coords["d"]) == [1]
+    assert list(trace.posterior.coords["c"]) == ["x", "y", "z", ""]
+    assert list(trace.posterior.coords["d"]) == [0]
     assert list(trace.posterior.coords["e"]) == ["foo"]
     assert trace.posterior.coords["f"].dtype == np.float64
 
@@ -511,10 +513,11 @@ def test_zarr_store(tmp_path):
         "datetime64[us]",
     ]
     assert trace.posterior.coords["b"].values[0] == np.datetime64("2023-01-01")
-    assert list(trace.posterior.coords["c"]) == ["x", "y", "z"]
-    assert list(trace.posterior.coords["d"]) == [1]
+    assert list(trace.posterior.coords["c"]) == ["x", "y", "z", ""]
+    assert list(trace.posterior.coords["d"]) == [0]
     assert list(trace.posterior.coords["e"]) == ["foo"]
     assert trace.posterior.coords["f"].dtype == np.float64
+    assert trace.posterior.coords["g"].shape == (0,)
 
 
 @pytest.fixture
