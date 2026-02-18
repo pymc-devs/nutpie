@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.16.6] - 2026-02-18
+
+### Miscellaneous Tasks
+
+- Bump bytes in the cargo group across 1 directory (dependabot[bot])
+
+- Update dependencies (Adrian Seyboldt)
+
+
+### Testing
+
+- Add test for empty arrays with zarr (Adrian Seyboldt)
+
+
 ## [0.16.5] - 2026-02-02
 
 ### Bug Fixes
