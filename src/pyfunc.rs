@@ -1,9 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{anyhow, bail, Context, Result};
-use numpy::{
-    NotContiguousError, PyArray1, PyReadonlyArray1, PyReadonlyArrayDyn, PyUntypedArrayMethods,
-};
+use numpy::{AsSliceError, PyArray1, PyReadonlyArray1, PyReadonlyArrayDyn, PyUntypedArrayMethods};
 use nuts_rs::{CpuLogpFunc, CpuMath, HasDims, LogpError, Model, Storable, Value};
 use pyo3::{
     exceptions::PyRuntimeError,
@@ -20,7 +18,7 @@ use crate::{
     wrapper::PyTransformAdapt,
 };
 
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyModel {
     make_logp_func: Arc<Py<PyAny>>,
@@ -94,7 +92,7 @@ pub enum PyLogpError {
     #[error("logp function must return float.")]
     ReturnTypeError(),
     #[error("Python retured a non-contigous array")]
-    NotContiguousError(#[from] NotContiguousError),
+    NotContiguousError(#[from] AsSliceError),
     #[error("Unknown error: {0}")]
     Anyhow(#[from] anyhow::Error),
 }

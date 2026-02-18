@@ -1,7 +1,7 @@
 use std::{collections::HashMap, ffi::c_void, sync::Arc};
 
 use anyhow::{anyhow, bail, Context, Result};
-use numpy::{NotContiguousError, PyReadonlyArray1};
+use numpy::{AsSliceError, PyReadonlyArray1};
 use nuts_rs::{CpuLogpFunc, CpuMath, HasDims, LogpError, Model, Storable, Value};
 use pyo3::{
     exceptions::PyRuntimeError,
@@ -36,7 +36,7 @@ type RawExpandFunc = unsafe extern "C" fn(
     *const std::ffi::c_void,
 ) -> std::os::raw::c_int;
 
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub(crate) struct LogpFunc {
     func: RawLogpFunc,
@@ -62,7 +62,7 @@ impl LogpFunc {
     }
 }
 
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub(crate) struct ExpandFunc {
     func: RawExpandFunc,
@@ -156,7 +156,7 @@ pub enum PyMcLogpError {
     #[error("Python error: {0}")]
     PyError(#[from] PyErr),
     #[error("Python retured a non-contigous array")]
-    NotContiguousError(#[from] NotContiguousError),
+    NotContiguousError(#[from] AsSliceError),
     #[error("Unknown error: {0}")]
     Anyhow(#[from] anyhow::Error),
     #[error("Logp function returned error code: {0}")]
@@ -396,7 +396,7 @@ impl CpuLogpFunc for PyMcModelRef<'_> {
     }
 }
 
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub(crate) struct PyMcModel {
     dim: usize,
