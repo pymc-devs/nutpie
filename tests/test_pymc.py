@@ -527,3 +527,24 @@ def tmp_path():
 
     with tempfile.TemporaryDirectory() as tmpdirname:
         yield Path(tmpdirname)
+
+
+@pytest.mark.pymc
+@parameterize_backends
+def test_dims_model(backend, gradient_backend):
+    import pymc.dims as pmd
+
+    coords = {"a": range(3), "b": range(5)}
+    with pm.Model(coords=coords) as model:
+        print(model.dim_lengths)
+        zero_sum = pmd.ZeroSumNormal("zero_sum", core_dims=("a",), dims=("a", "b"))
+        pmd.Deterministic("one_sum", zero_sum + 1 / 3, dims=(..., "a"))
+
+    compiled = nutpie.compile_pymc_model(
+        model, backend=backend, gradient_backend=gradient_backend
+    )
+    post = nutpie.sample(compiled, chains=1).posterior
+    assert post["zero_sum"].dims == ("chain", "draw", "a", "b")
+    assert post["one_sum"].dims == ("chain", "draw", "b", "a")
+    np.testing.assert_allclose(post["zero_sum"].sum(dim="a"), 0, atol=1e-5)
+    np.testing.assert_allclose(post["one_sum"].sum(dim="a"), 1, atol=1e-5)
