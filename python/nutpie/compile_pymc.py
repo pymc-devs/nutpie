@@ -586,6 +586,7 @@ def _wrap_with_lock(func: Callable) -> Callable:
 
 def _compute_shapes(model) -> dict[str, tuple[int, ...]]:
     import pytensor
+    from pytensor.tensor import as_tensor
     from pymc.initial_point import make_initial_point_fn
 
     point = make_initial_point_fn(model=model, return_transformed=True)(0)
@@ -596,9 +597,9 @@ def _compute_shapes(model) -> dict[str, tuple[int, ...]]:
         if var not in model.observed_RVs + model.potentials
     }
 
-    shape_func = pytensor.compile.function.function(
+    shape_func = pytensor.function(
         inputs=[],
-        outputs=[var.shape for var in trace_vars.values()],
+        outputs=[as_tensor(var.shape) for var in trace_vars.values()],
         givens=(
             [(obs, model.rvs_to_values[obs]) for obs in model.observed_RVs]
             + [
@@ -607,7 +608,7 @@ def _compute_shapes(model) -> dict[str, tuple[int, ...]]:
                 if name in point
             ]
         ),
-        mode=pytensor.compile.mode.FAST_COMPILE,
+        mode="FAST_COMPILE",
         on_unused_input="ignore",
     )
     return dict(zip(trace_vars.keys(), shape_func()))
@@ -694,7 +695,12 @@ def _make_functions(
 
     if compute_grad:
         grads = pytensor.gradient.grad(logp, value_vars)
-        grad = pt.concatenate([grad.ravel() for grad in grads])
+        grad = pt.concatenate(
+            [
+                pt.as_tensor(grad, allow_xtensor_conversion=True).ravel()
+                for grad in grads
+            ]
+        )
 
     count = 0
     joined_slices = []
@@ -775,7 +781,17 @@ def _make_functions(
     num_expanded = count
 
     if join_expanded:
-        allvars = [pt.concatenate([joined, *[var.ravel() for var in remaining_rvs]])]
+        allvars = [
+            pt.concatenate(
+                [
+                    joined,
+                    *[
+                        pt.as_tensor(var, allow_xtensor_conversion=True).ravel()
+                        for var in remaining_rvs
+                    ],
+                ]
+            )
+        ]
     else:
         allvars = [*variables, *remaining_rvs]
     with model:
