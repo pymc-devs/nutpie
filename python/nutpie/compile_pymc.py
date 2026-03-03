@@ -511,6 +511,7 @@ def compile_pymc_model(
     freeze_model : bool | None
         Freeze all dimensions and shared variables to treat them as compile time
         constants.
+        
     Returns
     -------
     compiled_model : CompiledPyMCModel
