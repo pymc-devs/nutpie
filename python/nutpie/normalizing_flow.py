@@ -1717,10 +1717,9 @@ def make_flow_scan(
         )
 
         out_axes = eqx.tree_at(
-            lambda tree: select_coupling(tree)
-            .conditioner.layers[1]
-            .layers[-1]
-            .layers[0],
+            lambda tree: (
+                select_coupling(tree).conditioner.layers[1].layers[-1].layers[0]
+            ),
             pytree=out_axes,
             replace=None,
         )
@@ -1741,10 +1740,9 @@ def make_flow_scan(
             replace=False,
         )
         vectorize = eqx.tree_at(
-            lambda tree: select_coupling(tree)
-            .conditioner.layers[1]
-            .layers[-1]
-            .layers[0],
+            lambda tree: (
+                select_coupling(tree).conditioner.layers[1].layers[-1].layers[0]
+            ),
             pytree=vectorize,
             replace=False,
         )
