@@ -37,9 +37,18 @@ class PyFuncModel(CompiledModel):
         return self._n_dim
 
     def with_data(self, **updates):
-        for name in updates:
+        for name, new_val in updates.items():
             if name not in self._shared_data:
                 raise ValueError(f"Unknown data variable: {name}")
+            old_shape = np.shape(self._shared_data[name])
+            new_shape = np.shape(new_val)
+            if old_shape != new_shape:
+                raise ValueError(
+                    f"Shared variable '{name}' has shape {old_shape}, "
+                    f"but the new value has shape {new_shape}. "
+                    f"Changing the shape of shared data requires recompiling "
+                    f"the model with compile_pymc_model()."
+                )
 
         updated = self._shared_data.copy()
         updated.update(**updates)
