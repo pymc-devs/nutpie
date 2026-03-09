@@ -406,6 +406,24 @@ impl PyNutsSettings {
     }
 
     #[getter]
+    fn store_transformed(&self) -> bool {
+        match &self.inner {
+            Settings::Diag(nuts_settings) => nuts_settings.store_transformed,
+            Settings::LowRank(nuts_settings) => nuts_settings.store_transformed,
+            Settings::Transforming(nuts_settings) => nuts_settings.store_transformed,
+        }
+    }
+
+    #[setter(store_transformed)]
+    fn set_store_transformed(&mut self, val: bool) {
+        match &mut self.inner {
+            Settings::Diag(nuts_settings) => nuts_settings.store_transformed = val,
+            Settings::LowRank(nuts_settings) => nuts_settings.store_transformed = val,
+            Settings::Transforming(nuts_settings) => nuts_settings.store_transformed = val,
+        }
+    }
+
+    #[getter]
     fn store_divergences(&self) -> bool {
         match &self.inner {
             Settings::Diag(nuts_settings) => nuts_settings.store_divergences,
@@ -533,6 +551,42 @@ impl PyNutsSettings {
             }
         }
         Ok(())
+    }
+
+    #[getter]
+    fn exact_normal_trajectory(&self) -> bool {
+        match &self.inner {
+            Settings::LowRank(settings) => settings.exact_normal_trajectory,
+            Settings::Diag(settings) => settings.exact_normal_trajectory,
+            Settings::Transforming(settings) => settings.exact_normal_trajectory,
+        }
+    }
+
+    #[setter(exact_normal_trajectory)]
+    fn set_exact_normal_trajectory(&mut self, val: bool) {
+        match &mut self.inner {
+            Settings::LowRank(settings) => settings.exact_normal_trajectory = val,
+            Settings::Diag(settings) => settings.exact_normal_trajectory = val,
+            Settings::Transforming(settings) => settings.exact_normal_trajectory = val,
+        }
+    }
+
+    #[getter]
+    fn extra_doublings(&self) -> u64 {
+        match &self.inner {
+            Settings::LowRank(settings) => settings.extra_doublings,
+            Settings::Diag(settings) => settings.extra_doublings,
+            Settings::Transforming(settings) => settings.extra_doublings,
+        }
+    }
+
+    #[setter(extra_doublings)]
+    fn set_extra_doublings(&mut self, val: u64) {
+        match &mut self.inner {
+            Settings::LowRank(settings) => settings.extra_doublings = val,
+            Settings::Diag(settings) => settings.extra_doublings = val,
+            Settings::Transforming(settings) => settings.extra_doublings = val,
+        }
     }
 
     #[getter]
@@ -692,20 +746,19 @@ impl PyNutsSettings {
 
     #[setter(step_size_adapt_method)]
     fn set_step_size_adapt_method(&mut self, method: Py<PyAny>) -> Result<()> {
-        let method = Python::attach(|py| {
-            if let Ok(method) = method.extract::<String>(py) {
-                match method.as_str() {
-                    "dual_average" => Ok(StepSizeAdaptMethod::DualAverage),
-                    "adam" => Ok(StepSizeAdaptMethod::Adam),
-                    _ => {
-                        if let Ok(step_size) = method.parse::<f64>() {
-                            Ok(StepSizeAdaptMethod::Fixed(step_size))
-                        } else {
-                            bail!("step_size_adapt_method must be a positive float when using fixed step size");
-                        }
+        let method = Python::attach(|py| match method.extract::<String>(py) {
+            Ok(method) => match method.as_str() {
+                "dual_average" => Ok(StepSizeAdaptMethod::DualAverage),
+                "adam" => Ok(StepSizeAdaptMethod::Adam),
+                _ => {
+                    if let Ok(step_size) = method.parse::<f64>() {
+                        Ok(StepSizeAdaptMethod::Fixed(step_size))
+                    } else {
+                        bail!("step_size_adapt_method must be a positive float when using fixed step size");
                     }
                 }
-            } else {
+            },
+            _ => {
                 bail!("step_size_adapt_method must be a string");
             }
         })?;
