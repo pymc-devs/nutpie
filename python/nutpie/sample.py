@@ -135,6 +135,8 @@ def _add_arrow_data(data_dict, max_length, batch, chain, n_chains, dims, skip_va
         if name not in data_dict:
             if dtype in [np.float64, np.float32]:
                 data = np.full(total_shape, np.nan, dtype=dtype)
+            elif dtype == np.dtype("O"):
+                data = np.full(total_shape, None, dtype=dtype)
             else:
                 data = np.zeros(total_shape, dtype=dtype)
             data_dict[name] = data
@@ -148,6 +150,8 @@ def _add_arrow_data(data_dict, max_length, batch, chain, n_chains, dims, skip_va
             )
         else:
             is_null = is_null.to_numpy(False)
+            if values.shape[0] == num_draws:
+                values = values[~is_null]
             data_dict[name][chain, :num_draws][~is_null] = values.reshape(
                 ((~is_null).sum(),) + tuple(item_shape)
             )
@@ -583,8 +587,16 @@ class _BackgroundSampler:
                     ],
                 }
 
+                def _get_nested(settings, name, default):
+                    parts = name.split(".")
+                    for part in parts:
+                        if part not in settings:
+                            return default
+                        settings = settings[part]
+                    return settings
+
                 for setting, names in skips.items():
-                    if not getattr(self._settings, setting, False):
+                    if not _get_nested(settings_dict["settings"], setting, False):
                         skip_vars.extend(names)
 
                 draw_batches, stat_batches = results.get_arrow_trace()
