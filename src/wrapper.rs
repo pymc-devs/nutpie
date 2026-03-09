@@ -21,14 +21,16 @@ use nuts_rs::{
     TransformedNutsSettings, ZarrAsyncConfig,
 };
 use pyo3::{
-    exceptions::{PyTimeoutError, PyValueError},
+    exceptions::{PyAttributeError, PyTimeoutError, PyValueError},
     intern,
     prelude::*,
-    types::PyList,
+    types::PyDict,
 };
 use pyo3_arrow::PyRecordBatch;
 use pyo3_object_store::AnyObjectStore;
+use pythonize::{depythonize_bound, pythonize};
 use rand::{rng, Rng};
+use serde_json::Value as JsonValue;
 use tokio::runtime::Runtime;
 use zarrs_object_store::{object_store::limit::LimitStore, AsyncObjectStore};
 
@@ -113,6 +115,84 @@ enum Settings {
     Transforming(TransformedNutsSettings),
 }
 
+macro_rules! with_all_settings_mut {
+    ($self:expr, $settings:ident => $body:block) => {{
+        match &mut $self.inner {
+            Settings::Diag($settings) => $body,
+            Settings::LowRank($settings) => $body,
+            Settings::Transforming($settings) => $body,
+        }
+    }};
+}
+
+macro_rules! set_all_settings_field {
+    ($self:expr, $field:ident = $value:expr) => {{
+        with_all_settings_mut!($self, settings => {
+            settings.$field = $value;
+        });
+    }};
+    ($self:expr, $field:ident $(. $rest:ident)+ = $value:expr) => {{
+        with_all_settings_mut!($self, settings => {
+            settings.$field$(.$rest)+ = $value;
+        });
+    }};
+}
+
+macro_rules! unsupported_option_error {
+    ($option:expr, $adaptation:expr) => {
+        PyValueError::new_err(format!(
+            "Option {} not available for {} adaptation",
+            $option, $adaptation
+        ))
+    };
+}
+
+macro_rules! with_diag_or_low_rank_settings_mut {
+    ($self:expr, $option:expr, $settings:ident => $body:block) => {{
+        match &mut $self.inner {
+            Settings::Diag($settings) => $body,
+            Settings::LowRank($settings) => $body,
+            Settings::Transforming(_) => {
+                return Err(unsupported_option_error!($option, "transforming"))
+            }
+        }
+    }};
+}
+
+macro_rules! with_diag_settings_mut {
+    ($self:expr, $option:expr, $settings:ident => $body:block) => {{
+        match &mut $self.inner {
+            Settings::Diag($settings) => $body,
+            Settings::LowRank(_) => return Err(unsupported_option_error!($option, "low-rank")),
+            Settings::Transforming(_) => {
+                return Err(unsupported_option_error!($option, "transforming"))
+            }
+        }
+    }};
+}
+
+macro_rules! with_low_rank_settings_mut {
+    ($self:expr, $option:expr, $settings:ident => $body:block) => {{
+        match &mut $self.inner {
+            Settings::LowRank($settings) => $body,
+            Settings::Diag(_) => return Err(unsupported_option_error!($option, "diag")),
+            Settings::Transforming(_) => {
+                return Err(unsupported_option_error!($option, "transforming"))
+            }
+        }
+    }};
+}
+
+macro_rules! with_transform_settings_mut {
+    ($self:expr, $option:expr, $settings:ident => $body:block) => {{
+        match &mut $self.inner {
+            Settings::Transforming($settings) => $body,
+            Settings::Diag(_) => return Err(unsupported_option_error!($option, "diag")),
+            Settings::LowRank(_) => return Err(unsupported_option_error!($option, "low-rank")),
+        }
+    }};
+}
+
 impl PyNutsSettings {
     fn new_diag(seed: Option<u64>) -> Self {
         let seed = seed.unwrap_or_else(|| {
@@ -158,6 +238,277 @@ impl PyNutsSettings {
             inner: Settings::Transforming(settings),
         }
     }
+
+    fn update_from_nested_dict(&mut self, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        match &mut self.inner {
+            Settings::Diag(settings) => {
+                *settings = depythonize_bound(value)
+                    .map_err(|err| PyValueError::new_err(err.to_string()))?;
+            }
+            Settings::LowRank(settings) => {
+                *settings = depythonize_bound(value)
+                    .map_err(|err| PyValueError::new_err(err.to_string()))?;
+            }
+            Settings::Transforming(settings) => {
+                *settings = depythonize_bound(value)
+                    .map_err(|err| PyValueError::new_err(err.to_string()))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_update(&mut self, name: &str, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        match name {
+            "num_tune" => {
+                let value: u64 = value.extract()?;
+                set_all_settings_field!(self, num_tune = value);
+            }
+            "num_chains" => {
+                let value: usize = value.extract()?;
+                set_all_settings_field!(self, num_chains = value);
+            }
+            "num_draws" => {
+                let value: u64 = value.extract()?;
+                set_all_settings_field!(self, num_draws = value);
+            }
+            "window_switch_freq" => {
+                let value: u64 = value.extract()?;
+                match &mut self.inner {
+                    Settings::Diag(settings) => {
+                        settings.adapt_options.mass_matrix_switch_freq = value
+                    }
+                    Settings::LowRank(settings) => {
+                        settings.adapt_options.mass_matrix_switch_freq = value
+                    }
+                    Settings::Transforming(settings) => {
+                        settings.adapt_options.transform_update_freq = value
+                    }
+                }
+            }
+            "early_window_switch_freq" => {
+                let value: u64 = value.extract()?;
+                with_diag_or_low_rank_settings_mut!(
+                    self,
+                    "early_window_switch_freq",
+                    settings => {
+                        settings.adapt_options.early_mass_matrix_switch_freq = value;
+                    }
+                );
+            }
+            "initial_step" => {
+                let value: f64 = value.extract()?;
+                set_all_settings_field!(
+                    self,
+                    adapt_options.step_size_settings.initial_step = value
+                );
+            }
+            "maxdepth" => {
+                let value: u64 = value.extract()?;
+                set_all_settings_field!(self, maxdepth = value);
+            }
+            "mindepth" => {
+                let value: u64 = value.extract()?;
+                set_all_settings_field!(self, mindepth = value);
+            }
+            "store_gradient" => {
+                let value: bool = value.extract()?;
+                set_all_settings_field!(self, store_gradient = value);
+            }
+            "store_unconstrained" => {
+                let value: bool = value.extract()?;
+                set_all_settings_field!(self, store_unconstrained = value);
+            }
+            "store_transformed" => {
+                let value: bool = value.extract()?;
+                set_all_settings_field!(self, store_transformed = value);
+            }
+            "store_divergences" => {
+                let value: bool = value.extract()?;
+                set_all_settings_field!(self, store_divergences = value);
+            }
+            "max_energy_error" => {
+                let value: f64 = value.extract()?;
+                set_all_settings_field!(self, max_energy_error = value);
+            }
+            "target_accept" => {
+                let value: f64 = value.extract()?;
+                set_all_settings_field!(
+                    self,
+                    adapt_options.step_size_settings.target_accept = value
+                );
+            }
+            "max_step_size" => {
+                let value: f64 = value.extract()?;
+                set_all_settings_field!(
+                    self,
+                    adapt_options
+                        .step_size_settings
+                        .adapt_options
+                        .dual_average
+                        .max_step_size = value
+                );
+            }
+            "store_mass_matrix" => {
+                let value: bool = value.extract()?;
+                with_diag_or_low_rank_settings_mut!(
+                    self,
+                    "store_mass_matrix",
+                    settings => {
+                        settings.adapt_options.mass_matrix_options.store_mass_matrix = value;
+                    }
+                );
+            }
+            "use_grad_based_mass_matrix" => {
+                let value: bool = value.extract()?;
+                with_diag_settings_mut!(
+                    self,
+                    "use_grad_based_mass_matrix",
+                    settings => {
+                        settings.adapt_options.mass_matrix_options.use_grad_based_estimate = value;
+                    }
+                );
+            }
+            "microcanonical_trajectory" => {
+                let value: bool = value.extract()?;
+                if value {
+                    set_all_settings_field!(
+                        self,
+                        trajectory_kind = KineticEnergyKind::Microcanonical
+                    );
+                }
+            }
+            "exact_normal_trajectory" => {
+                let value: bool = value.extract()?;
+                if value {
+                    set_all_settings_field!(self, trajectory_kind = KineticEnergyKind::ExactNormal);
+                }
+            }
+            "extra_doublings" => {
+                let value: u64 = value.extract()?;
+                set_all_settings_field!(self, extra_doublings = value);
+            }
+            "mass_matrix_switch_freq" => {
+                let value: u64 = value.extract()?;
+                with_diag_or_low_rank_settings_mut!(
+                    self,
+                    "mass_matrix_switch_freq",
+                    settings => {
+                        settings.adapt_options.mass_matrix_switch_freq = value;
+                    }
+                );
+            }
+            "mass_matrix_eigval_cutoff" => {
+                let value: Option<f64> = value.extract()?;
+                if let Some(value) = value {
+                    with_low_rank_settings_mut!(
+                        self,
+                        "mass_matrix_eigval_cutoff",
+                        settings => {
+                            settings.adapt_options.mass_matrix_options.eigval_cutoff = value;
+                        }
+                    );
+                }
+            }
+            "mass_matrix_gamma" => {
+                let value: Option<f64> = value.extract()?;
+                if let Some(value) = value {
+                    with_low_rank_settings_mut!(
+                        self,
+                        "mass_matrix_gamma",
+                        settings => {
+                            settings.adapt_options.mass_matrix_options.gamma = value;
+                        }
+                    );
+                }
+            }
+            "train_on_orbit" => {
+                let value: bool = value.extract()?;
+                with_transform_settings_mut!(
+                    self,
+                    "train_on_orbit",
+                    settings => {
+                        settings.adapt_options.use_orbit_for_training = value;
+                    }
+                );
+            }
+            "check_turning" => {
+                let value: bool = value.extract()?;
+                set_all_settings_field!(self, check_turning = value);
+            }
+            "step_size_adapt_method" => {
+                let method = match value.extract::<String>() {
+                    Ok(method) => match method.as_str() {
+                        "dual_average" => StepSizeAdaptMethod::DualAverage,
+                        "adam" => StepSizeAdaptMethod::Adam,
+                        _ => {
+                            if let Ok(step_size) = method.parse::<f64>() {
+                                StepSizeAdaptMethod::Fixed(step_size)
+                            } else {
+                                return Err(PyValueError::new_err(
+                                    "step_size_adapt_method must be a positive float when using fixed step size",
+                                ));
+                            }
+                        }
+                    },
+                    _ => {
+                        return Err(PyValueError::new_err(
+                            "step_size_adapt_method must be a string",
+                        ));
+                    }
+                };
+
+                set_all_settings_field!(
+                    self,
+                    adapt_options.step_size_settings.adapt_options.method = method
+                );
+            }
+            "step_size_adam_learning_rate" => {
+                let value: Option<f64> = value.extract()?;
+                if let Some(value) = value {
+                    set_all_settings_field!(
+                        self,
+                        adapt_options
+                            .step_size_settings
+                            .adapt_options
+                            .adam
+                            .learning_rate = value
+                    );
+                }
+            }
+            "step_size_jitter" => {
+                let mut value: Option<f64> = value.extract()?;
+                if let Some(jitter) = value {
+                    if jitter < 0.0 {
+                        return Err(PyValueError::new_err("step_size_jitter must be positive"));
+                    }
+                    if jitter == 0.0 {
+                        value = None;
+                    }
+                }
+                set_all_settings_field!(self, adapt_options.step_size_settings.jitter = value);
+            }
+            _ => {
+                return Err(PyAttributeError::new_err(format!(
+                    "Unknown settings attribute: {name}",
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn to_nested_json(&self) -> PyResult<JsonValue> {
+        match &self.inner {
+            Settings::Diag(settings) => {
+                serde_json::to_value(settings).map_err(|err| PyValueError::new_err(err.to_string()))
+            }
+            Settings::LowRank(settings) => {
+                serde_json::to_value(settings).map_err(|err| PyValueError::new_err(err.to_string()))
+            }
+            Settings::Transforming(settings) => {
+                serde_json::to_value(settings).map_err(|err| PyValueError::new_err(err.to_string()))
+            }
+        }
+    }
 }
 
 // TODO switch to serde to expose all the options...
@@ -184,812 +535,26 @@ impl PyNutsSettings {
         PyNutsSettings::new_tranform_adapt(seed)
     }
 
-    #[getter]
-    fn num_tune(&self) -> u64 {
-        match &self.inner {
-            Settings::Diag(nuts_settings) => nuts_settings.num_tune,
-            Settings::LowRank(nuts_settings) => nuts_settings.num_tune,
-            Settings::Transforming(nuts_settings) => nuts_settings.num_tune,
-        }
-    }
-
-    #[setter(num_tune)]
-    fn set_num_tune(&mut self, val: u64) {
-        match &mut self.inner {
-            Settings::Diag(nuts_settings) => nuts_settings.num_tune = val,
-            Settings::LowRank(nuts_settings) => nuts_settings.num_tune = val,
-            Settings::Transforming(nuts_settings) => nuts_settings.num_tune = val,
-        }
-    }
-
-    #[getter]
-    fn num_chains(&self) -> usize {
-        match &self.inner {
-            Settings::Diag(nuts_settings) => nuts_settings.num_chains,
-            Settings::LowRank(nuts_settings) => nuts_settings.num_chains,
-            Settings::Transforming(nuts_settings) => nuts_settings.num_chains,
-        }
-    }
-
-    #[setter(num_chains)]
-    fn set_num_chains(&mut self, val: usize) {
-        match &mut self.inner {
-            Settings::Diag(nuts_settings) => nuts_settings.num_chains = val,
-            Settings::LowRank(nuts_settings) => nuts_settings.num_chains = val,
-            Settings::Transforming(nuts_settings) => nuts_settings.num_chains = val,
-        }
-    }
-
-    #[getter]
-    fn num_draws(&self) -> u64 {
-        match &self.inner {
-            Settings::Diag(nuts_settings) => nuts_settings.num_draws,
-            Settings::LowRank(nuts_settings) => nuts_settings.num_draws,
-            Settings::Transforming(nuts_settings) => nuts_settings.num_draws,
-        }
-    }
-
-    #[setter(num_draws)]
-    fn set_num_draws(&mut self, val: u64) {
-        match &mut self.inner {
-            Settings::Diag(nuts_settings) => nuts_settings.num_draws = val,
-            Settings::LowRank(nuts_settings) => nuts_settings.num_draws = val,
-            Settings::Transforming(nuts_settings) => nuts_settings.num_draws = val,
-        }
-    }
-
-    #[getter]
-    fn window_switch_freq(&self) -> Result<u64> {
-        match &self.inner {
-            Settings::Diag(nuts_settings) => {
-                Ok(nuts_settings.adapt_options.mass_matrix_switch_freq)
-            }
-            Settings::LowRank(nuts_settings) => {
-                Ok(nuts_settings.adapt_options.mass_matrix_switch_freq)
-            }
-            Settings::Transforming(nuts_settings) => {
-                Ok(nuts_settings.adapt_options.transform_update_freq)
-            }
-        }
-    }
-
-    #[setter(window_switch_freq)]
-    fn set_window_switch_freq(&mut self, val: u64) -> Result<()> {
-        match &mut self.inner {
-            Settings::Diag(nuts_settings) => {
-                nuts_settings.adapt_options.mass_matrix_switch_freq = val;
-                Ok(())
-            }
-            Settings::LowRank(nuts_settings) => {
-                nuts_settings.adapt_options.mass_matrix_switch_freq = val;
-                Ok(())
-            }
-            Settings::Transforming(nuts_settings) => {
-                nuts_settings.adapt_options.transform_update_freq = val;
-                Ok(())
-            }
-        }
-    }
-
-    #[getter]
-    fn early_window_switch_freq(&self) -> Result<u64> {
-        match &self.inner {
-            Settings::Diag(nuts_settings) => {
-                Ok(nuts_settings.adapt_options.early_mass_matrix_switch_freq)
-            }
-            Settings::LowRank(nuts_settings) => {
-                Ok(nuts_settings.adapt_options.early_mass_matrix_switch_freq)
-            }
-            Settings::Transforming(_) => {
-                bail!("Option early_window_switch_freq not availbale for transformation adaptation")
-            }
-        }
-    }
-
-    #[setter(early_window_switch_freq)]
-    fn set_early_window_switch_freq(&mut self, val: u64) -> Result<()> {
-        match &mut self.inner {
-            Settings::Diag(nuts_settings) => {
-                nuts_settings.adapt_options.early_mass_matrix_switch_freq = val;
-                Ok(())
-            }
-            Settings::LowRank(nuts_settings) => {
-                nuts_settings.adapt_options.early_mass_matrix_switch_freq = val;
-                Ok(())
-            }
-            Settings::Transforming(_) => {
-                bail!("Option early_window_switch_freq not availbale for transformation adaptation")
-            }
-        }
-    }
-
-    #[getter]
-    fn initial_step(&self) -> f64 {
-        match &self.inner {
-            Settings::Diag(nuts_settings) => {
-                nuts_settings.adapt_options.step_size_settings.initial_step
-            }
-            Settings::LowRank(nuts_settings) => {
-                nuts_settings.adapt_options.step_size_settings.initial_step
-            }
-            Settings::Transforming(nuts_settings) => {
-                nuts_settings.adapt_options.step_size_settings.initial_step
-            }
-        }
-    }
-
-    #[setter(initial_step)]
-    fn set_initial_step(&mut self, val: f64) {
-        match &mut self.inner {
-            Settings::Diag(nuts_settings) => {
-                nuts_settings.adapt_options.step_size_settings.initial_step = val;
-            }
-            Settings::LowRank(nuts_settings) => {
-                nuts_settings.adapt_options.step_size_settings.initial_step = val;
-            }
-            Settings::Transforming(nuts_settings) => {
-                nuts_settings.adapt_options.step_size_settings.initial_step = val;
-            }
-        }
-    }
-
-    #[getter]
-    fn maxdepth(&self) -> u64 {
-        match &self.inner {
-            Settings::Diag(nuts_settings) => nuts_settings.maxdepth,
-            Settings::LowRank(nuts_settings) => nuts_settings.maxdepth,
-            Settings::Transforming(nuts_settings) => nuts_settings.maxdepth,
-        }
-    }
-
-    #[setter(maxdepth)]
-    fn set_maxdepth(&mut self, val: u64) {
-        match &mut self.inner {
-            Settings::Diag(nuts_settings) => nuts_settings.maxdepth = val,
-            Settings::LowRank(nuts_settings) => nuts_settings.maxdepth = val,
-            Settings::Transforming(nuts_settings) => nuts_settings.maxdepth = val,
-        }
-    }
-
-    #[getter]
-    fn mindepth(&self) -> u64 {
-        match &self.inner {
-            Settings::Diag(nuts_settings) => nuts_settings.mindepth,
-            Settings::LowRank(nuts_settings) => nuts_settings.mindepth,
-            Settings::Transforming(nuts_settings) => nuts_settings.mindepth,
-        }
-    }
-
-    #[setter(mindepth)]
-    fn set_mindepth(&mut self, val: u64) {
-        match &mut self.inner {
-            Settings::Diag(nuts_settings) => nuts_settings.mindepth = val,
-            Settings::LowRank(nuts_settings) => nuts_settings.mindepth = val,
-            Settings::Transforming(nuts_settings) => nuts_settings.mindepth = val,
-        }
-    }
-
-    #[getter]
-    fn store_gradient(&self) -> bool {
-        match &self.inner {
-            Settings::Diag(nuts_settings) => nuts_settings.store_gradient,
-            Settings::LowRank(nuts_settings) => nuts_settings.store_gradient,
-            Settings::Transforming(nuts_settings) => nuts_settings.store_gradient,
-        }
-    }
-
-    #[setter(store_gradient)]
-    fn set_store_gradient(&mut self, val: bool) {
-        match &mut self.inner {
-            Settings::Diag(nuts_settings) => nuts_settings.store_gradient = val,
-            Settings::LowRank(nuts_settings) => nuts_settings.store_gradient = val,
-            Settings::Transforming(nuts_settings) => nuts_settings.store_gradient = val,
-        }
-    }
-
-    #[getter]
-    fn store_unconstrained(&self) -> bool {
-        match &self.inner {
-            Settings::Diag(nuts_settings) => nuts_settings.store_unconstrained,
-            Settings::LowRank(nuts_settings) => nuts_settings.store_unconstrained,
-            Settings::Transforming(nuts_settings) => nuts_settings.store_unconstrained,
-        }
-    }
-
-    #[setter(store_unconstrained)]
-    fn set_store_unconstrained(&mut self, val: bool) {
-        match &mut self.inner {
-            Settings::Diag(nuts_settings) => nuts_settings.store_unconstrained = val,
-            Settings::LowRank(nuts_settings) => nuts_settings.store_unconstrained = val,
-            Settings::Transforming(nuts_settings) => nuts_settings.store_unconstrained = val,
-        }
-    }
-
-    #[getter]
-    fn store_transformed(&self) -> bool {
-        match &self.inner {
-            Settings::Diag(nuts_settings) => nuts_settings.store_transformed,
-            Settings::LowRank(nuts_settings) => nuts_settings.store_transformed,
-            Settings::Transforming(nuts_settings) => nuts_settings.store_transformed,
-        }
-    }
-
-    #[setter(store_transformed)]
-    fn set_store_transformed(&mut self, val: bool) {
-        match &mut self.inner {
-            Settings::Diag(nuts_settings) => nuts_settings.store_transformed = val,
-            Settings::LowRank(nuts_settings) => nuts_settings.store_transformed = val,
-            Settings::Transforming(nuts_settings) => nuts_settings.store_transformed = val,
-        }
-    }
-
-    #[getter]
-    fn store_divergences(&self) -> bool {
-        match &self.inner {
-            Settings::Diag(nuts_settings) => nuts_settings.store_divergences,
-            Settings::LowRank(nuts_settings) => nuts_settings.store_divergences,
-            Settings::Transforming(nuts_settings) => nuts_settings.store_divergences,
-        }
-    }
-
-    #[setter(store_divergences)]
-    fn set_store_divergences(&mut self, val: bool) {
-        match &mut self.inner {
-            Settings::Diag(nuts_settings) => nuts_settings.store_divergences = val,
-            Settings::LowRank(nuts_settings) => nuts_settings.store_divergences = val,
-            Settings::Transforming(nuts_settings) => nuts_settings.store_divergences = val,
-        }
-    }
-
-    #[getter]
-    fn max_energy_error(&self) -> f64 {
-        match &self.inner {
-            Settings::Diag(nuts_settings) => nuts_settings.max_energy_error,
-            Settings::LowRank(nuts_settings) => nuts_settings.max_energy_error,
-            Settings::Transforming(nuts_settings) => nuts_settings.max_energy_error,
-        }
-    }
-
-    #[setter(max_energy_error)]
-    fn set_max_energy_error(&mut self, val: f64) {
-        match &mut self.inner {
-            Settings::Diag(nuts_settings) => nuts_settings.max_energy_error = val,
-            Settings::LowRank(nuts_settings) => nuts_settings.max_energy_error = val,
-            Settings::Transforming(nuts_settings) => nuts_settings.max_energy_error = val,
-        }
-    }
-
-    #[getter]
-    fn target_accept(&self) -> f64 {
-        match &self.inner {
-            Settings::Diag(nuts_settings) => {
-                nuts_settings.adapt_options.step_size_settings.target_accept
-            }
-            Settings::LowRank(nuts_settings) => {
-                nuts_settings.adapt_options.step_size_settings.target_accept
-            }
-            Settings::Transforming(nuts_settings) => {
-                nuts_settings.adapt_options.step_size_settings.target_accept
-            }
-        }
-    }
-
-    #[setter(target_accept)]
-    fn set_target_accept(&mut self, val: f64) {
-        match &mut self.inner {
-            Settings::Diag(nuts_settings) => {
-                nuts_settings.adapt_options.step_size_settings.target_accept = val
-            }
-            Settings::LowRank(nuts_settings) => {
-                nuts_settings.adapt_options.step_size_settings.target_accept = val
-            }
-            Settings::Transforming(nuts_settings) => {
-                nuts_settings.adapt_options.step_size_settings.target_accept = val
-            }
-        }
-    }
-
-    #[getter]
-    fn max_step_size(&self) -> f64 {
-        match &self.inner {
-            Settings::Diag(nuts_settings) => {
-                nuts_settings
-                    .adapt_options
-                    .step_size_settings
-                    .adapt_options
-                    .dual_average
-                    .max_step_size
-            }
-            Settings::LowRank(nuts_settings) => {
-                nuts_settings
-                    .adapt_options
-                    .step_size_settings
-                    .adapt_options
-                    .dual_average
-                    .max_step_size
-            }
-            Settings::Transforming(nuts_settings) => {
-                nuts_settings
-                    .adapt_options
-                    .step_size_settings
-                    .adapt_options
-                    .dual_average
-                    .max_step_size
-            }
-        }
-    }
-
-    #[setter(max_step_size)]
-    fn set_max_step_size(&mut self, val: f64) {
-        match &mut self.inner {
-            Settings::Diag(nuts_settings) => {
-                nuts_settings
-                    .adapt_options
-                    .step_size_settings
-                    .adapt_options
-                    .dual_average
-                    .max_step_size = val
-            }
-            Settings::LowRank(nuts_settings) => {
-                nuts_settings
-                    .adapt_options
-                    .step_size_settings
-                    .adapt_options
-                    .dual_average
-                    .max_step_size = val
-            }
-            Settings::Transforming(nuts_settings) => {
-                nuts_settings
-                    .adapt_options
-                    .step_size_settings
-                    .adapt_options
-                    .dual_average
-                    .max_step_size = val
-            }
-        }
-    }
-
-    #[getter]
-    fn store_mass_matrix(&self) -> Result<bool> {
-        match &self.inner {
-            Settings::LowRank(settings) => {
-                Ok(settings.adapt_options.mass_matrix_options.store_mass_matrix)
-            }
-            Settings::Diag(settings) => {
-                Ok(settings.adapt_options.mass_matrix_options.store_mass_matrix)
-            }
-            Settings::Transforming(_) => Ok(false),
-        }
-    }
-
-    #[setter(store_mass_matrix)]
-    fn set_store_mass_matrix(&mut self, val: bool) -> Result<()> {
-        match &mut self.inner {
-            Settings::LowRank(settings) => {
-                settings.adapt_options.mass_matrix_options.store_mass_matrix = val;
-                Ok(())
-            }
-            Settings::Diag(settings) => {
-                settings.adapt_options.mass_matrix_options.store_mass_matrix = val;
-                Ok(())
-            }
-            Settings::Transforming(_) => {
-                bail!("Option store_mass_matrix not availbale for transformation adaptation")
-            }
-        }
-    }
-
-    #[getter]
-    fn use_grad_based_mass_matrix(&self) -> Result<bool> {
-        match &self.inner {
-            Settings::LowRank(_) => {
-                bail!("non-grad based mass matrix not available for low-rank adaptation")
-            }
-            Settings::Transforming(_) => {
-                bail!("non-grad based mass matrix not available for transforming adaptation")
-            }
-            Settings::Diag(diag) => Ok(diag
-                .adapt_options
-                .mass_matrix_options
-                .use_grad_based_estimate),
-        }
-    }
-
-    #[setter(use_grad_based_mass_matrix)]
-    fn set_use_grad_based_mass_matrix(&mut self, val: bool) -> Result<()> {
-        match &mut self.inner {
-            Settings::LowRank(_) => {
-                bail!("non-grad based mass matrix not available for low-rank adaptation");
-            }
-            Settings::Transforming(_) => {
-                bail!("non-grad based mass matrix not available for transforming adaptation");
-            }
-            Settings::Diag(diag) => {
-                diag.adapt_options
-                    .mass_matrix_options
-                    .use_grad_based_estimate = val;
-            }
+    fn update(&mut self, kwargs: &Bound<'_, PyDict>) -> PyResult<()> {
+        for (key, value) in kwargs.iter() {
+            let key: String = key.extract()?;
+            self.apply_update(&key, &value)?;
         }
         Ok(())
     }
 
-    #[getter]
-    fn microcanonical_trajectory(&self) -> bool {
-        match &self.inner {
-            Settings::LowRank(settings) => {
-                settings.trajectory_kind == KineticEnergyKind::Microcanonical
-            }
-            Settings::Diag(settings) => {
-                settings.trajectory_kind == KineticEnergyKind::Microcanonical
-            }
-            Settings::Transforming(settings) => {
-                settings.trajectory_kind == KineticEnergyKind::Microcanonical
-            }
-        }
+    fn __setattr__(&mut self, name: &str, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.apply_update(name, value)
     }
 
-    #[setter(microcanonical_trajectory)]
-    fn set_microcanonical_trajectory(&mut self, val: bool) {
-        let kind = if val {
-            KineticEnergyKind::Microcanonical
-        } else {
-            KineticEnergyKind::Euclidean
-        };
-        match &mut self.inner {
-            Settings::LowRank(settings) => settings.trajectory_kind = kind,
-            Settings::Diag(settings) => settings.trajectory_kind = kind,
-            Settings::Transforming(settings) => settings.trajectory_kind = kind,
-        }
+    fn update_settings(&mut self, settings: &Bound<'_, PyDict>) -> PyResult<()> {
+        self.update_from_nested_dict(settings.as_any())
     }
 
-    #[getter]
-    fn exact_normal_trajectory(&self) -> bool {
-        match &self.inner {
-            Settings::LowRank(settings) => {
-                settings.trajectory_kind == KineticEnergyKind::ExactNormal
-            }
-            Settings::Diag(settings) => settings.trajectory_kind == KineticEnergyKind::ExactNormal,
-            Settings::Transforming(settings) => {
-                settings.trajectory_kind == KineticEnergyKind::ExactNormal
-            }
-        }
-    }
-
-    #[setter(exact_normal_trajectory)]
-    fn set_exact_normal_trajectory(&mut self, val: bool) {
-        let kind = if val {
-            KineticEnergyKind::ExactNormal
-        } else {
-            KineticEnergyKind::Euclidean
-        };
-        match &mut self.inner {
-            Settings::LowRank(settings) => settings.trajectory_kind = kind,
-            Settings::Diag(settings) => settings.trajectory_kind = kind,
-            Settings::Transforming(settings) => settings.trajectory_kind = kind,
-        }
-    }
-
-    #[getter]
-    fn extra_doublings(&self) -> u64 {
-        match &self.inner {
-            Settings::LowRank(settings) => settings.extra_doublings,
-            Settings::Diag(settings) => settings.extra_doublings,
-            Settings::Transforming(settings) => settings.extra_doublings,
-        }
-    }
-
-    #[setter(extra_doublings)]
-    fn set_extra_doublings(&mut self, val: u64) {
-        match &mut self.inner {
-            Settings::LowRank(settings) => settings.extra_doublings = val,
-            Settings::Diag(settings) => settings.extra_doublings = val,
-            Settings::Transforming(settings) => settings.extra_doublings = val,
-        }
-    }
-
-    #[getter]
-    fn mass_matrix_switch_freq(&self) -> Result<u64> {
-        match &self.inner {
-            Settings::Diag(settings) => Ok(settings.adapt_options.mass_matrix_switch_freq),
-            Settings::LowRank(settings) => Ok(settings.adapt_options.mass_matrix_switch_freq),
-            Settings::Transforming(_) => {
-                bail!("mass_matrix_switch_freq not available for transforming adaptation");
-            }
-        }
-    }
-
-    #[setter(mass_matrix_switch_freq)]
-    fn set_mass_matrix_switch_freq(&mut self, val: u64) -> Result<()> {
-        match &mut self.inner {
-            Settings::Diag(settings) => settings.adapt_options.mass_matrix_switch_freq = val,
-            Settings::LowRank(settings) => settings.adapt_options.mass_matrix_switch_freq = val,
-            Settings::Transforming(_) => {
-                bail!("mass_matrix_switch_freq not available for transforming adaptation");
-            }
-        }
-        Ok(())
-    }
-
-    #[getter]
-    fn mass_matrix_eigval_cutoff(&self) -> Result<f64> {
-        match &self.inner {
-            Settings::LowRank(inner) => Ok(inner.adapt_options.mass_matrix_options.eigval_cutoff),
-            Settings::Diag(_) => {
-                bail!("eigenvalue cutoff not available for diag mass matrix adaptation");
-            }
-            Settings::Transforming(_) => {
-                bail!("eigenvalue cutoff not available for transfor adaptation");
-            }
-        }
-    }
-
-    #[setter(mass_matrix_eigval_cutoff)]
-    fn set_mass_matrix_eigval_cutoff(&mut self, val: Option<f64>) -> Result<()> {
-        let Some(val) = val else {
-            return Ok(());
-        };
-        match &mut self.inner {
-            Settings::LowRank(inner) => inner.adapt_options.mass_matrix_options.eigval_cutoff = val,
-            Settings::Diag(_) => {
-                bail!("eigenvalue cutoff not available for diag mass matrix adaptation");
-            }
-            Settings::Transforming(_) => {
-                bail!("eigenvalue cutoff not available for transfor adaptation");
-            }
-        }
-        Ok(())
-    }
-
-    #[getter]
-    fn mass_matrix_gamma(&self) -> Result<f64> {
-        match &self.inner {
-            Settings::LowRank(inner) => Ok(inner.adapt_options.mass_matrix_options.gamma),
-            Settings::Diag(_) => {
-                bail!("gamma not available for diag mass matrix adaptation");
-            }
-            Settings::Transforming(_) => {
-                bail!("gamma not available for transform adaptation");
-            }
-        }
-    }
-
-    #[setter(mass_matrix_gamma)]
-    fn set_mass_matrix_gamma(&mut self, val: Option<f64>) -> Result<()> {
-        let Some(val) = val else {
-            return Ok(());
-        };
-        match &mut self.inner {
-            Settings::LowRank(inner) => {
-                inner.adapt_options.mass_matrix_options.gamma = val;
-            }
-            Settings::Diag(_) => {
-                bail!("gamma not available for diag mass matrix adaptation");
-            }
-            Settings::Transforming(_) => {
-                bail!("gamma not available for transform adaptation");
-            }
-        }
-        Ok(())
-    }
-
-    #[getter]
-    fn train_on_orbit(&self) -> Result<bool> {
-        match &self.inner {
-            Settings::LowRank(_) => {
-                bail!("gamma not available for low rank mass matrix adaptation");
-            }
-            Settings::Diag(_) => {
-                bail!("gamma not available for diag mass matrix adaptation");
-            }
-            Settings::Transforming(inner) => Ok(inner.adapt_options.use_orbit_for_training),
-        }
-    }
-
-    #[setter(train_on_orbit)]
-    fn set_train_on_orbit(&mut self, val: bool) -> Result<()> {
-        match &mut self.inner {
-            Settings::LowRank(_) => {
-                bail!("gamma not available for low rank mass matrix adaptation");
-            }
-            Settings::Diag(_) => {
-                bail!("gamma not available for diag mass matrix adaptation");
-            }
-            Settings::Transforming(inner) => inner.adapt_options.use_orbit_for_training = val,
-        }
-        Ok(())
-    }
-
-    #[getter]
-    fn check_turning(&self) -> Result<bool> {
-        match &self.inner {
-            Settings::LowRank(inner) => Ok(inner.check_turning),
-            Settings::Diag(inner) => Ok(inner.check_turning),
-            Settings::Transforming(inner) => Ok(inner.check_turning),
-        }
-    }
-
-    #[setter(check_turning)]
-    fn set_check_turning(&mut self, val: bool) -> Result<()> {
-        match &mut self.inner {
-            Settings::LowRank(inner) => {
-                inner.check_turning = val;
-            }
-            Settings::Diag(inner) => {
-                inner.check_turning = val;
-            }
-            Settings::Transforming(inner) => {
-                inner.check_turning = val;
-            }
-        }
-        Ok(())
-    }
-
-    #[getter]
-    fn step_size_adapt_method(&self) -> String {
-        let method = match &self.inner {
-            Settings::LowRank(inner) => inner.adapt_options.step_size_settings.adapt_options.method,
-            Settings::Diag(inner) => inner.adapt_options.step_size_settings.adapt_options.method,
-            Settings::Transforming(inner) => {
-                inner.adapt_options.step_size_settings.adapt_options.method
-            }
-        };
-
-        match method {
-            nuts_rs::StepSizeAdaptMethod::DualAverage => "dual_average",
-            nuts_rs::StepSizeAdaptMethod::Adam => "adam",
-            nuts_rs::StepSizeAdaptMethod::Fixed(_) => "fixed",
-        }
-        .to_string()
-    }
-
-    #[setter(step_size_adapt_method)]
-    fn set_step_size_adapt_method(&mut self, method: Py<PyAny>) -> Result<()> {
-        let method = Python::attach(|py| match method.extract::<String>(py) {
-            Ok(method) => match method.as_str() {
-                "dual_average" => Ok(StepSizeAdaptMethod::DualAverage),
-                "adam" => Ok(StepSizeAdaptMethod::Adam),
-                _ => {
-                    if let Ok(step_size) = method.parse::<f64>() {
-                        Ok(StepSizeAdaptMethod::Fixed(step_size))
-                    } else {
-                        bail!("step_size_adapt_method must be a positive float when using fixed step size");
-                    }
-                }
-            },
-            _ => {
-                bail!("step_size_adapt_method must be a string");
-            }
-        })?;
-
-        match &mut self.inner {
-            Settings::LowRank(inner) => {
-                inner.adapt_options.step_size_settings.adapt_options.method = method
-            }
-            Settings::Diag(inner) => {
-                inner.adapt_options.step_size_settings.adapt_options.method = method
-            }
-            Settings::Transforming(inner) => {
-                inner.adapt_options.step_size_settings.adapt_options.method = method
-            }
-        };
-        Ok(())
-    }
-
-    #[getter]
-    fn step_size_adam_learning_rate(&self) -> Option<f64> {
-        match &self.inner {
-            Settings::LowRank(inner) => {
-                if let StepSizeAdaptMethod::Adam =
-                    inner.adapt_options.step_size_settings.adapt_options.method
-                {
-                    Some(
-                        inner
-                            .adapt_options
-                            .step_size_settings
-                            .adapt_options
-                            .adam
-                            .learning_rate,
-                    )
-                } else {
-                    None
-                }
-            }
-            Settings::Diag(inner) => {
-                if let StepSizeAdaptMethod::Adam =
-                    inner.adapt_options.step_size_settings.adapt_options.method
-                {
-                    Some(
-                        inner
-                            .adapt_options
-                            .step_size_settings
-                            .adapt_options
-                            .adam
-                            .learning_rate,
-                    )
-                } else {
-                    None
-                }
-            }
-            Settings::Transforming(inner) => {
-                if let StepSizeAdaptMethod::Adam =
-                    inner.adapt_options.step_size_settings.adapt_options.method
-                {
-                    Some(
-                        inner
-                            .adapt_options
-                            .step_size_settings
-                            .adapt_options
-                            .adam
-                            .learning_rate,
-                    )
-                } else {
-                    None
-                }
-            }
-        }
-    }
-
-    #[setter(step_size_adam_learning_rate)]
-    fn set_step_size_adam_learning_rate(&mut self, val: Option<f64>) -> Result<()> {
-        let Some(val) = val else {
-            return Ok(());
-        };
-        match &mut self.inner {
-            Settings::LowRank(inner) => {
-                inner
-                    .adapt_options
-                    .step_size_settings
-                    .adapt_options
-                    .adam
-                    .learning_rate = val
-            }
-            Settings::Diag(inner) => {
-                inner
-                    .adapt_options
-                    .step_size_settings
-                    .adapt_options
-                    .adam
-                    .learning_rate = val
-            }
-            Settings::Transforming(inner) => {
-                inner
-                    .adapt_options
-                    .step_size_settings
-                    .adapt_options
-                    .adam
-                    .learning_rate = val
-            }
-        };
-        Ok(())
-    }
-
-    #[getter(step_size_jitter)]
-    fn step_size_jitter(&self) -> Option<f64> {
-        match &self.inner {
-            Settings::LowRank(inner) => inner.adapt_options.step_size_settings.jitter,
-            Settings::Diag(inner) => inner.adapt_options.step_size_settings.jitter,
-            Settings::Transforming(inner) => inner.adapt_options.step_size_settings.jitter,
-        }
-    }
-
-    #[setter(step_size_jitter)]
-    fn set_step_size_jitter(&mut self, mut val: Option<f64>) -> PyResult<()> {
-        if let Some(val) = val {
-            if val < 0.0 {
-                return Err(PyValueError::new_err("step_size_jitter must be positive"));
-            }
-        }
-        if let Some(jitter) = val {
-            if jitter == 0.0 {
-                val = None;
-            }
-        }
-        match &mut self.inner {
-            Settings::LowRank(inner) => inner.adapt_options.step_size_settings.jitter = val,
-            Settings::Diag(inner) => inner.adapt_options.step_size_settings.jitter = val,
-            Settings::Transforming(inner) => inner.adapt_options.step_size_settings.jitter = val,
-        }
-        Ok(())
+    fn as_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let value = self.to_nested_json()?;
+        let obj = pythonize(py, &value).map_err(|err| PyValueError::new_err(err.to_string()))?;
+        Ok(obj.unbind())
     }
 }
 

@@ -902,15 +902,15 @@ def sample(
             f"Expected one of: 'diag', 'draw_diag', 'low_rank', 'flow'."
         )
 
+    updates = dict(kwargs)
     if tune is not None:
-        settings.num_tune = tune
+        updates["num_tune"] = tune
     if draws is not None:
-        settings.num_draws = draws
+        updates["num_draws"] = draws
     if chains is not None:
-        settings.num_chains = chains
+        updates["num_chains"] = chains
 
-    for name, val in kwargs.items():
-        setattr(settings, name, val)
+    settings.update(updates)
 
     if cores is None:
         try:
