@@ -546,6 +546,7 @@ class _BackgroundSampler:
         return self._extract(results)
 
     def _extract(self, results):
+        settings_dict = self._settings.as_dict()
         if self._return_raw_trace:
             return results
         else:
@@ -570,7 +571,7 @@ class _BackgroundSampler:
                 skips = {
                     "store_gradient": ["gradient"],
                     "store_unconstrained": ["unconstrained_draw"],
-                    "store_mass_matrix": [
+                    "adapt_options.mass_matrix_options.store_mass_matrix": [
                         "mass_matrix_inv",
                         "mass_matrix_eigvals",
                         "mass_matrix_stds",
@@ -584,6 +585,7 @@ class _BackgroundSampler:
                     "store_transformed": [
                         "transformed_position",
                         "transformed_gradient",
+                        "transformed_mu",
                     ],
                 }
 
@@ -731,6 +733,7 @@ def sample(
     seed: int | None = None,
     save_warmup: bool = True,
     progress_bar: bool = True,
+    sampler: Literal["nuts", "mclmc"] = "nuts",
     adaptation: Literal["diag", "draw_diag", "low_rank", "flow"] = "diag",
     init_mean: np.ndarray | None = None,
     return_raw_trace: bool = False,
@@ -796,6 +799,12 @@ def sample(
     return_raw_trace: bool, default=False
         Return the raw trace object (an apache arrow structure)
         instead of converting to arviz.
+    sampler: str, default="nuts"
+        The sampler to use. One of:
+
+        - ``"nuts"`` (default): No-U-Turn Sampler.
+        - ``"mclmc"``: Microcanonical Langevin Monte Carlo.
+
     adaptation: str, default="diag"
         The mass matrix adaptation strategy to use. One of:
 
@@ -900,18 +909,37 @@ def sample(
             stacklevel=2,
         )
 
-    if adaptation == "low_rank":
-        settings = _lib.PyNutsSettings.LowRank(seed)
-    elif adaptation == "flow":
-        settings = _lib.PyNutsSettings.Transform(seed)
-    elif adaptation in ("diag", "draw_diag"):
-        settings = _lib.PyNutsSettings.Diag(seed)
-        if adaptation == "draw_diag" or _use_grad_based is False:
-            settings.use_grad_based_mass_matrix = False
+    if sampler == "nuts":
+        if adaptation == "low_rank":
+            settings = _lib.PyNutsSettings.LowRank(seed)
+        elif adaptation == "flow":
+            settings = _lib.PyNutsSettings.Flow(seed)
+        elif adaptation in ("diag", "draw_diag"):
+            settings = _lib.PyNutsSettings.Diag(seed)
+            if adaptation == "draw_diag" or _use_grad_based is False:
+                settings.use_grad_based_mass_matrix = False
+        else:
+            raise ValueError(
+                f"Unknown adaptation strategy '{adaptation}'. "
+                f"Expected one of: 'diag', 'draw_diag', 'low_rank', 'flow'."
+            )
+    elif sampler == "mclmc":
+        if adaptation == "low_rank":
+            settings = _lib.PyMclmcSettings.LowRank(seed)
+        elif adaptation == "flow":
+            settings = _lib.PyMclmcSettings.Flow(seed)
+        elif adaptation in ("diag", "draw_diag"):
+            settings = _lib.PyMclmcSettings.Diag(seed)
+            if adaptation == "draw_diag" or _use_grad_based is False:
+                settings.use_grad_based_mass_matrix = False
+        else:
+            raise ValueError(
+                f"Unknown adaptation strategy '{adaptation}'. "
+                f"Expected one of: 'diag', 'draw_diag', 'low_rank', 'flow'."
+            )
     else:
         raise ValueError(
-            f"Unknown adaptation strategy '{adaptation}'. "
-            f"Expected one of: 'diag', 'draw_diag', 'low_rank', 'flow'."
+            f"Unknown sampler '{sampler}'. Expected one of: 'nuts', 'mclmc'."
         )
 
     updates = dict(kwargs)
@@ -938,7 +966,7 @@ def sample(
     if init_mean is None:
         init_mean = np.zeros(compiled_model.n_dim)
 
-    sampler = _BackgroundSampler(
+    background_sampler = _BackgroundSampler(
         compiled_model,
         settings,
         init_mean,
@@ -954,14 +982,14 @@ def sample(
     )
 
     if not blocking:
-        return sampler
+        return background_sampler
 
     try:
-        result = sampler.wait()
+        result = background_sampler.wait()
     except KeyboardInterrupt:
-        result = sampler.abort()
+        result = background_sampler.abort()
     except:
-        sampler.cancel()
+        background_sampler.cancel()
         raise
 
     return result

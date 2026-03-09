@@ -16,19 +16,19 @@ use crate::{
 use anyhow::{anyhow, bail, Context, Result};
 use numpy::{PyArray1, PyReadonlyArray1};
 use nuts_rs::{
-    ArrowConfig, ArrowTrace, ChainProgress, DiagGradNutsSettings, KineticEnergyKind,
-    LowRankNutsSettings, Model, ProgressCallback, Sampler, SamplerWaitResult, StepSizeAdaptMethod,
-    TransformedNutsSettings, ZarrAsyncConfig,
+    ArrowConfig, ArrowTrace, ChainProgress, DiagMclmcSettings, DiagNutsSettings, FlowMclmcSettings,
+    FlowNutsSettings, KineticEnergyKind, LowRankMclmcSettings, LowRankNutsSettings, Model,
+    ProgressCallback, Sampler, SamplerWaitResult, StepSizeAdaptMethod, ZarrAsyncConfig,
 };
 use pyo3::{
     exceptions::{PyAttributeError, PyTimeoutError, PyValueError},
     intern,
     prelude::*,
-    types::PyDict,
+    types::{PyDict, PyList},
 };
 use pyo3_arrow::PyRecordBatch;
 use pyo3_object_store::AnyObjectStore;
-use pythonize::{depythonize_bound, pythonize};
+use pythonize::{depythonize, pythonize};
 use rand::{rng, Rng};
 use serde_json::Value as JsonValue;
 use tokio::runtime::Runtime;
@@ -105,37 +105,33 @@ impl PyChainProgress {
 #[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct PyNutsSettings {
-    inner: Settings,
+    inner: NutsSettingsKind,
+}
+
+#[derive(Clone, FromPyObject)]
+enum PySamplerSettings {
+    Nuts(PyNutsSettings),
+    Mclmc(PyMclmcSettings),
 }
 
 #[derive(Clone, Debug)]
-enum Settings {
-    Diag(DiagGradNutsSettings),
+enum NutsSettingsKind {
+    Diag(DiagNutsSettings),
     LowRank(LowRankNutsSettings),
-    Transforming(TransformedNutsSettings),
+    Flow(FlowNutsSettings),
 }
 
-macro_rules! with_all_settings_mut {
-    ($self:expr, $settings:ident => $body:block) => {{
-        match &mut $self.inner {
-            Settings::Diag($settings) => $body,
-            Settings::LowRank($settings) => $body,
-            Settings::Transforming($settings) => $body,
-        }
-    }};
+#[pyclass(from_py_object)]
+#[derive(Clone)]
+pub struct PyMclmcSettings {
+    inner: MclmcSettingsKind,
 }
 
-macro_rules! set_all_settings_field {
-    ($self:expr, $field:ident = $value:expr) => {{
-        with_all_settings_mut!($self, settings => {
-            settings.$field = $value;
-        });
-    }};
-    ($self:expr, $field:ident $(. $rest:ident)+ = $value:expr) => {{
-        with_all_settings_mut!($self, settings => {
-            settings.$field$(.$rest)+ = $value;
-        });
-    }};
+#[derive(Clone, Debug)]
+enum MclmcSettingsKind {
+    Diag(DiagMclmcSettings),
+    LowRank(LowRankMclmcSettings),
+    Flow(FlowMclmcSettings),
 }
 
 macro_rules! unsupported_option_error {
@@ -147,296 +143,208 @@ macro_rules! unsupported_option_error {
     };
 }
 
-macro_rules! with_diag_or_low_rank_settings_mut {
-    ($self:expr, $option:expr, $settings:ident => $body:block) => {{
+macro_rules! with_all_settings_mut {
+    ($self:expr, $enum_name:ident, $settings:ident => $body:block) => {{
         match &mut $self.inner {
-            Settings::Diag($settings) => $body,
-            Settings::LowRank($settings) => $body,
-            Settings::Transforming(_) => {
-                return Err(unsupported_option_error!($option, "transforming"))
-            }
+            $enum_name::Diag($settings) => $body,
+            $enum_name::LowRank($settings) => $body,
+            $enum_name::Flow($settings) => $body,
+        }
+    }};
+}
+
+macro_rules! set_all_settings_field {
+    ($self:expr, $enum_name:ident, $field:ident = $value:expr) => {{
+        with_all_settings_mut!($self, $enum_name, settings => {
+            settings.$field = $value;
+        });
+    }};
+    ($self:expr, $enum_name:ident, $field:ident $(. $rest:ident)+ = $value:expr) => {{
+        with_all_settings_mut!($self, $enum_name, settings => {
+            settings.$field$(.$rest)+ = $value;
+        });
+    }};
+}
+
+macro_rules! with_diag_or_low_rank_settings_mut {
+    ($self:expr, $enum_name:ident, $option:expr, $settings:ident => $body:block) => {{
+        match &mut $self.inner {
+            $enum_name::Diag($settings) => $body,
+            $enum_name::LowRank($settings) => $body,
+            $enum_name::Flow(_) => return Err(unsupported_option_error!($option, "flow")),
         }
     }};
 }
 
 macro_rules! with_diag_settings_mut {
-    ($self:expr, $option:expr, $settings:ident => $body:block) => {{
+    ($self:expr, $enum_name:ident, $option:expr, $settings:ident => $body:block) => {{
         match &mut $self.inner {
-            Settings::Diag($settings) => $body,
-            Settings::LowRank(_) => return Err(unsupported_option_error!($option, "low-rank")),
-            Settings::Transforming(_) => {
-                return Err(unsupported_option_error!($option, "transforming"))
-            }
+            $enum_name::Diag($settings) => $body,
+            $enum_name::LowRank(_) => return Err(unsupported_option_error!($option, "low-rank")),
+            $enum_name::Flow(_) => return Err(unsupported_option_error!($option, "flow")),
         }
     }};
 }
 
 macro_rules! with_low_rank_settings_mut {
-    ($self:expr, $option:expr, $settings:ident => $body:block) => {{
+    ($self:expr, $enum_name:ident, $option:expr, $settings:ident => $body:block) => {{
         match &mut $self.inner {
-            Settings::LowRank($settings) => $body,
-            Settings::Diag(_) => return Err(unsupported_option_error!($option, "diag")),
-            Settings::Transforming(_) => {
-                return Err(unsupported_option_error!($option, "transforming"))
-            }
+            $enum_name::LowRank($settings) => $body,
+            $enum_name::Diag(_) => return Err(unsupported_option_error!($option, "diag")),
+            $enum_name::Flow(_) => return Err(unsupported_option_error!($option, "flow")),
         }
     }};
 }
 
-macro_rules! with_transform_settings_mut {
-    ($self:expr, $option:expr, $settings:ident => $body:block) => {{
+macro_rules! with_flow_settings_mut {
+    ($self:expr, $enum_name:ident, $option:expr, $settings:ident => $body:block) => {{
         match &mut $self.inner {
-            Settings::Transforming($settings) => $body,
-            Settings::Diag(_) => return Err(unsupported_option_error!($option, "diag")),
-            Settings::LowRank(_) => return Err(unsupported_option_error!($option, "low-rank")),
+            $enum_name::Flow($settings) => $body,
+            $enum_name::Diag(_) => return Err(unsupported_option_error!($option, "diag")),
+            $enum_name::LowRank(_) => return Err(unsupported_option_error!($option, "low-rank")),
         }
     }};
 }
 
-impl PyNutsSettings {
-    fn new_diag(seed: Option<u64>) -> Self {
-        let seed = seed.unwrap_or_else(|| {
-            let mut rng = rng();
-            rng.next_u64()
-        });
-        let settings = DiagGradNutsSettings {
-            seed,
-            ..Default::default()
-        };
-
-        Self {
-            inner: Settings::Diag(settings),
-        }
-    }
-
-    fn new_low_rank(seed: Option<u64>) -> Self {
-        let seed = seed.unwrap_or_else(|| {
-            let mut rng = rng();
-            rng.next_u64()
-        });
-        let settings = LowRankNutsSettings {
-            seed,
-            ..Default::default()
-        };
-
-        Self {
-            inner: Settings::LowRank(settings),
-        }
-    }
-
-    fn new_tranform_adapt(seed: Option<u64>) -> Self {
-        let seed = seed.unwrap_or_else(|| {
-            let mut rng = rng();
-            rng.next_u64()
-        });
-        let settings = TransformedNutsSettings {
-            seed,
-            ..Default::default()
-        };
-
-        Self {
-            inner: Settings::Transforming(settings),
-        }
-    }
-
-    fn update_from_nested_dict(&mut self, value: &Bound<'_, PyAny>) -> PyResult<()> {
-        match &mut self.inner {
-            Settings::Diag(settings) => {
-                *settings = depythonize_bound(value)
-                    .map_err(|err| PyValueError::new_err(err.to_string()))?;
-            }
-            Settings::LowRank(settings) => {
-                *settings = depythonize_bound(value)
-                    .map_err(|err| PyValueError::new_err(err.to_string()))?;
-            }
-            Settings::Transforming(settings) => {
-                *settings = depythonize_bound(value)
-                    .map_err(|err| PyValueError::new_err(err.to_string()))?;
-            }
-        }
-        Ok(())
-    }
-
-    fn apply_update(&mut self, name: &str, value: &Bound<'_, PyAny>) -> PyResult<()> {
-        match name {
-            "num_tune" => {
-                let value: u64 = value.extract()?;
-                set_all_settings_field!(self, num_tune = value);
-            }
-            "num_chains" => {
-                let value: usize = value.extract()?;
-                set_all_settings_field!(self, num_chains = value);
-            }
-            "num_draws" => {
-                let value: u64 = value.extract()?;
-                set_all_settings_field!(self, num_draws = value);
-            }
+macro_rules! try_shared_euclidean_adapt_update {
+    ($self:expr, $enum_name:ident, $name:expr, $value:expr) => {{
+        match $name {
             "window_switch_freq" => {
-                let value: u64 = value.extract()?;
-                match &mut self.inner {
-                    Settings::Diag(settings) => {
+                let value: u64 = $value.extract()?;
+                match &mut $self.inner {
+                    $enum_name::Diag(settings) => {
                         settings.adapt_options.mass_matrix_switch_freq = value
                     }
-                    Settings::LowRank(settings) => {
+                    $enum_name::LowRank(settings) => {
                         settings.adapt_options.mass_matrix_switch_freq = value
                     }
-                    Settings::Transforming(settings) => {
+                    $enum_name::Flow(settings) => {
                         settings.adapt_options.transform_update_freq = value
                     }
                 }
+                true
             }
             "early_window_switch_freq" => {
-                let value: u64 = value.extract()?;
+                let value: u64 = $value.extract()?;
                 with_diag_or_low_rank_settings_mut!(
-                    self,
+                    $self,
+                    $enum_name,
                     "early_window_switch_freq",
                     settings => {
                         settings.adapt_options.early_mass_matrix_switch_freq = value;
                     }
                 );
+                true
             }
             "initial_step" => {
-                let value: f64 = value.extract()?;
+                let value: f64 = $value.extract()?;
                 set_all_settings_field!(
-                    self,
+                    $self,
+                    $enum_name,
                     adapt_options.step_size_settings.initial_step = value
                 );
-            }
-            "maxdepth" => {
-                let value: u64 = value.extract()?;
-                set_all_settings_field!(self, maxdepth = value);
-            }
-            "mindepth" => {
-                let value: u64 = value.extract()?;
-                set_all_settings_field!(self, mindepth = value);
-            }
-            "store_gradient" => {
-                let value: bool = value.extract()?;
-                set_all_settings_field!(self, store_gradient = value);
-            }
-            "store_unconstrained" => {
-                let value: bool = value.extract()?;
-                set_all_settings_field!(self, store_unconstrained = value);
-            }
-            "store_transformed" => {
-                let value: bool = value.extract()?;
-                set_all_settings_field!(self, store_transformed = value);
-            }
-            "store_divergences" => {
-                let value: bool = value.extract()?;
-                set_all_settings_field!(self, store_divergences = value);
-            }
-            "max_energy_error" => {
-                let value: f64 = value.extract()?;
-                set_all_settings_field!(self, max_energy_error = value);
+                true
             }
             "target_accept" => {
-                let value: f64 = value.extract()?;
+                let value: f64 = $value.extract()?;
                 set_all_settings_field!(
-                    self,
+                    $self,
+                    $enum_name,
                     adapt_options.step_size_settings.target_accept = value
                 );
+                true
             }
             "max_step_size" => {
-                let value: f64 = value.extract()?;
+                let value: f64 = $value.extract()?;
                 set_all_settings_field!(
-                    self,
+                    $self,
+                    $enum_name,
                     adapt_options
                         .step_size_settings
                         .adapt_options
                         .dual_average
                         .max_step_size = value
                 );
+                true
             }
             "store_mass_matrix" => {
-                let value: bool = value.extract()?;
+                let value: bool = $value.extract()?;
                 with_diag_or_low_rank_settings_mut!(
-                    self,
+                    $self,
+                    $enum_name,
                     "store_mass_matrix",
                     settings => {
                         settings.adapt_options.mass_matrix_options.store_mass_matrix = value;
                     }
                 );
+                true
             }
             "use_grad_based_mass_matrix" => {
-                let value: bool = value.extract()?;
+                let value: bool = $value.extract()?;
                 with_diag_settings_mut!(
-                    self,
+                    $self,
+                    $enum_name,
                     "use_grad_based_mass_matrix",
                     settings => {
                         settings.adapt_options.mass_matrix_options.use_grad_based_estimate = value;
                     }
                 );
-            }
-            "microcanonical_trajectory" => {
-                let value: bool = value.extract()?;
-                if value {
-                    set_all_settings_field!(
-                        self,
-                        trajectory_kind = KineticEnergyKind::Microcanonical
-                    );
-                }
-            }
-            "exact_normal_trajectory" => {
-                let value: bool = value.extract()?;
-                if value {
-                    set_all_settings_field!(self, trajectory_kind = KineticEnergyKind::ExactNormal);
-                }
-            }
-            "extra_doublings" => {
-                let value: u64 = value.extract()?;
-                set_all_settings_field!(self, extra_doublings = value);
+                true
             }
             "mass_matrix_switch_freq" => {
-                let value: u64 = value.extract()?;
+                let value: u64 = $value.extract()?;
                 with_diag_or_low_rank_settings_mut!(
-                    self,
+                    $self,
+                    $enum_name,
                     "mass_matrix_switch_freq",
                     settings => {
                         settings.adapt_options.mass_matrix_switch_freq = value;
                     }
                 );
+                true
             }
             "mass_matrix_eigval_cutoff" => {
-                let value: Option<f64> = value.extract()?;
+                let value: Option<f64> = $value.extract()?;
                 if let Some(value) = value {
                     with_low_rank_settings_mut!(
-                        self,
+                        $self,
+                        $enum_name,
                         "mass_matrix_eigval_cutoff",
                         settings => {
                             settings.adapt_options.mass_matrix_options.eigval_cutoff = value;
                         }
                     );
                 }
+                true
             }
             "mass_matrix_gamma" => {
-                let value: Option<f64> = value.extract()?;
+                let value: Option<f64> = $value.extract()?;
                 if let Some(value) = value {
                     with_low_rank_settings_mut!(
-                        self,
+                        $self,
+                        $enum_name,
                         "mass_matrix_gamma",
                         settings => {
                             settings.adapt_options.mass_matrix_options.gamma = value;
                         }
                     );
                 }
+                true
             }
             "train_on_orbit" => {
-                let value: bool = value.extract()?;
-                with_transform_settings_mut!(
-                    self,
+                let value: bool = $value.extract()?;
+                with_flow_settings_mut!(
+                    $self,
+                    $enum_name,
                     "train_on_orbit",
                     settings => {
                         settings.adapt_options.use_orbit_for_training = value;
                     }
                 );
-            }
-            "check_turning" => {
-                let value: bool = value.extract()?;
-                set_all_settings_field!(self, check_turning = value);
+                true
             }
             "step_size_adapt_method" => {
-                let method = match value.extract::<String>() {
+                let method = match $value.extract::<String>() {
                     Ok(method) => match method.as_str() {
                         "dual_average" => StepSizeAdaptMethod::DualAverage,
                         "adam" => StepSizeAdaptMethod::Adam,
@@ -458,15 +366,18 @@ impl PyNutsSettings {
                 };
 
                 set_all_settings_field!(
-                    self,
+                    $self,
+                    $enum_name,
                     adapt_options.step_size_settings.adapt_options.method = method
                 );
+                true
             }
             "step_size_adam_learning_rate" => {
-                let value: Option<f64> = value.extract()?;
+                let value: Option<f64> = $value.extract()?;
                 if let Some(value) = value {
                     set_all_settings_field!(
-                        self,
+                        $self,
+                        $enum_name,
                         adapt_options
                             .step_size_settings
                             .adapt_options
@@ -474,9 +385,10 @@ impl PyNutsSettings {
                             .learning_rate = value
                     );
                 }
+                true
             }
             "step_size_jitter" => {
-                let mut value: Option<f64> = value.extract()?;
+                let mut value: Option<f64> = $value.extract()?;
                 if let Some(jitter) = value {
                     if jitter < 0.0 {
                         return Err(PyValueError::new_err("step_size_jitter must be positive"));
@@ -485,29 +397,300 @@ impl PyNutsSettings {
                         value = None;
                     }
                 }
-                set_all_settings_field!(self, adapt_options.step_size_settings.jitter = value);
+                set_all_settings_field!(
+                    $self,
+                    $enum_name,
+                    adapt_options.step_size_settings.jitter = value
+                );
+                true
+            }
+            "store_unconstrained" => {
+                let value: bool = $value.extract()?;
+                set_all_settings_field!($self, $enum_name, store_unconstrained = value);
+                true
+            }
+            "store_gradient" => {
+                let value: bool = $value.extract()?;
+                set_all_settings_field!($self, $enum_name, store_gradient = value);
+                true
+            }
+            "num_tune" => {
+                let value: u64 = $value.extract()?;
+                set_all_settings_field!($self, $enum_name, num_tune = value);
+                true
+            }
+            "num_chains" => {
+                let value: usize = $value.extract()?;
+                set_all_settings_field!($self, $enum_name, num_chains = value);
+                true
+            }
+            "num_draws" => {
+                let value: u64 = $value.extract()?;
+                set_all_settings_field!($self, $enum_name, num_draws = value);
+                true
+            }
+            "store_transformed" => {
+                let value: bool = $value.extract()?;
+                set_all_settings_field!($self, $enum_name, store_transformed = value);
+                true
+            }
+            "store_divergences" => {
+                let value: bool = $value.extract()?;
+                set_all_settings_field!($self, $enum_name, store_divergences = value);
+                true
+            }
+            "max_energy_error" => {
+                let value: f64 = $value.extract()?;
+                set_all_settings_field!($self, $enum_name, max_energy_error = value);
+                true
+            }
+            _ => false,
+        }
+    }};
+}
+
+fn random_seed(seed: Option<u64>) -> u64 {
+    seed.unwrap_or_else(|| {
+        let mut rng = rng();
+        rng.next_u64()
+    })
+}
+
+fn update_nuts_from_nested_dict(
+    inner: &mut NutsSettingsKind,
+    value: &Bound<'_, PyAny>,
+) -> PyResult<()> {
+    match inner {
+        NutsSettingsKind::Diag(settings) => {
+            *settings = depythonize(value).map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
+        NutsSettingsKind::LowRank(settings) => {
+            *settings = depythonize(value).map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
+        NutsSettingsKind::Flow(settings) => {
+            *settings = depythonize(value).map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
+fn update_mclmc_from_nested_dict(
+    inner: &mut MclmcSettingsKind,
+    value: &Bound<'_, PyAny>,
+) -> PyResult<()> {
+    match inner {
+        MclmcSettingsKind::Diag(settings) => {
+            *settings = depythonize(value).map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
+        MclmcSettingsKind::LowRank(settings) => {
+            *settings = depythonize(value).map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
+        MclmcSettingsKind::Flow(settings) => {
+            *settings = depythonize(value).map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
+fn nuts_to_nested_json(inner: &NutsSettingsKind) -> PyResult<JsonValue> {
+    match inner {
+        NutsSettingsKind::Diag(settings) => {
+            serde_json::to_value(settings).map_err(|err| PyValueError::new_err(err.to_string()))
+        }
+        NutsSettingsKind::LowRank(settings) => {
+            serde_json::to_value(settings).map_err(|err| PyValueError::new_err(err.to_string()))
+        }
+        NutsSettingsKind::Flow(settings) => {
+            serde_json::to_value(settings).map_err(|err| PyValueError::new_err(err.to_string()))
+        }
+    }
+}
+
+fn mclmc_to_nested_json(inner: &MclmcSettingsKind) -> PyResult<JsonValue> {
+    match inner {
+        MclmcSettingsKind::Diag(settings) => {
+            serde_json::to_value(settings).map_err(|err| PyValueError::new_err(err.to_string()))
+        }
+        MclmcSettingsKind::LowRank(settings) => {
+            serde_json::to_value(settings).map_err(|err| PyValueError::new_err(err.to_string()))
+        }
+        MclmcSettingsKind::Flow(settings) => {
+            serde_json::to_value(settings).map_err(|err| PyValueError::new_err(err.to_string()))
+        }
+    }
+}
+
+impl PyNutsSettings {
+    fn new_diag(seed: Option<u64>) -> Self {
+        let settings = DiagNutsSettings {
+            seed: random_seed(seed),
+            ..Default::default()
+        };
+        Self {
+            inner: NutsSettingsKind::Diag(settings),
+        }
+    }
+
+    fn new_low_rank(seed: Option<u64>) -> Self {
+        let settings = LowRankNutsSettings {
+            seed: random_seed(seed),
+            ..Default::default()
+        };
+        Self {
+            inner: NutsSettingsKind::LowRank(settings),
+        }
+    }
+
+    fn new_flow(seed: Option<u64>) -> Self {
+        let settings = FlowNutsSettings {
+            seed: random_seed(seed),
+            ..Default::default()
+        };
+        Self {
+            inner: NutsSettingsKind::Flow(settings),
+        }
+    }
+
+    fn update_from_nested_dict(&mut self, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        update_nuts_from_nested_dict(&mut self.inner, value)
+    }
+
+    fn to_nested_json(&self) -> PyResult<JsonValue> {
+        nuts_to_nested_json(&self.inner)
+    }
+
+    fn apply_update(&mut self, name: &str, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        match name {
+            "maxdepth" => {
+                let value: u64 = value.extract()?;
+                set_all_settings_field!(self, NutsSettingsKind, maxdepth = value);
+            }
+            "mindepth" => {
+                let value: u64 = value.extract()?;
+                set_all_settings_field!(self, NutsSettingsKind, mindepth = value);
+            }
+            "check_turning" => {
+                let value: bool = value.extract()?;
+                set_all_settings_field!(self, NutsSettingsKind, check_turning = value);
+            }
+            "target_integration_time" => {
+                let value: Option<f64> = value.extract()?;
+                set_all_settings_field!(self, NutsSettingsKind, target_integration_time = value);
+            }
+            "extra_doublings" => {
+                let value: u64 = value.extract()?;
+                set_all_settings_field!(self, NutsSettingsKind, extra_doublings = value);
             }
             _ => {
-                return Err(PyAttributeError::new_err(format!(
-                    "Unknown settings attribute: {name}",
-                )));
+                if try_shared_euclidean_adapt_update!(self, NutsSettingsKind, name, value) {
+                    // handled above
+                } else {
+                    match name {
+                        "microcanonical_trajectory" => {
+                            let value: bool = value.extract()?;
+                            if value {
+                                set_all_settings_field!(
+                                    self,
+                                    NutsSettingsKind,
+                                    trajectory_kind = KineticEnergyKind::Microcanonical
+                                );
+                            }
+                        }
+                        "exact_normal_trajectory" => {
+                            let value: bool = value.extract()?;
+                            if value {
+                                set_all_settings_field!(
+                                    self,
+                                    NutsSettingsKind,
+                                    trajectory_kind = KineticEnergyKind::ExactNormal
+                                );
+                            }
+                        }
+                        _ => {
+                            return Err(PyAttributeError::new_err(format!(
+                                "Unknown settings attribute: {name}",
+                            )));
+                        }
+                    }
+                }
             }
         }
         Ok(())
     }
+}
+
+impl PyMclmcSettings {
+    fn new_diag(seed: Option<u64>) -> Self {
+        let settings = DiagMclmcSettings {
+            seed: random_seed(seed),
+            ..Default::default()
+        };
+        Self {
+            inner: MclmcSettingsKind::Diag(settings),
+        }
+    }
+
+    fn new_low_rank(seed: Option<u64>) -> Self {
+        let settings = LowRankMclmcSettings {
+            seed: random_seed(seed),
+            ..Default::default()
+        };
+        Self {
+            inner: MclmcSettingsKind::LowRank(settings),
+        }
+    }
+
+    fn new_flow(seed: Option<u64>) -> Self {
+        let settings = FlowMclmcSettings {
+            seed: random_seed(seed),
+            ..Default::default()
+        };
+        Self {
+            inner: MclmcSettingsKind::Flow(settings),
+        }
+    }
+
+    fn update_from_nested_dict(&mut self, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        update_mclmc_from_nested_dict(&mut self.inner, value)
+    }
 
     fn to_nested_json(&self) -> PyResult<JsonValue> {
-        match &self.inner {
-            Settings::Diag(settings) => {
-                serde_json::to_value(settings).map_err(|err| PyValueError::new_err(err.to_string()))
+        mclmc_to_nested_json(&self.inner)
+    }
+
+    fn apply_update(&mut self, name: &str, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        match name {
+            "step_size" => {
+                let value: f64 = value.extract()?;
+                set_all_settings_field!(self, MclmcSettingsKind, step_size = value);
             }
-            Settings::LowRank(settings) => {
-                serde_json::to_value(settings).map_err(|err| PyValueError::new_err(err.to_string()))
+            "momentum_decoherence_length" => {
+                let value: f64 = value.extract()?;
+                set_all_settings_field!(
+                    self,
+                    MclmcSettingsKind,
+                    momentum_decoherence_length = value
+                );
             }
-            Settings::Transforming(settings) => {
-                serde_json::to_value(settings).map_err(|err| PyValueError::new_err(err.to_string()))
+            "subsample_frequency" => {
+                let value: f64 = value.extract()?;
+                set_all_settings_field!(self, MclmcSettingsKind, subsample_frequency = value);
+            }
+            "dynamic_step_size" => {
+                let value: bool = value.extract()?;
+                set_all_settings_field!(self, MclmcSettingsKind, dynamic_step_size = value);
+            }
+            _ => {
+                if try_shared_euclidean_adapt_update!(self, MclmcSettingsKind, name, value) {
+                    // handled above
+                } else {
+                    return Err(PyAttributeError::new_err(format!(
+                        "Unknown settings attribute: {name}",
+                    )));
+                }
             }
         }
+        Ok(())
     }
 }
 
@@ -531,8 +714,8 @@ impl PyNutsSettings {
     #[staticmethod]
     #[allow(non_snake_case)]
     #[pyo3(signature = (seed=None))]
-    fn Transform(seed: Option<u64>) -> Self {
-        PyNutsSettings::new_tranform_adapt(seed)
+    fn Flow(seed: Option<u64>) -> Self {
+        PyNutsSettings::new_flow(seed)
     }
 
     fn update(&mut self, kwargs: &Bound<'_, PyDict>) -> PyResult<()> {
@@ -552,7 +735,73 @@ impl PyNutsSettings {
     }
 
     fn as_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let value = self.to_nested_json()?;
+        let settings = self.to_nested_json()?;
+        let adaptation = match self.inner {
+            NutsSettingsKind::Diag(_) => "diag",
+            NutsSettingsKind::LowRank(_) => "low_rank",
+            NutsSettingsKind::Flow(_) => "flow",
+        };
+        let value = serde_json::json!({
+            "sampler": "nuts",
+            "adaptation": adaptation,
+            "settings": settings,
+        });
+        let obj = pythonize(py, &value).map_err(|err| PyValueError::new_err(err.to_string()))?;
+        Ok(obj.unbind())
+    }
+}
+
+#[pymethods]
+impl PyMclmcSettings {
+    #[staticmethod]
+    #[allow(non_snake_case)]
+    #[pyo3(signature = (seed=None))]
+    fn Diag(seed: Option<u64>) -> Self {
+        PyMclmcSettings::new_diag(seed)
+    }
+
+    #[staticmethod]
+    #[allow(non_snake_case)]
+    #[pyo3(signature = (seed=None))]
+    fn LowRank(seed: Option<u64>) -> Self {
+        PyMclmcSettings::new_low_rank(seed)
+    }
+
+    #[staticmethod]
+    #[allow(non_snake_case)]
+    #[pyo3(signature = (seed=None))]
+    fn Flow(seed: Option<u64>) -> Self {
+        PyMclmcSettings::new_flow(seed)
+    }
+
+    fn update(&mut self, kwargs: &Bound<'_, PyDict>) -> PyResult<()> {
+        for (key, value) in kwargs.iter() {
+            let key: String = key.extract()?;
+            self.apply_update(&key, &value)?;
+        }
+        Ok(())
+    }
+
+    fn __setattr__(&mut self, name: &str, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.apply_update(name, value)
+    }
+
+    fn update_settings(&mut self, settings: &Bound<'_, PyDict>) -> PyResult<()> {
+        self.update_from_nested_dict(settings.as_any())
+    }
+
+    fn as_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let settings = self.to_nested_json()?;
+        let adaptation = match self.inner {
+            MclmcSettingsKind::Diag(_) => "diag",
+            MclmcSettingsKind::LowRank(_) => "low_rank",
+            MclmcSettingsKind::Flow(_) => "flow",
+        };
+        let value = serde_json::json!({
+            "sampler": "mclmc",
+            "adaptation": adaptation,
+            "settings": settings,
+        });
         let obj = pythonize(py, &value).map_err(|err| PyValueError::new_err(err.to_string()))?;
         Ok(obj.unbind())
     }
@@ -688,7 +937,7 @@ struct PySampler(Mutex<(SamplerState, Runtime)>);
 
 impl PySampler {
     fn new<M: Model>(
-        settings: PyNutsSettings,
+        settings: PySamplerSettings,
         cores: usize,
         model: M,
         progress_type: ProgressType,
@@ -703,31 +952,59 @@ impl PySampler {
         match &mut store.0 {
             InnerPyStorage::Arrow => {
                 let storage_config = ArrowConfig::new();
-                match settings.inner {
-                    Settings::LowRank(settings) => {
-                        let sampler =
-                            Sampler::new(model, settings, storage_config, cores, callback)?;
-                        Ok(PySampler(Mutex::new((
-                            SamplerState::RunningArrow(sampler).into(),
-                            tokio_rt,
-                        ))))
-                    }
-                    Settings::Diag(settings) => {
-                        let sampler =
-                            Sampler::new(model, settings, storage_config, cores, callback)?;
-                        Ok(PySampler(Mutex::new((
-                            SamplerState::RunningArrow(sampler).into(),
-                            tokio_rt,
-                        ))))
-                    }
-                    Settings::Transforming(settings) => {
-                        let sampler =
-                            Sampler::new(model, settings, storage_config, cores, callback)?;
-                        Ok(PySampler(Mutex::new((
-                            SamplerState::RunningArrow(sampler).into(),
-                            tokio_rt,
-                        ))))
-                    }
+                match settings {
+                    PySamplerSettings::Nuts(settings) => match settings.inner {
+                        NutsSettingsKind::LowRank(settings) => {
+                            let sampler =
+                                Sampler::new(model, settings, storage_config, cores, callback)?;
+                            Ok(PySampler(Mutex::new((
+                                SamplerState::RunningArrow(sampler).into(),
+                                tokio_rt,
+                            ))))
+                        }
+                        NutsSettingsKind::Diag(settings) => {
+                            let sampler =
+                                Sampler::new(model, settings, storage_config, cores, callback)?;
+                            Ok(PySampler(Mutex::new((
+                                SamplerState::RunningArrow(sampler).into(),
+                                tokio_rt,
+                            ))))
+                        }
+                        NutsSettingsKind::Flow(settings) => {
+                            let sampler =
+                                Sampler::new(model, settings, storage_config, cores, callback)?;
+                            Ok(PySampler(Mutex::new((
+                                SamplerState::RunningArrow(sampler).into(),
+                                tokio_rt,
+                            ))))
+                        }
+                    },
+                    PySamplerSettings::Mclmc(settings) => match settings.inner {
+                        MclmcSettingsKind::LowRank(settings) => {
+                            let sampler =
+                                Sampler::new(model, settings, storage_config, cores, callback)?;
+                            Ok(PySampler(Mutex::new((
+                                SamplerState::RunningArrow(sampler).into(),
+                                tokio_rt,
+                            ))))
+                        }
+                        MclmcSettingsKind::Diag(settings) => {
+                            let sampler =
+                                Sampler::new(model, settings, storage_config, cores, callback)?;
+                            Ok(PySampler(Mutex::new((
+                                SamplerState::RunningArrow(sampler).into(),
+                                tokio_rt,
+                            ))))
+                        }
+                        MclmcSettingsKind::Flow(settings) => {
+                            let sampler =
+                                Sampler::new(model, settings, storage_config, cores, callback)?;
+                            Ok(PySampler(Mutex::new((
+                                SamplerState::RunningArrow(sampler).into(),
+                                tokio_rt,
+                            ))))
+                        }
+                    },
                 }
             }
             InnerPyStorage::Zarr(store) => {
@@ -741,31 +1018,59 @@ impl PySampler {
                 let store = Arc::new(store);
                 let storage_config = ZarrAsyncConfig::new(tokio_rt.handle().clone(), store);
                 let storage_config = storage_config.with_chunk_size(16);
-                match settings.inner {
-                    Settings::LowRank(settings) => {
-                        let sampler =
-                            Sampler::new(model, settings, storage_config, cores, callback)?;
-                        Ok(PySampler(Mutex::new((
-                            SamplerState::RunningZarr(sampler).into(),
-                            tokio_rt,
-                        ))))
-                    }
-                    Settings::Diag(settings) => {
-                        let sampler =
-                            Sampler::new(model, settings, storage_config, cores, callback)?;
-                        Ok(PySampler(Mutex::new((
-                            SamplerState::RunningZarr(sampler).into(),
-                            tokio_rt,
-                        ))))
-                    }
-                    Settings::Transforming(settings) => {
-                        let sampler =
-                            Sampler::new(model, settings, storage_config, cores, callback)?;
-                        Ok(PySampler(Mutex::new((
-                            SamplerState::RunningZarr(sampler).into(),
-                            tokio_rt,
-                        ))))
-                    }
+                match settings {
+                    PySamplerSettings::Nuts(settings) => match settings.inner {
+                        NutsSettingsKind::LowRank(settings) => {
+                            let sampler =
+                                Sampler::new(model, settings, storage_config, cores, callback)?;
+                            Ok(PySampler(Mutex::new((
+                                SamplerState::RunningZarr(sampler).into(),
+                                tokio_rt,
+                            ))))
+                        }
+                        NutsSettingsKind::Diag(settings) => {
+                            let sampler =
+                                Sampler::new(model, settings, storage_config, cores, callback)?;
+                            Ok(PySampler(Mutex::new((
+                                SamplerState::RunningZarr(sampler).into(),
+                                tokio_rt,
+                            ))))
+                        }
+                        NutsSettingsKind::Flow(settings) => {
+                            let sampler =
+                                Sampler::new(model, settings, storage_config, cores, callback)?;
+                            Ok(PySampler(Mutex::new((
+                                SamplerState::RunningZarr(sampler).into(),
+                                tokio_rt,
+                            ))))
+                        }
+                    },
+                    PySamplerSettings::Mclmc(settings) => match settings.inner {
+                        MclmcSettingsKind::LowRank(settings) => {
+                            let sampler =
+                                Sampler::new(model, settings, storage_config, cores, callback)?;
+                            Ok(PySampler(Mutex::new((
+                                SamplerState::RunningZarr(sampler).into(),
+                                tokio_rt,
+                            ))))
+                        }
+                        MclmcSettingsKind::Diag(settings) => {
+                            let sampler =
+                                Sampler::new(model, settings, storage_config, cores, callback)?;
+                            Ok(PySampler(Mutex::new((
+                                SamplerState::RunningZarr(sampler).into(),
+                                tokio_rt,
+                            ))))
+                        }
+                        MclmcSettingsKind::Flow(settings) => {
+                            let sampler =
+                                Sampler::new(model, settings, storage_config, cores, callback)?;
+                            Ok(PySampler(Mutex::new((
+                                SamplerState::RunningZarr(sampler).into(),
+                                tokio_rt,
+                            ))))
+                        }
+                    },
                 }
             }
         }
@@ -865,7 +1170,7 @@ impl PySampler {
 impl PySampler {
     #[staticmethod]
     fn from_pymc(
-        settings: PyNutsSettings,
+        settings: PySamplerSettings,
         cores: usize,
         model: PyMcModel,
         progress_type: ProgressType,
@@ -886,7 +1191,7 @@ impl PySampler {
 
     #[staticmethod]
     fn from_stan(
-        settings: PyNutsSettings,
+        settings: PySamplerSettings,
         cores: usize,
         model: StanModel,
         progress_type: ProgressType,
@@ -907,7 +1212,7 @@ impl PySampler {
 
     #[staticmethod]
     fn from_pyfunc(
-        settings: PyNutsSettings,
+        settings: PySamplerSettings,
         cores: usize,
         model: PyModel,
         progress_type: ProgressType,
@@ -1421,6 +1726,7 @@ pub fn _lib(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<StanLibrary>()?;
     m.add_class::<StanModel>()?;
     m.add_class::<PyNutsSettings>()?;
+    m.add_class::<PyMclmcSettings>()?;
     m.add_class::<PyChainProgress>()?;
     m.add_class::<ProgressType>()?;
     m.add_class::<PyModel>()?;
