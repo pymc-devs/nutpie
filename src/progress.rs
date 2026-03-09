@@ -11,9 +11,11 @@ use std::{
 use anyhow::{Context, Result};
 use indicatif::{MultiProgress, ProgressBar, ProgressFinish, ProgressStyle};
 use nuts_rs::{ChainProgress, ProgressCallback};
-use pyo3::{Py, PyAny, Python};
+use pyo3::{types::PyList, Py, PyAny, Python};
 use time_humanize::{Accuracy, Tense};
 use upon::{Engine, Value};
+
+use crate::wrapper::PyChainProgress;
 
 pub struct ProgressHandler {
     engine: Engine<'static>,
@@ -399,6 +401,36 @@ impl IndicatifHandler {
                     bar.set_mode(ChainState::Divergences);
                 }
                 bar.update_position(chain);
+            }
+        };
+
+        Ok(ProgressCallback {
+            callback: Box::new(callback),
+            rate: self.rate,
+        })
+    }
+}
+
+pub struct RawCallbackHandler {
+    callback: Arc<Py<PyAny>>,
+    rate: Duration,
+}
+
+impl RawCallbackHandler {
+    pub fn new(callback: Arc<Py<PyAny>>, rate: Duration) -> Self {
+        Self { callback, rate }
+    }
+
+    pub fn into_callback(self) -> Result<ProgressCallback> {
+        let callback = move |_time_sampling: Duration, progress: Box<[ChainProgress]>| {
+            let res = Python::attach(|py| {
+                let items: Vec<PyChainProgress> =
+                    progress.iter().cloned().map(PyChainProgress::new).collect();
+                let list = PyList::new(py, items).expect("failed to build PyList");
+                self.callback.call1(py, (list,))
+            });
+            if let Err(err) = res {
+                eprintln!("Error in progress callback: {err}");
             }
         };
 

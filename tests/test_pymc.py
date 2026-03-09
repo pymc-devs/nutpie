@@ -35,6 +35,38 @@ def test_pymc_model(backend, gradient_backend):
 
 @pytest.mark.pymc
 @parameterize_backends
+def test_progress_callback(backend, gradient_backend):
+    with pm.Model() as model:
+        pm.Normal("a")
+
+    compiled = nutpie.compile_pymc_model(
+        model, backend=backend, gradient_backend=gradient_backend
+    )
+
+    received = []
+
+    def callback(chains):
+        received.append(chains)
+
+    nutpie.sample(
+        compiled,
+        chains=2,
+        progress_bar=False,
+        progress_callback=callback,
+    )
+
+    assert len(received) > 0
+    chains = received[-1]
+    assert len(chains) == 2
+    chain = chains[0]
+    assert chain.total_draws > 0
+    assert chain.finished_draws == chain.total_draws
+    assert isinstance(chain.step_size, float)
+    assert isinstance(chain.divergent_draws, list)
+
+
+@pytest.mark.pymc
+@parameterize_backends
 def test_name_x(backend, gradient_backend):
     with pm.Model() as model:
         x = pm.Data("x", 1.0)

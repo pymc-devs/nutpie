@@ -7,7 +7,7 @@ use std::{
 
 use crate::{
     common::PyVariable,
-    progress::{IndicatifHandler, ProgressHandler},
+    progress::{IndicatifHandler, ProgressHandler, RawCallbackHandler},
     pyfunc::PyModel,
     pymc::{ExpandFunc, LogpFunc, PyMcModel},
     stan::{StanLibrary, StanModel},
@@ -33,7 +33,13 @@ use tokio::runtime::Runtime;
 use zarrs_object_store::{object_store::limit::LimitStore, AsyncObjectStore};
 
 #[pyclass]
-struct PyChainProgress(ChainProgress);
+pub struct PyChainProgress(ChainProgress);
+
+impl PyChainProgress {
+    pub(crate) fn new(progress: ChainProgress) -> Self {
+        Self(progress)
+    }
+}
 
 #[pymethods]
 impl PyChainProgress {
@@ -63,13 +69,34 @@ impl PyChainProgress {
     }
 
     #[getter]
+    fn latest_num_steps(&self) -> usize {
+        self.0.latest_num_steps
+    }
+
+    // Keep the old name as an alias for backward compatibility
+    #[getter]
     fn num_steps(&self) -> usize {
         self.0.latest_num_steps
     }
 
     #[getter]
+    fn total_num_steps(&self) -> usize {
+        self.0.total_num_steps
+    }
+
+    #[getter]
     fn step_size(&self) -> f64 {
         self.0.step_size
+    }
+
+    #[getter]
+    fn runtime_ms(&self) -> u64 {
+        self.0.runtime.as_millis() as u64
+    }
+
+    #[getter]
+    fn divergent_draws(&self) -> Vec<usize> {
+        self.0.divergent_draws.clone()
     }
 }
 
@@ -842,8 +869,13 @@ enum InnerProgressType {
 pub struct ProgressType(InnerProgressType);
 
 impl ProgressType {
-    fn into_callback(self) -> Result<Option<ProgressCallback>> {
-        match self.0 {
+    fn into_callback(
+        self,
+        extra_callback: Option<Arc<Py<PyAny>>>,
+        extra_rate: Duration,
+    ) -> Result<Option<ProgressCallback>> {
+        // Build the primary callback (if any).
+        let primary: Option<ProgressCallback> = match self.0 {
             InnerProgressType::Callback {
                 callback,
                 rate,
@@ -851,15 +883,40 @@ impl ProgressType {
                 template,
             } => {
                 let handler = ProgressHandler::new(callback, rate, template, n_cores);
-                let callback = handler.into_callback()?;
-
-                Ok(Some(callback))
+                Some(handler.into_callback()?)
             }
             InnerProgressType::Indicatif { rate } => {
                 let handler = IndicatifHandler::new(rate);
-                Ok(Some(handler.into_callback()?))
+                Some(handler.into_callback()?)
             }
-            InnerProgressType::None {} => Ok(None),
+            InnerProgressType::None {} => None,
+        };
+
+        // Build the optional user-supplied raw callback.
+        let raw: Option<ProgressCallback> = match extra_callback {
+            Some(cb) => {
+                let handler = RawCallbackHandler::new(cb, extra_rate);
+                Some(handler.into_callback()?)
+            }
+            None => None,
+        };
+
+        // Combine them.
+        match (primary, raw) {
+            (None, None) => Ok(None),
+            (Some(p), None) => Ok(Some(p)),
+            (None, Some(r)) => Ok(Some(r)),
+            (Some(mut p), Some(mut r)) => {
+                let rate = p.rate.min(r.rate);
+                let combined = move |time: Duration, progress: Box<[ChainProgress]>| {
+                    (p.callback)(time, progress.clone());
+                    (r.callback)(time, progress);
+                };
+                Ok(Some(ProgressCallback {
+                    callback: Box::new(combined),
+                    rate,
+                }))
+            }
         }
     }
 }
@@ -919,9 +976,13 @@ impl PySampler {
         cores: usize,
         model: M,
         progress_type: ProgressType,
+        extra_callback: Option<Py<PyAny>>,
+        extra_callback_rate: u64,
         store: &mut PyStorage,
     ) -> PyResult<Self> {
-        let callback = progress_type.into_callback()?;
+        let extra_callback = extra_callback.map(Arc::new);
+        let extra_rate = Duration::from_millis(extra_callback_rate);
+        let callback = progress_type.into_callback(extra_callback, extra_rate)?;
         let tokio_rt = Runtime::new().context("Failed to create Tokio runtime")?;
         match &mut store.0 {
             InnerPyStorage::Arrow => {
@@ -1092,9 +1153,19 @@ impl PySampler {
         cores: usize,
         model: PyMcModel,
         progress_type: ProgressType,
+        extra_callback: Option<Py<PyAny>>,
+        extra_callback_rate: u64,
         store: &mut PyStorage,
     ) -> PyResult<PySampler> {
-        PySampler::new(settings, cores, model, progress_type, store)
+        PySampler::new(
+            settings,
+            cores,
+            model,
+            progress_type,
+            extra_callback,
+            extra_callback_rate,
+            store,
+        )
     }
 
     #[staticmethod]
@@ -1103,9 +1174,19 @@ impl PySampler {
         cores: usize,
         model: StanModel,
         progress_type: ProgressType,
+        extra_callback: Option<Py<PyAny>>,
+        extra_callback_rate: u64,
         store: &mut PyStorage,
     ) -> PyResult<PySampler> {
-        PySampler::new(settings, cores, model, progress_type, store)
+        PySampler::new(
+            settings,
+            cores,
+            model,
+            progress_type,
+            extra_callback,
+            extra_callback_rate,
+            store,
+        )
     }
 
     #[staticmethod]
@@ -1114,9 +1195,19 @@ impl PySampler {
         cores: usize,
         model: PyModel,
         progress_type: ProgressType,
+        extra_callback: Option<Py<PyAny>>,
+        extra_callback_rate: u64,
         store: &mut PyStorage,
     ) -> PyResult<PySampler> {
-        PySampler::new(settings, cores, model, progress_type, store)
+        PySampler::new(
+            settings,
+            cores,
+            model,
+            progress_type,
+            extra_callback,
+            extra_callback_rate,
+            store,
+        )
     }
 
     fn is_finished(&mut self, py: Python<'_>) -> PyResult<bool> {

@@ -424,6 +424,7 @@ class _BackgroundSampler:
         cores,
         *,
         progress_bar=True,
+        progress_callback=None,
         save_warmup=True,
         return_raw_trace=False,
         progress_template=None,
@@ -511,6 +512,8 @@ class _BackgroundSampler:
             init_mean,
             cores,
             progress_type,
+            progress_callback,
+            progress_rate,
             self._store,
         )
 
@@ -635,6 +638,7 @@ def sample(
     adaptation: Literal["diag", "draw_diag", "low_rank", "flow"] = "diag",
     init_mean: np.ndarray | None = None,
     return_raw_trace: bool = False,
+    progress_callback: Any | None = None,
     progress_template: str | None = None,
     progress_style: str | None = None,
     progress_rate: int = 100,
@@ -657,6 +661,7 @@ def sample(
     init_mean: np.ndarray | None = None,
     return_raw_trace: bool = False,
     blocking: Literal[True],
+    progress_callback: Any | None = None,
     progress_template: str | None = None,
     progress_style: str | None = None,
     progress_rate: int = 100,
@@ -680,6 +685,7 @@ def sample(
     init_mean: np.ndarray | None = None,
     return_raw_trace: bool = False,
     blocking: Literal[False],
+    progress_callback: Any | None = None,
     progress_template: str | None = None,
     progress_style: str | None = None,
     progress_rate: int = 100,
@@ -702,6 +708,7 @@ def sample(
     init_mean: np.ndarray | None = None,
     return_raw_trace: bool = False,
     blocking: bool = True,
+    progress_callback: Any | None = None,
     progress_template: str | None = None,
     progress_style: str | None = None,
     progress_rate: int = 100,
@@ -793,6 +800,28 @@ def sample(
         for the progress bar (eg CSS).
     progress_rate: int, default=500
         Rate in ms at which the progress should be updated.
+    progress_callback: callable(list[ChainProgress]) | None, default=None
+        An optional callback function that is called periodically with the
+        current progress of all chains. It receives a list of
+        ``nutpie.ChainProgress`` objects, one per chain, each exposing:
+
+        - ``finished_draws`` – number of draws completed so far
+        - ``total_draws`` – total draws to produce (tune + draws)
+        - ``divergences`` – number of divergent transitions so far
+        - ``tuning`` – whether the chain is still in the warmup phase
+        - ``started`` – whether the chain has started
+        - ``latest_num_steps`` – leapfrog steps in the last trajectory
+        - ``total_num_steps`` – cumulative leapfrog steps
+        - ``step_size`` – current step size
+        - ``runtime_ms`` – wall-clock time spent sampling (milliseconds)
+        - ``divergent_draws`` – list of draw indices that diverged
+
+        The callback fires at the same rate as the progress bar
+        (``progress_rate`` ms). It runs on a background thread, so it must
+        be thread-safe. Exceptions raised inside it are printed to stderr
+        and otherwise silently swallowed so that sampling is not interrupted.
+        The built-in progress bar is still shown regardless of whether this
+        callback is set.
     zarr_store: nutpie.zarr_store.*
         A store created using nutpie.zarr_store to store the samples
         in. If None (default), the samples will be stored in
@@ -888,6 +917,7 @@ def sample(
         init_mean,
         cores,
         progress_bar=progress_bar,
+        progress_callback=progress_callback,
         save_warmup=save_warmup,
         return_raw_trace=return_raw_trace,
         progress_template=progress_template,
