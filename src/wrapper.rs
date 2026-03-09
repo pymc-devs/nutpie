@@ -17,8 +17,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use numpy::{PyArray1, PyReadonlyArray1};
 use nuts_rs::{
     ArrowConfig, ArrowTrace, ChainProgress, DiagMclmcSettings, DiagNutsSettings, FlowMclmcSettings,
-    FlowNutsSettings, KineticEnergyKind, LowRankMclmcSettings, LowRankNutsSettings, Model,
-    ProgressCallback, Sampler, SamplerWaitResult, StepSizeAdaptMethod, ZarrAsyncConfig,
+    FlowNutsSettings, KineticEnergyKind, LowRankMclmcSettings, LowRankNutsSettings,
+    MclmcTrajectoryKind, Model, ProgressCallback, Sampler, SamplerWaitResult, StepSizeAdaptMethod,
+    ZarrAsyncConfig,
 };
 use pyo3::{
     exceptions::{PyAttributeError, PyTimeoutError, PyValueError},
@@ -679,6 +680,23 @@ impl PyMclmcSettings {
             "dynamic_step_size" => {
                 let value: bool = value.extract()?;
                 set_all_settings_field!(self, MclmcSettingsKind, dynamic_step_size = value);
+            }
+            "trajectory" => {
+                let value: String = value.extract()?;
+                let value = match value.as_str() {
+                    "microcanonical" => MclmcTrajectoryKind::Microcanonical,
+                    "euclidean" => MclmcTrajectoryKind::Euclidean,
+                    "euclidean_then_microcanonical" => {
+                        MclmcTrajectoryKind::EuclideanEarlyThenMicrocanonical
+                    }
+                    _ => {
+                        return Err(PyValueError::new_err(format!(
+                            "Unknown trajectory: {}",
+                            value
+                        )))
+                    }
+                };
+                set_all_settings_field!(self, MclmcSettingsKind, trajectory_kind = value);
             }
             _ => {
                 if try_shared_euclidean_adapt_update!(self, MclmcSettingsKind, name, value) {
