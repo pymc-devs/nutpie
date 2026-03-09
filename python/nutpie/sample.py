@@ -1,6 +1,7 @@
 import os
+import warnings
 from dataclasses import dataclass
-from typing import Any, Literal, Optional, cast, overload
+from typing import Any, Literal, Optional, cast, get_args, overload
 
 import arviz
 import numpy as np
@@ -631,8 +632,7 @@ def sample(
     seed: int | None = None,
     save_warmup: bool = True,
     progress_bar: bool = True,
-    low_rank_modified_mass_matrix: bool = False,
-    transform_adapt: bool = False,
+    adaptation: Literal["diag", "draw_diag", "low_rank", "flow"] = "diag",
     init_mean: np.ndarray | None = None,
     return_raw_trace: bool = False,
     progress_template: str | None = None,
@@ -653,8 +653,7 @@ def sample(
     seed: int | None = None,
     save_warmup: bool = True,
     progress_bar: bool = True,
-    low_rank_modified_mass_matrix: bool = False,
-    transform_adapt: bool = False,
+    adaptation: Literal["diag", "draw_diag", "low_rank", "flow"] = "diag",
     init_mean: np.ndarray | None = None,
     return_raw_trace: bool = False,
     blocking: Literal[True],
@@ -677,8 +676,7 @@ def sample(
     seed: int | None = None,
     save_warmup: bool = True,
     progress_bar: bool = True,
-    low_rank_modified_mass_matrix: bool = False,
-    transform_adapt: bool = False,
+    adaptation: Literal["diag", "draw_diag", "low_rank", "flow"] = "diag",
     init_mean: np.ndarray | None = None,
     return_raw_trace: bool = False,
     blocking: Literal[False],
@@ -700,8 +698,7 @@ def sample(
     seed: int | None = None,
     save_warmup: bool = True,
     progress_bar: bool = True,
-    low_rank_modified_mass_matrix: bool = False,
-    transform_adapt: bool = False,
+    adaptation: Literal["diag", "draw_diag", "low_rank", "flow"] = "diag",
     init_mean: np.ndarray | None = None,
     return_raw_trace: bool = False,
     blocking: bool = True,
@@ -765,10 +762,29 @@ def sample(
     return_raw_trace: bool, default=False
         Return the raw trace object (an apache arrow structure)
         instead of converting to arviz.
-    use_grad_based_mass_matrix: bool, default=True
-        Use a mass matrix estimate that is based on draw and gradient
-        variance. Set to `False` to get mass matrix adaptation more
-        similar to PyMC and Stan.
+    adaptation: str, default="diag"
+        The mass matrix adaptation strategy to use. One of:
+
+        - ``"diag"`` (default): Diagonal mass matrix estimated from
+          draw and gradient variance. This is nutpie's standard
+          adaptation.
+        - ``"draw_diag"``: Diagonal mass matrix estimated from draw
+          variance only, similar to the adaptation in Stan and PyMC.
+          Usually less efficient, but occasionally produces a higher
+          total number of effective samples.
+        - ``"low_rank"``: Low-rank modified diagonal mass matrix that
+          can adapt to some posterior correlations. *Experimental.*
+        - ``"flow"``: Normalizing-flow reparameterisation during
+          tuning. *Experimental.*
+    mass_matrix_eigval_cutoff: float > 1, default=100
+        Ignore eigenvalues between cutoff and 1/cutoff in the
+        low-rank modified mass matrix estimate. Higher values
+        lead to worse correlation fitting, but increase
+        the performance of leapfrog steps.
+        Only applicable with ``adaptation="low_rank"``.
+    mass_matrix_gamma: float > 0, default=1e-5
+        Regularisation parameter for the eigenvalues. Only
+        applicable with ``adaptation="low_rank"``.
     progress_template: str
         This is only exposed for experimentation. upon template
         for the html progress representation.
@@ -777,22 +793,6 @@ def sample(
         for the progress bar (eg CSS).
     progress_rate: int, default=500
         Rate in ms at which the progress should be updated.
-    low_rank_modified_mass_matrix: bool, default=False
-        Allow adaptation to some posterior correlations using
-        a low-rank updated mass matrix. This is *experimental*
-        and details about this will probably change in the next
-        release.
-    mass_matrix_eigval_cutoff: float > 1, defaul=100
-        Ignore eigenvalues between cutoff and 1/cutoff in the
-        low-rank modified mass matrix estimate. Higher values
-        lead to worse correclation fitting, but increase
-        the performance of leapfrog steps.
-    mass_matrix_gamma: float > 0, default=1e-5
-        Regularisation parameter for the eigenvalues. Only
-        applicable with low_rank_modified_mass_matrix=True.
-    transform_adapt: bool, default=False
-        Use the experimental transform adaptation algorithm
-        during tuning.
     zarr_store: nutpie.zarr_store.*
         A store created using nutpie.zarr_store to store the samples
         in. If None (default), the samples will be stored in
@@ -808,17 +808,55 @@ def sample(
         An ArviZ ``InferenceData`` object that contains the samples.
     """
 
-    if low_rank_modified_mass_matrix and transform_adapt:
-        raise ValueError(
-            "Specify only one of `low_rank_modified_mass_matrix` and `transform_adapt`"
+    # Backward-compatible deprecated keyword arguments.
+    _use_grad_based = None
+    for _old_name, _new_adaptation in [
+        ("low_rank_modified_mass_matrix", "low_rank"),
+        ("transform_adapt", "flow"),
+    ]:
+        if _old_name in kwargs:
+            _val = kwargs.pop(_old_name)
+            if _val:
+                warnings.warn(
+                    f"`{_old_name}` is deprecated. "
+                    f"Use `adaptation='{_new_adaptation}'` instead.",
+                    FutureWarning,
+                    stacklevel=2,
+                )
+                if adaptation == "diag":
+                    _AdaptationLiteral = Literal[
+                        "diag", "draw_diag", "low_rank", "flow"
+                    ]
+                    assert _new_adaptation in get_args(_AdaptationLiteral)
+                    adaptation = cast(_AdaptationLiteral, _new_adaptation)
+                else:
+                    raise ValueError(
+                        f"`{_old_name}` is deprecated and cannot be combined "
+                        f"with the `adaptation` argument."
+                    )
+    if "use_grad_based_mass_matrix" in kwargs:
+        _use_grad_based = kwargs.pop("use_grad_based_mass_matrix")
+        warnings.warn(
+            "`use_grad_based_mass_matrix` is deprecated. "
+            "Use `adaptation='draw_diag'` instead of "
+            "`use_grad_based_mass_matrix=False`.",
+            FutureWarning,
+            stacklevel=2,
         )
 
-    if low_rank_modified_mass_matrix:
+    if adaptation == "low_rank":
         settings = _lib.PyNutsSettings.LowRank(seed)
-    elif transform_adapt:
+    elif adaptation == "flow":
         settings = _lib.PyNutsSettings.Transform(seed)
-    else:
+    elif adaptation in ("diag", "draw_diag"):
         settings = _lib.PyNutsSettings.Diag(seed)
+        if adaptation == "draw_diag" or _use_grad_based is False:
+            settings.use_grad_based_mass_matrix = False
+    else:
+        raise ValueError(
+            f"Unknown adaptation strategy '{adaptation}'. "
+            f"Expected one of: 'diag', 'draw_diag', 'low_rank', 'flow'."
+        )
 
     if tune is not None:
         settings.num_tune = tune

@@ -94,52 +94,65 @@ parameter space, where the model is most likely to diverge.
 Nutpie offers several strategies for adapting the mass matrix, which determines
 how the sampler navigates the parameter space.
 
-### Standard Adaptation
+The adaptation strategy is controlled by the `adaptation` argument, which
+accepts one of four values:
 
-By setting `use_grad_based_mass_matrix=False`, the sampling algorithm will more
-closely resemble the algorithm in Stan and PyMC. Usually, this will result in
-less efficient sampling, but the total number of effective samples is sometimes
-higher. If this is set to `True` (the default), nutpie will use diagonal mass
-matrix estimates that are based on the posterior draws and the scores at those
-positions.
+### `"diag"` (default)
+
+The default strategy. Nutpie estimates a diagonal mass matrix from both draw
+variance and gradient variance. This is usually the most efficient choice.
+
+```python
+trace = nutpie.sample(model)
+# equivalent to:
+trace = nutpie.sample(model, adaptation="diag")
+```
+
+### `"draw_diag"`
+
+A diagonal mass matrix estimated from draw variance only, similar to the
+adaptation used in Stan and PyMC. This will usually result in less efficient
+sampling, but the total number of effective samples is occasionally higher.
 
 ```python
 trace = nutpie.sample(
     model,
-    use_grad_based_mass_matrix=False
+    adaptation="draw_diag"
 )
 ```
 
-### Low-Rank Updates
+### `"low_rank"`
 
-For models with strong parameter correlations you can enable a low rank modified
-mass matrix. The `mass_matrix_gamma` parameter is a regularization parameter.
-More regularization will lead to a smaller effect of the low-rank components,
-but might work better for higher dimensional problems.
+For models with strong parameter correlations you can enable a low-rank
+modified mass matrix. This extends the diagonal mass matrix with a low-rank
+update that can capture some posterior correlations. The `mass_matrix_gamma`
+parameter is a regularization parameter — more regularization will lead to a
+smaller effect of the low-rank components, but might work better for
+higher-dimensional problems.
 
 `mass_matrix_eigval_cutoff` should be greater than one, and controls how large
-an eigenvalue of the full mass matrix has to be, to be included into the
-low-rank mass matirx.
+an eigenvalue of the full mass matrix has to be to be included in the low-rank
+mass matrix.
 
 ```python
 trace = nutpie.sample(
     model,
-    low_rank_modified_mass_matrix=True,
+    adaptation="low_rank",
     mass_matrix_eigval_cutoff=3,
     mass_matrix_gamma=1e-5
 )
 ```
 
-### Experimental Features
+### `"flow"` (Experimental)
 
-`trasform_adapt` is an experimental feature that allows sampling from many
-posteriors, where current methods diverge. It is described in more detail
-[here](nf-adapt.qmd).
+A normalizing-flow reparameterisation that is adapted during tuning. This
+allows sampling from many posteriors where current methods diverge. It is
+described in more detail [here](nf-adapt.qmd).
 
 ```python
 trace = nutpie.sample(
     model,
-    transform_adapt=True  # Experimental reparameterization
+    adaptation="flow"
 )
 ```
 
