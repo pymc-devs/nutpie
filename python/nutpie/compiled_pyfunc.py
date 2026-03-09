@@ -48,13 +48,24 @@ class PyFuncModel(CompiledModel):
     def with_transform_adapt(self, **kwargs):
         return dataclasses.replace(self, _transform_adapt_args=kwargs)
 
-    def _make_sampler(self, settings, init_mean, cores, progress_type, store):
+    def _make_sampler(
+        self,
+        settings,
+        init_mean,
+        cores,
+        progress_type,
+        extra_callback,
+        extra_callback_rate,
+        store,
+    ):
         model = self._make_model(init_mean)
         return _lib.PySampler.from_pyfunc(
             settings,
             cores,
             model,
             progress_type,
+            extra_callback,
+            extra_callback_rate,
             store,
         )
 

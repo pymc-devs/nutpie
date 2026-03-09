@@ -147,13 +147,24 @@ class CompiledPyMCModel(CompiledModel):
             user_data=user_data,
         )
 
-    def _make_sampler(self, settings, init_mean, cores, progress_type, store):
+    def _make_sampler(
+        self,
+        settings,
+        init_mean,
+        cores,
+        progress_type,
+        extra_callback,
+        extra_callback_rate,
+        store,
+    ):
         model = self._make_model(init_mean)
         return _lib.PySampler.from_pymc(
             settings,
             cores,
             model,
             progress_type,
+            extra_callback,
+            extra_callback_rate,
             store,
         )
 
@@ -511,7 +522,7 @@ def compile_pymc_model(
     freeze_model : bool | None
         Freeze all dimensions and shared variables to treat them as compile time
         constants.
-        
+
     Returns
     -------
     compiled_model : CompiledPyMCModel
@@ -531,8 +542,8 @@ def compile_pymc_model(
     if backend is not None:
         backend = backend.lower()  # type: ignore[assignment]
 
-    from pymc.model.transform.optimization import freeze_dims_and_data
     from pymc.initial_point import make_initial_point_fn
+    from pymc.model.transform.optimization import freeze_dims_and_data
 
     if freeze_model is None:
         freeze_model = backend == "jax"
@@ -587,8 +598,8 @@ def _wrap_with_lock(func: Callable) -> Callable:
 
 def _compute_shapes(model) -> dict[str, tuple[int, ...]]:
     import pytensor
-    from pytensor.tensor import as_tensor
     from pymc.initial_point import make_initial_point_fn
+    from pytensor.tensor import as_tensor
 
     point = make_initial_point_fn(model=model, return_transformed=True)(0)
 
