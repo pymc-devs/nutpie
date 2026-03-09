@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import pyarrow
 
-from nutpie import _lib  # type: ignore
+from nutpie import _lib
 
 
 @dataclass(frozen=True)
@@ -297,7 +297,7 @@ _progress_template = """
 
 def in_marimo_notebook() -> bool:
     try:
-        import marimo as mo
+        import marimo as mo  # ty:ignore[unresolved-import]
 
         return mo.running_in_notebook()
     except ImportError:
@@ -306,17 +306,25 @@ def in_marimo_notebook() -> bool:
 
 def _mo_write_internal(cell_id, stream, value: object) -> None:
     """Write to marimo cell given cell_id and stream."""
-    import marimo
+    import marimo  # ty:ignore[unresolved-import]
 
     if marimo.__version__ < "0.19.0":
         # The old CellOp API is identical to new CellNotificationUtils
-        from marimo._messaging.ops import CellOp as CellNotificationUtils
+        from marimo._messaging.ops import (  # ty:ignore[unresolved-import]
+            CellOp as CellNotificationUtils,
+        )
     else:
-        from marimo._messaging.notification_utils import CellNotificationUtils
+        from marimo._messaging.notification_utils import (  # ty:ignore[unresolved-import]
+            CellNotificationUtils,
+        )
 
-    from marimo._messaging.cell_output import CellChannel
-    from marimo._messaging.tracebacks import write_traceback
-    from marimo._output import formatting
+    from marimo._messaging.cell_output import (  # ty:ignore[unresolved-import]
+        CellChannel,
+    )
+    from marimo._messaging.tracebacks import (  # ty:ignore[unresolved-import]
+        write_traceback,
+    )
+    from marimo._output import formatting  # ty:ignore[unresolved-import]
 
     output = formatting.try_format(value)
     if output.traceback is not None:
@@ -333,9 +341,11 @@ def _mo_write_internal(cell_id, stream, value: object) -> None:
 
 def _mo_create_replace():
     """Create mo.output.replace with current context pinned."""
-    from marimo._output import formatting
-    from marimo._runtime.context import get_context
-    from marimo._runtime.context.types import ContextNotInitializedError
+    from marimo._output import formatting  # ty:ignore[unresolved-import]
+    from marimo._runtime.context import get_context  # ty:ignore[unresolved-import]
+    from marimo._runtime.context.types import (  # ty:ignore[unresolved-import]
+        ContextNotInitializedError,
+    )
 
     try:
         ctx = get_context()
@@ -359,7 +369,7 @@ def in_notebook():
     def in_colab():
         "Check if the code is running in Google Colaboratory"
         try:
-            from google import colab  # noqa: F401
+            from google import colab  # noqa: F401  # ty:ignore[unresolved-import]
 
             return True
         except ImportError:
@@ -371,7 +381,7 @@ def in_notebook():
         shell = get_ipython().__class__.__name__  # type: ignore
         if shell == "ZMQInteractiveShell":  # Jupyter notebook, Spyder or qtconsole
             try:
-                from IPython.display import (
+                from IPython.display import (  # ty:ignore[unresolved-import]
                     HTML,  # noqa: F401
                     clear_output,  # noqa: F401
                     display,  # noqa: F401
@@ -457,7 +467,7 @@ class _BackgroundSampler:
             if progress_style is None:
                 progress_style = _progress_style
 
-            import IPython
+            import IPython  # ty:ignore[unresolved-import]
 
             self._html = ""
 
@@ -483,7 +493,7 @@ class _BackgroundSampler:
                 progress_rate, progress_template, cores, callback
             )
         elif in_marimo_notebook():
-            import marimo as mo
+            import marimo as mo  # ty:ignore[unresolved-import]
 
             if progress_template is None:
                 progress_template = _progress_template
@@ -548,7 +558,7 @@ class _BackgroundSampler:
                 store = cls(*args, **kwargs)
 
                 obj_store = ObjectStore(store, read_only=True)
-                ds = xr.open_datatree(obj_store, engine="zarr", consolidated=False)
+                ds = xr.open_datatree(obj_store, engine="zarr", consolidated=False)  # ty:ignore[invalid-argument-type]
                 return arviz.from_datatree(ds)
 
             elif results.is_arrow():
@@ -642,28 +652,6 @@ def sample(
     adaptation: Literal["diag", "draw_diag", "low_rank", "flow"] = "diag",
     init_mean: np.ndarray | None = None,
     return_raw_trace: bool = False,
-    progress_callback: Any | None = None,
-    progress_template: str | None = None,
-    progress_style: str | None = None,
-    progress_rate: int = 100,
-    zarr_store: _ZarrStoreType | None = None,
-) -> arviz.InferenceData: ...
-
-
-@overload
-def sample(
-    compiled_model: CompiledModel,
-    *,
-    draws: int | None = None,
-    tune: int | None = None,
-    chains: int | None = None,
-    cores: int | None = None,
-    seed: int | None = None,
-    save_warmup: bool = True,
-    progress_bar: bool = True,
-    adaptation: Literal["diag", "draw_diag", "low_rank", "flow"] = "diag",
-    init_mean: np.ndarray | None = None,
-    return_raw_trace: bool = False,
     blocking: Literal[True],
     progress_callback: Any | None = None,
     progress_template: str | None = None,
@@ -696,6 +684,29 @@ def sample(
     zarr_store: _ZarrStoreType | None = None,
     **kwargs,
 ) -> _BackgroundSampler: ...
+
+
+@overload
+def sample(
+    compiled_model: CompiledModel,
+    *,
+    draws: int | None = None,
+    tune: int | None = None,
+    chains: int | None = None,
+    cores: int | None = None,
+    seed: int | None = None,
+    save_warmup: bool = True,
+    progress_bar: bool = True,
+    adaptation: Literal["diag", "draw_diag", "low_rank", "flow"] = "diag",
+    init_mean: np.ndarray | None = None,
+    return_raw_trace: bool = False,
+    progress_callback: Any | None = None,
+    progress_template: str | None = None,
+    progress_style: str | None = None,
+    progress_rate: int = 100,
+    zarr_store: _ZarrStoreType | None = None,
+    **kwargs,
+) -> arviz.InferenceData: ...
 
 
 def sample(
