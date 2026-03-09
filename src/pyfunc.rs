@@ -6,8 +6,8 @@ use nuts_rs::{CpuLogpFunc, CpuMath, HasDims, LogpError, Model, Storable, Value};
 use pyo3::{
     exceptions::PyRuntimeError,
     pyclass, pymethods,
-    types::{PyAnyMethods, PyDict, PyDictMethods, PyList, PyListMethods},
-    Bound, Py, PyAny, PyErr, Python,
+    types::{PyAnyMethods, PyDict, PyDictMethods, PyList, PyListMethods, PyNone},
+    Bound, BoundObject, Py, PyAny, PyErr, Python,
 };
 use rand::Rng;
 use rand_distr::{Distribution, Uniform};
@@ -477,7 +477,7 @@ impl CpuLogpFunc for PyDensity {
         Ok(())
     }
 
-    fn new_transformation<R: rand::Rng + ?Sized>(
+    fn init_transformation<R: rand::Rng + ?Sized>(
         &mut self,
         rng: &mut R,
         untransformed_position: &[f64],
@@ -490,6 +490,18 @@ impl CpuLogpFunc for PyDensity {
             .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?
             .new_transformation(rng, untransformed_position, untransformed_gradient, chain)?;
         Ok(trafo)
+    }
+
+    fn new_transformation<R: rand::Rng + ?Sized>(
+        &mut self,
+        _rng: &mut R,
+        _dim: usize,
+        _chain: u64,
+    ) -> std::result::Result<Self::FlowParameters, Self::LogpError> {
+        Python::attach(|py| {
+            let params = PyNone::get(py);
+            Ok(params.unbind().into())
+        })
     }
 
     fn transformation_id(&self, params: &Py<PyAny>) -> std::result::Result<i64, Self::LogpError> {
