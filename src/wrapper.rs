@@ -16,9 +16,9 @@ use crate::{
 use anyhow::{anyhow, bail, Context, Result};
 use numpy::{PyArray1, PyReadonlyArray1};
 use nuts_rs::{
-    ArrowConfig, ArrowTrace, ChainProgress, DiagGradNutsSettings, LowRankNutsSettings, Model,
-    ProgressCallback, Sampler, SamplerWaitResult, StepSizeAdaptMethod, TransformedNutsSettings,
-    ZarrAsyncConfig,
+    ArrowConfig, ArrowTrace, ChainProgress, DiagGradNutsSettings, KineticEnergyKind,
+    LowRankNutsSettings, Model, ProgressCallback, Sampler, SamplerWaitResult, StepSizeAdaptMethod,
+    TransformedNutsSettings, ZarrAsyncConfig,
 };
 use pyo3::{
     exceptions::{PyTimeoutError, PyValueError},
@@ -460,7 +460,7 @@ impl PyNutsSettings {
     }
 
     #[getter]
-    fn set_target_accept(&self) -> f64 {
+    fn target_accept(&self) -> f64 {
         match &self.inner {
             Settings::Diag(nuts_settings) => {
                 nuts_settings.adapt_options.step_size_settings.target_accept
@@ -475,7 +475,7 @@ impl PyNutsSettings {
     }
 
     #[setter(target_accept)]
-    fn target_accept(&mut self, val: f64) {
+    fn set_target_accept(&mut self, val: f64) {
         match &mut self.inner {
             Settings::Diag(nuts_settings) => {
                 nuts_settings.adapt_options.step_size_settings.target_accept = val
@@ -485,6 +485,66 @@ impl PyNutsSettings {
             }
             Settings::Transforming(nuts_settings) => {
                 nuts_settings.adapt_options.step_size_settings.target_accept = val
+            }
+        }
+    }
+
+    #[getter]
+    fn max_step_size(&self) -> f64 {
+        match &self.inner {
+            Settings::Diag(nuts_settings) => {
+                nuts_settings
+                    .adapt_options
+                    .step_size_settings
+                    .adapt_options
+                    .dual_average
+                    .max_step_size
+            }
+            Settings::LowRank(nuts_settings) => {
+                nuts_settings
+                    .adapt_options
+                    .step_size_settings
+                    .adapt_options
+                    .dual_average
+                    .max_step_size
+            }
+            Settings::Transforming(nuts_settings) => {
+                nuts_settings
+                    .adapt_options
+                    .step_size_settings
+                    .adapt_options
+                    .dual_average
+                    .max_step_size
+            }
+        }
+    }
+
+    #[setter(max_step_size)]
+    fn set_max_step_size(&mut self, val: f64) {
+        match &mut self.inner {
+            Settings::Diag(nuts_settings) => {
+                nuts_settings
+                    .adapt_options
+                    .step_size_settings
+                    .adapt_options
+                    .dual_average
+                    .max_step_size = val
+            }
+            Settings::LowRank(nuts_settings) => {
+                nuts_settings
+                    .adapt_options
+                    .step_size_settings
+                    .adapt_options
+                    .dual_average
+                    .max_step_size = val
+            }
+            Settings::Transforming(nuts_settings) => {
+                nuts_settings
+                    .adapt_options
+                    .step_size_settings
+                    .adapt_options
+                    .dual_average
+                    .max_step_size = val
             }
         }
     }
@@ -554,20 +614,58 @@ impl PyNutsSettings {
     }
 
     #[getter]
+    fn microcanonical_trajectory(&self) -> bool {
+        match &self.inner {
+            Settings::LowRank(settings) => {
+                settings.trajectory_kind == KineticEnergyKind::Microcanonical
+            }
+            Settings::Diag(settings) => {
+                settings.trajectory_kind == KineticEnergyKind::Microcanonical
+            }
+            Settings::Transforming(settings) => {
+                settings.trajectory_kind == KineticEnergyKind::Microcanonical
+            }
+        }
+    }
+
+    #[setter(microcanonical_trajectory)]
+    fn set_microcanonical_trajectory(&mut self, val: bool) {
+        let kind = if val {
+            KineticEnergyKind::Microcanonical
+        } else {
+            KineticEnergyKind::Euclidean
+        };
+        match &mut self.inner {
+            Settings::LowRank(settings) => settings.trajectory_kind = kind,
+            Settings::Diag(settings) => settings.trajectory_kind = kind,
+            Settings::Transforming(settings) => settings.trajectory_kind = kind,
+        }
+    }
+
+    #[getter]
     fn exact_normal_trajectory(&self) -> bool {
         match &self.inner {
-            Settings::LowRank(settings) => settings.exact_normal_trajectory,
-            Settings::Diag(settings) => settings.exact_normal_trajectory,
-            Settings::Transforming(settings) => settings.exact_normal_trajectory,
+            Settings::LowRank(settings) => {
+                settings.trajectory_kind == KineticEnergyKind::ExactNormal
+            }
+            Settings::Diag(settings) => settings.trajectory_kind == KineticEnergyKind::ExactNormal,
+            Settings::Transforming(settings) => {
+                settings.trajectory_kind == KineticEnergyKind::ExactNormal
+            }
         }
     }
 
     #[setter(exact_normal_trajectory)]
     fn set_exact_normal_trajectory(&mut self, val: bool) {
+        let kind = if val {
+            KineticEnergyKind::ExactNormal
+        } else {
+            KineticEnergyKind::Euclidean
+        };
         match &mut self.inner {
-            Settings::LowRank(settings) => settings.exact_normal_trajectory = val,
-            Settings::Diag(settings) => settings.exact_normal_trajectory = val,
-            Settings::Transforming(settings) => settings.exact_normal_trajectory = val,
+            Settings::LowRank(settings) => settings.trajectory_kind = kind,
+            Settings::Diag(settings) => settings.trajectory_kind = kind,
+            Settings::Transforming(settings) => settings.trajectory_kind = kind,
         }
     }
 
