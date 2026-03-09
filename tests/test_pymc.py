@@ -89,11 +89,11 @@ def test_low_rank(backend, gradient_backend):
     compiled = nutpie.compile_pymc_model(
         model, backend=backend, gradient_backend=gradient_backend
     )
-    trace = nutpie.sample(compiled, chains=1, low_rank_modified_mass_matrix=True)
+    trace = nutpie.sample(compiled, chains=1, adaptation="low_rank")
 
     assert "mass_matrix_eigvals" not in trace.sample_stats
     trace = nutpie.sample(
-        compiled, chains=1, low_rank_modified_mass_matrix=True, store_mass_matrix=True
+        compiled, chains=1, adaptation="low_rank", store_mass_matrix=True
     )
     assert "mass_matrix_eigvals" in trace.sample_stats
 
@@ -109,7 +109,35 @@ def test_low_rank_half_normal(backend, gradient_backend):
     compiled = nutpie.compile_pymc_model(
         model, backend=backend, gradient_backend=gradient_backend
     )
-    trace = nutpie.sample(compiled, chains=1, low_rank_modified_mass_matrix=True)
+    trace = nutpie.sample(compiled, chains=1, adaptation="low_rank")
+    trace.posterior.a  # noqa: B018
+
+
+@pytest.mark.pymc
+@parameterize_backends
+def test_deprecated_low_rank_modified_mass_matrix(backend, gradient_backend):
+    with pm.Model() as model:
+        pm.Normal("a")
+
+    compiled = nutpie.compile_pymc_model(
+        model, backend=backend, gradient_backend=gradient_backend
+    )
+    with pytest.warns(FutureWarning, match="low_rank_modified_mass_matrix"):
+        trace = nutpie.sample(compiled, chains=1, low_rank_modified_mass_matrix=True)
+    trace.posterior.a  # noqa: B018
+
+
+@pytest.mark.pymc
+@parameterize_backends
+def test_deprecated_use_grad_based_mass_matrix(backend, gradient_backend):
+    with pm.Model() as model:
+        pm.Normal("a")
+
+    compiled = nutpie.compile_pymc_model(
+        model, backend=backend, gradient_backend=gradient_backend
+    )
+    with pytest.warns(FutureWarning, match="use_grad_based_mass_matrix"):
+        trace = nutpie.sample(compiled, chains=1, use_grad_based_mass_matrix=False)
     trace.posterior.a  # noqa: B018
 
 
@@ -402,7 +430,7 @@ def test_normalizing_flow():
     trace = nutpie.sample(
         compiled,
         chains=1,
-        transform_adapt=True,
+        adaptation="flow",
         window_switch_freq=128,
         seed=1,
         draws=500,
