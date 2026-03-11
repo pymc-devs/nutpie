@@ -2,6 +2,37 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.16.8] - 2026-03-11
+
+### Documentation
+
+- Fix docstring formatting (Eliot Carlson)
+
+
+### Miscellaneous Tasks
+
+- Bump quinn-proto in the cargo group across 1 directory (dependabot[bot])
+
+
+## [0.16.7] - 2026-03-03
+
+### Bug Fixes
+
+- Limit to arviz < 1.0 (Adrian Seyboldt)
+
+
+### Miscellaneous Tasks
+
+- Update dependencies (Adrian Seyboldt)
+
+- Update github ci actions (Adrian Seyboldt)
+
+
+### Styling
+
+- Update pre-commit ruff version (Adrian Seyboldt)
+
+
 ## [0.16.6] - 2026-02-18
 
 ### Miscellaneous Tasks
@@ -549,8 +580,6 @@ All notable changes to this project will be documented in this file.
 
 ### Ci
 
-- Fix uploads of releases (Adrian Seyboldt)
-
 - Fix architectures in CI (Adrian Seyboldt)
 
 
@@ -573,6 +602,8 @@ All notable changes to this project will be documented in this file.
 
 
 ### Miscellaneous Tasks
+
+- Bump actions/download-artifact from 3 to 4 (dependabot[bot])
 
 - Bump actions/setup-python from 4 to 5 (dependabot[bot])
 
@@ -598,7 +629,12 @@ All notable changes to this project will be documented in this file.
 - Set the number of parallel chains dynamically (Adrian Seyboldt)
 
 
-## [0.9.2] - 2024-02-19
+### Ci
+
+- Fix uploads of releases (Adrian Seyboldt)
+
+
+## [0.9.2] - 2023-10-24
 
 ### Bug Fixes
 
@@ -615,11 +651,6 @@ All notable changes to this project will be documented in this file.
 ### Features
 
 - Handle missing libraries more robustly (#72) (Ben Mares)
-
-
-### Miscellaneous Tasks
-
-- Bump actions/download-artifact from 3 to 4 (dependabot[bot])
 
 
 ### Ci
