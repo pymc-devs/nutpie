@@ -48,16 +48,10 @@ at build time and applies it to the Python wheel.
    Create the release promptly after merging so the tag lands on the merge commit
    rather than on something unrelated that arrives later.
 
-## What happens next
-
-Creating the GitHub Release produces a tag. CI (`.github/workflows/ci.yml`) detects
-it and:
-
-- Builds wheels for Linux (x86_64, aarch64), macOS (x86_64, aarch64), and Windows (x64)
-- Builds an sdist
-- Generates artifact attestation
-- Publishes everything to **PyPI** via `maturin upload`
-- Uploads wheel assets to the GitHub Release
+5. **Approve the deployment.** Once CI finishes building wheels and the sdist, the
+   `release` job will be pending review. A `pypi` environment reviewer must approve
+   the deployment from the Actions tab. Once approved, wheels and the sdist are
+   published to PyPI.
 
 ## Conventions
 
