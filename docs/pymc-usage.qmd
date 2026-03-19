@@ -97,7 +97,7 @@ information about how each chain is doing:
   (100 to 1000) are a sign that the parameterization of the model is not ideal,
   and the sampler is very inefficient.
 
-After sampling, this returns an `arviz` InferenceData object that you can use to
+After sampling, this returns a `DataTree` object that follows the InferenceData schema, which you can use to
 analyze the trace.
 
 For example, we should check the effective sample size:
@@ -110,7 +110,7 @@ az.ess(trace)
 and take a look at a trace plot:
 
 ```{python}
-az.plot_trace(trace);
+az.plot_trace_dist(trace);
 ```
 
 ### Choosing the backend

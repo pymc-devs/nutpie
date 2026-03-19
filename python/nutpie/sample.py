@@ -6,6 +6,7 @@ import arviz
 import numpy as np
 import pandas as pd
 import pyarrow
+from xarray import Datatree
 
 from nutpie import _lib  # type: ignore
 
@@ -96,11 +97,14 @@ def _arrow_to_arviz(draw_batches, stat_batches, skip_vars=None, **kwargs):
             stats_posterior, max_posterior, stat_posterior, i, n_chains, dims, skip_vars
         )
 
+    data = {
+        "posterior": data_posterior,
+        "sample_stats": stats_posterior,
+        "warmup_posterior": data_tune,
+        "warmup_sample_stats": stats_tune,
+    }
     return arviz.from_dict(
-        data_posterior,
-        sample_stats=stats_posterior,
-        warmup_posterior=data_tune,
-        warmup_sample_stats=stats_tune,
+        data,
         dims=dims,
         **kwargs,
     )
@@ -639,7 +643,7 @@ def sample(
     progress_style: str | None = None,
     progress_rate: int = 100,
     zarr_store: _ZarrStoreType | None = None,
-) -> arviz.InferenceData: ...
+) -> Datatree: ...
 
 
 @overload
@@ -663,7 +667,7 @@ def sample(
     progress_rate: int = 100,
     zarr_store: _ZarrStoreType | None = None,
     **kwargs,
-) -> arviz.InferenceData: ...
+) -> Datatree: ...
 
 
 @overload
@@ -710,7 +714,7 @@ def sample(
     progress_rate: int = 100,
     zarr_store: _ZarrStoreType | None = None,
     **kwargs,
-) -> arviz.InferenceData | _BackgroundSampler:
+) -> Datatree | _BackgroundSampler:
     """Sample the posterior distribution for a compiled model.
 
     Parameters
@@ -804,8 +808,8 @@ def sample(
 
     Returns
     -------
-    trace : arviz.InferenceData
-        An ArviZ ``InferenceData`` object that contains the samples.
+    trace : Datatree
+        A `DataTree` following the InferenceData schema that contains the samples.
     """
 
     if low_rank_modified_mass_matrix and transform_adapt:
