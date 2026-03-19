@@ -6,7 +6,7 @@ import arviz
 import numpy as np
 import pandas as pd
 import pyarrow
-from xarray import Datatree
+from xarray import DataTree
 
 from nutpie import _lib  # type: ignore
 
@@ -643,7 +643,7 @@ def sample(
     progress_style: str | None = None,
     progress_rate: int = 100,
     zarr_store: _ZarrStoreType | None = None,
-) -> Datatree: ...
+) -> DataTree: ...
 
 
 @overload
@@ -667,7 +667,7 @@ def sample(
     progress_rate: int = 100,
     zarr_store: _ZarrStoreType | None = None,
     **kwargs,
-) -> Datatree: ...
+) -> DataTree: ...
 
 
 @overload
@@ -714,7 +714,7 @@ def sample(
     progress_rate: int = 100,
     zarr_store: _ZarrStoreType | None = None,
     **kwargs,
-) -> Datatree | _BackgroundSampler:
+) -> DataTree | _BackgroundSampler:
     """Sample the posterior distribution for a compiled model.
 
     Parameters
@@ -808,7 +808,7 @@ def sample(
 
     Returns
     -------
-    trace : Datatree
+    trace : DataTree
         A `DataTree` following the InferenceData schema that contains the samples.
     """
 
