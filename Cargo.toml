@@ -41,8 +41,11 @@ pyo3-object_store = "0.9.0"
 zarrs = { version = "0.23.2", features = ["async"] }
 zarrs_object_store = "0.6.0"
 tokio = { version = "1.47.1", features = ["rt", "rt-multi-thread"] }
-pyo3-arrow = "0.16.0"
-arrow = { version = "57.0.0", features = ["json"] }
+pyo3-arrow = "0.17.0"
+arrow = { version = "58.0.0", features = ["json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+pythonize = "0.28.0"
 
 [dependencies.pyo3]
 version = "0.28.0"
