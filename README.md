@@ -95,7 +95,7 @@ compiled_model = nutpie.compile_pymc_model(pymc_model)
 trace_pymc = nutpie.sample(compiled_model)
 ```
 
-`trace_pymc` now contains an ArviZ `InferenceData` object, including sampling
+`trace_pymc` now contains a `DataTree` object, including sampling
 statistics and the posterior of the variables defined above.
 
 We can also control the sampler in a non-blocking way:
@@ -111,7 +111,7 @@ sampler.resume()
 # Wait for the sampler to finish (up to timeout seconds)
 sampler.wait(timeout=0.1)
 # Note that not passing any timeout to `wait` will
-# wait until the sampler finishes, then return the InferenceData object:
+# wait until the sampler finishes, then return the DataTree object:
 idata = sampler.wait()
 
 # or we can also abort the sampler (and return the incomplete trace)
