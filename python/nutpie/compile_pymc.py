@@ -352,7 +352,6 @@ def _prepare_dims_and_coords(model, shape_info, unconstrained_info):
         if vals is None:
             vals = pd.RangeIndex(int(model.dim_lengths[name].eval()))
         idx = pd.Index(vals)
-        # Convert string indexes to plain lists so the Rust layer can handle them
         if idx.dtype == "object" or idx.dtype == "string":
             coords[name] = idx.tolist()
         else:
@@ -361,19 +360,7 @@ def _prepare_dims_and_coords(model, shape_info, unconstrained_info):
     if "unconstrained_parameter" in coords:
         raise ValueError("Model contains invalid name 'unconstrained_parameter'.")
 
-    # Build unconstrained_parameter coordinate from the unconstrained
-    # variable names/shapes (the full draw vector), which may differ from
-    # shape_info since shape_info excludes transformed variables from the trace.
-    unconstrained_names, unconstrained_shapes = unconstrained_info
-    names = []
-    for base, shape in zip(unconstrained_names, unconstrained_shapes):
-        for idx in itertools.product(*[range(length) for length in shape]):
-            if len(idx) == 0:
-                names.append(base)
-            else:
-                names.append(f"{base}_{'.'.join(str(i) for i in idx)}")
-    coords["unconstrained_parameter"] = names
-
+    unconstrained_names, unconstrained_shapes = unconstrained_info names = [] for base, shape in zip(unconstrained_names, unconstrained_shapes): for idx in itertools.product(*[range(length) for length in shape]): if len(idx) == 0: names.append(base) else: names.append(f"{base}_{'.'.join(str(i) for i in idx)}") coords["unconstrained_parameter"] = names
     dims = model.named_vars_to_dims
     return dims, coords
 
