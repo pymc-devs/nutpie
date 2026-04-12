@@ -3,12 +3,16 @@ import warnings
 from dataclasses import dataclass
 from typing import Any, Literal, Optional, cast, get_args, overload
 
+import xarray as xr
 import arviz
 import numpy as np
 import pandas as pd
 import pyarrow
 
 from nutpie import _lib  # type: ignore
+
+
+
 
 
 @dataclass(frozen=True)
@@ -98,10 +102,12 @@ def _arrow_to_arviz(draw_batches, stat_batches, skip_vars=None, **kwargs):
         )
 
     return arviz.from_dict(
-        data_posterior,
-        sample_stats=stats_posterior,
-        warmup_posterior=data_tune,
-        warmup_sample_stats=stats_tune,
+        {
+            "posterior": data_posterior,
+            "sample_stats": stats_posterior,
+            "warmup_posterior": data_tune,
+            "warmup_sample_stats" :stats_tune,
+        },
         dims=dims,
         **kwargs,
     )
@@ -537,7 +543,6 @@ class _BackgroundSampler:
         else:
             if results.is_zarr():
                 import obstore
-                import xarray as xr
                 from zarr.storage import ObjectStore
 
                 assert self._zarr_store is not None
@@ -643,7 +648,7 @@ def sample(
     progress_style: str | None = None,
     progress_rate: int = 100,
     zarr_store: _ZarrStoreType | None = None,
-) -> arviz.InferenceData: ...
+) -> xr.DataTree: ...
 
 
 @overload
@@ -667,7 +672,7 @@ def sample(
     progress_rate: int = 100,
     zarr_store: _ZarrStoreType | None = None,
     **kwargs,
-) -> arviz.InferenceData: ...
+) -> xr.DataTree: ...
 
 
 @overload
@@ -714,7 +719,7 @@ def sample(
     progress_rate: int = 100,
     zarr_store: _ZarrStoreType | None = None,
     **kwargs,
-) -> arviz.InferenceData | _BackgroundSampler:
+) -> xr.DataTree | _BackgroundSampler:
     """Sample the posterior distribution for a compiled model.
 
     Parameters
@@ -833,8 +838,8 @@ def sample(
 
     Returns
     -------
-    trace : arviz.InferenceData
-        An ArviZ ``InferenceData`` object that contains the samples.
+    trace : xr.DataTree:
+        An Xarray ``DataTree`` object that contains the samples.
     """
 
     # Backward-compatible deprecated keyword arguments.
