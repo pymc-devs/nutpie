@@ -273,6 +273,7 @@ def _compile_pymc_model_numba(
         expand_fn_pt,
         initial_point_fn,
         shape_info,
+        unconstrained_info,
     ) = _make_functions(
         model,
         mode="NUMBA",
@@ -326,7 +327,7 @@ def _compile_pymc_model_numba(
 
         expand_numba = numba.cfunc(c_sig_expand, **kwargs)(expand_numba_raw)
 
-    dims, coords = _prepare_dims_and_coords(model, shape_info)
+    dims, coords = _prepare_dims_and_coords(model, shape_info, unconstrained_info)
 
     return CompiledPyMCModel(
         _n_dim=n_dim,
@@ -345,26 +346,33 @@ def _compile_pymc_model_numba(
     )
 
 
-def _prepare_dims_and_coords(model, shape_info):
+def _prepare_dims_and_coords(model, shape_info, unconstrained_info):
     coords = {}
     for name, vals in model.coords.items():
         if vals is None:
             vals = pd.RangeIndex(int(model.dim_lengths[name].eval()))
-        coords[name] = pd.Index(vals)
+        idx = pd.Index(vals)
+        # Convert string indexes to plain lists so the Rust layer can handle them
+        if idx.dtype == "object" or idx.dtype == "string":
+            coords[name] = idx.tolist()
+        else:
+            coords[name] = idx
 
     if "unconstrained_parameter" in coords:
         raise ValueError("Model contains invalid name 'unconstrained_parameter'.")
 
+    # Build unconstrained_parameter coordinate from the unconstrained
+    # variable names/shapes (the full draw vector), which may differ from
+    # shape_info since shape_info excludes transformed variables from the trace.
+    unconstrained_names, unconstrained_shapes = unconstrained_info
     names = []
-    for base, _, shape in zip(*shape_info):
-        if base not in [var.name for var in model.value_vars]:
-            continue
+    for base, shape in zip(unconstrained_names, unconstrained_shapes):
         for idx in itertools.product(*[range(length) for length in shape]):
             if len(idx) == 0:
                 names.append(base)
             else:
                 names.append(f"{base}_{'.'.join(str(i) for i in idx)}")
-    coords["unconstrained_parameter"] = pd.Index(names)
+    coords["unconstrained_parameter"] = names
 
     dims = model.named_vars_to_dims
     return dims, coords
@@ -399,6 +407,7 @@ def _compile_pymc_model_jax(
         expand_fn_pt,
         initial_point_fn,
         shape_info,
+        unconstrained_info,
     ) = _make_functions(
         model,
         mode="JAX",
@@ -464,7 +473,7 @@ def _compile_pymc_model_jax(
 
         return expand
 
-    dims, coords = _prepare_dims_and_coords(model, shape_info)
+    dims, coords = _prepare_dims_and_coords(model, shape_info, unconstrained_info)
 
     return from_pyfunc(
         ndim=n_dim,
@@ -641,6 +650,7 @@ def _make_functions(
     Callable,
     Callable,
     tuple[list[str], list[slice], list[tuple[int, ...]]],
+    tuple[list[str], list[tuple[int, ...]]],
 ]:
     """
     Compile functions required by nuts-rs from a given PyMC model.
@@ -747,7 +757,7 @@ def _make_functions(
     if use_split:
         variables = pt.split(joined, splits, len(splits))
     else:
-        variables = [joined[slice_val] for slice_val in zip(joined_slices)]
+        variables = [joined[slice_val] for slice_val in joined_slices]
 
     replacements = {
         model.rvs_to_values[var]: value.reshape(shape).astype(var.dtype)
@@ -767,6 +777,13 @@ def _make_functions(
         with model:
             logp_fn_pt = compile_pymc((joined,), (logp,), mode=mode)
 
+    # Identify which joined variables have a transform applied
+    transformed_value_names = set()
+    for var in model.free_RVs:
+        value_var = model.rvs_to_values[var]
+        if model.rvs_to_transforms.get(var) is not None:
+            transformed_value_names.add(value_var.name)
+
     # Make function that computes remaining variables for the trace
     remaining_rvs = [
         var for var in model.unobserved_value_vars if var.name not in joined_names
@@ -776,27 +793,39 @@ def _make_functions(
         names = set(var_names)
         remaining_rvs = [var for var in remaining_rvs if var.name in names]
 
-    all_names = joined_names + remaining_rvs
+    # Build trace variables: untransformed free variables + remaining variables
+    # Exclude transformed value variables (e.g. sigma_log__) since users want
+    # the original-scale versions (e.g. sigma) which are in remaining_rvs.
+    all_names = []
+    all_slices = []
+    all_shapes = []
+    count_expanded = 0
 
-    all_names = joined_names.copy()
-    all_slices = joined_slices.copy()
-    all_shapes = joined_shapes.copy()
+    untransformed_free = []
+    for var_expr, name, shape in zip(variables, joined_names, joined_shapes):
+        if name not in transformed_value_names:
+            length = prod(shape)
+            all_names.append(name)
+            all_shapes.append(shape)
+            all_slices.append(slice(count_expanded, count_expanded + length))
+            count_expanded += length
+            untransformed_free.append(var_expr)
 
     for var in remaining_rvs:
         all_names.append(var.name)
         shape = cast(tuple[int, ...], shapes[var.name])
         all_shapes.append(shape)
         length = prod(shape)
-        all_slices.append(slice(count, count + length))
-        count += length
+        all_slices.append(slice(count_expanded, count_expanded + length))
+        count_expanded += length
 
-    num_expanded = count
+    num_expanded = count_expanded
 
     if join_expanded:
         allvars = [
             pt.concatenate(
                 [
-                    joined,
+                    *[v.ravel() for v in untransformed_free],
                     *[
                         pt.as_tensor(var, allow_xtensor_conversion=True).ravel()
                         for var in remaining_rvs
@@ -805,7 +834,7 @@ def _make_functions(
             )
         ]
     else:
-        allvars = [*variables, *remaining_rvs]
+        allvars = [*untransformed_free, *remaining_rvs]
     with model:
         expand_fn_pt = compile_pymc(
             (joined,),
@@ -821,6 +850,7 @@ def _make_functions(
         expand_fn_pt,
         initial_point_fn,
         (all_names, all_slices, all_shapes),
+        (joined_names, joined_shapes),
     )
 
 
