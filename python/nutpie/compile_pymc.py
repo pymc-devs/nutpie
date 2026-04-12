@@ -360,7 +360,16 @@ def _prepare_dims_and_coords(model, shape_info, unconstrained_info):
     if "unconstrained_parameter" in coords:
         raise ValueError("Model contains invalid name 'unconstrained_parameter'.")
 
-    unconstrained_names, unconstrained_shapes = unconstrained_info names = [] for base, shape in zip(unconstrained_names, unconstrained_shapes): for idx in itertools.product(*[range(length) for length in shape]): if len(idx) == 0: names.append(base) else: names.append(f"{base}_{'.'.join(str(i) for i in idx)}") coords["unconstrained_parameter"] = names
+    unconstrained_names, unconstrained_shapes = unconstrained_info
+    names = []
+    for base, shape in zip(unconstrained_names, unconstrained_shapes):
+        for idx in itertools.product(*[range(length) for length in shape]):
+            if len(idx) == 0:
+                names.append(base)
+            else:
+                names.append(f"{base}_{'.'.join(str(i) for i in idx)}")
+    coords["unconstrained_parameter"] = names
+
     dims = model.named_vars_to_dims
     return dims, coords
 
@@ -780,9 +789,6 @@ def _make_functions(
         names = set(var_names)
         remaining_rvs = [var for var in remaining_rvs if var.name in names]
 
-    # Build trace variables: untransformed free variables + remaining variables
-    # Exclude transformed value variables (e.g. sigma_log__) since users want
-    # the original-scale versions (e.g. sigma) which are in remaining_rvs.
     all_names = []
     all_slices = []
     all_shapes = []
