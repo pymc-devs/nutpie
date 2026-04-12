@@ -773,7 +773,6 @@ def _make_functions(
         with model:
             logp_fn_pt = compile_pymc((joined,), (logp,), mode=mode)
 
-    # Identify which joined variables have a transform applied
     transformed_value_names = set()
     for var in model.free_RVs:
         value_var = model.rvs_to_values[var]
