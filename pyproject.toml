@@ -19,6 +19,8 @@ dependencies = [
   "pyarrow >= 12.0.0",
   "arro3-core >= 0.6.0",
   "pandas >= 2.0",
+  "pytensor @ git+https://github.com/pymc-devs/pytensor.git@v3",
+  "pymc @ git+https://github.com/pymc-devs/pymc.git@v6",
   "xarray >= 2025.01.2",
   "arviz >= 1.0.0,<2.0",
   "obstore >= 0.8.0",
