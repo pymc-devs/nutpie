@@ -553,8 +553,7 @@ class _BackgroundSampler:
                 store = cls(*args, **kwargs)
 
                 obj_store = ObjectStore(store, read_only=True)
-                ds = xr.open_datatree(obj_store, engine="zarr", consolidated=False)
-                return arviz.from_datatree(ds)
+                return xr.open_datatree(obj_store, engine="zarr", consolidated=False)
 
             elif results.is_arrow():
                 skip_vars = []
