@@ -34,14 +34,12 @@ Repository = "https://github.com/pymc-devs/nutpie"
 
 [project.optional-dependencies]
 stan = ["bridgestan >= 2.7.0", "stanio >= 0.5.1"]
-pymc = ["pymc >= 5.20.1", "numba >= 0.60.0"]
-pymc-jax = ["pymc >= 5.20.1", "jax >= 0.4.27"]
+pymc = ["numba >= 0.60.0"]
+pymc-jax = ["jax >= 0.4.27"]
 nnflow = ["flowjax >= 17.1.0", "equinox >= 0.11.12"]
 dev = [
   "bridgestan >= 2.7.0",
   "stanio >= 0.5.1",
-  "pytensor @ git+https://github.com/pymc-devs/pytensor.git@v3",
-  "pymc @ git+https://github.com/pymc-devs/pymc.git@v6",
   "numba >= 0.60.0",
   "jax >= 0.4.27",
   "flowjax >= 17.0.2",
@@ -52,7 +50,6 @@ dev = [
 all = [
   "bridgestan >= 2.7.0",
   "stanio >= 0.5.1",
-  "pymc >= 5.20.1",
   "numba >= 0.60.0",
   "jax >= 0.4.27",
   "flowjax >= 17.1.0",
