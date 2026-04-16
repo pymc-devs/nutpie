@@ -20,7 +20,7 @@ dependencies = [
   "arro3-core >= 0.6.0",
   "pandas >= 2.0",
   "xarray >= 2025.01.2",
-  "arviz >= 0.20.0,<1.0",
+  "arviz >= 1.0.0,<2.0",
   "obstore >= 0.8.0",
   "zarr >= 3.1.0",
 ]
