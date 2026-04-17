@@ -12,9 +12,6 @@ import pyarrow
 from nutpie import _lib  # type: ignore
 
 
-
-
-
 @dataclass(frozen=True)
 class CompiledModel:
     dims: Optional[dict[str, tuple[str, ...]]]
@@ -106,7 +103,7 @@ def _arrow_to_arviz(draw_batches, stat_batches, skip_vars=None, **kwargs):
             "posterior": data_posterior,
             "sample_stats": stats_posterior,
             "warmup_posterior": data_tune,
-            "warmup_sample_stats" :stats_tune,
+            "warmup_sample_stats": stats_tune,
         },
         dims=dims,
         **kwargs,
