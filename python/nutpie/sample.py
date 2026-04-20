@@ -804,6 +804,8 @@ def sample(
 
         - ``"nuts"`` (default): No-U-Turn Sampler.
         - ``"mclmc"``: Microcanonical Langevin Monte Carlo.
+          mclmc is **experimental** and might change or disapear
+          in a future release. It might also eat your homework.
 
     adaptation: str, default="diag"
         The mass matrix adaptation strategy to use. One of:
