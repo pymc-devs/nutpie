@@ -69,8 +69,8 @@ ban-relative-imports = "all"
 known-first-party = ["nutpie"]
 
 [tool.pyright]
-venvPath = ".pixi/envs/"
-venv = "default"
+venvPath = "."
+venv = ".venv"
 
 [tool.maturin]
 module-name = "nutpie._lib"
