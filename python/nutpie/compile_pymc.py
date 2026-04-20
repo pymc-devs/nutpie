@@ -138,6 +138,13 @@ class CompiledPyMCModel(CompiledModel):
                 raise ValueError(
                     f"Shared variable {name} must have rank {old_val.ndim}"
                 )
+            if old_val.shape != new_val.shape:
+                raise ValueError(
+                    f"Shared variable '{name}' has shape {old_val.shape}, "
+                    f"but the new value has shape {new_val.shape}. "
+                    f"Changing the shape of shared data requires recompiling "
+                    f"the model with compile_pymc_model()."
+                )
             shared_data[name] = new_val
         user_data = update_user_data(user_data, shared_data)
 
@@ -522,7 +529,7 @@ def compile_pymc_model(
     freeze_model : bool | None
         Freeze all dimensions and shared variables to treat them as compile time
         constants.
-
+        
     Returns
     -------
     compiled_model : CompiledPyMCModel
