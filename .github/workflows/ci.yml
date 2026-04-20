@@ -245,6 +245,37 @@ jobs:
             uv pip install 'nutpie[all]' --find-links dist --force-reinstall
             pytest -m flow --arraydiff
           fi
+  docs:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+      - name: Install Quarto
+        uses: quarto-dev/quarto-actions/setup@v2
+      - name: Build and install nutpie
+        run: |
+          python3 -m venv .venv
+          source .venv/bin/activate
+          uv pip install maturin
+          maturin build --release --out dist
+      - name: Install doc dependencies
+        run: |
+          source .venv/bin/activate
+          uv pip install "nutpie[docs]"
+      - name: Render docs
+        env:
+          TBB_CXX_TYPE: clang
+        run: |
+          source .venv/bin/activate
+          cd docs
+          quarto render
+
   sdist:
     runs-on: ubuntu-latest
     steps:
@@ -264,7 +295,7 @@ jobs:
     name: Release
     runs-on: ubuntu-latest
     if: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
-    needs: [linux, windows, macos, sdist]
+    needs: [linux, windows, macos, sdist, docs]
     environment:
       name: pypi
     permissions:

@@ -56,6 +56,19 @@ all = [
   "flowjax >= 17.1.0",
   "equinox >= 0.11.12",
 ]
+docs = [
+  "bridgestan >= 2.7.0",
+  "stanio >= 0.5.1",
+  "pymc >= 5.20.1",
+  "numba >= 0.60.0",
+  "jax >= 0.4.27",
+  "flowjax >= 17.1.0",
+  "equinox >= 0.11.12",
+  "cmdstanpy >= 1.2.0",
+  "matplotlib >= 3.8.0",
+  "seaborn >= 0.13.0",
+  "jupyter",
+]
 
 [tool.ruff]
 line-length = 88
