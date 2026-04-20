@@ -773,11 +773,11 @@ def _make_functions(
         with model:
             logp_fn_pt = compile_pymc((joined,), (logp,), mode=mode)
 
-    transformed_value_names = set()
+    reparameterized_names = set()
     for var in model.free_RVs:
         value_var = model.rvs_to_values[var]
         if model.rvs_to_transforms.get(var) is not None:
-            transformed_value_names.add(value_var.name)
+            reparameterized_names.add(value_var.name)
 
     # Make function that computes remaining variables for the trace
     remaining_rvs = [
@@ -793,15 +793,15 @@ def _make_functions(
     all_shapes = []
     count_expanded = 0
 
-    untransformed_free = []
+    identity_free = []
     for var_expr, name, shape in zip(variables, joined_names, joined_shapes):
-        if name not in transformed_value_names:
+        if name not in reparameterized_names:
             length = prod(shape)
             all_names.append(name)
             all_shapes.append(shape)
             all_slices.append(slice(count_expanded, count_expanded + length))
             count_expanded += length
-            untransformed_free.append(var_expr)
+            identity_free.append(var_expr)
 
     for var in remaining_rvs:
         all_names.append(var.name)
@@ -817,7 +817,7 @@ def _make_functions(
         allvars = [
             pt.concatenate(
                 [
-                    *[v.ravel() for v in untransformed_free],
+                    *[v.ravel() for v in identity_free],
                     *[
                         pt.as_tensor(var, allow_xtensor_conversion=True).ravel()
                         for var in remaining_rvs
@@ -826,7 +826,7 @@ def _make_functions(
             )
         ]
     else:
-        allvars = [*untransformed_free, *remaining_rvs]
+        allvars = [*identity_free, *remaining_rvs]
     with model:
         expand_fn_pt = compile_pymc(
             (joined,),
