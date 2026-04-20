@@ -10,6 +10,8 @@ import pyarrow
 
 from nutpie import _lib  # type: ignore
 
+ReparameterizedInfo = list[tuple[str, tuple[int, ...], slice, tuple[str, ...]]]
+
 
 @dataclass(frozen=True)
 class CompiledModel:
@@ -55,7 +57,9 @@ class CompiledModel:
         return pd.concat(times)
 
 
-def _arrow_to_arviz(draw_batches, stat_batches, skip_vars=None, **kwargs):
+def _arrow_to_arviz(
+    draw_batches, stat_batches, skip_vars=None, reparameterized_info=None, **kwargs
+):
     if skip_vars is None:
         skip_vars = []
 
@@ -97,7 +101,11 @@ def _arrow_to_arviz(draw_batches, stat_batches, skip_vars=None, **kwargs):
             stats_posterior, max_posterior, stat_posterior, i, n_chains, dims, skip_vars
         )
 
-    return arviz.from_dict(
+    uc_flat_posterior = stats_posterior.pop("unconstrained_draw", None)
+    uc_flat_tune = stats_tune.pop("unconstrained_draw", None)
+    dims.pop("unconstrained_draw", None)
+
+    idata = arviz.from_dict(
         data_posterior,
         sample_stats=stats_posterior,
         warmup_posterior=data_tune,
@@ -105,6 +113,35 @@ def _arrow_to_arviz(draw_batches, stat_batches, skip_vars=None, **kwargs):
         dims=dims,
         **kwargs,
     )
+
+    if reparameterized_info and uc_flat_posterior is not None:
+        coords = kwargs.get("coords")
+        uc_dims = {
+            name: list(var_dims) for name, _, _, var_dims in reparameterized_info
+        }
+
+        def _reshape(flat, n_draws):
+            return {
+                name: flat[..., slc].reshape(n_chains, n_draws, *shape)
+                for name, shape, slc, _ in reparameterized_info
+            }
+
+        groups = {
+            "unconstrained_posterior": arviz.dict_to_dataset(
+                _reshape(uc_flat_posterior, max_posterior),
+                coords=coords,
+                dims=uc_dims,
+            )
+        }
+        if uc_flat_tune is not None:
+            groups["warmup_unconstrained_posterior"] = arviz.dict_to_dataset(
+                _reshape(uc_flat_tune, max_tuning),
+                coords=coords,
+                dims=uc_dims,
+            )
+        idata.add_groups(groups)
+
+    return idata
 
 
 def _add_arrow_data(data_dict, max_length, batch, chain, n_chains, dims, skip_vars):
@@ -578,6 +615,9 @@ class _BackgroundSampler:
                     draw_batches,
                     stat_batches,
                     skip_vars=skip_vars,
+                    reparameterized_info=getattr(
+                        self._compiled_model, "reparameterized_info", None
+                    ),
                     coords={
                         name: pd.Index(vals)
                         for name, vals in self._compiled_model.coords.items()

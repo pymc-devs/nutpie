@@ -1,5 +1,4 @@
 import dataclasses
-import itertools
 import threading
 import warnings
 from collections.abc import Iterable
@@ -15,7 +14,7 @@ from numpy.typing import NDArray
 
 from nutpie import _lib
 from nutpie.compiled_pyfunc import SeedType, from_pyfunc
-from nutpie.sample import CompiledModel
+from nutpie.sample import CompiledModel, ReparameterizedInfo
 
 try:
     from numba.extending import intrinsic
@@ -112,6 +111,7 @@ class CompiledPyMCModel(CompiledModel):
     _shapes: dict[str, tuple[int, ...]]
     _coords: Optional[dict[str, Any]]
     _transform_adapt_args: dict | None = None
+    reparameterized_info: ReparameterizedInfo | None = None
 
     @property
     def n_dim(self):
@@ -273,7 +273,7 @@ def _compile_pymc_model_numba(
         expand_fn_pt,
         initial_point_fn,
         shape_info,
-        unconstrained_info,
+        reparameterized_info,
     ) = _make_functions(
         model,
         mode="NUMBA",
@@ -327,7 +327,7 @@ def _compile_pymc_model_numba(
 
         expand_numba = numba.cfunc(c_sig_expand, **kwargs)(expand_numba_raw)
 
-    dims, coords = _prepare_dims_and_coords(model, shape_info, unconstrained_info)
+    dims, coords = _prepare_dims_and_coords(model, shape_info)
 
     return CompiledPyMCModel(
         _n_dim=n_dim,
@@ -343,10 +343,11 @@ def _compile_pymc_model_numba(
         shape_info=shape_info,
         logp_func=logp_fn_pt,
         expand_func=expand_fn_pt,
+        reparameterized_info=reparameterized_info,
     )
 
 
-def _prepare_dims_and_coords(model, shape_info, unconstrained_info):
+def _prepare_dims_and_coords(model, shape_info):
     coords = {}
     for name, vals in model.coords.items():
         if vals is None:
@@ -356,19 +357,6 @@ def _prepare_dims_and_coords(model, shape_info, unconstrained_info):
             coords[name] = idx.tolist()
         else:
             coords[name] = idx
-
-    if "unconstrained_parameter" in coords:
-        raise ValueError("Model contains invalid name 'unconstrained_parameter'.")
-
-    unconstrained_names, unconstrained_shapes = unconstrained_info
-    names = []
-    for base, shape in zip(unconstrained_names, unconstrained_shapes):
-        for idx in itertools.product(*[range(length) for length in shape]):
-            if len(idx) == 0:
-                names.append(base)
-            else:
-                names.append(f"{base}_{'.'.join(str(i) for i in idx)}")
-    coords["unconstrained_parameter"] = names
 
     dims = model.named_vars_to_dims
     return dims, coords
@@ -403,7 +391,7 @@ def _compile_pymc_model_jax(
         expand_fn_pt,
         initial_point_fn,
         shape_info,
-        unconstrained_info,
+        reparameterized_info,
     ) = _make_functions(
         model,
         mode="JAX",
@@ -469,7 +457,7 @@ def _compile_pymc_model_jax(
 
         return expand
 
-    dims, coords = _prepare_dims_and_coords(model, shape_info, unconstrained_info)
+    dims, coords = _prepare_dims_and_coords(model, shape_info)
 
     return from_pyfunc(
         ndim=n_dim,
@@ -483,6 +471,7 @@ def _compile_pymc_model_jax(
         dims=dims,
         coords=coords,
         raw_logp_fn=orig_logp_fn,
+        reparameterized_info=reparameterized_info,
     )
 
 
@@ -646,7 +635,7 @@ def _make_functions(
     Callable,
     Callable,
     tuple[list[str], list[slice], list[tuple[int, ...]]],
-    tuple[list[str], list[tuple[int, ...]]],
+    ReparameterizedInfo,
 ]:
     """
     Compile functions required by nuts-rs from a given PyMC model.
@@ -773,11 +762,16 @@ def _make_functions(
         with model:
             logp_fn_pt = compile_pymc((joined,), (logp,), mode=mode)
 
-    reparameterized_names = set()
-    for var in model.free_RVs:
-        value_var = model.rvs_to_values[var]
+    reparameterized_info = []
+    for var, joined_name, joined_shape, joined_slice in zip(
+        model.free_RVs, joined_names, joined_shapes, joined_slices
+    ):
         if model.rvs_to_transforms.get(var) is not None:
-            reparameterized_names.add(value_var.name)
+            var_dims = tuple(model.named_vars_to_dims.get(var.name, ()) or ())
+            reparameterized_info.append(
+                (joined_name, joined_shape, joined_slice, var_dims)
+            )
+    reparameterized_names = {info[0] for info in reparameterized_info}
 
     # Make function that computes remaining variables for the trace
     remaining_rvs = [
@@ -842,7 +836,7 @@ def _make_functions(
         expand_fn_pt,
         initial_point_fn,
         (all_names, all_slices, all_shapes),
-        (joined_names, joined_shapes),
+        reparameterized_info,
     )
 
 
