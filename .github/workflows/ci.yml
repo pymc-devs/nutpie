@@ -12,6 +12,8 @@ on:
 
 permissions:
   contents: read
+  pages: write
+  id-token: write
 
 jobs:
   linux:
@@ -275,6 +277,27 @@ jobs:
           source .venv/bin/activate
           cd docs
           quarto render
+      - name: Upload docs artifact
+        if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/_site
+
+  deploy-docs:
+    name: Deploy Docs
+    runs-on: ubuntu-latest
+    if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') }}
+    needs: [docs]
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
 
   sdist:
     runs-on: ubuntu-latest
