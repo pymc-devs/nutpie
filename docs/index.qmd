@@ -14,6 +14,11 @@ likelihoods with gradient are coming soon).
 - *Experimental* normalizing flow adaptation for more efficient sampling of
   difficult posteriors.
 
+For more details on the algorithms used in nutpie, see the paper
+[Preconditioning Hamiltonian Monte Carlo by minimizing Fisher
+Divergence](https://arxiv.org/abs/2603.18845). If you use nutpie in your
+research, please see the [citation instructions](about.qmd#citation).
+
 ## Quickstart: PyMC
 
 Install `nutpie` with pip, uv, pixi, or conda:

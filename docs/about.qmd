@@ -15,3 +15,30 @@ For more information about the PyMC organization, visit the following links:
 
 - [PyMC Website](https://www.pymc.io)
 - [PyMC GitHub Organization](https://github.com/pymc-devs)
+
+## Paper
+
+The algorithms behind nutpie's mass matrix adaptation are described in the
+following paper:
+
+> Adrian Seyboldt, Eliot L. Carlson, Bob Carpenter (2026).
+> **Preconditioning Hamiltonian Monte Carlo by minimizing Fisher Divergence.**
+> arXiv:2603.18845 [stat.CO].
+> [https://arxiv.org/abs/2603.18845](https://arxiv.org/abs/2603.18845)
+
+## Citation
+
+If you use nutpie in your research, please cite the following paper:
+
+```bibtex
+@article{seyboldt2026preconditioning,
+  title   = {Preconditioning {Hamiltonian Monte Carlo} by minimizing
+             {Fisher} Divergence},
+  author  = {Adrian Seyboldt and Eliot L. Carlson and Bob Carpenter},
+  year    = {2026},
+  eprint  = {2603.18845},
+  archivePrefix = {arXiv},
+  primaryClass  = {stat.CO},
+  url     = {https://arxiv.org/abs/2603.18845}
+}
+```

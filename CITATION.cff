@@ -22,3 +22,21 @@ keywords:
   - Bayesian inference
   - MCMC
 license: MIT
+preferred-citation:
+  type: article
+  title: >-
+    Preconditioning Hamiltonian Monte Carlo by minimizing Fisher Divergence
+  authors:
+    - given-names: Adrian
+      family-names: Seyboldt
+    - given-names: Eliot L.
+      family-names: Carlson
+    - given-names: Bob
+      family-names: Carpenter
+  year: 2026
+  identifiers:
+    - type: other
+      value: 'arXiv:2603.18845'
+      description: arXiv preprint
+  url: 'https://arxiv.org/abs/2603.18845'
+  doi: '10.48550/arXiv.2603.18845'
