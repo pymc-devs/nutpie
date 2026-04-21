@@ -321,7 +321,7 @@ def test_pymc_model_store_extra(backend, gradient_backend):
     trace.posterior.a  # noqa: B018
     trace.posterior.b  # noqa: B018
     assert trace.unconstrained_posterior.b_log__.dims == ("chain", "draw", "foo")
-    assert "unconstrained_draw" not in trace.sample_stats
+    _ = trace.sample_stats.unconstrained_draw
     _ = trace.sample_stats.gradient
     _ = trace.sample_stats.divergence_start
     _ = trace.sample_stats.mass_matrix_inv

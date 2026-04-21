@@ -58,7 +58,12 @@ class CompiledModel:
 
 
 def _arrow_to_arviz(
-    draw_batches, stat_batches, skip_vars=None, reparameterized_info=None, **kwargs
+    draw_batches,
+    stat_batches,
+    skip_vars=None,
+    reparameterized_info=None,
+    keep_unconstrained_draw=False,
+    **kwargs,
 ):
     if skip_vars is None:
         skip_vars = []
@@ -101,9 +106,13 @@ def _arrow_to_arviz(
             stats_posterior, max_posterior, stat_posterior, i, n_chains, dims, skip_vars
         )
 
-    uc_flat_posterior = stats_posterior.pop("unconstrained_draw", None)
-    uc_flat_tune = stats_tune.pop("unconstrained_draw", None)
-    dims.pop("unconstrained_draw", None)
+    if keep_unconstrained_draw:
+        uc_flat_posterior = stats_posterior.get("unconstrained_draw")
+        uc_flat_tune = stats_tune.get("unconstrained_draw")
+    else:
+        uc_flat_posterior = stats_posterior.pop("unconstrained_draw", None)
+        uc_flat_tune = stats_tune.pop("unconstrained_draw", None)
+        dims.pop("unconstrained_draw", None)
 
     idata = arviz.from_dict(
         data_posterior,
@@ -468,11 +477,13 @@ class _BackgroundSampler:
         progress_style=None,
         progress_rate=100,
         store=None,
+        store_unconstrained=False,
     ):
         self._settings = settings
         self._compiled_model = compiled_model
         self._save_warmup = save_warmup
         self._return_raw_trace = return_raw_trace
+        self._store_unconstrained = store_unconstrained
 
         self._html = None
 
@@ -615,9 +626,12 @@ class _BackgroundSampler:
                     draw_batches,
                     stat_batches,
                     skip_vars=skip_vars,
-                    reparameterized_info=getattr(
-                        self._compiled_model, "reparameterized_info", None
+                    reparameterized_info=(
+                        getattr(self._compiled_model, "reparameterized_info", None)
+                        if self._store_unconstrained
+                        else None
                     ),
+                    keep_unconstrained_draw=self._store_unconstrained,
                     coords={
                         name: pd.Index(vals)
                         for name, vals in self._compiled_model.coords.items()
@@ -683,6 +697,7 @@ def sample(
     progress_style: str | None = None,
     progress_rate: int = 100,
     zarr_store: _ZarrStoreType | None = None,
+    store_unconstrained: bool = False,
 ) -> arviz.InferenceData: ...
 
 
@@ -706,6 +721,7 @@ def sample(
     progress_style: str | None = None,
     progress_rate: int = 100,
     zarr_store: _ZarrStoreType | None = None,
+    store_unconstrained: bool = False,
     **kwargs,
 ) -> arviz.InferenceData: ...
 
@@ -730,6 +746,7 @@ def sample(
     progress_style: str | None = None,
     progress_rate: int = 100,
     zarr_store: _ZarrStoreType | None = None,
+    store_unconstrained: bool = False,
     **kwargs,
 ) -> _BackgroundSampler: ...
 
@@ -753,6 +770,7 @@ def sample(
     progress_style: str | None = None,
     progress_rate: int = 100,
     zarr_store: _ZarrStoreType | None = None,
+    store_unconstrained: bool = False,
     **kwargs,
 ) -> arviz.InferenceData | _BackgroundSampler:
     """Sample the posterior distribution for a compiled model.
@@ -789,8 +807,11 @@ def sample(
         point on the transformed parameter space. Defaults to
         zeros.
     store_unconstrained: bool
-        If True, store each draw in the unconstrained (transformed)
-        space in the sample stats.
+        If True, store the unconstrained (transformed) draws in two forms:
+        a flat ``unconstrained_draw`` vector in ``sample_stats`` and a
+        per-variable ``unconstrained_posterior`` group (with
+        ``warmup_unconstrained_posterior`` when ``save_warmup=True``) whose
+        dims are copied from the corresponding RV.
     store_gradient: bool
         If True, store the logp gradient of each draw in the unconstrained
         space in the sample stats.
@@ -937,6 +958,9 @@ def sample(
     for name, val in kwargs.items():
         setattr(settings, name, val)
 
+    if store_unconstrained:
+        settings.store_unconstrained = True
+
     if cores is None:
         try:
             # Only available in python>=3.13
@@ -964,6 +988,7 @@ def sample(
         progress_style=progress_style,
         progress_rate=progress_rate,
         store=zarr_store,
+        store_unconstrained=store_unconstrained,
     )
 
     if not blocking:
