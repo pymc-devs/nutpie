@@ -7,9 +7,9 @@ use bridgestan::open_library;
 use itertools::Itertools;
 use nuts_rs::{CpuLogpFunc, CpuMath, HasDims, LogpError, Model, Storable, Value};
 use pyo3::exceptions::PyRuntimeError;
-use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyTuple};
+use pyo3::types::{PyDict, PyNone, PyTuple};
 use pyo3::{exceptions::PyValueError, pyclass, pymethods, PyResult};
+use pyo3::{prelude::*, BoundObject};
 use rand::prelude::Distribution;
 use rand::{rng, Rng};
 use rand_distr::StandardNormal;
@@ -202,7 +202,7 @@ where
 
     let (mut shape, is_complex) = group
         .iter()
-        .map(|&(_, is_complex, ref idx)| (idx, is_complex))
+        .map(|&(_, is_complex, idx)| (idx, is_complex))
         .fold(None, |acc, (elem_index, &elem_is_complex)| {
             let (mut shape, is_complex) = acc.unwrap_or((elem_index.clone(), elem_is_complex));
             assert!(
@@ -630,7 +630,7 @@ impl<'model> CpuLogpFunc for StanDensity<'model> {
         Ok(())
     }
 
-    fn new_transformation<R: rand::Rng + ?Sized>(
+    fn init_transformation<R: rand::Rng + ?Sized>(
         &mut self,
         rng: &mut R,
         untransformed_position: &[f64],
@@ -644,6 +644,18 @@ impl<'model> CpuLogpFunc for StanDensity<'model> {
             .new_transformation(rng, untransformed_position, untransformed_gradient, chain)
             .context("Could not create transformation adapter")?;
         Ok(trafo)
+    }
+
+    fn new_transformation<R: rand::Rng + ?Sized>(
+        &mut self,
+        _rng: &mut R,
+        _dim: usize,
+        _chain: u64,
+    ) -> std::result::Result<Self::FlowParameters, Self::LogpError> {
+        Python::attach(|py| {
+            let params = PyNone::get(py);
+            Ok(params.unbind().into())
+        })
     }
 
     fn transformation_id(&self, params: &Py<PyAny>) -> std::result::Result<i64, Self::LogpError> {
