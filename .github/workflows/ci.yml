@@ -15,6 +15,7 @@ permissions:
 
 jobs:
   linux:
+    name: build linux (${{ matrix.platform.target }})
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       fail-fast: false
@@ -50,20 +51,56 @@ jobs:
         with:
           name: wheels-linux-${{ matrix.platform.target }}
           path: dist
+
+  test_linux:
+    name: test linux (${{ matrix.target }}, ${{ matrix.suite }})
+    runs-on: ${{ matrix.runner }}
+    needs: linux
+    # stan failures block release; pymc/flow are expected red against
+    # released pymc, so allow them to fail without gating.
+    continue-on-error: ${{ matrix.suite != 'stan' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64, aarch64]
+        suite: [stan, pymc, flow]
+        include:
+          - target: x86_64
+            runner: ubuntu-22.04
+          - target: aarch64
+            runner: ubuntu-22.04-arm
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v8
+        with:
+          name: wheels-linux-${{ matrix.target }}
+          path: dist
       - name: pytest
         shell: bash
         run: |
           set -e
           python3 -m venv .venv
           source .venv/bin/activate
-          uv pip install 'nutpie[stan]' --find-links dist --force-reinstall
           uv pip install pytest pytest-timeout pytest-arraydiff
-          pytest -m "stan and not flow" --arraydiff
-          uv pip install 'nutpie[pymc]' --find-links dist --force-reinstall
-          uv pip install jax
-          pytest -m "pymc and not flow" --arraydiff
-          uv pip install 'nutpie[all]' --find-links dist --force-reinstall
-          pytest -m flow --arraydiff
+          case "${{ matrix.suite }}" in
+            stan)
+              uv pip install 'nutpie[stan]' --find-links dist --force-reinstall
+              pytest -m "stan and not flow" --arraydiff
+              ;;
+            pymc)
+              uv pip install 'nutpie[pymc]' jax --find-links dist --force-reinstall
+              pytest -m "pymc and not flow" --arraydiff
+              ;;
+            flow)
+              uv pip install 'nutpie[all]' --find-links dist --force-reinstall
+              pytest -m flow --arraydiff
+              ;;
+          esac
 
   # pyarrow doesn't currently seem to work on musllinux
   #musllinux:
@@ -136,12 +173,8 @@ jobs:
   #          pytest
 
   windows:
-    runs-on: ${{ matrix.platform.runner }}
-    strategy:
-      matrix:
-        platform:
-          - runner: windows-latest
-            target: x64
+    name: build windows
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -152,7 +185,7 @@ jobs:
             3.12
             3.13
             3.14
-          architecture: ${{ matrix.platform.target }}
+          architecture: x64
       - name: Install uv
         uses: astral-sh/setup-uv@v7
       - name: Install LLVM and Clang
@@ -161,7 +194,6 @@ jobs:
           version: "15.0"
           directory: ${{ runner.temp }}/llvm
       - name: Set up TBB
-        if: matrix.os == 'windows-latest'
         run: |
           Add-Content $env:GITHUB_PATH "$(pwd)/stan/lib/stan_math/lib/tbb"
       - name: Build wheels
@@ -169,31 +201,59 @@ jobs:
         env:
           LIBCLANG_PATH: ${{ runner.temp }}/llvm/lib
         with:
-          target: ${{ matrix.platform.target }}
+          target: x64
           args: --release --out dist --find-interpreter
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
       - name: Upload wheels
         uses: actions/upload-artifact@v7
         with:
-          name: wheels-windows-${{ matrix.platform.target }}
+          name: wheels-windows-x64
+          path: dist
+
+  test_windows:
+    name: test windows (${{ matrix.suite }})
+    runs-on: windows-latest
+    needs: windows
+    continue-on-error: ${{ matrix.suite != 'stan' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [stan, pymc, flow]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: wheels-windows-x64
           path: dist
       - name: pytest
-        if: ${{ !startsWith(matrix.platform.target, 'aarch64') }}
         shell: bash
         run: |
           set -e
           python3 -m venv .venv
           source .venv/Scripts/activate
-          uv pip install "nutpie[stan]" --find-links dist --force-reinstall
           uv pip install pytest pytest-timeout pytest-arraydiff
-          pytest -m "stan and not flow" --arraydiff
-          uv pip install "nutpie[pymc]" --find-links dist --force-reinstall
-          uv pip install jax
-          pytest -m "pymc and not flow" --arraydiff
-          uv pip install "nutpie[all]" --find-links dist --force-reinstall
-          pytest -m flow --arraydiff
+          case "${{ matrix.suite }}" in
+            stan)
+              uv pip install "nutpie[stan]" --find-links dist --force-reinstall
+              pytest -m "stan and not flow" --arraydiff
+              ;;
+            pymc)
+              uv pip install "nutpie[pymc]" jax --find-links dist --force-reinstall
+              pytest -m "pymc and not flow" --arraydiff
+              ;;
+            flow)
+              uv pip install "nutpie[all]" --find-links dist --force-reinstall
+              pytest -m flow --arraydiff
+              ;;
+          esac
 
   macos:
+    name: build macos (${{ matrix.platform.target }})
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       fail-fast: false
@@ -229,26 +289,28 @@ jobs:
         with:
           name: wheels-macos-${{ matrix.platform.target }}
           path: dist
-      - name: pytest
-        run: |
-          set -e
-          python3 -m venv .venv
-          source .venv/bin/activate
-          uv pip install 'nutpie[stan]' --find-links dist --force-reinstall
-          uv pip install pytest pytest-timeout pytest-arraydiff
-          pytest -m "stan and not flow" --arraydiff
-          # Skip on x86_64 due to lack of numba support
-          if [ "${{ matrix.platform.target }}" != "x86_64" ]; then
-            uv pip install 'nutpie[pymc]' --find-links dist --force-reinstall
-            uv pip install jax
-            pytest -m "pymc and not flow" --arraydiff
-            uv pip install 'nutpie[all]' --find-links dist --force-reinstall
-            pytest -m flow --arraydiff
-          fi
-  pymc_dev:
-    name: pymc (dev)
-    runs-on: ubuntu-22.04
-    needs: linux
+
+  test_macos:
+    name: test macos (${{ matrix.target }}, ${{ matrix.suite }})
+    runs-on: ${{ matrix.runner }}
+    needs: macos
+    continue-on-error: ${{ matrix.suite != 'stan' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64, aarch64]
+        suite: [stan, pymc, flow]
+        include:
+          - target: x86_64
+            runner: macos-15-intel
+          - target: aarch64
+            runner: macos-14
+        exclude:
+          # numba isn't available on macOS x86_64
+          - target: x86_64
+            suite: pymc
+          - target: x86_64
+            suite: flow
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -256,6 +318,42 @@ jobs:
           python-version: "3.12"
       - name: Install uv
         uses: astral-sh/setup-uv@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: wheels-macos-${{ matrix.target }}
+          path: dist
+      - name: pytest
+        run: |
+          set -e
+          python3 -m venv .venv
+          source .venv/bin/activate
+          uv pip install pytest pytest-timeout pytest-arraydiff
+          case "${{ matrix.suite }}" in
+            stan)
+              uv pip install 'nutpie[stan]' --find-links dist --force-reinstall
+              pytest -m "stan and not flow" --arraydiff
+              ;;
+            pymc)
+              uv pip install 'nutpie[pymc]' jax --find-links dist --force-reinstall
+              pytest -m "pymc and not flow" --arraydiff
+              ;;
+            flow)
+              uv pip install 'nutpie[all]' --find-links dist --force-reinstall
+              pytest -m flow --arraydiff
+              ;;
+          esac
+
+  pymc_dev:
+    name: pymc (dev)
+    runs-on: ubuntu-22.04
+    needs: linux
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
       - uses: actions/download-artifact@v8
         with:
           name: wheels-linux-x86_64
@@ -287,7 +385,8 @@ jobs:
     name: Release
     runs-on: ubuntu-latest
     if: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
-    needs: [linux, windows, macos, sdist]
+    needs:
+      [linux, windows, macos, sdist, test_linux, test_windows, test_macos, pymc_dev]
     environment:
       name: pypi
     permissions:
