@@ -1,4 +1,4 @@
-# Understanding Sampler Statistics in Nutpie
+# Sampler Statistics in Nutpie
 
 This guide explains the various statistics that nutpie collects during sampling. We'll use Neal's funnel distribution as an example, as it's a challenging model that demonstrates many important sampling concepts.
 
@@ -29,6 +29,7 @@ trace = nutpie.sample(
     store_gradient=True,
     store_unconstrained=True,
     store_divergences=True,
+    store_transformed=True,
     seed=42,
 )
 ```
@@ -149,6 +150,7 @@ trace = nutpie.sample(
     tune=1000,
     store_gradient=True,
     store_unconstrained=True,
+    store_transformed=True,
     store_mass_matrix=True,
     seed=42,
 )
@@ -158,12 +160,10 @@ Now we can compute eigenvalues of the covariance matrix of the gradient and
 draws (using the singular value decomposition to avoid quadratic cost):
 
 ```{python}
-def covariance_eigenvalues(x, mass_matrix):
+def covariance_eigenvalues(x):
     assert x.dims == ("chain", "draw", "unconstrained_parameter")
     x = x.stack(sample=["draw", "chain"])
-    x = (x - x.mean("sample")) / np.sqrt(mass_matrix)
     u, s, v = np.linalg.svd(x.T / np.sqrt(x.shape[1]), full_matrices=False)
-    print(u.shape, s.shape, v.shape)
     s = xr.DataArray(
         s,
         dims=["eigenvalue"],
@@ -180,8 +180,8 @@ def covariance_eigenvalues(x, mass_matrix):
     return s ** 2, v
 
 mass_matrix = trace.sample_stats.mass_matrix_inv.isel(draw=-1, chain=0)
-draws_eigs, draws_eigv = covariance_eigenvalues(trace.sample_stats.unconstrained_draw, mass_matrix)
-grads_eigs, grads_eigv = covariance_eigenvalues(trace.sample_stats.gradient, 1 / mass_matrix)
+draws_eigs, draws_eigv = covariance_eigenvalues(trace.sample_stats.transformed_position)
+grads_eigs, grads_eigv = covariance_eigenvalues(trace.sample_stats.transformed_gradient)
 
 draws_eigs.plot.line(x="eigenvalue", yscale="log")
 grads_eigs.plot.line(x="eigenvalue", yscale="log")
@@ -218,4 +218,67 @@ the correlations:
     .tail(10)
     .plot.bar(x="unconstrained_parameter")
 )
+```
+
+# Fisher divergence
+
+We can measure how well the mass matrix adaptation could approximate the posterior
+by checking the fisher divergence between the transformed draws and a standard normal
+distribution. (The transformed position and scores are only saved with `store_transformed=True`).
+
+```{python}
+fisher_divergence_warmup = (
+    trace.warmup_sample_stats.transformed_position
+    + trace.warmup_sample_stats.transformed_gradient
+) ** 2
+
+fisher_divergence = (
+    trace.sample_stats.transformed_position
+    + trace.sample_stats.transformed_gradient
+) ** 2
+
+fisher_divergence_warmup.sum("unconstrained_parameter").plot.line(x="draw")
+plt.ylim(1e-3, None)
+plt.yscale("log");
+```
+
+The relatively large divergence value of more than 1000 tells us that the mass matrix can not adapt well to the posterior.
+
+We can investigate this on a per-variable basis to get a good indication about
+which variables are involved in the problematic region:
+
+```{python}
+fisher_divergence.mean(["draw", "chain"]).to_pandas().sort_values().tail()
+```
+
+Sampling with low rank mass matrix adaptation improves the fit of the mass matrix, and increases sampler efficiency.
+
+```{python}
+compiled = nutpie.compile_pymc_model(model)
+trace = nutpie.sample(
+    compiled,
+    tune=1000,
+    store_gradient=True,
+    store_unconstrained=True,
+    store_transformed=True,
+    store_mass_matrix=True,
+    seed=42,
+    adaptation="low_rank",
+)
+```
+
+```{python}
+fisher_divergence_warmup = (
+    trace.warmup_sample_stats.transformed_position
+    + trace.warmup_sample_stats.transformed_gradient
+) ** 2
+
+fisher_divergence = (
+    trace.sample_stats.transformed_position
+    + trace.sample_stats.transformed_gradient
+) ** 2
+
+fisher_divergence_warmup.sum("unconstrained_parameter").plot.line(x="draw")
+plt.ylim(1e-3, None)
+plt.yscale("log");
 ```
