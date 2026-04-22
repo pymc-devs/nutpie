@@ -7,7 +7,7 @@ name = "nutpie"
 description = "Sample Stan or PyMC models"
 authors = [{ name = "PyMC Developers", email = "pymc.devs@gmail.com" }]
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 license = { text = "MIT" }
 classifiers = [
   "Programming Language :: Rust",
@@ -72,7 +72,7 @@ docs = [
 
 [tool.ruff]
 line-length = 88
-target-version = "py310"
+target-version = "py312"
 show-fixes = true
 output-format = "full"
 
