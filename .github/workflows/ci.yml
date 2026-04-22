@@ -90,17 +90,18 @@ jobs:
           python3 -m venv .venv
           source .venv/bin/activate
           uv pip install pytest pytest-timeout pytest-arraydiff
+          uv pip install nutpie --no-deps --find-links dist --no-index
           case "${{ matrix.suite }}" in
             stan)
-              uv pip install 'nutpie[stan]' --find-links dist --force-reinstall
+              uv pip install 'nutpie[stan]'
               pytest -m "stan and not flow" --arraydiff
               ;;
             pymc)
-              uv pip install 'nutpie[pymc]' jax --find-links dist --force-reinstall
+              uv pip install 'nutpie[pymc]' jax --constraint .github/uv-constraints-main.txt
               pytest -m "pymc and not flow" --arraydiff
               ;;
             flow)
-              uv pip install 'nutpie[all]' --find-links dist --force-reinstall
+              uv pip install 'nutpie[all]' --constraint .github/uv-constraints-main.txt
               pytest -m flow --arraydiff
               ;;
           esac
@@ -241,17 +242,18 @@ jobs:
           python3 -m venv .venv
           source .venv/Scripts/activate
           uv pip install pytest pytest-timeout pytest-arraydiff
+          uv pip install nutpie --no-deps --find-links dist --no-index
           case "${{ matrix.suite }}" in
             stan)
-              uv pip install "nutpie[stan]" --find-links dist --force-reinstall
+              uv pip install "nutpie[stan]"
               pytest -m "stan and not flow" --arraydiff
               ;;
             pymc)
-              uv pip install "nutpie[pymc]" jax --find-links dist --force-reinstall
+              uv pip install "nutpie[pymc]" jax --constraint .github/uv-constraints-main.txt
               pytest -m "pymc and not flow" --arraydiff
               ;;
             flow)
-              uv pip install "nutpie[all]" --find-links dist --force-reinstall
+              uv pip install "nutpie[all]" --constraint .github/uv-constraints-main.txt
               pytest -m flow --arraydiff
               ;;
           esac
@@ -333,17 +335,18 @@ jobs:
           python3 -m venv .venv
           source .venv/bin/activate
           uv pip install pytest pytest-timeout pytest-arraydiff
+          uv pip install nutpie --no-deps --find-links dist --no-index
           case "${{ matrix.suite }}" in
             stan)
-              uv pip install 'nutpie[stan]' --find-links dist --force-reinstall
+              uv pip install 'nutpie[stan]'
               pytest -m "stan and not flow" --arraydiff
               ;;
             pymc)
-              uv pip install 'nutpie[pymc]' jax --find-links dist --force-reinstall
+              uv pip install 'nutpie[pymc]' jax --constraint .github/uv-constraints-main.txt
               pytest -m "pymc and not flow" --arraydiff
               ;;
             flow)
-              uv pip install 'nutpie[all]' --find-links dist --force-reinstall
+              uv pip install 'nutpie[all]' --constraint .github/uv-constraints-main.txt
               pytest -m flow --arraydiff
               ;;
           esac
@@ -367,8 +370,9 @@ jobs:
         run: |
           python3 -m venv .venv
           source .venv/bin/activate
-          uv pip install 'nutpie[dev]' --constraint .github/uv-constraints.txt --find-links dist --force-reinstall
-          pytest -m "pymc and not flow" --arraydiff
+          uv pip install nutpie --no-deps --find-links dist --no-index
+          uv pip install 'nutpie[dev]' --constraint .github/uv-constraints-dev.txt
+          pytest -m "pymc" --arraydiff
 
   docs:
     runs-on: ubuntu-22.04
@@ -392,7 +396,8 @@ jobs:
       - name: Install doc dependencies
         run: |
           source .venv/bin/activate
-          uv pip install --constraint .github/uv-constraints.txt "nutpie[docs]" --find-links dist --force-reinstall
+          uv pip install nutpie --no-deps --find-links dist --no-index
+          uv pip install --constraint .github/uv-constraints-dev.txt "nutpie[docs]"
       - name: Render docs
         env:
           TBB_CXX_TYPE: clang
