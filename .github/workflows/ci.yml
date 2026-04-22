@@ -34,8 +34,6 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: |
-            3.10
-            3.11
             3.12
             3.13
             3.14
@@ -43,7 +41,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.platform.target }}
-          args: --release --out dist --interpreter 3.10 3.11 3.12 3.13 3.14 --zig
+          args: --release --out dist --interpreter 3.12 3.13 3.14 --zig
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
           manylinux: auto
           before-script-linux: |
@@ -66,7 +64,7 @@ jobs:
       matrix:
         target: [x86_64, aarch64]
         suite: [stan, pymc, flow]
-        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        python-version: ["3.12", "3.13", "3.14"]
         include:
           - target: x86_64
             runner: ubuntu-22.04
@@ -184,8 +182,6 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: |
-            3.10
-            3.11
             3.12
             3.13
             3.14
@@ -206,7 +202,7 @@ jobs:
           LIBCLANG_PATH: ${{ runner.temp }}/llvm/lib
         with:
           target: x64
-          args: --release --out dist --find-interpreter
+          args: --release --out dist --interpreter 3.12 3.13 3.14
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
       - name: Upload wheels
         uses: actions/upload-artifact@v7
@@ -223,7 +219,7 @@ jobs:
       fail-fast: false
       matrix:
         suite: [stan, pymc, flow]
-        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        python-version: ["3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -274,8 +270,6 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: |
-            3.10
-            3.11
             3.12
             3.13
             3.14
@@ -288,7 +282,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.platform.target }}
-          args: --release --out dist --find-interpreter
+          args: --release --out dist --interpreter 3.12 3.13 3.14 --zig
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
       - name: Upload wheels
         uses: actions/upload-artifact@v7
@@ -306,7 +300,7 @@ jobs:
       matrix:
         target: [x86_64, aarch64]
         suite: [stan, pymc, flow]
-        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        python-version: ["3.12", "3.13", "3.14"]
         include:
           - target: x86_64
             runner: macos-15-intel
