@@ -1,0 +1,2 @@
+pytensor @ git+https://github.com/pymc-devs/pytensor.git@v3
+pymc @ git+https://github.com/pymc-devs/pymc.git@v6
