@@ -2289,8 +2289,6 @@ dependencies = [
 [[package]]
 name = "nuts-derive"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a8cce587b5f36bc6bfa54cbf2eaf31fe5a5e0d73e96d31fde5de87a701689363"
 dependencies = [
  "nuts-storable",
  "proc-macro2",
@@ -2301,8 +2299,6 @@ dependencies = [
 [[package]]
 name = "nuts-rs"
 version = "0.18.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed964f329c9de6147920b5bbc55cdeb8ad69c7909f68539b592889dfc07b04de"
 dependencies = [
  "anyhow",
  "arrow",

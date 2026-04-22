@@ -110,7 +110,7 @@ az.ess(trace)
 and take a look at a trace plot:
 
 ```{python}
-az.plot_trace_dist(trace);
+az.plot_trace(trace);
 ```
 
 ### Choosing the backend

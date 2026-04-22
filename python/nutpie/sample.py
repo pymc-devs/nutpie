@@ -98,16 +98,31 @@ def _arrow_to_arviz(draw_batches, stat_batches, skip_vars=None, **kwargs):
             stats_posterior, max_posterior, stat_posterior, i, n_chains, dims, skip_vars
         )
 
-    return arviz.from_dict(
-        {
-            "posterior": data_posterior,
-            "sample_stats": stats_posterior,
-            "warmup_posterior": data_tune,
-            "warmup_sample_stats": stats_tune,
-        },
-        dims=dims,
-        **kwargs,
-    )
+    from importlib.metadata import version
+
+    arviz_version = version("arviz")
+    if tuple(map(int, arviz_version.split(".")[:2])) >= (1, 0):
+        return arviz.from_dict(
+            {
+                "posterior": data_posterior,
+                "sample_stats": stats_posterior,
+                "warmup_posterior": data_tune,
+                "warmup_sample_stats": stats_tune,
+            },
+            dims=dims,
+            **kwargs,
+        )
+    else:
+        return arviz.from_dict(
+            **{
+                "posterior": data_posterior,
+                "sample_stats": stats_posterior,
+                "warmup_posterior": data_tune,
+                "warmup_sample_stats": stats_tune,
+            },  # ty:ignore[invalid-argument-type]
+            dims=dims,
+            **kwargs,
+        )
 
 
 def _add_arrow_data(data_dict, max_length, batch, chain, n_chains, dims, skip_vars):
