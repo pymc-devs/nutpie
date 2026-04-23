@@ -1355,11 +1355,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0de51e6874e94e7bf76d726fc5d13ba782deca734ff60d5bb2fb2607c7406555"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi 6.0.0",
  "rand_core 0.10.1",
  "wasip2",
  "wasip3",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -2289,6 +2291,8 @@ dependencies = [
 [[package]]
 name = "nuts-derive"
 version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a8cce587b5f36bc6bfa54cbf2eaf31fe5a5e0d73e96d31fde5de87a701689363"
 dependencies = [
  "nuts-storable",
  "proc-macro2",
@@ -2298,12 +2302,15 @@ dependencies = [
 
 [[package]]
 name = "nuts-rs"
-version = "0.18.0"
+version = "0.18.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a62664bb4327ef957a2188e2ea314d6693261100b9c2cc68c1b2398da301f6e2"
 dependencies = [
  "anyhow",
  "arrow",
  "arrow-schema",
  "faer",
+ "getrandom 0.4.2",
  "itertools 0.14.0",
  "nuts-derive",
  "nuts-storable",
@@ -2321,6 +2328,8 @@ dependencies = [
 [[package]]
 name = "nuts-storable"
 version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9257959045c9682c06b3f993215f1b2896bf276a1fcf39f83ac0755a904dc0d"
 
 [[package]]
 name = "object_store"
@@ -3125,9 +3134,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.38"
+version = "0.23.39"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69f9466fb2c14ea04357e91413efb882e2a6d4a406e625449bc0a5d360d53a21"
+checksum = "7c2c118cb077cca2822033836dfb1b975355dfb784b5e8da48f7b6c5db74e60e"
 dependencies = [
  "once_cell",
  "ring",
@@ -3161,9 +3170,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.12"
+version = "0.103.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8279bb85272c9f10811ae6a6c547ff594d6a7f3c6c6b02ee9726d1d0dcfcdd06"
+checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
 dependencies = [
  "ring",
  "rustls-pki-types",
