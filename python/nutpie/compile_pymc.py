@@ -681,7 +681,8 @@ def _make_functions(
         correspond to the variables in the flat array, and the third list
         contains the shapes of the variables.
     """
-    import pytensor
+    from pytensor.graph import rewrite_graph, clone_replace
+
     import pytensor.tensor as pt
     from pymc.pytensorf import compile as compile_pymc
 
@@ -698,10 +699,10 @@ def _make_functions(
     if not model.check_bounds:
         rewrites.append("local_remove_check_parameter")
 
-    logp = pytensor.graph.rewrite_graph(logp, include=rewrites)
+    logp = rewrite_graph(logp, include=rewrites)
 
     if compute_grad:
-        grads = pytensor.gradient.grad(logp, value_vars)
+        grads = pt.grad(logp, value_vars)
         grad = pt.concatenate(
             [
                 pt.as_tensor(grad, allow_xtensor_conversion=True).ravel()
@@ -754,11 +755,11 @@ def _make_functions(
     }
 
     if compute_grad:
-        (logp, grad) = pytensor.clone_replace([logp, grad], replacements)
+        (logp, grad) = clone_replace([logp, grad], replacements)
         with model:
             logp_fn_pt = compile_pymc((joined,), (logp, grad), mode=mode)
     else:
-        (logp,) = pytensor.clone_replace([logp], replacements)
+        (logp,) = clone_replace([logp], replacements)
         with model:
             logp_fn_pt = compile_pymc((joined,), (logp,), mode=mode)
 

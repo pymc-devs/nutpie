@@ -7,7 +7,7 @@ name = "nutpie"
 description = "Sample Stan or PyMC models"
 authors = [{ name = "PyMC Developers", email = "pymc.devs@gmail.com" }]
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 license = { text = "MIT" }
 classifiers = [
   "Programming Language :: Rust",
@@ -19,8 +19,9 @@ dependencies = [
   "pyarrow >= 12.0.0",
   "arro3-core >= 0.6.0",
   "pandas >= 2.0",
+  "platformdirs >= 3.0.0",
   "xarray >= 2025.01.2",
-  "arviz >= 0.20.0,<1.0",
+  "arviz >= 0.23.0,<2.0",
   "obstore >= 0.8.0",
   "zarr >= 3.1.0",
 ]
@@ -55,10 +56,23 @@ all = [
   "flowjax >= 17.1.0",
   "equinox >= 0.11.12",
 ]
+docs = [
+  "bridgestan >= 2.7.0",
+  "stanio >= 0.5.1",
+  "pymc >= 5.20.1",
+  "numba >= 0.60.0",
+  "jax >= 0.4.27",
+  "flowjax >= 17.1.0",
+  "equinox >= 0.11.12",
+  "cmdstanpy >= 1.2.0",
+  "matplotlib >= 3.8.0",
+  "seaborn >= 0.13.0",
+  "jupyter",
+]
 
 [tool.ruff]
 line-length = 88
-target-version = "py310"
+target-version = "py312"
 show-fixes = true
 output-format = "full"
 

@@ -359,7 +359,7 @@ def test_det(backend, gradient_backend):
 @parameterize_backends
 def test_non_identifier_names(backend, gradient_backend):
     with pm.Model() as model:
-        a = pm.Uniform("a/b", shape=2)
+        a = pm.Uniform("a::b", shape=2)
         with pm.Model("foo"):
             c = pm.Data("c", np.array([2.0, 3.0]))
             pm.Deterministic("b", c * a)
@@ -368,7 +368,7 @@ def test_non_identifier_names(backend, gradient_backend):
         model, backend=backend, gradient_backend=gradient_backend
     )
     trace = nutpie.sample(compiled, chains=1)
-    assert trace.posterior["a/b"].shape[-1] == 2
+    assert trace.posterior["a::b"].shape[-1] == 2
     assert trace.posterior["foo::b"].shape[-1] == 2
 
 
