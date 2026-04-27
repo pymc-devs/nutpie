@@ -46,7 +46,7 @@ For more information, see the detailed [PyMC usage guide](pymc-usage.qmd).
 
 ## Quickstart: Stan
 
-Stan needs access to a compiler toolchain, for which you can find installation instructions 
+Stan needs access to a compiler toolchain, for which you can find installation instructions
 [here](https://mc-stan.org/docs/cmdstan-guide/installation.html#cpp-toolchain).
 You can then install nutpie through pip or uv:
 

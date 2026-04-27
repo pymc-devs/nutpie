@@ -31,7 +31,7 @@ trace = nutpie.sample(
 
 The number of draws affects both accuracy and computational cost:
 
-- Too few draws (< 500) may not capture the posterior well  
+- Too few draws (< 500) may not capture the posterior well
 - Too many draws (> 10000) may waste computation time
 
 If a model is sampling without divergences, but with effective sample sizes that
@@ -63,7 +63,6 @@ For each of the `store_*` arguments, additional arrays will be available in the
 ## Non-blocking sampling
 
 
-
 ### Settings for HMC and NUTS
 
 ```python
@@ -87,7 +86,7 @@ the underlying problem.
 
 Lowering the maximum energy error to, for instance, 10 will often increase the
 number of divergences, and make it easier to diagnose their cause. Moreover, with a lower
-value for `max_energy_error`, divergences often get reported closer to the critical point(s) 
+value for `max_energy_error`, divergences often get reported closer to the critical point(s)
 in parameter space that are actually causing them.
 
 ## Mass Matrix Adaptation
@@ -132,7 +131,7 @@ smaller effect of the low-rank components, but might work better for
 higher-dimensional problems.
 
 `mass_matrix_eigval_cutoff` should be greater than one, and controls how large
-an eigenvalue of the full mass matrix must be in order for its associated eigenvector 
+an eigenvalue of the full mass matrix must be in order for its associated eigenvector
 to be included in the low-rank mass matrix.
 
 ```python
