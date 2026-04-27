@@ -68,10 +68,6 @@ ban-relative-imports = "all"
 [tool.ruff.lint.isort]
 known-first-party = ["nutpie"]
 
-[tool.pyright]
-venvPath = "."
-venv = ".venv"
-
 [tool.maturin]
 module-name = "nutpie._lib"
 python-source = "python"
