@@ -14,7 +14,7 @@ from numpy.typing import NDArray
 
 from nutpie import _lib
 from nutpie.compiled_pyfunc import SeedType, from_pyfunc
-from nutpie.sample import CompiledModel, ReparameterizedInfo
+from nutpie.sample import CompiledModel
 
 try:
     from numba.extending import intrinsic
@@ -111,7 +111,6 @@ class CompiledPyMCModel(CompiledModel):
     _shapes: dict[str, tuple[int, ...]]
     _coords: Optional[dict[str, Any]]
     _transform_adapt_args: dict | None = None
-    reparameterized_info: ReparameterizedInfo | None = None
 
     @property
     def n_dim(self):
@@ -273,7 +272,7 @@ def _compile_pymc_model_numba(
         expand_fn_pt,
         initial_point_fn,
         shape_info,
-        reparameterized_info,
+        reparameterized_names,
     ) = _make_functions(
         model,
         mode="NUMBA",
@@ -327,7 +326,7 @@ def _compile_pymc_model_numba(
 
         expand_numba = numba.cfunc(c_sig_expand, **kwargs)(expand_numba_raw)
 
-    dims, coords = _prepare_dims_and_coords(model, shape_info)
+    dims, coords = _prepare_dims_and_coords(model, shape_info, reparameterized_names)
 
     return CompiledPyMCModel(
         _n_dim=n_dim,
@@ -343,11 +342,11 @@ def _compile_pymc_model_numba(
         shape_info=shape_info,
         logp_func=logp_fn_pt,
         expand_func=expand_fn_pt,
-        reparameterized_info=reparameterized_info,
+        reparameterized_names=reparameterized_names,
     )
 
 
-def _prepare_dims_and_coords(model, shape_info):
+def _prepare_dims_and_coords(model, shape_info, reparameterized_names):
     coords = {}
     for name, vals in model.coords.items():
         if vals is None:
@@ -358,7 +357,19 @@ def _prepare_dims_and_coords(model, shape_info):
         else:
             coords[name] = idx
 
-    dims = model.named_vars_to_dims
+    names, _, shape_list = shape_info
+    shape_by_name = {n: tuple(s) for n, s in zip(names, shape_list)}
+    value_to_rv = {model.rvs_to_values[var].name: var.name for var in model.free_RVs}
+
+    dims = dict(model.named_vars_to_dims)
+    for value_name in reparameterized_names:
+        rv_name = value_to_rv[value_name]
+        rv_dims = dims.get(rv_name)
+        if rv_dims is None:
+            continue
+        if shape_by_name.get(rv_name) == shape_by_name.get(value_name):
+            dims[value_name] = rv_dims
+
     return dims, coords
 
 
@@ -391,7 +402,7 @@ def _compile_pymc_model_jax(
         expand_fn_pt,
         initial_point_fn,
         shape_info,
-        reparameterized_info,
+        reparameterized_names,
     ) = _make_functions(
         model,
         mode="JAX",
@@ -457,7 +468,7 @@ def _compile_pymc_model_jax(
 
         return expand
 
-    dims, coords = _prepare_dims_and_coords(model, shape_info)
+    dims, coords = _prepare_dims_and_coords(model, shape_info, reparameterized_names)
 
     return from_pyfunc(
         ndim=n_dim,
@@ -471,7 +482,7 @@ def _compile_pymc_model_jax(
         dims=dims,
         coords=coords,
         raw_logp_fn=orig_logp_fn,
-        reparameterized_info=reparameterized_info,
+        reparameterized_names=reparameterized_names,
     )
 
 
@@ -635,7 +646,7 @@ def _make_functions(
     Callable,
     Callable,
     tuple[list[str], list[slice], list[tuple[int, ...]]],
-    ReparameterizedInfo,
+    list[str],
 ]:
     """
     Compile functions required by nuts-rs from a given PyMC model.
@@ -763,16 +774,11 @@ def _make_functions(
         with model:
             logp_fn_pt = compile_pymc((joined,), (logp,), mode=mode)
 
-    reparameterized_info = []
-    for var, joined_name, joined_shape, joined_slice in zip(
-        model.free_RVs, joined_names, joined_shapes, joined_slices
-    ):
-        if model.rvs_to_transforms.get(var) is not None:
-            var_dims = tuple(model.named_vars_to_dims.get(var.name, ()) or ())
-            reparameterized_info.append(
-                (joined_name, joined_shape, joined_slice, var_dims)
-            )
-    reparameterized_names = {info[0] for info in reparameterized_info}
+    reparameterized_names = [
+        model.rvs_to_values[var].name
+        for var in model.free_RVs
+        if model.rvs_to_transforms.get(var) is not None
+    ]
 
     # Make function that computes remaining variables for the trace
     remaining_rvs = [
@@ -790,13 +796,12 @@ def _make_functions(
 
     identity_free = []
     for var_expr, name, shape in zip(variables, joined_names, joined_shapes):
-        if name not in reparameterized_names:
-            length = prod(shape)
-            all_names.append(name)
-            all_shapes.append(shape)
-            all_slices.append(slice(count_expanded, count_expanded + length))
-            count_expanded += length
-            identity_free.append(var_expr)
+        length = prod(shape)
+        all_names.append(name)
+        all_shapes.append(shape)
+        all_slices.append(slice(count_expanded, count_expanded + length))
+        count_expanded += length
+        identity_free.append(var_expr)
 
     for var in remaining_rvs:
         all_names.append(var.name)
@@ -837,7 +842,7 @@ def _make_functions(
         expand_fn_pt,
         initial_point_fn,
         (all_names, all_slices, all_shapes),
-        reparameterized_info,
+        reparameterized_names,
     )
 
 

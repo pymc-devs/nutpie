@@ -1,6 +1,6 @@
 import os
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from importlib.metadata import version
 from typing import Any, Literal, Optional, cast, get_args, overload
 
@@ -12,12 +12,11 @@ import xarray as xr
 
 from nutpie import _lib
 
-ReparameterizedInfo = list[tuple[str, tuple[int, ...], slice, tuple[str, ...]]]
-
 
 @dataclass(frozen=True)
 class CompiledModel:
     dims: Optional[dict[str, tuple[str, ...]]]
+    reparameterized_names: list[str] | None = field(default=None, kw_only=True)
 
     @property
     def n_dim(self) -> int:
@@ -63,12 +62,14 @@ def _arrow_to_arviz(
     draw_batches,
     stat_batches,
     skip_vars=None,
-    reparameterized_info=None,
+    reparameterized_names=None,
     keep_unconstrained_draw=False,
     **kwargs,
 ):
     if skip_vars is None:
         skip_vars = []
+    if reparameterized_names is None:
+        reparameterized_names = []
 
     n_chains = len(draw_batches)
     assert n_chains == len(stat_batches)
@@ -108,12 +109,18 @@ def _arrow_to_arviz(
             stats_posterior, max_posterior, stat_posterior, i, n_chains, dims, skip_vars
         )
 
-    if keep_unconstrained_draw:
-        uc_flat_posterior = stats_posterior.get("unconstrained_draw")
-        uc_flat_tune = stats_tune.get("unconstrained_draw")
-    else:
-        uc_flat_posterior = stats_posterior.pop("unconstrained_draw", None)
-        uc_flat_tune = stats_tune.pop("unconstrained_draw", None)
+    uc_data_posterior = {
+        name: data_posterior.pop(name)
+        for name in reparameterized_names
+        if name in data_posterior
+    }
+    uc_data_tune = {
+        name: data_tune.pop(name) for name in reparameterized_names if name in data_tune
+    }
+
+    if not keep_unconstrained_draw:
+        stats_posterior.pop("unconstrained_draw", None)
+        stats_tune.pop("unconstrained_draw", None)
         dims.pop("unconstrained_draw", None)
 
     arviz_version = version("arviz")
@@ -140,30 +147,17 @@ def _arrow_to_arviz(
             **kwargs,
         )
 
-    if reparameterized_info and uc_flat_posterior is not None:
+    if keep_unconstrained_draw and uc_data_posterior:
         coords = kwargs.get("coords")
-        uc_dims = {
-            name: list(var_dims) for name, _, _, var_dims in reparameterized_info
-        }
-
-        def _reshape(flat, n_draws):
-            return {
-                name: flat[..., slc].reshape(n_chains, n_draws, *shape)
-                for name, shape, slc, _ in reparameterized_info
-            }
-
+        uc_dims = {name: dims.get(name, []) for name in uc_data_posterior}
         groups = {
             "unconstrained_posterior": arviz.dict_to_dataset(
-                _reshape(uc_flat_posterior, max_posterior),
-                coords=coords,
-                dims=uc_dims,
+                uc_data_posterior, coords=coords, dims=uc_dims
             )
         }
-        if uc_flat_tune is not None:
+        if uc_data_tune:
             groups["warmup_unconstrained_posterior"] = arviz.dict_to_dataset(
-                _reshape(uc_flat_tune, max_tuning),
-                coords=coords,
-                dims=uc_dims,
+                uc_data_tune, coords=coords, dims=uc_dims
             )
         idata.add_groups(groups)
 
@@ -669,11 +663,7 @@ class _BackgroundSampler:
                     draw_batches,
                     stat_batches,
                     skip_vars=skip_vars,
-                    reparameterized_info=(
-                        getattr(self._compiled_model, "reparameterized_info", None)
-                        if self._store_unconstrained
-                        else None
-                    ),
+                    reparameterized_names=self._compiled_model.reparameterized_names,
                     keep_unconstrained_draw=self._store_unconstrained,
                     coords={
                         name: pd.Index(vals)

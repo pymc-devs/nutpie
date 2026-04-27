@@ -6,7 +6,7 @@ from typing import Any, Callable
 import numpy as np
 
 from nutpie import _lib  # type: ignore
-from nutpie.sample import CompiledModel, ReparameterizedInfo
+from nutpie.sample import CompiledModel
 
 SeedType = int
 
@@ -23,7 +23,6 @@ class PyFuncModel(CompiledModel):
     _coords: dict[str, Any]
     _raw_logp_fn: Callable | None
     _transform_adapt_args: dict | None = None
-    reparameterized_info: ReparameterizedInfo | None = None
 
     @property
     def shapes(self) -> dict[str, tuple[int, ...]]:
@@ -120,7 +119,7 @@ def from_pyfunc(
     make_initial_point_fn: Callable[[SeedType], np.ndarray] | None = None,
     make_transform_adapter=None,
     raw_logp_fn=None,
-    reparameterized_info=None,
+    reparameterized_names=None,
 ):
     if coords is None:
         coords = {}
@@ -152,5 +151,5 @@ def from_pyfunc(
         _variables=variables,
         _shared_data=shared_data,
         _raw_logp_fn=raw_logp_fn,
-        reparameterized_info=reparameterized_info,
+        reparameterized_names=reparameterized_names,
     )
