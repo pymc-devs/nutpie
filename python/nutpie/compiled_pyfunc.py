@@ -39,7 +39,13 @@ class PyFuncModel(CompiledModel):
     _init_point_layout: tuple[list[str], list[tuple[int, ...]]] | None = None
     # User init function `fn(model, rng, chain_id)`, see `with_init_point_fn`
     _init_point_fn: Callable | None = None
+    # Force the sampler to run a single chain at a time. Used by backends
+    # that are not thread-safe (e.g. MLX/Metal).
     _force_single_core: bool = False
+    # Optional converter applied to values passed to ``with_data`` so that
+    # backends with non-numpy array types (e.g. MLX) can keep ``_shared_data``
+    # in their native format.
+    _shared_data_converter: Callable[[Any], Any] | None = None
 
     @property
     def shapes(self) -> dict[str, tuple[int, ...]]:
@@ -59,13 +65,9 @@ class PyFuncModel(CompiledModel):
                 raise ValueError(f"Unknown data variable: {name}")
 
         updated = self._shared_data.copy()
-
-        # Convert to MLX arrays if using MLX backend (indicated by force_single_core)
-        if self._force_single_core:
-            import mlx.core as mx
-
+        if self._shared_data_converter is not None:
             for name, value in updates.items():
-                updated[name] = mx.array(value)
+                updated[name] = self._shared_data_converter(value)
         else:
             updated.update(**updates)
 
@@ -180,6 +182,7 @@ def from_pyfunc(
     raw_logp_fn=None,
     reparameterized_names=None,
     force_single_core: bool = False,
+    shared_data_converter: Callable[[Any], Any] | None = None,
 ):
     if coords is None:
         coords = {}
@@ -218,4 +221,5 @@ def from_pyfunc(
         _init_point_layout=init_point_layout,
         reparameterized_names=reparameterized_names,
         _force_single_core=force_single_core,
+        _shared_data_converter=shared_data_converter,
     )
