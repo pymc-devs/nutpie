@@ -33,3 +33,8 @@ reports
 benchmarks*
 reports*
 results*
+
+# ai folders
+.ai/
+.cursor/
+.claude/
