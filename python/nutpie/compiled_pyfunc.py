@@ -23,7 +23,13 @@ class PyFuncModel(CompiledModel):
     _coords: dict[str, Any]
     _raw_logp_fn: Callable | None
     _transform_adapt_args: dict | None = None
+    # Force the sampler to run a single chain at a time. Used by backends
+    # that are not thread-safe (e.g. MLX/Metal).
     _force_single_core: bool = False
+    # Optional converter applied to values passed to ``with_data`` so that
+    # backends with non-numpy array types (e.g. MLX) can keep ``_shared_data``
+    # in their native format.
+    _shared_data_converter: Callable[[Any], Any] | None = None
 
     @property
     def shapes(self) -> dict[str, tuple[int, ...]]:
@@ -43,13 +49,9 @@ class PyFuncModel(CompiledModel):
                 raise ValueError(f"Unknown data variable: {name}")
 
         updated = self._shared_data.copy()
-
-        # Convert to MLX arrays if using MLX backend (indicated by force_single_core)
-        if self._force_single_core:
-            import mlx.core as mx
-
+        if self._shared_data_converter is not None:
             for name, value in updates.items():
-                updated[name] = mx.array(value)
+                updated[name] = self._shared_data_converter(value)
         else:
             updated.update(**updates)
 
@@ -133,6 +135,7 @@ def from_pyfunc(
     make_transform_adapter=None,
     raw_logp_fn=None,
     force_single_core: bool = False,
+    shared_data_converter: Callable[[Any], Any] | None = None,
 ):
     if coords is None:
         coords = {}
@@ -165,4 +168,5 @@ def from_pyfunc(
         _shared_data=shared_data,
         _raw_logp_fn=raw_logp_fn,
         _force_single_core=force_single_core,
+        _shared_data_converter=shared_data_converter,
     )

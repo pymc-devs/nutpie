@@ -498,6 +498,31 @@ def _compile_pymc_model_mlx(
         )
     import mlx.core as mx
 
+    # mlx 0.31.x crashes with SIGSEGV inside ``Compiled::eval_gpu`` when the
+    # nutpie sampler worker thread evaluates auto-fused element-wise kernels
+    # (https://github.com/ml-explore/mlx/issues/3329). Until that's fixed
+    # upstream we refuse to start instead of segfaulting partway through
+    # sampling. ``pyproject.toml`` already pins ``mlx<0.31`` for the
+    # ``pymc-mlx``/``dev``/``all`` extras; this guard catches the case where
+    # the user installed mlx independently.
+    from importlib.metadata import PackageNotFoundError, version as _pkg_version
+
+    try:
+        _mlx_version_str = _pkg_version("mlx")
+    except PackageNotFoundError:
+        _mlx_version_str = None
+    if _mlx_version_str is not None:
+        _mlx_version = tuple(
+            int(p) for p in _mlx_version_str.split(".")[:2] if p.isdigit()
+        )
+        if _mlx_version >= (0, 31):
+            raise RuntimeError(
+                f"MLX {_mlx_version_str} is not supported by nutpie's MLX "
+                "backend due to a known SIGSEGV in compiled Metal kernels "
+                "(see https://github.com/ml-explore/mlx/issues/3329). "
+                "Please install mlx>=0.29,<0.31."
+            )
+
     if gradient_backend is None:
         gradient_backend = "pytensor"
     elif gradient_backend not in ["mlx", "pytensor"]:
@@ -525,18 +550,17 @@ def _compile_pymc_model_mlx(
     logp_shared_names = [var.name for var in logp_fn_pt.get_shared()]
     expand_shared_names = [var.name for var in expand_fn_pt.get_shared()]
 
+    # PyTensor's MLX linker already calls ``mx.compile`` on the inner graph
+    # for both ``logp_fn`` and ``expand_fn``. The custom gradient wrapper
+    # below is plain Python, so we compile it explicitly (5-20% speedup on
+    # small models, in line with the JAX backend's ``jax.jit`` step).
     if gradient_backend == "mlx":
-        orig_logp_fn = logp_fn
+        inner_logp_fn = logp_fn
 
         def logp_fn_mlx_grad(x, *shared):
-            return mx.value_and_grad(lambda x: orig_logp_fn(x, *shared)[0])(x)
+            return mx.value_and_grad(lambda x: inner_logp_fn(x, *shared)[0])(x)
 
-        # JIT compile for performance, similar to jax.jit() in JAX backend
-        logp_fn_mlx_grad = mx.compile(logp_fn_mlx_grad)
-
-        logp_fn = logp_fn_mlx_grad
-    else:
-        orig_logp_fn = None
+        logp_fn = mx.compile(logp_fn_mlx_grad)
 
     shared_data = {}
     shared_vars = {}
@@ -563,7 +587,8 @@ def _compile_pymc_model_mlx(
     def make_expand_func(seed1, seed2, chain):
         # TODO handle seeds
         def expand(_x, **shared):
-            values = expand_fn(_x, *[shared[name] for name in expand_shared_names])
+            _x_mlx = mx.array(_x)
+            values = expand_fn(_x_mlx, *[shared[name] for name in expand_shared_names])
             return {
                 name: np.asarray(val, order="C", dtype=dtype).reshape(shape)
                 for name, val, dtype, shape in zip(
@@ -586,8 +611,15 @@ def _compile_pymc_model_mlx(
         shared_data=shared_data,
         dims=dims,
         coords=coords,
-        raw_logp_fn=orig_logp_fn,
-        force_single_core=(gradient_backend == "mlx"),
+        # The transform adapter is flowjax-based (JAX-only), so MLX cannot
+        # expose a raw logp for it.
+        raw_logp_fn=None,
+        # MLX (Metal) is not thread-safe regardless of how the gradient is
+        # computed: running multiple chains concurrently triggers
+        # "A command encoder is already encoding to this command buffer".
+        # See https://github.com/ml-explore/mlx/issues/2133.
+        force_single_core=True,
+        shared_data_converter=mx.array,
     )
 
 
