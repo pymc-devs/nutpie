@@ -39,12 +39,7 @@ class PyFuncModel(CompiledModel):
     _init_point_layout: tuple[list[str], list[tuple[int, ...]]] | None = None
     # User init function `fn(model, rng, chain_id)`, see `with_init_point_fn`
     _init_point_fn: Callable | None = None
-    # Force the sampler to run a single chain at a time. Used by backends
-    # that are not thread-safe (e.g. MLX/Metal).
     _force_single_core: bool = False
-    # Optional converter applied to values passed to ``with_data`` so that
-    # backends with non-numpy array types (e.g. MLX) can keep ``_shared_data``
-    # in their native format.
     _shared_data_converter: Callable[[Any], Any] | None = None
 
     @property
@@ -115,7 +110,6 @@ class PyFuncModel(CompiledModel):
         extra_callback_rate,
         store,
     ):
-        # Force single-core execution if required (e.g., for MLX backend)
         if self._force_single_core:
             cores = 1
         model = self._make_model()
