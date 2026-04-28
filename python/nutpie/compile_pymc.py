@@ -498,13 +498,8 @@ def _compile_pymc_model_mlx(
         )
     import mlx.core as mx
 
-    # mlx 0.31.x crashes with SIGSEGV inside ``Compiled::eval_gpu`` when the
-    # nutpie sampler worker thread evaluates auto-fused element-wise kernels
-    # (https://github.com/ml-explore/mlx/issues/3329). Until that's fixed
-    # upstream we refuse to start instead of segfaulting partway through
-    # sampling. ``pyproject.toml`` already pins ``mlx<0.31`` for the
-    # ``pymc-mlx``/``dev``/``all`` extras; this guard catches the case where
-    # the user installed mlx independently.
+    # mlx>=0.31 segfaults inside Compiled::eval_gpu on the sampler worker
+    # thread; see https://github.com/ml-explore/mlx/issues/3329.
     from importlib.metadata import PackageNotFoundError, version as _pkg_version
 
     try:
@@ -550,10 +545,6 @@ def _compile_pymc_model_mlx(
     logp_shared_names = [var.name for var in logp_fn_pt.get_shared()]
     expand_shared_names = [var.name for var in expand_fn_pt.get_shared()]
 
-    # PyTensor's MLX linker already calls ``mx.compile`` on the inner graph
-    # for both ``logp_fn`` and ``expand_fn``. The custom gradient wrapper
-    # below is plain Python, so we compile it explicitly (5-20% speedup on
-    # small models, in line with the JAX backend's ``jax.jit`` step).
     if gradient_backend == "mlx":
         inner_logp_fn = logp_fn
 
@@ -611,13 +602,8 @@ def _compile_pymc_model_mlx(
         shared_data=shared_data,
         dims=dims,
         coords=coords,
-        # The transform adapter is flowjax-based (JAX-only), so MLX cannot
-        # expose a raw logp for it.
         raw_logp_fn=None,
-        # MLX (Metal) is not thread-safe regardless of how the gradient is
-        # computed: running multiple chains concurrently triggers
-        # "A command encoder is already encoding to this command buffer".
-        # See https://github.com/ml-explore/mlx/issues/2133.
+        # MLX is not thread-safe; see https://github.com/ml-explore/mlx/issues/2133.
         force_single_core=True,
         shared_data_converter=mx.array,
     )

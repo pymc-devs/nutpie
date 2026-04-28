@@ -337,10 +337,7 @@ jobs:
               ;;
             pymc)
               uv pip install 'nutpie[pymc]' jax --constraint .github/uv-constraints-main.txt
-              # Install MLX only on Apple Silicon (aarch64); macOS pymc only
-              # runs there per matrix excludes. Pinned to <0.31 because of the
-              # auto-fused-kernel SIGSEGV in mlx 0.31.x:
-              # https://github.com/ml-explore/mlx/issues/3329
+              # mlx<0.31: https://github.com/ml-explore/mlx/issues/3329
               if [ "${{ matrix.target }}" = "aarch64" ]; then
                 uv pip install 'mlx>=0.29.0,<0.31'
               fi

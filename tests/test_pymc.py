@@ -546,9 +546,6 @@ def test_deterministic_sampling_jax():
     return trace.posterior.a.values.ravel()
 
 
-# MLX sampling is not bit-identical across machines/versions, similar to the
-# situation for ``test_normalizing_flow`` above, so we run this purely as a
-# smoke test (no ``array_compare`` marker) until that's resolved.
 @pytest.mark.pymc
 def test_deterministic_sampling_mlx():
     if not MLX_AVAILABLE:
