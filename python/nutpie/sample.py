@@ -399,6 +399,9 @@ def in_notebook():
 
     if in_colab():
         return True
+    # Databricks sets this env var on all cluster runtimes (same check as rich)
+    if os.getenv("DATABRICKS_RUNTIME_VERSION"):
+        return True
     try:
         shell = get_ipython().__class__.__name__  # type: ignore
         if shell == "ZMQInteractiveShell":  # Jupyter notebook, Spyder or qtconsole
