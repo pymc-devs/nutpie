@@ -58,7 +58,16 @@ class PyFuncModel(CompiledModel):
     def with_transform_adapt(self, **kwargs):
         return dataclasses.replace(self, _transform_adapt_args=kwargs)
 
-    def _make_sampler(self, settings, init_mean, cores, progress_type, store):
+    def _make_sampler(
+        self,
+        settings,
+        init_mean,
+        cores,
+        progress_type,
+        extra_callback,
+        extra_callback_rate,
+        store,
+    ):
         # Force single-core execution if required (e.g., for MLX backend)
         if self._force_single_core:
             cores = 1
@@ -68,6 +77,8 @@ class PyFuncModel(CompiledModel):
             cores,
             model,
             progress_type,
+            extra_callback,
+            extra_callback_rate,
             store,
         )
 

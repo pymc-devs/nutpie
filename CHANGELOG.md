@@ -2,6 +2,122 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.16.8] - 2026-03-11
+
+### Documentation
+
+- Fix docstring formatting (Eliot Carlson)
+
+
+### Miscellaneous Tasks
+
+- Bump quinn-proto in the cargo group across 1 directory (dependabot[bot])
+
+
+## [0.16.7] - 2026-03-03
+
+### Bug Fixes
+
+- Limit to arviz < 1.0 (Adrian Seyboldt)
+
+
+### Miscellaneous Tasks
+
+- Update dependencies (Adrian Seyboldt)
+
+- Update github ci actions (Adrian Seyboldt)
+
+
+### Styling
+
+- Update pre-commit ruff version (Adrian Seyboldt)
+
+
+## [0.16.6] - 2026-02-18
+
+### Miscellaneous Tasks
+
+- Bump bytes in the cargo group across 1 directory (dependabot[bot])
+
+- Update dependencies (Adrian Seyboldt)
+
+
+### Testing
+
+- Add test for empty arrays with zarr (Adrian Seyboldt)
+
+
+## [0.16.5] - 2026-02-02
+
+### Bug Fixes
+
+- Compatibility with pandas 3.0 for string coords (Adrian Seyboldt)
+
+
+### Miscellaneous Tasks
+
+- Update dependencies (Adrian Seyboldt)
+
+- Bump actions/download-artifact from 6 to 7 (dependabot[bot])
+
+- Bump actions/upload-artifact from 5 to 6 (dependabot[bot])
+
+- Require python 3.11 (Adrian Seyboldt)
+
+- Update cargo lock (Adrian Seyboldt)
+
+
+### Testing
+
+- Fix test failure due to numpy datetime representation (Adrian Seyboldt)
+
+
+### Ci
+
+- Update macos github runners (Adrian Seyboldt)
+
+- Test and build with python 3.14 (Adrian Seyboldt)
+
+
+## [0.16.4] - 2025-11-27
+
+### Bug Fixes
+
+- Improve zarr object storage settings (Adrian Seyboldt)
+
+- Don't store zarrs attr in every trace (Adrian Seyboldt)
+
+
+### Miscellaneous Tasks
+
+- Bump actions/checkout from 5 to 6 (dependabot[bot])
+
+- Update nuts-rs to make use of zarr fix (Adrian Seyboldt)
+
+
+## [0.16.3] - 2025-11-13
+
+### Bug Fixes
+
+- Restore maxdepth sampler option (Adrian Seyboldt)
+
+- Silence error messages when sampler is dropped (Adrian Seyboldt)
+
+
+### Features
+
+- Support datetime coordinates (Adrian Seyboldt)
+
+
+### Miscellaneous Tasks
+
+- Bump actions/upload-artifact from 4 to 5 (dependabot[bot])
+
+- Bump actions/download-artifact from 5 to 6 (dependabot[bot])
+
+- Update nuts-rs and other deps (Adrian Seyboldt)
+
+
 ## [0.16.2] - 2025-10-22
 
 ### Bug Fixes
@@ -464,8 +580,6 @@ All notable changes to this project will be documented in this file.
 
 ### Ci
 
-- Fix uploads of releases (Adrian Seyboldt)
-
 - Fix architectures in CI (Adrian Seyboldt)
 
 
@@ -488,6 +602,8 @@ All notable changes to this project will be documented in this file.
 
 
 ### Miscellaneous Tasks
+
+- Bump actions/download-artifact from 3 to 4 (dependabot[bot])
 
 - Bump actions/setup-python from 4 to 5 (dependabot[bot])
 
@@ -513,7 +629,12 @@ All notable changes to this project will be documented in this file.
 - Set the number of parallel chains dynamically (Adrian Seyboldt)
 
 
-## [0.9.2] - 2024-02-19
+### Ci
+
+- Fix uploads of releases (Adrian Seyboldt)
+
+
+## [0.9.2] - 2023-10-24
 
 ### Bug Fixes
 
@@ -530,11 +651,6 @@ All notable changes to this project will be documented in this file.
 ### Features
 
 - Handle missing libraries more robustly (#72) (Ben Mares)
-
-
-### Miscellaneous Tasks
-
-- Bump actions/download-artifact from 3 to 4 (dependabot[bot])
 
 
 ### Ci

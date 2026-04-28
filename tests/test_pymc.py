@@ -1,11 +1,13 @@
-from importlib.util import find_spec
 import time
+from importlib.util import find_spec
+
 import pytest
 
 if find_spec("pymc") is None:
     pytest.skip("Skip pymc tests", allow_module_level=True)
 
 import numpy as np
+import pandas as pd
 import pymc as pm
 import pytest
 
@@ -48,6 +50,38 @@ def test_pymc_model(backend, gradient_backend):
     )
     trace = nutpie.sample(compiled, chains=1)
     trace.posterior.a  # noqa: B018
+
+
+@pytest.mark.pymc
+@parameterize_backends
+def test_progress_callback(backend, gradient_backend):
+    with pm.Model() as model:
+        pm.Normal("a")
+
+    compiled = nutpie.compile_pymc_model(
+        model, backend=backend, gradient_backend=gradient_backend
+    )
+
+    received = []
+
+    def callback(chains):
+        received.append(chains)
+
+    nutpie.sample(
+        compiled,
+        chains=2,
+        progress_bar=False,
+        progress_callback=callback,
+    )
+
+    assert len(received) > 0
+    chains = received[-1]
+    assert len(chains) == 2
+    chain = chains[0]
+    assert chain.total_draws > 0
+    assert chain.finished_draws == chain.total_draws
+    assert isinstance(chain.step_size, float)
+    assert isinstance(chain.divergent_draws, list)
 
 
 @pytest.mark.pymc
@@ -106,11 +140,11 @@ def test_low_rank(backend, gradient_backend):
     compiled = nutpie.compile_pymc_model(
         model, backend=backend, gradient_backend=gradient_backend
     )
-    trace = nutpie.sample(compiled, chains=1, low_rank_modified_mass_matrix=True)
+    trace = nutpie.sample(compiled, chains=1, adaptation="low_rank")
 
     assert "mass_matrix_eigvals" not in trace.sample_stats
     trace = nutpie.sample(
-        compiled, chains=1, low_rank_modified_mass_matrix=True, store_mass_matrix=True
+        compiled, chains=1, adaptation="low_rank", store_mass_matrix=True
     )
     assert "mass_matrix_eigvals" in trace.sample_stats
 
@@ -126,7 +160,35 @@ def test_low_rank_half_normal(backend, gradient_backend):
     compiled = nutpie.compile_pymc_model(
         model, backend=backend, gradient_backend=gradient_backend
     )
-    trace = nutpie.sample(compiled, chains=1, low_rank_modified_mass_matrix=True)
+    trace = nutpie.sample(compiled, chains=1, adaptation="low_rank")
+    trace.posterior.a  # noqa: B018
+
+
+@pytest.mark.pymc
+@parameterize_backends
+def test_deprecated_low_rank_modified_mass_matrix(backend, gradient_backend):
+    with pm.Model() as model:
+        pm.Normal("a")
+
+    compiled = nutpie.compile_pymc_model(
+        model, backend=backend, gradient_backend=gradient_backend
+    )
+    with pytest.warns(FutureWarning, match="low_rank_modified_mass_matrix"):
+        trace = nutpie.sample(compiled, chains=1, low_rank_modified_mass_matrix=True)
+    trace.posterior.a  # noqa: B018
+
+
+@pytest.mark.pymc
+@parameterize_backends
+def test_deprecated_use_grad_based_mass_matrix(backend, gradient_backend):
+    with pm.Model() as model:
+        pm.Normal("a")
+
+    compiled = nutpie.compile_pymc_model(
+        model, backend=backend, gradient_backend=gradient_backend
+    )
+    with pytest.warns(FutureWarning, match="use_grad_based_mass_matrix"):
+        trace = nutpie.sample(compiled, chains=1, use_grad_based_mass_matrix=False)
     trace.posterior.a  # noqa: B018
 
 
@@ -313,7 +375,7 @@ def test_det(backend, gradient_backend):
 @parameterize_backends
 def test_non_identifier_names(backend, gradient_backend):
     with pm.Model() as model:
-        a = pm.Uniform("a/b", shape=2)
+        a = pm.Uniform("a::b", shape=2)
         with pm.Model("foo"):
             c = pm.Data("c", np.array([2.0, 3.0]))
             pm.Deterministic("b", c * a)
@@ -322,7 +384,7 @@ def test_non_identifier_names(backend, gradient_backend):
         model, backend=backend, gradient_backend=gradient_backend
     )
     trace = nutpie.sample(compiled, chains=1)
-    assert trace.posterior["a/b"].shape[-1] == 2
+    assert trace.posterior["a::b"].shape[-1] == 2
     assert trace.posterior["foo::b"].shape[-1] == 2
 
 
@@ -419,7 +481,7 @@ def test_normalizing_flow():
     trace = nutpie.sample(
         compiled,
         chains=1,
-        transform_adapt=True,
+        adaptation="flow",
         window_switch_freq=128,
         seed=1,
         draws=500,
@@ -500,8 +562,19 @@ def test_deterministic_sampling_mlx():
 
 @pytest.mark.pymc
 def test_zarr_store(tmp_path):
-    with pm.Model() as model:
-        pm.HalfNormal("a")
+    coords = {
+        "a": np.arange(2).astype("f"),
+        "b": pd.date_range("2023-01-01", periods=1),
+        "c": ["x", "y", "z", ""],
+        "d": [0],
+        "e": pd.factorize(pd.Index(["foo"]))[1],
+        "f": np.arange(2).astype("d"),
+        "g": pd.date_range("2023-01-01", periods=0),
+    }
+    with pm.Model(coords=coords) as model:
+        pm.HalfNormal("x")
+        pm.Normal("y", dims=("a", "b", "c", "d", "e", "f"))
+        pm.Normal("z", dims="g")
 
     compiled = nutpie.compile_pymc_model(model, backend="numba")
 
@@ -511,7 +584,33 @@ def test_zarr_store(tmp_path):
     trace = nutpie.sample(
         compiled, chains=2, seed=123, draws=100, tune=100, zarr_store=store
     )
-    trace.load().posterior.a  # noqa: B018
+    trace.load().posterior.x
+
+    assert trace.posterior.coords["a"].dtype == np.float32
+    # pandas 3.0 changes datetime64 precision
+    assert trace.posterior.coords["b"].dtype.name in [
+        "datetime64[ns]",
+        "datetime64[us]",
+    ]
+    assert trace.posterior.coords["b"].values[0] == np.datetime64("2023-01-01")
+    assert list(trace.posterior.coords["c"]) == ["x", "y", "z", ""]
+    assert list(trace.posterior.coords["d"]) == [0]
+    assert list(trace.posterior.coords["e"]) == ["foo"]
+    assert trace.posterior.coords["f"].dtype == np.float64
+
+    trace = nutpie.sample(compiled, chains=2, seed=1234, draws=50, tune=50)
+    assert trace.posterior.coords["a"].dtype == np.float32
+    # pandas 3.0 changes datetime64 precision
+    assert trace.posterior.coords["b"].dtype.name in [
+        "datetime64[ns]",
+        "datetime64[us]",
+    ]
+    assert trace.posterior.coords["b"].values[0] == np.datetime64("2023-01-01")
+    assert list(trace.posterior.coords["c"]) == ["x", "y", "z", ""]
+    assert list(trace.posterior.coords["d"]) == [0]
+    assert list(trace.posterior.coords["e"]) == ["foo"]
+    assert trace.posterior.coords["f"].dtype == np.float64
+    assert trace.posterior.coords["g"].shape == (0,)
 
 
 @pytest.fixture
@@ -521,3 +620,24 @@ def tmp_path():
 
     with tempfile.TemporaryDirectory() as tmpdirname:
         yield Path(tmpdirname)
+
+
+@pytest.mark.pymc
+@parameterize_backends
+def test_dims_model(backend, gradient_backend):
+    import pymc.dims as pmd
+
+    coords = {"a": range(3), "b": range(5)}
+    with pm.Model(coords=coords) as model:
+        print(model.dim_lengths)
+        zero_sum = pmd.ZeroSumNormal("zero_sum", core_dims=("a",), dims=("a", "b"))
+        pmd.Deterministic("one_sum", zero_sum + 1 / 3, dims=(..., "a"))
+
+    compiled = nutpie.compile_pymc_model(
+        model, backend=backend, gradient_backend=gradient_backend
+    )
+    post = nutpie.sample(compiled, chains=1).posterior
+    assert post["zero_sum"].dims == ("chain", "draw", "a", "b")
+    assert post["one_sum"].dims == ("chain", "draw", "b", "a")
+    np.testing.assert_allclose(post["zero_sum"].sum(dim="a"), 0, atol=1e-5)
+    np.testing.assert_allclose(post["one_sum"].sum(dim="a"), 1, atol=1e-5)

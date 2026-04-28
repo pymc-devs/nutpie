@@ -1,4 +1,5 @@
 from importlib.util import find_spec
+
 import pytest
 
 if find_spec("bridgestan") is None:
@@ -40,7 +41,7 @@ def test_stan_model_low_rank():
     """
 
     compiled_model = nutpie.compile_stan_model(code=model)
-    trace = nutpie.sample(compiled_model, low_rank_modified_mass_matrix=True)
+    trace = nutpie.sample(compiled_model, adaptation="low_rank")
     trace.posterior.a  # noqa: B018
 
 
@@ -269,7 +270,7 @@ def test_stan_flow():
             num_layers=2,
             nn_width=4,
         )
-        trace = nutpie.sample(compiled_model, transform_adapt=True, tune=2000, chains=1)
+        trace = nutpie.sample(compiled_model, adaptation="flow", tune=2000, chains=1)
         assert float(trace.sample_stats.fisher_distance.mean()) < 0.1
         trace.posterior.a  # noqa: B018
     finally:

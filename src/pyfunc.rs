@@ -1,15 +1,13 @@
 use std::{collections::HashMap, sync::Arc};
 
-use anyhow::{bail, Context, Result};
-use numpy::{
-    NotContiguousError, PyArray1, PyReadonlyArray1, PyReadonlyArrayDyn, PyUntypedArrayMethods,
-};
+use anyhow::{anyhow, bail, Context, Result};
+use numpy::{AsSliceError, PyArray1, PyReadonlyArray1, PyReadonlyArrayDyn, PyUntypedArrayMethods};
 use nuts_rs::{CpuLogpFunc, CpuMath, HasDims, LogpError, Model, Storable, Value};
 use pyo3::{
     exceptions::PyRuntimeError,
     pyclass, pymethods,
-    types::{PyAnyMethods, PyDict, PyDictMethods, PyList, PyListMethods},
-    Bound, Py, PyAny, PyErr, Python,
+    types::{PyAnyMethods, PyDict, PyDictMethods, PyList, PyListMethods, PyNone},
+    Bound, BoundObject, Py, PyAny, PyErr, Python,
 };
 use rand::Rng;
 use rand_distr::{Distribution, Uniform};
@@ -20,7 +18,7 @@ use crate::{
     wrapper::PyTransformAdapt,
 };
 
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyModel {
     make_logp_func: Arc<Py<PyAny>>,
@@ -67,7 +65,7 @@ impl PyModel {
                 let key: String = key.extract().context("Coordinate key is not a string")?;
                 let value: PyValue = value
                     .extract()
-                    .context("Coordinate value has incorrect type")?;
+                    .with_context(|| format!("Coordinate {} value has unsupported type", key))?;
                 Ok((key, value.into_value()))
             })
             .collect::<Result<HashMap<_, _>>>()?;
@@ -94,7 +92,7 @@ pub enum PyLogpError {
     #[error("logp function must return float.")]
     ReturnTypeError(),
     #[error("Python retured a non-contigous array")]
-    NotContiguousError(#[from] NotContiguousError),
+    NotContiguousError(#[from] AsSliceError),
     #[error("Unknown error: {0}")]
     Anyhow(#[from] anyhow::Error),
 }
@@ -371,6 +369,20 @@ impl CpuLogpFunc for PyDensity {
                             .collect::<Result<_, _>>()?;
                         Some(Value::Strings(vec))
                     }
+                    nuts_rs::ItemType::DateTime64(date_time_unit) => {
+                        let arr = as_value::<i64>(var, &val)?;
+                        let slice = arr.as_slice().map_err(|_| {
+                            nuts_rs::CpuMathError::ExpandError("Could not read as slice".into())
+                        })?;
+                        Some(Value::DateTime64(*date_time_unit, slice.to_vec()))
+                    }
+                    nuts_rs::ItemType::TimeDelta64(date_time_unit) => {
+                        let arr = as_value::<i64>(var, &val)?;
+                        let slice = arr.as_slice().map_err(|_| {
+                            nuts_rs::CpuMathError::ExpandError("Could not read as slice".into())
+                        })?;
+                        Some(Value::TimeDelta64(*date_time_unit, slice.to_vec()))
+                    }
                 };
                 expanded.push(val_array);
             }
@@ -465,7 +477,7 @@ impl CpuLogpFunc for PyDensity {
         Ok(())
     }
 
-    fn new_transformation<R: rand::Rng + ?Sized>(
+    fn init_transformation<R: rand::Rng + ?Sized>(
         &mut self,
         rng: &mut R,
         untransformed_position: &[f64],
@@ -478,6 +490,18 @@ impl CpuLogpFunc for PyDensity {
             .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?
             .new_transformation(rng, untransformed_position, untransformed_gradient, chain)?;
         Ok(trafo)
+    }
+
+    fn new_transformation<R: rand::Rng + ?Sized>(
+        &mut self,
+        _rng: &mut R,
+        _dim: usize,
+        _chain: u64,
+    ) -> std::result::Result<Self::FlowParameters, Self::LogpError> {
+        Python::attach(|py| {
+            let params = PyNone::get(py);
+            Ok(params.unbind().into())
+        })
     }
 
     fn transformation_id(&self, params: &Py<PyAny>) -> std::result::Result<i64, Self::LogpError> {
@@ -528,7 +552,7 @@ impl Model for PyModel {
 
             let init_point: PyReadonlyArray1<f64> = init_point
                 .extract(py)
-                .context("Initializition array returned incorrect argument")?;
+                .map_err(|_| anyhow!("Initialization array returned incorrect argument"))?;
 
             let init_point = init_point
                 .as_slice()

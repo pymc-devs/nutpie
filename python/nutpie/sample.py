@@ -1,13 +1,15 @@
 import os
+import warnings
 from dataclasses import dataclass
-from typing import Any, Literal, Optional, cast, overload
+from typing import Any, Literal, Optional, cast, get_args, overload
 
 import arviz
 import numpy as np
 import pandas as pd
 import pyarrow
+import xarray as xr
 
-from nutpie import _lib  # type: ignore
+from nutpie import _lib
 
 
 @dataclass(frozen=True)
@@ -96,14 +98,31 @@ def _arrow_to_arviz(draw_batches, stat_batches, skip_vars=None, **kwargs):
             stats_posterior, max_posterior, stat_posterior, i, n_chains, dims, skip_vars
         )
 
-    return arviz.from_dict(
-        data_posterior,
-        sample_stats=stats_posterior,
-        warmup_posterior=data_tune,
-        warmup_sample_stats=stats_tune,
-        dims=dims,
-        **kwargs,
-    )
+    from importlib.metadata import version
+
+    arviz_version = version("arviz")
+    if tuple(map(int, arviz_version.split(".")[:2])) >= (1, 0):
+        return arviz.from_dict(
+            {
+                "posterior": data_posterior,
+                "sample_stats": stats_posterior,
+                "warmup_posterior": data_tune,
+                "warmup_sample_stats": stats_tune,
+            },
+            dims=dims,
+            **kwargs,
+        )
+    else:
+        return arviz.from_dict(
+            **{
+                "posterior": data_posterior,
+                "sample_stats": stats_posterior,
+                "warmup_posterior": data_tune,
+                "warmup_sample_stats": stats_tune,
+            },  # ty:ignore[invalid-argument-type]
+            dims=dims,
+            **kwargs,
+        )
 
 
 def _add_arrow_data(data_dict, max_length, batch, chain, n_chains, dims, skip_vars):
@@ -134,6 +153,8 @@ def _add_arrow_data(data_dict, max_length, batch, chain, n_chains, dims, skip_va
         if name not in data_dict:
             if dtype in [np.float64, np.float32]:
                 data = np.full(total_shape, np.nan, dtype=dtype)
+            elif dtype == np.dtype("O"):
+                data = np.full(total_shape, None, dtype=dtype)
             else:
                 data = np.zeros(total_shape, dtype=dtype)
             data_dict[name] = data
@@ -147,6 +168,8 @@ def _add_arrow_data(data_dict, max_length, batch, chain, n_chains, dims, skip_va
             )
         else:
             is_null = is_null.to_numpy(False)
+            if values.shape[0] == num_draws:
+                values = values[~is_null]
             data_dict[name][chain, :num_draws][~is_null] = values.reshape(
                 ((~is_null).sum(),) + tuple(item_shape)
             )
@@ -296,7 +319,7 @@ _progress_template = """
 
 def in_marimo_notebook() -> bool:
     try:
-        import marimo as mo
+        import marimo as mo  # ty:ignore[unresolved-import]
 
         return mo.running_in_notebook()
     except ImportError:
@@ -305,15 +328,30 @@ def in_marimo_notebook() -> bool:
 
 def _mo_write_internal(cell_id, stream, value: object) -> None:
     """Write to marimo cell given cell_id and stream."""
-    from marimo._output import formatting
-    from marimo._messaging.ops import CellOp
-    from marimo._messaging.tracebacks import write_traceback
-    from marimo._messaging.cell_output import CellChannel
+    import marimo  # ty:ignore[unresolved-import]
+
+    if marimo.__version__ < "0.19.0":
+        # The old CellOp API is identical to new CellNotificationUtils
+        from marimo._messaging.ops import (  # ty:ignore[unresolved-import]
+            CellOp as CellNotificationUtils,
+        )
+    else:
+        from marimo._messaging.notification_utils import (  # ty:ignore[unresolved-import]
+            CellNotificationUtils,
+        )
+
+    from marimo._messaging.cell_output import (  # ty:ignore[unresolved-import]
+        CellChannel,
+    )
+    from marimo._messaging.tracebacks import (  # ty:ignore[unresolved-import]
+        write_traceback,
+    )
+    from marimo._output import formatting  # ty:ignore[unresolved-import]
 
     output = formatting.try_format(value)
     if output.traceback is not None:
         write_traceback(output.traceback)
-    CellOp.broadcast_output(
+    CellNotificationUtils.broadcast_output(
         channel=CellChannel.OUTPUT,
         mimetype=output.mimetype,
         data=output.data,
@@ -325,9 +363,11 @@ def _mo_write_internal(cell_id, stream, value: object) -> None:
 
 def _mo_create_replace():
     """Create mo.output.replace with current context pinned."""
-    from marimo._runtime.context import get_context
-    from marimo._runtime.context.types import ContextNotInitializedError
-    from marimo._output import formatting
+    from marimo._output import formatting  # ty:ignore[unresolved-import]
+    from marimo._runtime.context import get_context  # ty:ignore[unresolved-import]
+    from marimo._runtime.context.types import (  # ty:ignore[unresolved-import]
+        ContextNotInitializedError,
+    )
 
     try:
         ctx = get_context()
@@ -351,7 +391,7 @@ def in_notebook():
     def in_colab():
         "Check if the code is running in Google Colaboratory"
         try:
-            from google import colab  # noqa: F401
+            from google import colab  # noqa: F401  # ty:ignore[unresolved-import]
 
             return True
         except ImportError:
@@ -363,7 +403,7 @@ def in_notebook():
         shell = get_ipython().__class__.__name__  # type: ignore
         if shell == "ZMQInteractiveShell":  # Jupyter notebook, Spyder or qtconsole
             try:
-                from IPython.display import (
+                from IPython.display import (  # ty:ignore[unresolved-import]
                     HTML,  # noqa: F401
                     clear_output,  # noqa: F401
                     display,  # noqa: F401
@@ -416,6 +456,7 @@ class _BackgroundSampler:
         cores,
         *,
         progress_bar=True,
+        progress_callback=None,
         save_warmup=True,
         return_raw_trace=False,
         progress_template=None,
@@ -448,7 +489,7 @@ class _BackgroundSampler:
             if progress_style is None:
                 progress_style = _progress_style
 
-            import IPython
+            import IPython  # ty:ignore[unresolved-import]
 
             self._html = ""
 
@@ -474,7 +515,7 @@ class _BackgroundSampler:
                 progress_rate, progress_template, cores, callback
             )
         elif in_marimo_notebook():
-            import marimo as mo
+            import marimo as mo  # ty:ignore[unresolved-import]
 
             if progress_template is None:
                 progress_template = _progress_template
@@ -503,6 +544,8 @@ class _BackgroundSampler:
             init_mean,
             cores,
             progress_type,
+            progress_callback,
+            progress_rate,
             self._store,
         )
 
@@ -521,13 +564,13 @@ class _BackgroundSampler:
         return self._extract(results)
 
     def _extract(self, results):
+        settings_dict = self._settings.as_dict()
         if self._return_raw_trace:
             return results
         else:
             if results.is_zarr():
-                from zarr.storage import ObjectStore
                 import obstore
-                import xarray as xr
+                from zarr.storage import ObjectStore
 
                 assert self._zarr_store is not None
 
@@ -537,15 +580,14 @@ class _BackgroundSampler:
                 store = cls(*args, **kwargs)
 
                 obj_store = ObjectStore(store, read_only=True)
-                ds = xr.open_datatree(obj_store, engine="zarr", consolidated=False)
-                return arviz.from_datatree(ds)
+                return xr.open_datatree(obj_store, engine="zarr", consolidated=False)  # ty:ignore[invalid-argument-type]
 
             elif results.is_arrow():
                 skip_vars = []
                 skips = {
                     "store_gradient": ["gradient"],
                     "store_unconstrained": ["unconstrained_draw"],
-                    "store_mass_matrix": [
+                    "adapt_options.mass_matrix_options.store_mass_matrix": [
                         "mass_matrix_inv",
                         "mass_matrix_eigvals",
                         "mass_matrix_stds",
@@ -556,10 +598,23 @@ class _BackgroundSampler:
                         "divergence_momentum",
                         "divergence_start_gradient",
                     ],
+                    "store_transformed": [
+                        "transformed_position",
+                        "transformed_gradient",
+                        "transformed_mu",
+                    ],
                 }
 
+                def _get_nested(settings, name, default):
+                    parts = name.split(".")
+                    for part in parts:
+                        if part not in settings:
+                            return default
+                        settings = settings[part]
+                    return settings
+
                 for setting, names in skips.items():
-                    if not getattr(self._settings, setting, False):
+                    if not _get_nested(settings_dict["settings"], setting, False):
                         skip_vars.extend(names)
 
                 draw_batches, stat_batches = results.get_arrow_trace()
@@ -604,7 +659,9 @@ class _BackgroundSampler:
         self._sampler.abort()
 
     def __del__(self):
-        if not self._sampler.is_empty():
+        if not hasattr(self, "_sampler"):
+            return
+        if not self._sampler.is_empty(ignore_error=True):
             self.cancel()
 
     def _repr_html_(self):
@@ -622,15 +679,15 @@ def sample(
     seed: int | None = None,
     save_warmup: bool = True,
     progress_bar: bool = True,
-    low_rank_modified_mass_matrix: bool = False,
-    transform_adapt: bool = False,
+    adaptation: Literal["diag", "draw_diag", "low_rank", "flow"] = "diag",
     init_mean: np.ndarray | None = None,
     return_raw_trace: bool = False,
+    progress_callback: Any | None = None,
     progress_template: str | None = None,
     progress_style: str | None = None,
     progress_rate: int = 100,
     zarr_store: _ZarrStoreType | None = None,
-) -> arviz.InferenceData: ...
+) -> xr.DataTree: ...
 
 
 @overload
@@ -644,17 +701,17 @@ def sample(
     seed: int | None = None,
     save_warmup: bool = True,
     progress_bar: bool = True,
-    low_rank_modified_mass_matrix: bool = False,
-    transform_adapt: bool = False,
+    adaptation: Literal["diag", "draw_diag", "low_rank", "flow"] = "diag",
     init_mean: np.ndarray | None = None,
     return_raw_trace: bool = False,
     blocking: Literal[True],
+    progress_callback: Any | None = None,
     progress_template: str | None = None,
     progress_style: str | None = None,
     progress_rate: int = 100,
     zarr_store: _ZarrStoreType | None = None,
     **kwargs,
-) -> arviz.InferenceData: ...
+) -> xr.DataTree: ...
 
 
 @overload
@@ -668,11 +725,11 @@ def sample(
     seed: int | None = None,
     save_warmup: bool = True,
     progress_bar: bool = True,
-    low_rank_modified_mass_matrix: bool = False,
-    transform_adapt: bool = False,
+    adaptation: Literal["diag", "draw_diag", "low_rank", "flow"] = "diag",
     init_mean: np.ndarray | None = None,
     return_raw_trace: bool = False,
     blocking: Literal[False],
+    progress_callback: Any | None = None,
     progress_template: str | None = None,
     progress_style: str | None = None,
     progress_rate: int = 100,
@@ -681,6 +738,7 @@ def sample(
 ) -> _BackgroundSampler: ...
 
 
+@overload
 def sample(
     compiled_model: CompiledModel,
     *,
@@ -691,17 +749,40 @@ def sample(
     seed: int | None = None,
     save_warmup: bool = True,
     progress_bar: bool = True,
-    low_rank_modified_mass_matrix: bool = False,
-    transform_adapt: bool = False,
+    adaptation: Literal["diag", "draw_diag", "low_rank", "flow"] = "diag",
     init_mean: np.ndarray | None = None,
     return_raw_trace: bool = False,
-    blocking: bool = True,
+    progress_callback: Any | None = None,
     progress_template: str | None = None,
     progress_style: str | None = None,
     progress_rate: int = 100,
     zarr_store: _ZarrStoreType | None = None,
     **kwargs,
-) -> arviz.InferenceData | _BackgroundSampler:
+) -> xr.DataTree: ...
+
+
+def sample(
+    compiled_model: CompiledModel,
+    *,
+    draws: int | None = None,
+    tune: int | None = None,
+    chains: int | None = None,
+    cores: int | None = None,
+    seed: int | None = None,
+    save_warmup: bool = True,
+    progress_bar: bool = True,
+    sampler: Literal["nuts", "mclmc"] = "nuts",
+    adaptation: Literal["diag", "draw_diag", "low_rank", "flow"] = "diag",
+    init_mean: np.ndarray | None = None,
+    return_raw_trace: bool = False,
+    blocking: bool = True,
+    progress_callback: Any | None = None,
+    progress_template: str | None = None,
+    progress_style: str | None = None,
+    progress_rate: int = 100,
+    zarr_store: _ZarrStoreType | None = None,
+    **kwargs,
+) -> xr.DataTree | _BackgroundSampler:
     """Sample the posterior distribution for a compiled model.
 
     Parameters
@@ -756,10 +837,37 @@ def sample(
     return_raw_trace: bool, default=False
         Return the raw trace object (an apache arrow structure)
         instead of converting to arviz.
-    use_grad_based_mass_matrix: bool, default=True
-        Use a mass matrix estimate that is based on draw and gradient
-        variance. Set to `False` to get mass matrix adaptation more
-        similar to PyMC and Stan.
+    sampler: str, default="nuts"
+        The sampler to use. One of:
+
+        - ``"nuts"`` (default): No-U-Turn Sampler.
+        - ``"mclmc"``: Microcanonical Langevin Monte Carlo.
+          mclmc is **experimental** and might change or disapear
+          in a future release. It might also eat your homework.
+
+    adaptation: str, default="diag"
+        The mass matrix adaptation strategy to use. One of:
+
+        - ``"diag"`` (default): Diagonal mass matrix estimated from
+          draw and gradient variance. This is nutpie's standard
+          adaptation.
+        - ``"draw_diag"``: Diagonal mass matrix estimated from draw
+          variance only, similar to the adaptation in Stan and PyMC.
+          Usually less efficient, but occasionally produces a higher
+          total number of effective samples.
+        - ``"low_rank"``: Low-rank modified diagonal mass matrix that
+          can adapt to some posterior correlations. *Experimental.*
+        - ``"flow"``: Normalizing-flow reparameterisation during
+          tuning. *Experimental.*
+    mass_matrix_eigval_cutoff: float > 1, default=100
+        Ignore eigenvalues between cutoff and 1/cutoff in the
+        low-rank modified mass matrix estimate. Higher values
+        lead to worse correlation fitting, but increase
+        the performance of leapfrog steps.
+        Only applicable with ``adaptation="low_rank"``.
+    mass_matrix_gamma: float > 0, default=1e-5
+        Regularisation parameter for the eigenvalues. Only
+        applicable with ``adaptation="low_rank"``.
     progress_template: str
         This is only exposed for experimentation. upon template
         for the html progress representation.
@@ -768,22 +876,28 @@ def sample(
         for the progress bar (eg CSS).
     progress_rate: int, default=500
         Rate in ms at which the progress should be updated.
-    low_rank_modified_mass_matrix: bool, default=False
-        Allow adaptation to some posterior correlations using
-        a low-rank updated mass matrix. This is *experimental*
-        and details about this will probably change in the next
-        release.
-    mass_matrix_eigval_cutoff: float > 1, defaul=100
-        Ignore eigenvalues between cutoff and 1/cutoff in the
-        low-rank modified mass matrix estimate. Higher values
-        lead to worse correclation fitting, but increase
-        the performance of leapfrog steps.
-    mass_matrix_gamma: float > 0, default=1e-5
-        Regularisation parameter for the eigenvalues. Only
-        applicable with low_rank_modified_mass_matrix=True.
-    transform_adapt: bool, default=False
-        Use the experimental transform adaptation algorithm
-        during tuning.
+    progress_callback: callable(list[ChainProgress]) | None, default=None
+        An optional callback function that is called periodically with the
+        current progress of all chains. It receives a list of
+        ``nutpie.ChainProgress`` objects, one per chain, each exposing:
+
+        - ``finished_draws`` – number of draws completed so far
+        - ``total_draws`` – total draws to produce (tune + draws)
+        - ``divergences`` – number of divergent transitions so far
+        - ``tuning`` – whether the chain is still in the warmup phase
+        - ``started`` – whether the chain has started
+        - ``latest_num_steps`` – leapfrog steps in the last trajectory
+        - ``total_num_steps`` – cumulative leapfrog steps
+        - ``step_size`` – current step size
+        - ``runtime_ms`` – wall-clock time spent sampling (milliseconds)
+        - ``divergent_draws`` – list of draw indices that diverged
+
+        The callback fires at the same rate as the progress bar
+        (``progress_rate`` ms). It runs on a background thread, so it must
+        be thread-safe. Exceptions raised inside it are printed to stderr
+        and otherwise silently swallowed so that sampling is not interrupted.
+        The built-in progress bar is still shown regardless of whether this
+        callback is set.
     zarr_store: nutpie.zarr_store.*
         A store created using nutpie.zarr_store to store the samples
         in. If None (default), the samples will be stored in
@@ -795,31 +909,88 @@ def sample(
 
     Returns
     -------
-    trace : arviz.InferenceData
-        An ArviZ ``InferenceData`` object that contains the samples.
+    trace : xr.DataTree:
+        An Xarray ``DataTree`` object that contains the samples.
     """
 
-    if low_rank_modified_mass_matrix and transform_adapt:
-        raise ValueError(
-            "Specify only one of `low_rank_modified_mass_matrix` and `transform_adapt`"
+    # Backward-compatible deprecated keyword arguments.
+    _use_grad_based = None
+    for _old_name, _new_adaptation in [
+        ("low_rank_modified_mass_matrix", "low_rank"),
+        ("transform_adapt", "flow"),
+    ]:
+        if _old_name in kwargs:
+            _val = kwargs.pop(_old_name)
+            if _val:
+                warnings.warn(
+                    f"`{_old_name}` is deprecated. "
+                    f"Use `adaptation='{_new_adaptation}'` instead.",
+                    FutureWarning,
+                    stacklevel=2,
+                )
+                if adaptation == "diag":
+                    _AdaptationLiteral = Literal[
+                        "diag", "draw_diag", "low_rank", "flow"
+                    ]
+                    assert _new_adaptation in get_args(_AdaptationLiteral)
+                    adaptation = cast(_AdaptationLiteral, _new_adaptation)
+                else:
+                    raise ValueError(
+                        f"`{_old_name}` is deprecated and cannot be combined "
+                        f"with the `adaptation` argument."
+                    )
+    if "use_grad_based_mass_matrix" in kwargs:
+        _use_grad_based = kwargs.pop("use_grad_based_mass_matrix")
+        warnings.warn(
+            "`use_grad_based_mass_matrix` is deprecated. "
+            "Use `adaptation='draw_diag'` instead of "
+            "`use_grad_based_mass_matrix=False`.",
+            FutureWarning,
+            stacklevel=2,
         )
 
-    if low_rank_modified_mass_matrix:
-        settings = _lib.PyNutsSettings.LowRank(seed)
-    elif transform_adapt:
-        settings = _lib.PyNutsSettings.Transform(seed)
+    if sampler == "nuts":
+        if adaptation == "low_rank":
+            settings = _lib.PyNutsSettings.LowRank(seed)
+        elif adaptation == "flow":
+            settings = _lib.PyNutsSettings.Flow(seed)
+        elif adaptation in ("diag", "draw_diag"):
+            settings = _lib.PyNutsSettings.Diag(seed)
+            if adaptation == "draw_diag" or _use_grad_based is False:
+                settings.use_grad_based_mass_matrix = False
+        else:
+            raise ValueError(
+                f"Unknown adaptation strategy '{adaptation}'. "
+                f"Expected one of: 'diag', 'draw_diag', 'low_rank', 'flow'."
+            )
+    elif sampler == "mclmc":
+        if adaptation == "low_rank":
+            settings = _lib.PyMclmcSettings.LowRank(seed)
+        elif adaptation == "flow":
+            settings = _lib.PyMclmcSettings.Flow(seed)
+        elif adaptation in ("diag", "draw_diag"):
+            settings = _lib.PyMclmcSettings.Diag(seed)
+            if adaptation == "draw_diag" or _use_grad_based is False:
+                settings.use_grad_based_mass_matrix = False
+        else:
+            raise ValueError(
+                f"Unknown adaptation strategy '{adaptation}'. "
+                f"Expected one of: 'diag', 'draw_diag', 'low_rank', 'flow'."
+            )
     else:
-        settings = _lib.PyNutsSettings.Diag(seed)
+        raise ValueError(
+            f"Unknown sampler '{sampler}'. Expected one of: 'nuts', 'mclmc'."
+        )
 
+    updates = dict(kwargs)
     if tune is not None:
-        settings.num_tune = tune
+        updates["num_tune"] = tune
     if draws is not None:
-        settings.num_draws = draws
+        updates["num_draws"] = draws
     if chains is not None:
-        settings.num_chains = chains
+        updates["num_chains"] = chains
 
-    for name, val in kwargs.items():
-        setattr(settings, name, val)
+    settings.update(updates)
 
     if cores is None:
         try:
@@ -835,12 +1006,13 @@ def sample(
     if init_mean is None:
         init_mean = np.zeros(compiled_model.n_dim)
 
-    sampler = _BackgroundSampler(
+    background_sampler = _BackgroundSampler(
         compiled_model,
         settings,
         init_mean,
         cores,
         progress_bar=progress_bar,
+        progress_callback=progress_callback,
         save_warmup=save_warmup,
         return_raw_trace=return_raw_trace,
         progress_template=progress_template,
@@ -850,14 +1022,14 @@ def sample(
     )
 
     if not blocking:
-        return sampler
+        return background_sampler
 
     try:
-        result = sampler.wait()
+        result = background_sampler.wait()
     except KeyboardInterrupt:
-        result = sampler.abort()
+        result = background_sampler.abort()
     except:
-        sampler.cancel()
+        background_sampler.cancel()
         raise
 
     return result

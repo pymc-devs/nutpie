@@ -12,9 +12,12 @@ on:
 
 permissions:
   contents: read
+  pages: write
+  id-token: write
 
 jobs:
-  linux:
+  build_linux:
+    name: build linux (${{ matrix.platform.target }})
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       fail-fast: false
@@ -25,29 +28,58 @@ jobs:
           - runner: ubuntu-22.04-arm
             target: aarch64
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - name: Install uv
         uses: astral-sh/setup-uv@v7
       - uses: actions/setup-python@v6
         with:
           python-version: |
-            3.10
-            3.11
             3.12
             3.13
+            3.14
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.platform.target }}
-          args: --release --out dist --interpreter 3.10 3.11 3.12 3.13 --zig
+          args: --release --out dist --interpreter 3.12 3.13 3.14 --zig
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
           manylinux: auto
           before-script-linux: |
             dnf install -y clang-libs clang || sudo apt install llvm-dev libclang-dev clang
       - name: Upload wheels
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wheels-linux-${{ matrix.platform.target }}
+          path: dist
+
+  test_linux:
+    name: test linux (${{ matrix.target }}, ${{ matrix.python-version }}, ${{ matrix.suite }})
+    runs-on: ${{ matrix.runner }}
+    needs: build_linux
+    # stan failures block release; pymc/flow are expected red against
+    # released pymc, so allow them to fail without gating.
+    continue-on-error: ${{ matrix.suite != 'stan' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64, aarch64]
+        suite: [stan, pymc, flow]
+        python-version: ["3.12", "3.13", "3.14"]
+        include:
+          - target: x86_64
+            runner: ubuntu-22.04
+          - target: aarch64
+            runner: ubuntu-22.04-arm
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: wheels-linux-${{ matrix.target }}
           path: dist
       - name: pytest
         shell: bash
@@ -55,14 +87,22 @@ jobs:
           set -e
           python3 -m venv .venv
           source .venv/bin/activate
-          uv pip install 'nutpie[stan]' --find-links dist --force-reinstall
           uv pip install pytest pytest-timeout pytest-arraydiff
-          pytest -m "stan and not flow" --arraydiff
-          uv pip install 'nutpie[pymc]' --find-links dist --force-reinstall
-          uv pip install jax
-          pytest -m "pymc and not flow" --arraydiff
-          uv pip install 'nutpie[all]' --find-links dist --force-reinstall
-          pytest -m flow --arraydiff
+          uv pip install nutpie --no-deps --find-links dist --no-index
+          case "${{ matrix.suite }}" in
+            stan)
+              uv pip install 'nutpie[stan]'
+              pytest -m "stan and not flow" --arraydiff
+              ;;
+            pymc)
+              uv pip install 'nutpie[pymc]' jax --constraint .github/uv-constraints-main.txt
+              pytest -m "pymc and not flow" --arraydiff
+              ;;
+            flow)
+              uv pip install 'nutpie[all]' --constraint .github/uv-constraints-main.txt
+              pytest -m flow --arraydiff
+              ;;
+          esac
 
   # pyarrow doesn't currently seem to work on musllinux
   #musllinux:
@@ -76,7 +116,7 @@ jobs:
   #        - runner: ubuntu-22.04
   #          target: aarch64
   #  steps:
-  #    - uses: actions/checkout@v5
+  #    - uses: actions/checkout@v6
   #    - uses: actions/setup-python@v6
   #      with:
   #        python-version: "3.12"
@@ -92,7 +132,7 @@ jobs:
   #        before-script-linux: |
   #          dnf install -y clang-libs clang || apt install llvm-dev libclang-dev clang
   #    - name: Upload wheels
-  #      uses: actions/upload-artifact@v4
+  #      uses: actions/upload-artifact@v7
   #      with:
   #        name: wheels-musllinux-${{ matrix.platform.target }}
   #        path: dist
@@ -134,23 +174,18 @@ jobs:
   #          uv pip install 'nutpie[stan]' --find-links dist --force-reinstall
   #          pytest
 
-  windows:
-    runs-on: ${{ matrix.platform.runner }}
-    strategy:
-      matrix:
-        platform:
-          - runner: windows-latest
-            target: x64
+  build_windows:
+    name: build windows
+    runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
         with:
           python-version: |
-            3.10
-            3.11
             3.12
             3.13
-          architecture: ${{ matrix.platform.target }}
+            3.14
+          architecture: x64
       - name: Install uv
         uses: astral-sh/setup-uv@v7
       - name: Install LLVM and Clang
@@ -159,7 +194,6 @@ jobs:
           version: "15.0"
           directory: ${{ runner.temp }}/llvm
       - name: Set up TBB
-        if: matrix.os == 'windows-latest'
         run: |
           Add-Content $env:GITHUB_PATH "$(pwd)/stan/lib/stan_math/lib/tbb"
       - name: Build wheels
@@ -167,49 +201,78 @@ jobs:
         env:
           LIBCLANG_PATH: ${{ runner.temp }}/llvm/lib
         with:
-          target: ${{ matrix.platform.target }}
-          args: --release --out dist --find-interpreter
+          target: x64
+          args: --release --out dist --interpreter 3.12 3.13 3.14
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
       - name: Upload wheels
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: wheels-windows-${{ matrix.platform.target }}
+          name: wheels-windows-x64
+          path: dist
+
+  test_windows:
+    name: test windows (${{ matrix.python-version }}, ${{ matrix.suite }})
+    runs-on: windows-latest
+    needs: build_windows
+    continue-on-error: ${{ matrix.suite != 'stan' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [stan, pymc, flow]
+        python-version: ["3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: wheels-windows-x64
           path: dist
       - name: pytest
-        if: ${{ !startsWith(matrix.platform.target, 'aarch64') }}
         shell: bash
         run: |
           set -e
           python3 -m venv .venv
           source .venv/Scripts/activate
-          uv pip install "nutpie[stan]" --find-links dist --force-reinstall
           uv pip install pytest pytest-timeout pytest-arraydiff
-          pytest -m "stan and not flow" --arraydiff
-          uv pip install "nutpie[pymc]" --find-links dist --force-reinstall
-          uv pip install jax
-          pytest -m "pymc and not flow" --arraydiff
-          uv pip install "nutpie[all]" --find-links dist --force-reinstall
-          pytest -m flow --arraydiff
+          uv pip install nutpie --no-deps --find-links dist --no-index
+          case "${{ matrix.suite }}" in
+            stan)
+              uv pip install "nutpie[stan]"
+              pytest -m "stan and not flow" --arraydiff
+              ;;
+            pymc)
+              uv pip install "nutpie[pymc]" jax --constraint .github/uv-constraints-main.txt
+              pytest -m "pymc and not flow" --arraydiff
+              ;;
+            flow)
+              uv pip install "nutpie[all]" --constraint .github/uv-constraints-main.txt
+              pytest -m flow --arraydiff
+              ;;
+          esac
 
-  macos:
+  build_macos:
+    name: build macos (${{ matrix.platform.target }})
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       fail-fast: false
       matrix:
         platform:
-          - runner: macos-13
+          - runner: macos-15-intel
             target: x86_64
           - runner: macos-14
             target: aarch64
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
         with:
           python-version: |
-            3.10
-            3.11
             3.12
             3.13
+            3.14
       - name: Install uv
         uses: astral-sh/setup-uv@v7
       - uses: maxim-lobanov/setup-xcode@v1
@@ -219,41 +282,160 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.platform.target }}
-          args: --release --out dist --find-interpreter
+          args: --release --out dist --interpreter 3.12 3.13 3.14 --zig
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
       - name: Upload wheels
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wheels-macos-${{ matrix.platform.target }}
+          path: dist
+
+  test_macos:
+    name: test macos (${{ matrix.target }}, ${{ matrix.python-version }}, ${{ matrix.suite }})
+    runs-on: ${{ matrix.runner }}
+    needs: build_macos
+    continue-on-error: ${{ matrix.suite != 'stan' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64, aarch64]
+        suite: [stan, pymc, flow]
+        python-version: ["3.12", "3.13", "3.14"]
+        include:
+          - target: x86_64
+            runner: macos-15-intel
+          - target: aarch64
+            runner: macos-14
+        exclude:
+          # numba isn't available on macOS x86_64
+          - target: x86_64
+            suite: pymc
+          - target: x86_64
+            suite: flow
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: wheels-macos-${{ matrix.target }}
           path: dist
       - name: pytest
         run: |
           set -e
           python3 -m venv .venv
           source .venv/bin/activate
-          uv pip install 'nutpie[stan]' --find-links dist --force-reinstall
           uv pip install pytest pytest-timeout pytest-arraydiff
-          pytest -m "stan and not flow" --arraydiff
-          uv pip install 'nutpie[pymc]' --find-links dist --force-reinstall
-          uv pip install jax
-          # Install MLX only on Apple Silicon (aarch64)
-          if [ "${{ matrix.platform.target }}" = "aarch64" ]; then
-            uv pip install mlx
-          fi
-          pytest -m "pymc and not flow" --arraydiff
-          uv pip install 'nutpie[all]' --find-links dist --force-reinstall
-          pytest -m flow --arraydiff
+          uv pip install nutpie --no-deps --find-links dist --no-index
+          case "${{ matrix.suite }}" in
+            stan)
+              uv pip install 'nutpie[stan]'
+              pytest -m "stan and not flow" --arraydiff
+              ;;
+            pymc)
+              uv pip install 'nutpie[pymc]' jax --constraint .github/uv-constraints-main.txt
+              # Install MLX only on Apple Silicon (aarch64); macOS pymc only runs there per matrix excludes.
+              if [ "${{ matrix.target }}" = "aarch64" ]; then
+                uv pip install mlx
+              fi
+              pytest -m "pymc and not flow" --arraydiff
+              ;;
+            flow)
+              uv pip install 'nutpie[all]' --constraint .github/uv-constraints-main.txt
+              pytest -m flow --arraydiff
+              ;;
+          esac
+
+  test_pymc_dev:
+    name: pymc (dev)
+    runs-on: ubuntu-22.04
+    needs: build_linux
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v8
+        with:
+          name: wheels-linux-x86_64
+          path: dist
+      - name: pytest
+        run: |
+          python3 -m venv .venv
+          source .venv/bin/activate
+          uv pip install nutpie --no-deps --find-links dist --no-index
+          uv pip install 'nutpie[dev]' --constraint .github/uv-constraints-dev.txt
+          pytest -m "pymc" --arraydiff
+
+  docs:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+      - name: Install Quarto
+        uses: quarto-dev/quarto-actions/setup@v2
+      - name: Build and install nutpie
+        run: |
+          python3 -m venv .venv
+          source .venv/bin/activate
+          uv pip install maturin
+          maturin build --release --out dist
+      - name: Install doc dependencies
+        run: |
+          source .venv/bin/activate
+          uv pip install nutpie --no-deps --find-links dist --no-index
+          uv pip install --constraint .github/uv-constraints-dev.txt "nutpie[docs]"
+      - name: Render docs
+        env:
+          TBB_CXX_TYPE: clang
+        run: |
+          source .venv/bin/activate
+          cd docs
+          quarto render
+      - name: Upload docs artifact
+        if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/_site
+
+  deploy-docs:
+    name: Deploy Docs
+    runs-on: ubuntu-latest
+    if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') }}
+    needs: [docs]
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
   sdist:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - name: Build sdist
         uses: PyO3/maturin-action@v1
         with:
           command: sdist
           args: --out dist
       - name: Upload sdist
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wheels-sdist
           path: dist
@@ -262,7 +444,18 @@ jobs:
     name: Release
     runs-on: ubuntu-latest
     if: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
-    needs: [linux, windows, macos, sdist]
+    needs:
+      [
+        build_linux,
+        build_windows,
+        build_macos,
+        sdist,
+        test_linux,
+        test_windows,
+        test_macos,
+        test_pymc_dev,
+        docs,
+      ]
     environment:
       name: pypi
     permissions:
@@ -273,9 +466,9 @@ jobs:
       # Used to generate artifact attestation
       attestations: write
     steps:
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v8
       - name: Generate artifact attestation
-        uses: actions/attest-build-provenance@v3
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: "wheels-*/*"
       - name: Publish to PyPI
@@ -285,7 +478,7 @@ jobs:
           command: upload
           args: --non-interactive --skip-existing wheels-*/*
       - name: Upload to GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             wasm-wheels/*.whl

@@ -1,13 +1,13 @@
 use std::{collections::HashMap, ffi::c_void, sync::Arc};
 
-use anyhow::{bail, Context, Result};
-use numpy::{NotContiguousError, PyReadonlyArray1};
+use anyhow::{anyhow, bail, Context, Result};
+use numpy::{AsSliceError, PyReadonlyArray1};
 use nuts_rs::{CpuLogpFunc, CpuMath, HasDims, LogpError, Model, Storable, Value};
 use pyo3::{
     exceptions::PyRuntimeError,
     pyclass, pymethods,
-    types::{PyAnyMethods, PyDict, PyDictMethods},
-    Py, PyAny, PyErr, PyResult, Python,
+    types::{PyAnyMethods, PyDict, PyDictMethods, PyNone},
+    BoundObject, Py, PyAny, PyErr, PyResult, Python,
 };
 
 use rand::Rng;
@@ -36,7 +36,7 @@ type RawExpandFunc = unsafe extern "C" fn(
     *const std::ffi::c_void,
 ) -> std::os::raw::c_int;
 
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub(crate) struct LogpFunc {
     func: RawLogpFunc,
@@ -62,7 +62,7 @@ impl LogpFunc {
     }
 }
 
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub(crate) struct ExpandFunc {
     func: RawExpandFunc,
@@ -156,7 +156,7 @@ pub enum PyMcLogpError {
     #[error("Python error: {0}")]
     PyError(#[from] PyErr),
     #[error("Python retured a non-contigous array")]
-    NotContiguousError(#[from] NotContiguousError),
+    NotContiguousError(#[from] AsSliceError),
     #[error("Unknown error: {0}")]
     Anyhow(#[from] anyhow::Error),
     #[error("Logp function returned error code: {0}")]
@@ -265,6 +265,11 @@ impl CpuLogpFunc for PyMcModelRef<'_> {
                         "String type not supported in expansion".into(),
                     ));
                 }
+                nuts_rs::ItemType::DateTime64(_) | nuts_rs::ItemType::TimeDelta64(_) => {
+                    return Err(nuts_rs::CpuMathError::ExpandError(
+                        "DateTime64 and TimeDelta64 types not supported in expansion".into(),
+                    ));
+                }
             };
 
             values.push(Some(value));
@@ -366,7 +371,7 @@ impl CpuLogpFunc for PyMcModelRef<'_> {
         Ok(())
     }
 
-    fn new_transformation<R: rand::Rng + ?Sized>(
+    fn init_transformation<R: rand::Rng + ?Sized>(
         &mut self,
         rng: &mut R,
         untransformed_position: &[f64],
@@ -381,6 +386,18 @@ impl CpuLogpFunc for PyMcModelRef<'_> {
         Ok(trafo)
     }
 
+    fn new_transformation<R: rand::Rng + ?Sized>(
+        &mut self,
+        _rng: &mut R,
+        _dim: usize,
+        _chain: u64,
+    ) -> std::result::Result<Self::FlowParameters, Self::LogpError> {
+        Python::attach(|py| {
+            let params = PyNone::get(py);
+            Ok(params.unbind().into())
+        })
+    }
+
     fn transformation_id(&self, params: &Py<PyAny>) -> std::result::Result<i64, Self::LogpError> {
         let id = self
             .transform_adapter
@@ -391,7 +408,7 @@ impl CpuLogpFunc for PyMcModelRef<'_> {
     }
 }
 
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub(crate) struct PyMcModel {
     dim: usize,
@@ -437,7 +454,7 @@ impl PyMcModel {
                 let key: String = key.extract().context("Coordinate key is not a string")?;
                 let value: PyValue = value
                     .extract()
-                    .context("Coordinate value has incorrect type")?;
+                    .with_context(|| format!("Coordinate {} value has unsupported type", key))?;
                 Ok((key, value.into_value()))
             })
             .collect::<Result<HashMap<_, _>>>()?;
@@ -500,7 +517,7 @@ impl Model for PyMcModel {
 
             let init_point: PyReadonlyArray1<f64> = init_point
                 .extract(py)
-                .context("Initializition array returned incorrect argument")?;
+                .map_err(|_| anyhow!("Initialization array returned incorrect argument"))?;
 
             let init_point = init_point
                 .as_slice()

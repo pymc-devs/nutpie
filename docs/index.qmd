@@ -3,16 +3,21 @@
 `nutpie` is a high-performance library designed for Bayesian inference, that
 provides efficient sampling algorithms for probabilistic models. It can sample
 models that are defined in PyMC or Stan (numpyro and custom hand-coded
-likelihoods with gradient are coming soon).
+likelihoods with gradient are coming soon). It provides:
 
 - Faster sampling than either the PyMC or Stan default samplers. (An average
   ~2x speedup on `posteriordb` compared to Stan)
 - All the diagnostic information of PyMC and Stan and some more.
-- GPU support for PyMC models through jax.
+- GPU support for PyMC models through `jax`.
 - A more informative progress bar.
 - Access to the incomplete trace during sampling.
 - *Experimental* normalizing flow adaptation for more efficient sampling of
   difficult posteriors.
+
+For more details on the algorithms used in nutpie, see the paper
+[Preconditioning Hamiltonian Monte Carlo by minimizing Fisher
+Divergence](https://arxiv.org/abs/2603.18845). If you use nutpie in your
+research, please see the [citation instructions](about.qmd#citation).
 
 ## Quickstart: PyMC
 
@@ -46,7 +51,7 @@ For more information, see the detailed [PyMC usage guide](pymc-usage.qmd).
 
 ## Quickstart: Stan
 
-Stan needs access to a compiler toolchain, you can find instructions for those
+Stan needs access to a compiler toolchain, for which you can find installation instructions
 [here](https://mc-stan.org/docs/cmdstan-guide/installation.html#cpp-toolchain).
 You can then install nutpie through pip or uv:
 
