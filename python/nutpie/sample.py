@@ -154,7 +154,11 @@ def _arrow_to_arviz(
             groups["warmup_unconstrained_posterior"] = arviz.dict_to_dataset(
                 uc_data_tune, coords=coords, dims=uc_dims
             )
-        idata.add_groups(groups)
+        if hasattr(idata, "add_groups"):
+            idata.add_groups(groups)
+        else:
+            for name, dataset in groups.items():
+                idata[name] = dataset
 
     return idata
 
