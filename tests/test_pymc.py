@@ -9,6 +9,7 @@ if find_spec("pymc") is None:
 import numpy as np
 import pandas as pd
 import pymc as pm
+import pytensor
 import pytest
 
 import nutpie
@@ -608,3 +609,20 @@ def test_dims_model(backend, gradient_backend):
     assert post["one_sum"].dims == ("chain", "draw", "b", "a")
     np.testing.assert_allclose(post["zero_sum"].sum(dim="a"), 0, atol=1e-5)
     np.testing.assert_allclose(post["one_sum"].sum(dim="a"), 1, atol=1e-5)
+
+
+@pytest.mark.pymc
+@parameterize_backends
+def test_unnamed_shared(backend, gradient_backend):
+    rng = np.random.default_rng(0)
+    x = rng.normal(size=100)
+    y = x + rng.normal(scale=1e-2, size=100)
+
+    x_shared = pytensor.shared(x)
+
+    with pm.Model() as model:
+        b = pm.Normal("b", 0.0, 10.0)
+        pm.Normal("obs", b * x_shared, np.sqrt(1e-2), observed=y, shape=x_shared.shape)
+
+    compiled = nutpie.compile_pymc_model(model)
+    nutpie.sample(compiled)
