@@ -14,9 +14,28 @@ import pytest
 import nutpie
 import nutpie.compile_pymc
 
+# Check if MLX is available (macOS only, optional dependency)
+MLX_AVAILABLE = find_spec("mlx") is not None
+
+# Build backend list dynamically based on availability
+backend_params = [
+    ("numba", None),
+    ("jax", "pytensor"),
+    ("jax", "jax"),
+]
+
+# Only add MLX backends if MLX is available
+if MLX_AVAILABLE:
+    backend_params.extend(
+        [
+            ("mlx", "pytensor"),
+            ("mlx", "mlx"),
+        ]
+    )
+
 parameterize_backends = pytest.mark.parametrize(
     "backend, gradient_backend",
-    [("numba", None), ("jax", "pytensor"), ("jax", "jax")],
+    backend_params,
 )
 
 
@@ -528,6 +547,20 @@ def test_deterministic_sampling_jax():
 
 
 @pytest.mark.pymc
+def test_deterministic_sampling_mlx():
+    if not MLX_AVAILABLE:
+        pytest.skip("MLX not installed")
+
+    with pm.Model() as model:
+        pm.HalfNormal("a")
+
+    compiled = nutpie.compile_pymc_model(model, backend="mlx", gradient_backend="mlx")
+    trace = nutpie.sample(compiled, chains=2, seed=123, draws=100, tune=100)
+    assert trace.posterior.a.shape == (2, 100)
+    assert np.all(np.isfinite(trace.posterior.a.values))
+
+
+@pytest.mark.pymc
 def test_zarr_store(tmp_path):
     coords = {
         "a": np.arange(2).astype("f"),
@@ -593,6 +626,12 @@ def tmp_path():
 @parameterize_backends
 def test_dims_model(backend, gradient_backend):
     import pymc.dims as pmd
+
+    if backend == "mlx":
+        pytest.xfail(
+            "PyTensor's MLX linker does not yet implement XTensorFromTensor; "
+            "see https://github.com/pymc-devs/pytensor/issues/1350"
+        )
 
     coords = {"a": range(3), "b": range(5)}
     with pm.Model(coords=coords) as model:
