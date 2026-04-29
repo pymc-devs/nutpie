@@ -305,6 +305,7 @@ def test_pymc_model_store_extra(backend, gradient_backend):
     with pm.Model() as model:
         model.add_coord("foo", length=5)
         pm.Normal("a", dims="foo")
+        pm.HalfNormal("b", sigma=1.0, dims="foo")
 
     compiled = nutpie.compile_pymc_model(
         model, backend=backend, gradient_backend=gradient_backend
@@ -318,6 +319,8 @@ def test_pymc_model_store_extra(backend, gradient_backend):
         store_gradient=True,
     )
     trace.posterior.a  # noqa: B018
+    trace.posterior.b  # noqa: B018
+    assert trace.unconstrained_posterior.b_log__.dims == ("chain", "draw", "foo")
     _ = trace.sample_stats.unconstrained_draw
     _ = trace.sample_stats.gradient
     _ = trace.sample_stats.divergence_start

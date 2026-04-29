@@ -119,6 +119,7 @@ def from_pyfunc(
     make_initial_point_fn: Callable[[SeedType], np.ndarray] | None = None,
     make_transform_adapter=None,
     raw_logp_fn=None,
+    reparameterized_names=None,
 ):
     if coords is None:
         coords = {}
@@ -150,4 +151,5 @@ def from_pyfunc(
         _variables=variables,
         _shared_data=shared_data,
         _raw_logp_fn=raw_logp_fn,
+        reparameterized_names=reparameterized_names,
     )
