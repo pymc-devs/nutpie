@@ -22,3 +22,7 @@ repos:
       - id: ruff
         args: ["--fix", "--output-format=full"]
       - id: ruff-format
+  - repo: https://github.com/zizmorcore/zizmor-pre-commit
+    rev: v1.22.0
+    hooks:
+    - id: zizmor

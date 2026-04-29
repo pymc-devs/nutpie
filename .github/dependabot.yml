@@ -8,7 +8,11 @@ updates:
     labels:
       - "Github CI/CD"
       - "no releasenotes"
+    cooldown:
+      default-days: 7
   - package-ecosystem: "cargo"
     directory: "/rust"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
