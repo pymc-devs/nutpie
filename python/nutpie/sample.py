@@ -118,11 +118,6 @@ def _arrow_to_arviz(
         name: data_tune.pop(name) for name in reparameterized_names if name in data_tune
     }
 
-    if not keep_unconstrained_draw:
-        stats_posterior.pop("unconstrained_draw", None)
-        stats_tune.pop("unconstrained_draw", None)
-        dims.pop("unconstrained_draw", None)
-
     arviz_version = version("arviz")
     if tuple(map(int, arviz_version.split(".")[:2])) >= (1, 0):
         idata = arviz.from_dict(

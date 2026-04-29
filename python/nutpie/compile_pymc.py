@@ -1,4 +1,5 @@
 import dataclasses
+import itertools
 import threading
 import warnings
 from collections.abc import Iterable
@@ -28,6 +29,9 @@ if TYPE_CHECKING:
     import numba.core.ccallback
     import pymc as pm
     from pytensor.tensor import TensorVariable, Variable
+
+
+_UNCONSTRAINED_PARAMETER = "unconstrained_parameter"
 
 
 def _rv_dict_to_flat_array_wrapper(
@@ -351,19 +355,27 @@ def _prepare_dims_and_coords(model, shape_info, reparameterized_names):
     for name, vals in model.coords.items():
         if vals is None:
             vals = pd.RangeIndex(int(model.dim_lengths[name].eval()))
-        idx = pd.Index(vals)
-        if idx.dtype == "object" or idx.dtype == "string":
-            coords[name] = idx.tolist()
-        else:
-            coords[name] = idx
+        coords[name] = pd.Index(vals)
+
+    if _UNCONSTRAINED_PARAMETER in coords:
+        raise ValueError(f"Model contains invalid name '{_UNCONSTRAINED_PARAMETER}'.")
 
     names, _, shape_list = shape_info
+    n_free = len(model.free_RVs)
+    coords[_UNCONSTRAINED_PARAMETER] = pd.Index(
+        base if not idx else f"{base}_{'.'.join(map(str, idx))}"
+        for base, shape in zip(names[:n_free], shape_list[:n_free])
+        for idx in itertools.product(*(range(n) for n in shape))
+    )
+
     shape_by_name = {n: tuple(s) for n, s in zip(names, shape_list)}
-    value_to_rv = {model.rvs_to_values[var].name: var.name for var in model.free_RVs}
+    value_to_rv = {v.name: rv.name for v, rv in model.values_to_rvs.items()}
 
     dims = dict(model.named_vars_to_dims)
     for value_name in reparameterized_names:
-        rv_name = value_to_rv[value_name]
+        rv_name = value_to_rv.get(value_name)
+        if rv_name is None:
+            continue
         rv_dims = dims.get(rv_name)
         if rv_dims is None:
             continue
@@ -789,19 +801,11 @@ def _make_functions(
         names = set(var_names)
         remaining_rvs = [var for var in remaining_rvs if var.name in names]
 
-    all_names = []
-    all_slices = []
-    all_shapes = []
-    count_expanded = 0
-
-    identity_free = []
-    for var_expr, name, shape in zip(variables, joined_names, joined_shapes):
-        length = prod(shape)
-        all_names.append(name)
-        all_shapes.append(shape)
-        all_slices.append(slice(count_expanded, count_expanded + length))
-        count_expanded += length
-        identity_free.append(var_expr)
+    all_names = list(joined_names)
+    all_slices = list(joined_slices)
+    all_shapes = list(joined_shapes)
+    count_expanded = num_free_vars
+    identity_free = list(variables)
 
     for var in remaining_rvs:
         all_names.append(var.name)
