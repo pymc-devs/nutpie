@@ -23,6 +23,8 @@ class PyFuncModel(CompiledModel):
     _coords: dict[str, Any]
     _raw_logp_fn: Callable | None
     _transform_adapt_args: dict | None = None
+    _force_single_core: bool = False
+    _shared_data_converter: Callable[[Any], Any] | None = None
 
     @property
     def shapes(self) -> dict[str, tuple[int, ...]]:
@@ -42,7 +44,12 @@ class PyFuncModel(CompiledModel):
                 raise ValueError(f"Unknown data variable: {name}")
 
         updated = self._shared_data.copy()
-        updated.update(**updates)
+        if self._shared_data_converter is not None:
+            for name, value in updates.items():
+                updated[name] = self._shared_data_converter(value)
+        else:
+            updated.update(**updates)
+
         return dataclasses.replace(self, _shared_data=updated)
 
     def with_transform_adapt(self, **kwargs):
@@ -58,6 +65,8 @@ class PyFuncModel(CompiledModel):
         extra_callback_rate,
         store,
     ):
+        if self._force_single_core:
+            cores = 1
         model = self._make_model(init_mean)
         return _lib.PySampler.from_pyfunc(
             settings,
@@ -119,6 +128,8 @@ def from_pyfunc(
     make_initial_point_fn: Callable[[SeedType], np.ndarray] | None = None,
     make_transform_adapter=None,
     raw_logp_fn=None,
+    force_single_core: bool = False,
+    shared_data_converter: Callable[[Any], Any] | None = None,
 ):
     if coords is None:
         coords = {}
@@ -150,4 +161,6 @@ def from_pyfunc(
         _variables=variables,
         _shared_data=shared_data,
         _raw_logp_fn=raw_logp_fn,
+        _force_single_core=force_single_core,
+        _shared_data_converter=shared_data_converter,
     )
