@@ -32,6 +32,9 @@ if TYPE_CHECKING:
     from pytensor.tensor import TensorVariable, Variable
 
 
+_UNCONSTRAINED_PARAMETER = "unconstrained_parameter"
+
+
 def _rv_dict_to_flat_array_wrapper(
     fn: Callable[[SeedType | None], dict[str, np.ndarray]],
     names: list[str],
@@ -288,6 +291,7 @@ def _compile_pymc_model_numba(
         expand_fn_pt,
         initial_point_fn,
         shape_info,
+        reparameterized_names,
     ) = _make_functions(
         model,
         mode="NUMBA",
@@ -342,7 +346,7 @@ def _compile_pymc_model_numba(
 
         expand_numba = numba.cfunc(c_sig_expand, **kwargs)(expand_numba_raw)
 
-    dims, coords = _prepare_dims_and_coords(model, shape_info)
+    dims, coords = _prepare_dims_and_coords(model, shape_info, reparameterized_names)
 
     return CompiledPyMCModel(
         _n_dim=n_dim,
@@ -359,18 +363,19 @@ def _compile_pymc_model_numba(
         shape_info=shape_info,
         logp_func=logp_fn_pt,
         expand_func=expand_fn_pt,
+        reparameterized_names=reparameterized_names,
     )
 
 
-def _prepare_dims_and_coords(model, shape_info):
+def _prepare_dims_and_coords(model, shape_info, reparameterized_names):
     coords = {}
     for name, vals in model.coords.items():
         if vals is None:
             vals = pd.RangeIndex(int(model.dim_lengths[name].eval()))
         coords[name] = pd.Index(vals)
 
-    if "unconstrained_parameter" in coords:
-        raise ValueError("Model contains invalid name 'unconstrained_parameter'.")
+    if _UNCONSTRAINED_PARAMETER in coords:
+        raise ValueError(f"Model contains invalid name '{_UNCONSTRAINED_PARAMETER}'.")
 
     names = []
     for base, _, shape in zip(*shape_info):
@@ -381,9 +386,24 @@ def _prepare_dims_and_coords(model, shape_info):
                 names.append(base)
             else:
                 names.append(f"{base}_{'.'.join(str(i) for i in idx)}")
-    coords["unconstrained_parameter"] = pd.Index(names)
+    coords[_UNCONSTRAINED_PARAMETER] = pd.Index(names)
 
-    dims = model.named_vars_to_dims
+    names, _, shape_list = shape_info
+
+    shape_by_name = {n: tuple(s) for n, s in zip(names, shape_list)}
+    value_to_rv = {v.name: rv.name for v, rv in model.values_to_rvs.items()}
+
+    dims = dict(model.named_vars_to_dims)
+    for value_name in reparameterized_names:
+        rv_name = value_to_rv.get(value_name)
+        if rv_name is None:
+            continue
+        rv_dims = dims.get(rv_name)
+        if rv_dims is None:
+            continue
+        if shape_by_name.get(rv_name) == shape_by_name.get(value_name):
+            dims[value_name] = rv_dims
+
     return dims, coords
 
 
@@ -416,6 +436,7 @@ def _compile_pymc_model_jax(
         expand_fn_pt,
         initial_point_fn,
         shape_info,
+        reparameterized_names,
     ) = _make_functions(
         model,
         mode="JAX",
@@ -481,7 +502,7 @@ def _compile_pymc_model_jax(
 
         return expand
 
-    dims, coords = _prepare_dims_and_coords(model, shape_info)
+    dims, coords = _prepare_dims_and_coords(model, shape_info, reparameterized_names)
 
     return from_pyfunc(
         ndim=n_dim,
@@ -495,6 +516,7 @@ def _compile_pymc_model_jax(
         dims=dims,
         coords=coords,
         raw_logp_fn=orig_logp_fn,
+        reparameterized_names=reparameterized_names,
     )
 
 
@@ -658,6 +680,7 @@ def _make_functions(
     Callable,
     Callable,
     tuple[list[str], list[slice], list[tuple[int, ...]]],
+    list[str],
 ]:
     """
     Compile functions required by nuts-rs from a given PyMC model.
@@ -764,7 +787,7 @@ def _make_functions(
     if use_split:
         variables = pt.split(joined, splits, len(splits))
     else:
-        variables = [joined[slice_val] for slice_val in zip(joined_slices)]
+        variables = [joined[slice_val] for slice_val in joined_slices]
 
     replacements = {
         model.rvs_to_values[var]: value.reshape(shape).astype(var.dtype)
@@ -784,6 +807,12 @@ def _make_functions(
         with model:
             logp_fn_pt = compile_pymc((joined,), (logp,), mode=mode)
 
+    reparameterized_names = [
+        model.rvs_to_values[var].name
+        for var in model.free_RVs
+        if model.rvs_to_transforms.get(var) is not None
+    ]
+
     # Make function that computes remaining variables for the trace
     remaining_rvs = [
         var for var in model.unobserved_value_vars if var.name not in joined_names
@@ -793,11 +822,11 @@ def _make_functions(
         names = set(var_names)
         remaining_rvs = [var for var in remaining_rvs if var.name in names]
 
-    all_names = joined_names + remaining_rvs
-
     all_names = joined_names.copy()
     all_slices = joined_slices.copy()
     all_shapes = joined_shapes.copy()
+    count = num_free_vars
+    identity_free = list(variables)
 
     for var in remaining_rvs:
         all_names.append(var.name)
@@ -813,7 +842,7 @@ def _make_functions(
         allvars = [
             pt.concatenate(
                 [
-                    joined,
+                    *[v.ravel() for v in identity_free],
                     *[
                         pt.as_tensor(var, allow_xtensor_conversion=True).ravel()
                         for var in remaining_rvs
@@ -822,7 +851,7 @@ def _make_functions(
             )
         ]
     else:
-        allvars = [*variables, *remaining_rvs]
+        allvars = [*identity_free, *remaining_rvs]
     with model:
         expand_fn_pt = compile_pymc(
             (joined,),
@@ -838,6 +867,7 @@ def _make_functions(
         expand_fn_pt,
         initial_point_fn,
         (all_names, all_slices, all_shapes),
+        reparameterized_names,
     )
 
 
