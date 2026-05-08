@@ -119,7 +119,8 @@ def _arrow_to_arviz(
     }
 
     arviz_version = version("arviz")
-    if tuple(map(int, arviz_version.split(".")[:2])) >= (1, 0):
+    use_datatree = tuple(map(int, arviz_version.split(".")[:2])) >= (1, 0)
+    if use_datatree:
         idata = arviz.from_dict(
             {
                 "posterior": data_posterior,
@@ -154,7 +155,10 @@ def _arrow_to_arviz(
             groups["warmup_unconstrained_posterior"] = arviz.dict_to_dataset(
                 uc_data_tune, coords=coords, dims=uc_dims
             )
-        idata.add_groups(groups)
+        if use_datatree:
+            idata = idata.assign(**{k: xr.DataTree(v) for k, v in groups.items()})
+        else:
+            idata.add_groups(groups)
 
     return idata
 
