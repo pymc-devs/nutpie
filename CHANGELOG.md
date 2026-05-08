@@ -2,6 +2,104 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.16.9] - 2026-05-08
+
+### Bug Fixes
+
+- Some typing improvements (Adrian Seyboldt)
+
+- Compat with newer PyTensor and Arviz (Ricardo Vieira)
+
+- Use keys instead of names to identify shared vars (Adrian Seyboldt)
+
+- Add extra groups with datatree.assign for new arviz (Adrian Seyboldt)
+
+
+### Documentation
+
+- Add release process documentation (#292) (Ben Mares)
+
+- Add citation instructions and link to paper (Adrian Seyboldt)
+
+- Add deployment workflow for docs (Adrian Seyboldt)
+
+- Add note that mclmc is experimental (Adrian Seyboldt)
+
+- Add fisher divergence section (Adrian Seyboldt)
+
+- Random webpage copy edits (#307) (Eliot Carlson)
+
+
+### Features
+
+- Cleaner arguments for mass matrix adaptation (Adrian Seyboldt)
+
+- Add user callback for progress info (Adrian Seyboldt)
+
+- Implement compile cache pruning (Adrian Seyboldt)
+
+- Handle string values in trace sample stats (Adrian Seyboldt)
+
+- Expose extra_doubling and exact_normal_trajectory (Adrian Seyboldt)
+
+- Support isokinetic solver (Adrian Seyboldt)
+
+- Support mclmc sampler (Adrian Seyboldt)
+
+- Expose trajectory option (Adrian Seyboldt)
+
+- Add databricks support. closes #218 (#311) (Will Dean)
+
+- Move unconstrained parameters in their own group (Chris Fonnesbeck)
+
+
+### Miscellaneous Tasks
+
+- Bump softprops/action-gh-release from 2 to 3 (dependabot[bot])
+
+- Bump rustls-webpki in the cargo group across 1 directory (dependabot[bot])
+
+- Update dependencies (Adrian Seyboldt)
+
+- Require python 3.12 (Adrian Seyboldt)
+
+- Support both arviz 1.0 and older (Adrian Seyboldt)
+
+- Update nuts-rs (Adrian Seyboldt)
+
+- Dont point pyright to pixi (#304) (Eliot Carlson)
+
+- Bump actions/deploy-pages from 4 to 5 (#309) (dependabot[bot])
+
+- Bump actions/upload-pages-artifact from 3 to 5 (#310) (dependabot[bot])
+
+- Allow low severity issues in github workflow (Adrian Seyboldt)
+
+
+### Refactor
+
+- Cleaner settings handling for nuts (Adrian Seyboldt)
+
+
+### Ci
+
+- Render docs during ci (Adrian Seyboldt)
+
+- Update reference draws due to change in window lengths (Adrian Seyboldt)
+
+- Test against upstream pytensor and pymc for now (aloctavodia)
+
+- Split CI into build + per-suite test jobs (Ricardo Vieira)
+
+- Make sure to use the local wheel to test nutpie (Adrian Seyboldt)
+
+- Fix branch of current dev pymc/pytensor (#312) (Adrian Seyboldt)
+
+- Harden CI workflows a bit (Adrian Seyboldt)
+
+- Move to pymc main for dev testing (Adrian Seyboldt)
+
+
 ## [0.16.8] - 2026-03-11
 
 ### Documentation
@@ -52,6 +150,8 @@ All notable changes to this project will be documented in this file.
 ### Bug Fixes
 
 - Compatibility with pandas 3.0 for string coords (Adrian Seyboldt)
+
+- Fix progress display in Marimo (Simon Mutch)
 
 
 ### Miscellaneous Tasks
@@ -580,6 +680,8 @@ All notable changes to this project will be documented in this file.
 
 ### Ci
 
+- Fix uploads of releases (Adrian Seyboldt)
+
 - Fix architectures in CI (Adrian Seyboldt)
 
 
@@ -602,8 +704,6 @@ All notable changes to this project will be documented in this file.
 
 
 ### Miscellaneous Tasks
-
-- Bump actions/download-artifact from 3 to 4 (dependabot[bot])
 
 - Bump actions/setup-python from 4 to 5 (dependabot[bot])
 
@@ -629,12 +729,7 @@ All notable changes to this project will be documented in this file.
 - Set the number of parallel chains dynamically (Adrian Seyboldt)
 
 
-### Ci
-
-- Fix uploads of releases (Adrian Seyboldt)
-
-
-## [0.9.2] - 2023-10-24
+## [0.9.2] - 2024-02-19
 
 ### Bug Fixes
 
@@ -653,6 +748,11 @@ All notable changes to this project will be documented in this file.
 - Handle missing libraries more robustly (#72) (Ben Mares)
 
 
+### Miscellaneous Tasks
+
+- Bump actions/download-artifact from 3 to 4 (dependabot[bot])
+
+
 ### Ci
 
 - Make sure the local nutpie is installed (Adrian Seyboldt)
@@ -660,11 +760,15 @@ All notable changes to this project will be documented in this file.
 - Install local nutpie package in all jobs (Adrian Seyboldt)
 
 
+## [0.9.1] - 2023-09-14
+
 ## [0.9.0] - 2023-09-12
 
 ### Bug Fixes
 
 - Better error context for init point errors (Adrian Seyboldt)
+
+- Fix make_initial_point_fn (Max Kochurov)
 
 
 ### Features
@@ -687,6 +791,8 @@ All notable changes to this project will be documented in this file.
 
 - Fix formatting (Adrian Seyboldt)
 
+
+## [0.8.1] - 2023-08-24
 
 ## [0.8.0] - 2023-08-18
 
@@ -755,6 +861,24 @@ All notable changes to this project will be documented in this file.
 
 - Bump version (Adrian Seyboldt)
 
+
+## [0.6.0-beta] - 2023-07-01
+
+## [0.5.1] - 2023-01-03
+
+## [0.5.0] - 2023-01-02
+
+## [0.4.0] - 2022-11-12
+
+## [0.2.1] - 2022-09-02
+
+## [0.2.0] - 2022-09-02
+
+## [0.1.3] - 2022-07-20
+
+## [0.1.2] - 2022-06-29
+
+## [0.1.1] - 2022-06-21
 
 ## [0.1.0] - 2022-06-21
 
