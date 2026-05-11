@@ -1,3 +1,4 @@
+import json
 import os
 import warnings
 from dataclasses import dataclass, field
@@ -661,6 +662,15 @@ class _BackgroundSampler:
                         skip_vars.extend(names)
 
                 draw_batches, stat_batches = results.get_arrow_trace()
+
+                from nutpie import __version__
+
+                attrs = {
+                    "inference_library": "nutpie",
+                    "inference_library_version": __version__,
+                    "inference_library_settings": json.dumps(self._settings.as_dict()),
+                }
+
                 return _arrow_to_arviz(
                     draw_batches,
                     stat_batches,
@@ -672,6 +682,7 @@ class _BackgroundSampler:
                         for name, vals in self._compiled_model.coords.items()
                     },
                     save_warmup=self._save_warmup,
+                    attrs={"sample_stats": attrs},
                 )
             else:
                 raise ValueError("Unknown results type")
