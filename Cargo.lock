@@ -2249,7 +2249,7 @@ dependencies = [
 
 [[package]]
 name = "nutpie"
-version = "0.16.9"
+version = "0.16.10"
 dependencies = [
  "anyhow",
  "arrow",

@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.16.10] - 2026-05-11
+
+### Bug Fixes
+
+- Skip unnecessary transformation_mu in sampled stats (Adrian Seyboldt)
+
+
+### Features
+
+- Add sampler settings attrs in arviz (Adrian Seyboldt)
+
+
 ## [0.16.9] - 2026-05-08
 
 ### Bug Fixes
