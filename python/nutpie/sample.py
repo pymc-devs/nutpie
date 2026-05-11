@@ -645,7 +645,7 @@ class _BackgroundSampler:
                     "store_transformed": [
                         "transformed_position",
                         "transformed_gradient",
-                        "transformed_mu",
+                        "transformation_mu",
                     ],
                 }
 
