@@ -2,6 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.16.11] - 2026-06-16
+
+### Bug Fixes
+
+- Correct 'Poisond' typo to 'Poisoned' in mutex expect messages (Ben Mares)
+
+
+### Miscellaneous Tasks
+
+- Bump actions/checkout from 6.0.2 to 6.0.3 (dependabot[bot])
+
+- Bump astral-sh/setup-uv from 8.1.0 to 8.2.0 (dependabot[bot])
+
+
+### Security
+
+- Upgrade PyO3 to 0.29 and align ecosystem crates (Ben Mares)
+
+
+### Deps
+
+- Regenerate Cargo.lock for PyO3 0.29 upgrade (Ben Mares)
+
+
 ## [0.16.10] - 2026-05-11
 
 ### Bug Fixes
