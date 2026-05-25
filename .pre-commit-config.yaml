@@ -17,13 +17,13 @@ repos:
       - id: trailing-whitespace
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.12
+    rev: v0.15.14
     hooks:
       - id: ruff
         args: ["--fix", "--output-format=full"]
       - id: ruff-format
   - repo: https://github.com/zizmorcore/zizmor-pre-commit
-    rev: v1.24.1
+    rev: v1.25.2
     hooks:
     - id: zizmor
       args: [--min-severity=medium]
