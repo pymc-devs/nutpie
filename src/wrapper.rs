@@ -1252,7 +1252,7 @@ impl PySampler {
     fn is_finished(&mut self, py: Python<'_>) -> PyResult<bool> {
         self.wait(py, Some(0.001))?;
         py.detach(|| {
-            let guard = &mut self.0.lock().expect("Poisond sampler state mutex");
+            let guard = &mut self.0.lock().expect("Poisoned sampler state mutex");
             Ok(matches!(
                 guard.deref_mut().0,
                 SamplerState::FinishedZarr | SamplerState::FinishedArrow(_) | SamplerState::Empty
@@ -1265,7 +1265,7 @@ impl PySampler {
             match self
                 .0
                 .lock()
-                .expect("Poisond sampler state mutex")
+                .expect("Poisoned sampler state mutex")
                 .deref_mut()
             {
                 (SamplerState::RunningZarr(control), _) => {
@@ -1286,7 +1286,7 @@ impl PySampler {
             match self
                 .0
                 .lock()
-                .expect("Poisond sampler state mutex")
+                .expect("Poisoned sampler state mutex")
                 .deref_mut()
             {
                 (SamplerState::RunningZarr(control), _) => {
@@ -1305,7 +1305,7 @@ impl PySampler {
     #[pyo3(signature = (timeout_seconds=None))]
     fn wait(&mut self, py: Python<'_>, timeout_seconds: Option<f64>) -> PyResult<()> {
         py.detach(|| {
-            let guard = &mut self.0.lock().expect("Poisond sampler state mutex");
+            let guard = &mut self.0.lock().expect("Poisoned sampler state mutex");
             let slot = guard.deref_mut();
             let slot = &mut slot.0;
 
@@ -1331,7 +1331,7 @@ impl PySampler {
 
     fn abort(&mut self, py: Python<'_>) -> PyResult<()> {
         py.detach(|| {
-            let guard = &mut self.0.lock().expect("Poisond sampler state mutex");
+            let guard = &mut self.0.lock().expect("Poisoned sampler state mutex");
             let slot = guard.deref_mut();
             let slot = &mut slot.0;
 
@@ -1380,7 +1380,7 @@ impl PySampler {
         match self
             .0
             .lock()
-            .expect("Poisond sampler state mutex")
+            .expect("Poisoned sampler state mutex")
             .deref_mut()
             .0
         {
@@ -1402,7 +1402,7 @@ impl PySampler {
         match &mut self
             .0
             .lock()
-            .expect("Poisond sampler state mutex")
+            .expect("Poisoned sampler state mutex")
             .deref_mut()
             .0
         {
@@ -1429,7 +1429,7 @@ impl PySampler {
     }
 
     fn take_results(&mut self) -> PyResult<PyTrace> {
-        let state = &mut self.0.lock().expect("Poisond sampler state mutex");
+        let state = &mut self.0.lock().expect("Poisoned sampler state mutex");
 
         match &state.0 {
             SamplerState::FinishedZarr => {
