@@ -969,7 +969,7 @@ impl PySampler {
         let tokio_rt = Runtime::new().context("Failed to create Tokio runtime")?;
         match &mut store.0 {
             InnerPyStorage::Arrow => {
-                let storage_config = ArrowConfig::new();
+                let storage_config = ArrowConfig::default();
                 match settings {
                     PySamplerSettings::Nuts(settings) => match settings.inner {
                         NutsSettingsKind::LowRank(settings) => {
