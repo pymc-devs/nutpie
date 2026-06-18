@@ -473,6 +473,31 @@ class Householder(AbstractBijection):
         return self._householder(y), jnp.zeros(())
 
 
+class AutoFlow(AbstractBijection):
+    shape: tuple[int, ...]
+    params: Array
+    transform_and_log_det_fn: Callable
+    inverse_and_log_det_fn: Callable
+    cond_shape = None
+
+    def __init__(
+        self, params: ArrayLike, shape, transform_and_log_det_fn, inverse_and_log_det_fn
+    ):
+        params = arraylike_to_array(params)
+        if params.ndim != 1:
+            raise ValueError("params must be a vector.")
+        self.shape = shape
+        self.params = params
+        self.transform_and_log_det_fn = transform_and_log_det_fn
+        self.inverse_and_log_det_fn = inverse_and_log_det_fn
+
+    def transform_and_log_det(self, x: jnp.ndarray, condition: Array | None = None):
+        return self.transform_and_log_det_fn(x, self.params)
+
+    def inverse_and_log_det(self, y: Array, condition: Array | None = None):
+        return self.inverse_and_log_det_fn(y, self.params)
+
+
 class MvScale(bijections.AbstractBijection):
     shape: tuple[int, ...]
     params: Array
@@ -1878,6 +1903,7 @@ def make_flow(
     sandwich_householder=False,
     activation=None,
     reuse_embed=False,
+    auto_flow=None,
 ):
     if activation is None:
         activation = jax.nn.leaky_relu
@@ -1900,6 +1926,14 @@ def make_flow(
 
     n_draws, n_dim = positions.shape
     assert positions.shape == gradients.shape
+
+    # Push positions and gradients through autoflow
+    if auto_flow is not None:
+        from nutpie.transform_adapter import inverse_gradient_and_val
+
+        positions, gradients, _logp = eqx.filter_vmap(
+            inverse_gradient_and_val, in_axes=(None, 0, 0, 0)
+        )(auto_flow, positions, gradients, jnp.zeros((n_draws,)))
 
     if n_draws == 0:
         raise ValueError("No draws")
@@ -1927,9 +1961,9 @@ def make_flow(
         replace=diag_param,
     )
 
-    flows = [
-        diag_affine,
-    ]
+    flows = [diag_affine]
+    if auto_flow is not None:
+        flows.append(auto_flow)
 
     if n_layers == 0:
         return bijections.Chain(flows)

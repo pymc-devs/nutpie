@@ -874,7 +874,7 @@ def make_transform_adapter(
     show_progress=False,
     nn_depth=None,
     nn_width=None,
-    num_layers=8,
+    num_layers=None,
     num_diag_windows=6,
     learning_rate=5e-4,
     untransformed_dim=None,
@@ -905,9 +905,20 @@ def make_transform_adapter(
     contract_transformer=True,
     asymmetric_transformer=False,
     reuse_embed=True,
+    auto_flow=None,
 ):
     if extension_windows is None:
         extension_windows = []
+
+    # Several auto flows compose into a single bijection; flowjax applies
+    # Chain members in order in the transform (sampler -> value) direction.
+    if isinstance(auto_flow, (list, tuple)):
+        auto_flow = bijections.Chain(list(auto_flow)) if auto_flow else None
+
+    # With an auto flow, default to fitting only the reparametrization (and
+    # the diag affine); set num_layers explicitly to add coupling layers.
+    if num_layers is None:
+        num_layers = 0 if auto_flow is not None else 8
 
     return partial(
         TransformAdapter,
@@ -930,6 +941,7 @@ def make_transform_adapter(
             contract_transformer=contract_transformer,
             asymmetric_transformer=asymmetric_transformer,
             reuse_embed=reuse_embed,
+            auto_flow=auto_flow,
         ),
         show_progress=show_progress,
         num_diag_windows=num_diag_windows,

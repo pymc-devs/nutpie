@@ -46,7 +46,15 @@ class PyFuncModel(CompiledModel):
         return dataclasses.replace(self, _shared_data=updated)
 
     def with_transform_adapt(self, **kwargs):
-        return dataclasses.replace(self, _transform_adapt_args=kwargs)
+        """Set arguments for the flow transform adapter (``adaptation="flow"``).
+
+        Arguments accumulate across calls (so e.g. the ``auto_flow`` attached
+        by ``compile_pymc_model(..., auto_reparam=True)`` survives later
+        tuning calls); pass ``None`` to reset an argument to its default.
+        """
+        merged = {**(self._transform_adapt_args or {}), **kwargs}
+        merged = {k: v for k, v in merged.items() if v is not None}
+        return dataclasses.replace(self, _transform_adapt_args=merged)
 
     def _make_sampler(
         self,
