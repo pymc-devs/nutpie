@@ -605,7 +605,15 @@ def _compile_pymc_model_mlx(
 
     def make_logp_func():
         def logp(_x, **shared):
-            _x_mlx = mx.array(_x)
+            # nutpie operates in float64, but MLX evaluates on the Metal GPU
+            # where float64 is unsupported, so the logp and its gradient are
+            # necessarily computed in float32. We cast explicitly rather than
+            # relying on ``mx.array``'s implicit float64->float32 downcast, so
+            # the precision contract cannot silently change with the MLX
+            # version or a global default-dtype override. This single-precision
+            # evaluation is the root cause of MLX sampling not being
+            # bit-reproducible across machines; see test_deterministic_sampling_mlx.
+            _x_mlx = mx.array(_x, dtype=mx.float32)
             logp, grad = logp_fn(_x_mlx, *[shared[name] for name in logp_shared_names])
             return float(logp), np.asarray(grad, dtype="float64", order="C")
 
@@ -618,7 +626,9 @@ def _compile_pymc_model_mlx(
     def make_expand_func(seed1, seed2, chain):
         # TODO handle seeds
         def expand(_x, **shared):
-            _x_mlx = mx.array(_x)
+            # Match the logp closure: cast explicitly to float32 (MLX has no
+            # float64 on the GPU) instead of relying on the implicit downcast.
+            _x_mlx = mx.array(_x, dtype=mx.float32)
             values = expand_fn(_x_mlx, *[shared[name] for name in expand_shared_names])
             return {
                 name: np.asarray(val, order="C", dtype=dtype).reshape(shape)

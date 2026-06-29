@@ -322,6 +322,20 @@ def test_pymc_model_with_coordinate(backend, gradient_backend):
 @pytest.mark.pymc
 @parameterize_backends
 def test_pymc_model_store_extra(backend, gradient_backend):
+    if backend == "mlx" and gradient_backend == "pytensor":
+        # PyTensor's MLX linker mis-handles uneven Split ops, which appear in
+        # the gradient graph of the ZeroSumNormal/Dirichlet transforms below.
+        # Its Split dispatch passes a numpy array of split indices to
+        # ``mx.split``, which MLX interprets as an equal-split *count* and
+        # raises "Array split does not result in sub arrays with equal size"
+        # (a Python list of indices would work). The mlx/mlx combination is
+        # unaffected because it differentiates with MLX instead of PyTensor.
+        pytest.xfail(
+            "PyTensor's MLX linker Split dispatch is broken for uneven splits "
+            "(pytensor/link/mlx/dispatch/core.py passes a numpy array to "
+            "mx.split); only affects gradient_backend='pytensor'."
+        )
+
     with pm.Model() as model:
         model.add_coord("foo", length=5)
         model.add_coord("bar", length=4)
@@ -571,18 +585,41 @@ def test_deterministic_sampling_jax():
     return trace.posterior.a.values.ravel()
 
 
+# NOTE: Unlike the numba/jax variants, this is intentionally *not* an
+# array_compare test. MLX evaluates the logp and its gradient on the Metal GPU
+# in float32 (float64 is unsupported on the GPU), and NUTS is a chaotic
+# integrator: the float32 rounding -- which varies with the GPU model, the
+# Metal/MLX version and kernel fusion -- accumulates across the leapfrog steps
+# and makes the draws differ between machines. So instead of comparing against
+# bit-exact reference values we validate statistical correctness against the
+# analytic posterior, which is machine-independent.
 @pytest.mark.pymc
 def test_deterministic_sampling_mlx():
     if not MLX_AVAILABLE:
         pytest.skip("MLX not installed")
 
+    # No observed data, so the posterior of ``a`` is exactly its
+    # HalfNormal(sigma=1) prior.
     with pm.Model() as model:
         pm.HalfNormal("a")
 
     compiled = nutpie.compile_pymc_model(model, backend="mlx", gradient_backend="mlx")
-    trace = nutpie.sample(compiled, chains=2, seed=123, draws=100, tune=100)
-    assert trace.posterior.a.shape == (2, 100)
-    assert np.all(np.isfinite(trace.posterior.a.values))
+    trace = nutpie.sample(
+        compiled, chains=2, seed=123, draws=1000, tune=1000, progress_bar=False
+    )
+    a = trace.posterior.a.values
+
+    assert a.shape == (2, 1000)
+    assert np.all(np.isfinite(a))
+    assert (a >= 0).all()  # HalfNormal support
+
+    # Analytic moments of HalfNormal(sigma=1). Tolerances are generous (~4x the
+    # Monte Carlo error) so the test is robust to the cross-machine float32
+    # differences described above while still catching a genuinely broken logp.
+    expected_mean = np.sqrt(2.0 / np.pi)  # ~0.7979
+    expected_std = np.sqrt(1.0 - 2.0 / np.pi)  # ~0.6028
+    assert a.mean() == pytest.approx(expected_mean, abs=0.05)
+    assert a.std() == pytest.approx(expected_std, abs=0.05)
 
 
 @pytest.mark.pymc
