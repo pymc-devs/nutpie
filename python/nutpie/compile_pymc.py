@@ -8,6 +8,7 @@ from functools import wraps
 from importlib.util import find_spec
 from math import prod
 from typing import TYPE_CHECKING, Any, Callable, Literal, Optional, Union, cast
+from uuid import uuid4
 
 import numpy as np
 import pandas as pd
@@ -29,6 +30,9 @@ if TYPE_CHECKING:
     import numba.core.ccallback
     import pymc as pm
     from pytensor.tensor import TensorVariable, Variable
+
+
+_UNCONSTRAINED_PARAMETER = "unconstrained_parameter"
 
 
 def _rv_dict_to_flat_array_wrapper(
@@ -102,8 +106,16 @@ class CompiledPyMCModel(CompiledModel):
     compiled_logp_func: "numba.core.ccallback.CFunc"
     compiled_expand_func: "numba.core.ccallback.CFunc"
     initial_point_func: Callable[[SeedType], np.ndarray]
+
+    # The value of the shared variables with a specific key
     shared_data: dict[str, NDArray]
+
+    # Map the shared variables to keys
+    shared_var_keys: dict[Any, str]
+
+    # The record ndarray with all the shared data pointers and shapes
     user_data: NDArray
+
     n_expanded: int
     shape_info: Any
     logp_func: Any
@@ -129,16 +141,22 @@ class CompiledPyMCModel(CompiledModel):
         shared_data = self.shared_data.copy()
         user_data = self.user_data.copy()
         for name, new_val in updates.items():
-            if name not in shared_data:
+            key = None
+            for var, var_key in self.shared_var_keys.items():
+                if var.name == name:
+                    if key is not None:
+                        raise ValueError(f"Name of shared variable {var} is not unique")
+                    key = var_key
+            if key is None:
                 raise KeyError(f"Unknown shared variable: {name}")
-            old_val = shared_data[name]
+            old_val = shared_data[key]
             new_val = np.array(new_val, dtype=old_val.dtype, order="C", copy=True)
             new_val.flags.writeable = False
             if old_val.ndim != new_val.ndim:
                 raise ValueError(
                     f"Shared variable {name} must have rank {old_val.ndim}"
                 )
-            shared_data[name] = new_val
+            shared_data[key] = new_val
         user_data = update_user_data(user_data, shared_data)
 
         return dataclasses.replace(
@@ -220,26 +238,26 @@ class CompiledPyMCModel(CompiledModel):
 
 def update_user_data(user_data, user_data_storage):
     user_data = user_data[()]
-    for name, val in user_data_storage.items():
-        user_data["shared"]["data"][name] = val.ctypes.data
-        user_data["shared"]["size"][name] = val.size
-        user_data["shared"]["shape"][name] = val.shape
+    for key, val in user_data_storage.items():
+        user_data["shared"]["data"][key] = val.ctypes.data
+        user_data["shared"]["size"][key] = val.size
+        user_data["shared"]["shape"][key] = val.shape
     return np.asarray(user_data)
 
 
-def make_user_data(shared_vars, shared_data):
+def make_user_data(shared_var_keys, shared_data):
     record_dtype = np.dtype(
         [
             (
                 "shared",
                 [
-                    ("data", [(var_name, np.uintp) for var_name in shared_vars]),
-                    ("size", [(var_name, np.uintp) for var_name in shared_vars]),
+                    ("data", [(key, np.uintp) for key in shared_var_keys.values()]),
+                    ("size", [(key, np.uintp) for key in shared_var_keys.values()]),
                     (
                         "shape",
                         [
-                            (var_name, np.uint, (var.ndim,))
-                            for var_name, var in shared_vars.items()
+                            (key, np.uint, (var.ndim,))
+                            for var, key in shared_var_keys.items()
                         ],
                     ),
                 ],
@@ -273,6 +291,7 @@ def _compile_pymc_model_numba(
         expand_fn_pt,
         initial_point_fn,
         shape_info,
+        reparameterized_names,
     ) = _make_functions(
         model,
         mode="NUMBA",
@@ -286,23 +305,24 @@ def _compile_pymc_model_numba(
     logp_fn = logp_fn_pt.vm.jit_fn
 
     shared_data = {}
-    shared_vars = {}
+    shared_var_keys = {}
     seen = set()
     for val in [*logp_fn_pt.get_shared(), *expand_fn_pt.get_shared()]:
-        if val.name in shared_data and val not in seen:
-            raise ValueError(f"Shared variables must have unique names: {val.name}")
-        shared_data[val.name] = np.array(val.get_value(), order="C", copy=True)
-        shared_vars[val.name] = val
+        if val in seen:
+            continue
+        key = uuid4().hex
+        shared_data[key] = np.array(val.get_value(), order="C", copy=True)
+        shared_var_keys[val] = key
         seen.add(val)
 
     for val in shared_data.values():
         val.flags.writeable = False
 
-    user_data = make_user_data(shared_vars, shared_data)
+    user_data = make_user_data(shared_var_keys, shared_data)
 
-    logp_shared_names = [var.name for var in logp_fn_pt.get_shared()]
+    logp_shared_keys = [shared_var_keys[var] for var in logp_fn_pt.get_shared()]
     logp_numba_raw, c_sig = _make_c_logp_func(
-        n_dim, logp_fn, user_data, logp_shared_names, shared_data
+        n_dim, logp_fn, user_data, logp_shared_keys, shared_data
     )
     with warnings.catch_warnings():
         warnings.filterwarnings(
@@ -313,9 +333,9 @@ def _compile_pymc_model_numba(
 
         logp_numba = numba.cfunc(c_sig, **kwargs)(logp_numba_raw)
 
-    expand_shared_names = [var.name for var in expand_fn_pt.get_shared()]
+    expand_shared_keys = [shared_var_keys[var] for var in expand_fn_pt.get_shared()]
     expand_numba_raw, c_sig_expand = _make_c_expand_func(
-        n_dim, n_expanded, expand_fn, user_data, expand_shared_names, shared_data
+        n_dim, n_expanded, expand_fn, user_data, expand_shared_keys, shared_data
     )
     with warnings.catch_warnings():
         warnings.filterwarnings(
@@ -326,7 +346,7 @@ def _compile_pymc_model_numba(
 
         expand_numba = numba.cfunc(c_sig_expand, **kwargs)(expand_numba_raw)
 
-    dims, coords = _prepare_dims_and_coords(model, shape_info)
+    dims, coords = _prepare_dims_and_coords(model, shape_info, reparameterized_names)
 
     return CompiledPyMCModel(
         _n_dim=n_dim,
@@ -337,23 +357,25 @@ def _compile_pymc_model_numba(
         compiled_expand_func=expand_numba,
         initial_point_func=initial_point_fn,
         shared_data=shared_data,
+        shared_var_keys=shared_var_keys,
         user_data=user_data,
         n_expanded=n_expanded,
         shape_info=shape_info,
         logp_func=logp_fn_pt,
         expand_func=expand_fn_pt,
+        reparameterized_names=reparameterized_names,
     )
 
 
-def _prepare_dims_and_coords(model, shape_info):
+def _prepare_dims_and_coords(model, shape_info, reparameterized_names):
     coords = {}
     for name, vals in model.coords.items():
         if vals is None:
             vals = pd.RangeIndex(int(model.dim_lengths[name].eval()))
         coords[name] = pd.Index(vals)
 
-    if "unconstrained_parameter" in coords:
-        raise ValueError("Model contains invalid name 'unconstrained_parameter'.")
+    if _UNCONSTRAINED_PARAMETER in coords:
+        raise ValueError(f"Model contains invalid name '{_UNCONSTRAINED_PARAMETER}'.")
 
     names = []
     for base, _, shape in zip(*shape_info):
@@ -364,9 +386,24 @@ def _prepare_dims_and_coords(model, shape_info):
                 names.append(base)
             else:
                 names.append(f"{base}_{'.'.join(str(i) for i in idx)}")
-    coords["unconstrained_parameter"] = pd.Index(names)
+    coords[_UNCONSTRAINED_PARAMETER] = pd.Index(names)
 
-    dims = model.named_vars_to_dims
+    names, _, shape_list = shape_info
+
+    shape_by_name = {n: tuple(s) for n, s in zip(names, shape_list)}
+    value_to_rv = {v.name: rv.name for v, rv in model.values_to_rvs.items()}
+
+    dims = dict(model.named_vars_to_dims)
+    for value_name in reparameterized_names:
+        rv_name = value_to_rv.get(value_name)
+        if rv_name is None:
+            continue
+        rv_dims = dims.get(rv_name)
+        if rv_dims is None:
+            continue
+        if shape_by_name.get(rv_name) == shape_by_name.get(value_name):
+            dims[value_name] = rv_dims
+
     return dims, coords
 
 
@@ -399,6 +436,7 @@ def _compile_pymc_model_jax(
         expand_fn_pt,
         initial_point_fn,
         shape_info,
+        reparameterized_names,
     ) = _make_functions(
         model,
         mode="JAX",
@@ -464,7 +502,7 @@ def _compile_pymc_model_jax(
 
         return expand
 
-    dims, coords = _prepare_dims_and_coords(model, shape_info)
+    dims, coords = _prepare_dims_and_coords(model, shape_info, reparameterized_names)
 
     return from_pyfunc(
         ndim=n_dim,
@@ -478,6 +516,7 @@ def _compile_pymc_model_jax(
         dims=dims,
         coords=coords,
         raw_logp_fn=orig_logp_fn,
+        reparameterized_names=reparameterized_names,
     )
 
 
@@ -530,6 +569,7 @@ def _compile_pymc_model_mlx(
         expand_fn_pt,
         initial_point_fn,
         shape_info,
+        reparameterized_names,
     ) = _make_functions(
         model,
         mode="MLX",
@@ -589,7 +629,7 @@ def _compile_pymc_model_mlx(
 
         return expand
 
-    dims, coords = _prepare_dims_and_coords(model, shape_info)
+    dims, coords = _prepare_dims_and_coords(model, shape_info, reparameterized_names)
 
     return from_pyfunc(
         ndim=n_dim,
@@ -603,6 +643,7 @@ def _compile_pymc_model_mlx(
         dims=dims,
         coords=coords,
         raw_logp_fn=None,
+        reparameterized_names=reparameterized_names,
         # MLX is not thread-safe; see https://github.com/ml-explore/mlx/issues/2133.
         force_single_core=True,
         shared_data_converter=mx.array,
@@ -779,6 +820,7 @@ def _make_functions(
     Callable,
     Callable,
     tuple[list[str], list[slice], list[tuple[int, ...]]],
+    list[str],
 ]:
     """
     Compile functions required by nuts-rs from a given PyMC model.
@@ -824,10 +866,9 @@ def _make_functions(
         correspond to the variables in the flat array, and the third list
         contains the shapes of the variables.
     """
-    from pytensor.graph import rewrite_graph, clone_replace
-
     import pytensor.tensor as pt
     from pymc.pytensorf import compile as compile_pymc
+    from pytensor.graph import clone_replace, rewrite_graph
 
     shapes = _compute_shapes(model)
 
@@ -886,7 +927,7 @@ def _make_functions(
     if use_split:
         variables = pt.split(joined, splits, len(splits))
     else:
-        variables = [joined[slice_val] for slice_val in zip(joined_slices)]
+        variables = [joined[slice_val] for slice_val in joined_slices]
 
     replacements = {
         model.rvs_to_values[var]: value.reshape(shape).astype(var.dtype)
@@ -906,6 +947,12 @@ def _make_functions(
         with model:
             logp_fn_pt = compile_pymc((joined,), (logp,), mode=mode)
 
+    reparameterized_names = [
+        model.rvs_to_values[var].name
+        for var in model.free_RVs
+        if model.rvs_to_transforms.get(var) is not None
+    ]
+
     # Make function that computes remaining variables for the trace
     remaining_rvs = [
         var for var in model.unobserved_value_vars if var.name not in joined_names
@@ -915,11 +962,11 @@ def _make_functions(
         names = set(var_names)
         remaining_rvs = [var for var in remaining_rvs if var.name in names]
 
-    all_names = joined_names + remaining_rvs
-
     all_names = joined_names.copy()
     all_slices = joined_slices.copy()
     all_shapes = joined_shapes.copy()
+    count = num_free_vars
+    identity_free = list(variables)
 
     for var in remaining_rvs:
         all_names.append(var.name)
@@ -935,7 +982,7 @@ def _make_functions(
         allvars = [
             pt.concatenate(
                 [
-                    joined,
+                    *[v.ravel() for v in identity_free],
                     *[
                         pt.as_tensor(var, allow_xtensor_conversion=True).ravel()
                         for var in remaining_rvs
@@ -944,7 +991,7 @@ def _make_functions(
             )
         ]
     else:
-        allvars = [*variables, *remaining_rvs]
+        allvars = [*identity_free, *remaining_rvs]
     with model:
         expand_fn_pt = compile_pymc(
             (joined,),
@@ -960,15 +1007,16 @@ def _make_functions(
         expand_fn_pt,
         initial_point_fn,
         (all_names, all_slices, all_shapes),
+        reparameterized_names,
     )
 
 
-def make_extraction_fn(inner, shared_data, shared_vars, record_dtype):
+def make_extraction_fn(inner, shared_data, shared_var_keys, record_dtype):
     import numba
     from numba import literal_unroll
     from numba.cpython.unsafe.tuple import alloca_once, tuple_setitem
 
-    if not shared_vars:
+    if not shared_var_keys:
 
         @numba.njit(inline="always")
         def extract_shared(x, user_data_):
@@ -978,17 +1026,16 @@ def make_extraction_fn(inner, shared_data, shared_vars, record_dtype):
 
     shared_metadata = tuple(
         [
-            name,
-            len(shared_data[name].shape),
-            shared_data[name].shape,
-            np.dtype(shared_data[name].dtype),
+            key,
+            len(shared_data[key].shape),
+            shared_data[key].shape,
+            np.dtype(shared_data[key].dtype),
         ]
-        for name in shared_vars
+        for key in shared_var_keys
     )
 
-    names = shared_vars
-    indices = tuple(range(len(names)))
-    shared_tuple = tuple(shared_data[name] for name in shared_vars)
+    indices = tuple(range(len(shared_var_keys)))
+    shared_tuple = tuple(shared_data[key] for key in shared_var_keys)
 
     @intrinsic
     def tuple_setitem_literal(typingctx, tup, idx, val):
@@ -1060,10 +1107,10 @@ def make_extraction_fn(inner, shared_data, shared_vars, record_dtype):
     return extract_shared
 
 
-def _make_c_logp_func(n_dim, logp_fn, user_data, shared_logp, shared_data):
+def _make_c_logp_func(n_dim, logp_fn, user_data, shared_keys, shared_data):
     import numba
 
-    extract = make_extraction_fn(logp_fn, shared_data, shared_logp, user_data.dtype)
+    extract = make_extraction_fn(logp_fn, shared_data, shared_keys, user_data.dtype)
 
     c_sig = numba.types.int64(
         numba.types.uint64,
@@ -1100,11 +1147,13 @@ def _make_c_logp_func(n_dim, logp_fn, user_data, shared_logp, shared_data):
 
 
 def _make_c_expand_func(
-    n_dim, n_expanded, expand_fn, user_data, shared_vars, shared_data
+    n_dim, n_expanded, expand_fn, user_data, shared_var_keys, shared_data
 ):
     import numba
 
-    extract = make_extraction_fn(expand_fn, shared_data, shared_vars, user_data.dtype)
+    extract = make_extraction_fn(
+        expand_fn, shared_data, shared_var_keys, user_data.dtype
+    )
 
     c_sig = numba.types.int64(
         numba.types.uint64,

@@ -128,6 +128,7 @@ def from_pyfunc(
     make_initial_point_fn: Callable[[SeedType], np.ndarray] | None = None,
     make_transform_adapter=None,
     raw_logp_fn=None,
+    reparameterized_names=None,
     force_single_core: bool = False,
     shared_data_converter: Callable[[Any], Any] | None = None,
 ):
@@ -161,6 +162,7 @@ def from_pyfunc(
         _variables=variables,
         _shared_data=shared_data,
         _raw_logp_fn=raw_logp_fn,
+        reparameterized_names=reparameterized_names,
         _force_single_core=force_single_core,
         _shared_data_converter=shared_data_converter,
     )

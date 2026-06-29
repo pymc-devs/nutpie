@@ -1,6 +1,8 @@
+import json
 import os
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from importlib.metadata import version
 from typing import Any, Literal, Optional, cast, get_args, overload
 
 import arviz
@@ -15,6 +17,7 @@ from nutpie import _lib
 @dataclass(frozen=True)
 class CompiledModel:
     dims: Optional[dict[str, tuple[str, ...]]]
+    reparameterized_names: list[str] | None = field(default=None, kw_only=True)
 
     @property
     def n_dim(self) -> int:
@@ -56,9 +59,18 @@ class CompiledModel:
         return pd.concat(times)
 
 
-def _arrow_to_arviz(draw_batches, stat_batches, skip_vars=None, **kwargs):
+def _arrow_to_arviz(
+    draw_batches,
+    stat_batches,
+    skip_vars=None,
+    reparameterized_names=None,
+    keep_unconstrained_draw=False,
+    **kwargs,
+):
     if skip_vars is None:
         skip_vars = []
+    if reparameterized_names is None:
+        reparameterized_names = []
 
     n_chains = len(draw_batches)
     assert n_chains == len(stat_batches)
@@ -98,11 +110,19 @@ def _arrow_to_arviz(draw_batches, stat_batches, skip_vars=None, **kwargs):
             stats_posterior, max_posterior, stat_posterior, i, n_chains, dims, skip_vars
         )
 
-    from importlib.metadata import version
+    uc_data_posterior = {
+        name: data_posterior.pop(name)
+        for name in reparameterized_names
+        if name in data_posterior
+    }
+    uc_data_tune = {
+        name: data_tune.pop(name) for name in reparameterized_names if name in data_tune
+    }
 
     arviz_version = version("arviz")
-    if tuple(map(int, arviz_version.split(".")[:2])) >= (1, 0):
-        return arviz.from_dict(
+    use_datatree = tuple(map(int, arviz_version.split(".")[:2])) >= (1, 0)
+    if use_datatree:
+        idata = arviz.from_dict(
             {
                 "posterior": data_posterior,
                 "sample_stats": stats_posterior,
@@ -113,7 +133,7 @@ def _arrow_to_arviz(draw_batches, stat_batches, skip_vars=None, **kwargs):
             **kwargs,
         )
     else:
-        return arviz.from_dict(
+        idata = arviz.from_dict(
             **{
                 "posterior": data_posterior,
                 "sample_stats": stats_posterior,
@@ -123,6 +143,25 @@ def _arrow_to_arviz(draw_batches, stat_batches, skip_vars=None, **kwargs):
             dims=dims,
             **kwargs,
         )
+
+    if keep_unconstrained_draw and uc_data_posterior:
+        coords = kwargs.get("coords")
+        uc_dims = {name: dims.get(name, []) for name in uc_data_posterior}
+        groups = {
+            "unconstrained_posterior": arviz.dict_to_dataset(
+                uc_data_posterior, coords=coords, dims=uc_dims
+            )
+        }
+        if uc_data_tune:
+            groups["warmup_unconstrained_posterior"] = arviz.dict_to_dataset(
+                uc_data_tune, coords=coords, dims=uc_dims
+            )
+        if use_datatree:
+            idata = idata.assign(**{k: xr.DataTree(v) for k, v in groups.items()})
+        else:
+            idata.add_groups(groups)
+
+    return idata
 
 
 def _add_arrow_data(data_dict, max_length, batch, chain, n_chains, dims, skip_vars):
@@ -399,6 +438,9 @@ def in_notebook():
 
     if in_colab():
         return True
+    # Databricks sets this env var on all cluster runtimes (same check as rich)
+    if os.getenv("DATABRICKS_RUNTIME_VERSION"):
+        return True
     try:
         shell = get_ipython().__class__.__name__  # type: ignore
         if shell == "ZMQInteractiveShell":  # Jupyter notebook, Spyder or qtconsole
@@ -463,11 +505,13 @@ class _BackgroundSampler:
         progress_style=None,
         progress_rate=100,
         store=None,
+        store_unconstrained=False,
     ):
         self._settings = settings
         self._compiled_model = compiled_model
         self._save_warmup = save_warmup
         self._return_raw_trace = return_raw_trace
+        self._store_unconstrained = store_unconstrained
 
         self._html = None
 
@@ -601,7 +645,7 @@ class _BackgroundSampler:
                     "store_transformed": [
                         "transformed_position",
                         "transformed_gradient",
-                        "transformed_mu",
+                        "transformation_mu",
                     ],
                 }
 
@@ -618,15 +662,27 @@ class _BackgroundSampler:
                         skip_vars.extend(names)
 
                 draw_batches, stat_batches = results.get_arrow_trace()
+
+                from nutpie import __version__
+
+                attrs = {
+                    "inference_library": "nutpie",
+                    "inference_library_version": __version__,
+                    "inference_library_settings": json.dumps(self._settings.as_dict()),
+                }
+
                 return _arrow_to_arviz(
                     draw_batches,
                     stat_batches,
                     skip_vars=skip_vars,
+                    reparameterized_names=self._compiled_model.reparameterized_names,
+                    keep_unconstrained_draw=self._store_unconstrained,
                     coords={
                         name: pd.Index(vals)
                         for name, vals in self._compiled_model.coords.items()
                     },
                     save_warmup=self._save_warmup,
+                    attrs={"sample_stats": attrs},
                 )
             else:
                 raise ValueError("Unknown results type")
@@ -687,6 +743,7 @@ def sample(
     progress_style: str | None = None,
     progress_rate: int = 100,
     zarr_store: _ZarrStoreType | None = None,
+    store_unconstrained: bool = False,
 ) -> xr.DataTree: ...
 
 
@@ -710,6 +767,7 @@ def sample(
     progress_style: str | None = None,
     progress_rate: int = 100,
     zarr_store: _ZarrStoreType | None = None,
+    store_unconstrained: bool = False,
     **kwargs,
 ) -> xr.DataTree: ...
 
@@ -734,6 +792,7 @@ def sample(
     progress_style: str | None = None,
     progress_rate: int = 100,
     zarr_store: _ZarrStoreType | None = None,
+    store_unconstrained: bool = False,
     **kwargs,
 ) -> _BackgroundSampler: ...
 
@@ -781,6 +840,7 @@ def sample(
     progress_style: str | None = None,
     progress_rate: int = 100,
     zarr_store: _ZarrStoreType | None = None,
+    store_unconstrained: bool = False,
     **kwargs,
 ) -> xr.DataTree | _BackgroundSampler:
     """Sample the posterior distribution for a compiled model.
@@ -817,8 +877,11 @@ def sample(
         point on the transformed parameter space. Defaults to
         zeros.
     store_unconstrained: bool
-        If True, store each draw in the unconstrained (transformed)
-        space in the sample stats.
+        If True, store the unconstrained (transformed) draws in two forms:
+        a flat ``unconstrained_draw`` vector in ``sample_stats`` and a
+        per-variable ``unconstrained_posterior`` group (with
+        ``warmup_unconstrained_posterior`` when ``save_warmup=True``) whose
+        dims are copied from the corresponding RV.
     store_gradient: bool
         If True, store the logp gradient of each draw in the unconstrained
         space in the sample stats.
@@ -992,6 +1055,9 @@ def sample(
 
     settings.update(updates)
 
+    if store_unconstrained:
+        settings.store_unconstrained = True
+
     if cores is None:
         try:
             # Only available in python>=3.13
@@ -1019,6 +1085,7 @@ def sample(
         progress_style=progress_style,
         progress_rate=progress_rate,
         store=zarr_store,
+        store_unconstrained=store_unconstrained,
     )
 
     if not blocking:
