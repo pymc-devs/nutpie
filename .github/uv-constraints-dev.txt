@@ -1,2 +1,7 @@
 pytensor @ git+https://github.com/pymc-devs/pytensor.git@main
 pymc @ git+https://github.com/pymc-devs/pymc.git@main
+# pandas 3.0 wheels are built against the numpy 2.5 C ABI but only declare
+# numpy>=1.26, while numba caps numpy<2.5. The resolver then pairs pandas 3.0
+# with numpy 2.4, and the ABI mismatch segfaults in native code (e.g.
+# pd.date_range in test_zarr_store). Pin until numba supports numpy>=2.5.
+pandas < 3.0.0
