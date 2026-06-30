@@ -1,4 +1,10 @@
-pytensor @ git+https://github.com/pymc-devs/pytensor.git@main
+# Test against pymc's development branch. We deliberately do NOT also pin
+# pytensor@main: pymc main caps the pytensor it supports (currently
+# pytensor>=3.0.7,<3.1), and whenever pytensor main has moved ahead of that cap
+# (e.g. pytensor main is >=3.1) the two git-main pins become mutually
+# unsatisfiable. uv then silently backtracks nutpie to an old PyPI release that
+# lacks the dev/docs extra, so pytest/jupyter never get installed. Let pymc@main
+# pull the (released) pytensor it is actually compatible with instead.
 pymc @ git+https://github.com/pymc-devs/pymc.git@main
 # pandas 3.0 wheels are built against the numpy 2.5 C ABI but only declare
 # numpy>=1.26, while numba caps numpy<2.5. The resolver then pairs pandas 3.0
