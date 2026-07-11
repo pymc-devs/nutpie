@@ -26,6 +26,7 @@ from flowjax.train.train_utils import (
     train_val_split,
 )
 import optax
+import optax.tree_utils as otu
 from paramax import unwrap, NonTrainable
 
 from nutpie.normalizing_flow import Coupling, Householder, Scan, extend_flow, make_flow
@@ -301,6 +302,21 @@ def inverse_gradient_and_val(bijection, draw, grad, logp):
         return (x, x_grad, logp + fwd_log_det)
 
 
+def _bucket_draws(*arrays, min_size=8):
+    """Truncate a window (oldest draws first) to a power-of-two length.
+
+    Every distinct draw count costs a fresh XLA compile of the loss, its
+    gradient and the vmapped transform. The windows grow by a handful of
+    draws each time, so without this each one is a new shape and adaptation
+    pays compile time it never amortizes.
+    """
+    n = len(arrays[0])
+    if n < min_size:
+        return arrays
+    size = 1 << (n.bit_length() - 1)
+    return tuple(a[-size:] for a in arrays)
+
+
 class FisherLoss:
     def __init__(self, gamma=None, log_inside_batch=False):
         self._gamma = gamma
@@ -392,6 +408,81 @@ def fit_flow(key, bijection, loss_fn, draws, grads, logps, **kwargs):
 
 
 @eqx.filter_jit
+def _run_lbfgs(params, static, loss_fn, draws, grads, logps, max_iter, gtol):
+    """L-BFGS to convergence, entirely inside one jit.
+
+    The loop is a ``lax.while_loop`` rather than a python loop around a
+    jitted step so the whole fit stays on the device -- no host sync per
+    iteration, and it runs on a GPU like the rest of the flow machinery.
+    """
+
+    def loss(params):
+        return loss_fn(params, static, draws, grads, logps)
+
+    optimizer = optax.lbfgs()
+    # Reuses the value/grad the zoom line search already computed.
+    value_and_grad = optax.value_and_grad_from_state(loss)
+
+    def lbfgs_step(carry):
+        params, state = carry
+        value, grad = value_and_grad(params, state=state)
+        updates, state = optimizer.update(
+            grad, state, params, value=value, grad=grad, value_fn=loss
+        )
+        return optax.apply_updates(params, updates), state
+
+    def not_converged(carry):
+        _, state = carry
+        count = otu.tree_get(state, "count")
+        grad = otu.tree_get(state, "grad")
+        return (count == 0) | ((count < max_iter) & (otu.tree_l2_norm(grad) >= gtol))
+
+    init = (params, optimizer.init(params))
+    params, state = jax.lax.while_loop(not_converged, lbfgs_step, init)
+    return params, otu.tree_get(state, "value")
+
+
+def fit_flow_lbfgs(
+    key,
+    bijection,
+    loss_fn,
+    draws,
+    grads,
+    logps,
+    *,
+    max_iter=200,
+    gtol=1e-5,
+    **_ignored,
+):
+    """Full-batch quasi-Newton fit of a low-dimensional flow.
+
+    The auto-reparam flow has only a handful of trainable knobs (the VIP
+    ``h``), a smooth deterministic loss and a window that fits in one
+    batch, so minibatch SGD spends thousands of tiny steps where L-BFGS
+    needs a few dozen full-batch evaluations. Not for the neural flows:
+    those have too many parameters and rely on the stochasticity.
+    """
+    flow = flowjax.flows.Transformed(
+        flowjax.distributions.StandardNormal(bijection.shape), bijection
+    )
+    params, static = eqx.partition(
+        flow,
+        eqx.is_inexact_array,
+        is_leaf=lambda leaf: isinstance(leaf, NonTrainable),
+    )
+    if not any(p.size for p in jax.tree.leaves(params)):
+        return bijection, {"train": [], "val": []}, None
+
+    draws, grads, logps = (jnp.asarray(a) for a in (draws, grads, logps))
+    params, value = _run_lbfgs(
+        params, static, loss_fn, draws, grads, logps, max_iter, gtol
+    )
+    fit = eqx.combine(params, static)
+    losses = [float(value)]
+    return fit.bijection, {"train": losses, "val": losses}, None
+
+
+@eqx.filter_jit
 def _init_from_transformed_position(logp_fn, bijection, transformed_position):
     bijection = unwrap(bijection)
     (untransformed_position, logdet), pull_grad = jax.vjp(
@@ -463,6 +554,8 @@ def _inv_transform(bijection, untransformed_position, untransformed_gradient):
 
 
 class TransformAdapter:
+    """Does optimization"""
+
     def __init__(
         self,
         seed,
@@ -493,7 +586,11 @@ class TransformAdapter:
         make_optimizer=None,
         num_layers=9,
         max_epochs=200,
+        fit_method="sgd",
     ):
+        if fit_method not in ("sgd", "lbfgs"):
+            raise ValueError(f"Unknown fit_method: {fit_method}")
+        self._fit_method = fit_method
         self._logp_fn = logp_fn
         self._make_flow_fn = make_flow_fn
         self._chain = chain
@@ -569,9 +666,9 @@ class TransformAdapter:
                     gradients = gradients_slice
                     logps = logp_slice
 
-                positions = np.array(positions)
-                gradients = np.array(gradients)
-                logps = np.array(logps)
+                positions, gradients, logps = _bucket_draws(
+                    np.array(positions), np.array(gradients), np.array(logps)
+                )
 
                 fit = self._make_flow_fn(seed, positions, gradients, n_layers=0)
 
@@ -590,9 +687,11 @@ class TransformAdapter:
 
                 return
 
-            positions = np.array(positions[self._initial_skip :][-self._window_size :])
-            gradients = np.array(gradients[self._initial_skip :][-self._window_size :])
-            logps = np.array(logps[self._initial_skip :][-self._window_size :])
+            positions, gradients, logps = _bucket_draws(
+                np.array(positions[self._initial_skip :][-self._window_size :]),
+                np.array(gradients[self._initial_skip :][-self._window_size :]),
+                np.array(logps[self._initial_skip :][-self._window_size :]),
+            )
 
             if len(positions) < 10:
                 return
@@ -609,6 +708,7 @@ class TransformAdapter:
             # TODO don't reuse seed
             key = jax.random.PRNGKey(seed % (2**63))
 
+            diag_was_refit = False
             if len(self._bijection.bijections) == 1:
                 base = self._make_flow_fn(
                     seed,
@@ -633,6 +733,36 @@ class TransformAdapter:
                             logps[-128:],
                         ),
                     )
+            elif isinstance(self._bijection.bijections[0], bijections.Affine):
+                # Diag-leading chain (the auto_flow/VIP case): no trained
+                # component consumes the diag's output, so the closed-form
+                # per-dimension scale estimate stays available all through
+                # tuning. Re-estimate the diag from this window's draws,
+                # conditional on the current trailing flows (make_flow pushes
+                # draws/grads through ``auto_flow`` before fitting), freeze
+                # it, and let the optimizer train only the trailing (VIP)
+                # parameters. Without this, the diag would stay stuck at its
+                # last diag-window fit and only creep by SGD.
+                # std <-  auto_reparam <- diag_affine <- draws
+                # std <-  diag_affine <- nf_flows <- draws
+                # (code order: VIP  std <- diag <- auto_reparam <- draws;
+                #  neural       std <- nf_flows <- diag <- draws)
+                rest = list(self._bijection.bijections[1:])
+                tail = rest[0] if len(rest) == 1 else bijections.Chain(rest)
+                fresh = self._make_flow_fn(
+                    seed, positions, gradients, n_layers=0, auto_flow=tail
+                )
+                diag = fresh.bijections[0]
+                diag = eqx.tree_at(
+                    lambda d: (d.loc, d.scale),
+                    diag,
+                    replace=(NonTrainable(diag.loc), NonTrainable(diag.scale)),
+                )
+                base = bijections.Chain([diag, *rest])
+                # Param structure changed (diag frozen out) — never reuse
+                # optimizer state across it.
+                self._opt_state = None
+                diag_was_refit = True
             else:
                 base = self._bijection
 
@@ -670,8 +800,8 @@ class TransformAdapter:
                 return
 
             flow = flowjax.flows.Transformed(
-                flowjax.distributions.StandardNormal(self._bijection.shape),
-                self._bijection,
+                flowjax.distributions.StandardNormal(base.shape),
+                base,
             )
             params, static = eqx.partition(flow, eqx.is_inexact_array)
 
@@ -679,12 +809,27 @@ class TransformAdapter:
                 params, static, positions[-128:], gradients[-128:], logps[-128:]
             )
 
-            if np.isfinite(old_loss) and old_loss < -4 and self.index > 10:
+            # The refit diag is an unconditional improvement candidate: adopt
+            # it now so it survives even if the SGD step below is rejected.
+            if base is not self._bijection and np.isfinite(old_loss):
+                self._bijection = base
+
+            # The absolute low-loss skip is miscalibrated on refit windows:
+            # a fresh diag alone often reaches loss < -4 while the VIP knobs
+            # still have large untapped gains (h stuck near 0), so only skip
+            # when the transform carried over unchanged.
+            if (
+                np.isfinite(old_loss)
+                and old_loss < -4
+                and self.index > 10
+                and not diag_was_refit
+            ):
                 if self._verbose:
                     print(f"Loss is low ({old_loss}), skipping training")
                 return
 
-            fit, _, opt_state = fit_flow(
+            fit_fn = fit_flow_lbfgs if self._fit_method == "lbfgs" else fit_flow
+            fit, _, opt_state = fit_fn(
                 key,
                 base,
                 self._loss_fn,
@@ -874,7 +1019,7 @@ def make_transform_adapter(
     show_progress=False,
     nn_depth=None,
     nn_width=None,
-    num_layers=8,
+    num_layers=None,
     num_diag_windows=6,
     learning_rate=5e-4,
     untransformed_dim=None,
@@ -905,9 +1050,27 @@ def make_transform_adapter(
     contract_transformer=True,
     asymmetric_transformer=False,
     reuse_embed=True,
+    auto_flow=None,
+    fit_method=None,
 ):
     if extension_windows is None:
         extension_windows = []
+
+    # Several auto flows compose into a single bijection; flowjax applies
+    # Chain members in order in the transform (sampler -> value) direction.
+    if isinstance(auto_flow, (list, tuple)):
+        auto_flow = bijections.Chain(list(auto_flow)) if auto_flow else None
+
+    # With an auto flow, default to fitting only the reparametrization (and
+    # the diag affine); set num_layers explicitly to add coupling layers.
+    if num_layers is None:
+        num_layers = 0 if auto_flow is not None else 8
+
+    # A pure auto flow has only the few VIP knobs to fit: full-batch L-BFGS
+    # converges in a few dozen loss evaluations where SGD needs thousands of
+    # steps. Neural layers keep the SGD path.
+    if fit_method is None:
+        fit_method = "lbfgs" if (auto_flow is not None and num_layers == 0) else "sgd"
 
     return partial(
         TransformAdapter,
@@ -930,6 +1093,7 @@ def make_transform_adapter(
             contract_transformer=contract_transformer,
             asymmetric_transformer=asymmetric_transformer,
             reuse_embed=reuse_embed,
+            auto_flow=auto_flow,
         ),
         show_progress=show_progress,
         num_diag_windows=num_diag_windows,
@@ -950,4 +1114,5 @@ def make_transform_adapter(
         make_optimizer=make_optimizer,
         num_layers=num_layers,
         max_epochs=max_epochs,
+        fit_method=fit_method,
     )

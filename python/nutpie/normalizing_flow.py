@@ -18,6 +18,17 @@ from equinox.nn import Linear
 from paramax.wrappers import AbstractUnwrappable
 
 
+def _positive(x):
+    """Unconstrained -> positive reparametrization (``exp(asinh(x))``).
+
+    A module-level function, not a lambda: ``Parameterize`` keeps it as a
+    static pytree leaf, so a fresh lambda per flow would change the static
+    structure and force jax to retrace and recompile every jitted function
+    touching the flow on every adaptation window.
+    """
+    return x + jnp.sqrt(1 + x**2)
+
+
 def _generate_sequences(k, r_vals):
     """
     Generate all binary sequences of length k with exactly r 1's.
@@ -342,8 +353,8 @@ class AsymmetricAffine(bijections.AbstractBijection):
         )
         self.shape = scale.shape
         assert self.shape == ()
-        self.scale = Parameterize(lambda x: x + jnp.sqrt(1 + x**2), jnp.zeros(()))
-        self.theta = Parameterize(lambda x: x + jnp.sqrt(1 + x**2), jnp.zeros(()))
+        self.scale = Parameterize(_positive, jnp.zeros(()))
+        self.theta = Parameterize(_positive, jnp.zeros(()))
 
     def _log_derivative_f(self, x, mu, sigma, theta):
         abs_x = jnp.abs(x)
@@ -471,6 +482,31 @@ class Householder(AbstractBijection):
 
     def inverse_and_log_det(self, y: Array, condition: Array | None = None):
         return self._householder(y), jnp.zeros(())
+
+
+class AutoFlow(AbstractBijection):
+    shape: tuple[int, ...]
+    params: Array
+    transform_and_log_det_fn: Callable
+    inverse_and_log_det_fn: Callable
+    cond_shape = None
+
+    def __init__(
+        self, params: ArrayLike, shape, transform_and_log_det_fn, inverse_and_log_det_fn
+    ):
+        params = arraylike_to_array(params)
+        if params.ndim != 1:
+            raise ValueError("params must be a vector.")
+        self.shape = shape
+        self.params = params
+        self.transform_and_log_det_fn = transform_and_log_det_fn
+        self.inverse_and_log_det_fn = inverse_and_log_det_fn
+
+    def transform_and_log_det(self, x: jnp.ndarray, condition: Array | None = None):
+        return self.transform_and_log_det_fn(x, self.params)
+
+    def inverse_and_log_det(self, y: Array, condition: Array | None = None):
+        return self.inverse_and_log_det_fn(y, self.params)
 
 
 class MvScale(bijections.AbstractBijection):
@@ -952,8 +988,8 @@ def make_hh(key, n_dim, size, randomize_base=False):
 def make_elemwise_trafo(key, n_dim, *, count=1, vmap=True):
     def make_elemwise(key, loc):
         key1, key2 = jax.random.split(key)
-        scale = Parameterize(lambda x: x + jnp.sqrt(1 + x**2), jnp.zeros(()))
-        theta = Parameterize(lambda x: x + jnp.sqrt(1 + x**2), jnp.zeros(()))
+        scale = Parameterize(_positive, jnp.zeros(()))
+        theta = Parameterize(_positive, jnp.zeros(()))
 
         affine = AsymmetricAffine(
             loc,
@@ -1422,7 +1458,7 @@ def make_transformer(
 
     if affine_transformer:
         affine = bijections.Affine(jnp.zeros(()), jnp.ones(()))
-        scale = Parameterize(lambda x: x + jnp.sqrt(1 + x**2), jnp.zeros(()))
+        scale = Parameterize(_positive, jnp.zeros(()))
         affine = eqx.tree_at(
             where=lambda aff: aff.scale,
             pytree=affine,
@@ -1432,8 +1468,8 @@ def make_transformer(
 
     if asymmetric_transformer:
         for loc in [0.0]:
-            scale = Parameterize(lambda x: x + jnp.sqrt(1 + x**2), jnp.zeros(()))
-            theta = Parameterize(lambda x: x + jnp.sqrt(1 + x**2), jnp.zeros(()))
+            scale = Parameterize(_positive, jnp.zeros(()))
+            theta = Parameterize(_positive, jnp.zeros(()))
 
             affine = AsymmetricAffine(
                 jnp.zeros(()) + loc,
@@ -1878,6 +1914,7 @@ def make_flow(
     sandwich_householder=False,
     activation=None,
     reuse_embed=False,
+    auto_flow=None,
 ):
     if activation is None:
         activation = jax.nn.leaky_relu
@@ -1901,23 +1938,36 @@ def make_flow(
     n_draws, n_dim = positions.shape
     assert positions.shape == gradients.shape
 
+    # Push positions and gradients through autoflow
+    if auto_flow is not None:
+        from nutpie.transform_adapter import inverse_gradient_and_val
+
+        positions, gradients, _logp = eqx.filter_vmap(
+            inverse_gradient_and_val, in_axes=(None, 0, 0, 0)
+        )(auto_flow, positions, gradients, jnp.zeros((n_draws,)))
+        positions = np.asarray(positions)
+        gradients = np.asarray(gradients)
+
     if n_draws == 0:
         raise ValueError("No draws")
     elif n_draws == 1:
         assert np.all(gradients != 0)
-        diag = np.clip(1 / jnp.sqrt(jnp.abs(gradients[0])), 1e-8, 1e8)
+        diag = np.clip(1 / np.sqrt(np.abs(gradients[0])), 1e-8, 1e8)
         assert np.isfinite(diag).all()
-        mean = jnp.zeros_like(diag)
+        mean = np.zeros_like(diag)
     else:
+        # numpy, not jnp: these run once per adaptation window on a
+        # window-sized array, and each new draw count would otherwise cost a
+        # fresh XLA compile.
         pos_std = np.clip(positions.std(0), 1e-8, 1e8)
         grad_std = np.clip(gradients.std(0), 1e-8, 1e8)
-        diag = jnp.sqrt(pos_std / grad_std)
+        diag = np.sqrt(pos_std / grad_std)
         mean = positions.mean(0) + gradients.mean(0) * diag * diag
 
     key = jax.random.key(seed % (2**63), impl="threefry2x32")
 
     diag_param = Parameterize(
-        lambda x: x + jnp.sqrt(1 + x**2),
+        _positive,
         (diag**2 - 1) / (2 * diag),
     )
     diag_affine = bijections.Affine(mean, diag)
@@ -1927,9 +1977,9 @@ def make_flow(
         replace=diag_param,
     )
 
-    flows = [
-        diag_affine,
-    ]
+    flows = [diag_affine]
+    if auto_flow is not None:
+        flows.append(auto_flow)
 
     if n_layers == 0:
         return bijections.Chain(flows)
@@ -2071,11 +2121,11 @@ def extend_flow(
 
     if True:
         scale = Parameterize(
-            lambda x: x + jnp.sqrt(1 + x**2),
+            _positive,
             jnp.array(0.0),
         )
         theta = Parameterize(
-            lambda x: x + jnp.sqrt(1 + x**2),
+            _positive,
             jnp.array(0.0),
         )
 
@@ -2152,7 +2202,7 @@ def extend_flow(
 
         if False:
             scale = Parameterize(
-                lambda x: x + jnp.sqrt(1 + x**2),
+                _positive,
                 jnp.array(0.0),
             )
             affine = eqx.tree_at(
@@ -2204,7 +2254,7 @@ def extend_flow(
         new_layer = bijections.Sandwich(inner, permute)
 
     scale = Parameterize(
-        lambda x: x + jnp.sqrt(1 + x**2),
+        _positive,
         jnp.zeros(n_dim),
     )
     affine = eqx.tree_at(
@@ -2227,7 +2277,7 @@ def extend_flow(
         ),
     )
     scale = Parameterize(
-        lambda x: x + jnp.sqrt(1 + x**2),
+        _positive,
         jnp.zeros(n_dim),
     )
     affine = eqx.tree_at(

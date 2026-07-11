@@ -217,6 +217,11 @@ class CompiledPyMCModel(CompiledModel):
             outer_kwargs = {}
 
         def make_adapter(*args, **kwargs):
+            if "numba_flow" in outer_kwargs:
+                from nutpie.transform_adapter_numba import make_numba_transform_adapter
+
+                return make_numba_transform_adapter(**outer_kwargs)(*args, **kwargs)
+
             from nutpie.transform_adapter import make_transform_adapter
 
             return make_transform_adapter(**outer_kwargs)(*args, **kwargs, logp_fn=None)
@@ -233,7 +238,14 @@ class CompiledPyMCModel(CompiledModel):
         )
 
     def with_transform_adapt(self, **kwargs):
-        return dataclasses.replace(self, _transform_adapt_args=kwargs)
+        """Set arguments for the flow transform adapter (``adaptation="flow"``).
+
+        Arguments accumulate across calls; pass ``None`` to reset an
+        argument to its default.
+        """
+        merged = {**(self._transform_adapt_args or {}), **kwargs}
+        merged = {k: v for k, v in merged.items() if v is not None}
+        return dataclasses.replace(self, _transform_adapt_args=merged)
 
 
 def update_user_data(user_data, user_data_storage):
@@ -273,6 +285,7 @@ def _compile_pymc_model_numba(
     model: "pm.Model",
     pymc_initial_point_fn: Callable[[SeedType], dict[str, np.ndarray]],
     var_names: Iterable[str] | None = None,
+    auto_reparam: bool = False,
     **kwargs,
 ) -> CompiledPyMCModel:
     if find_spec("numba") is None:
@@ -348,7 +361,7 @@ def _compile_pymc_model_numba(
 
     dims, coords = _prepare_dims_and_coords(model, shape_info, reparameterized_names)
 
-    return CompiledPyMCModel(
+    compiled = CompiledPyMCModel(
         _n_dim=n_dim,
         dims=dims,
         _coords=coords,
@@ -365,6 +378,16 @@ def _compile_pymc_model_numba(
         expand_func=expand_fn_pt,
         reparameterized_names=reparameterized_names,
     )
+
+    if auto_reparam:
+        from nutpie.transform_adapter_numba import build_auto_flow_numba
+
+        # None (with a warning) when the rewrite found nothing to do.
+        numba_flow = build_auto_flow_numba(model, compiled)
+        if numba_flow is not None:
+            compiled = compiled.with_transform_adapt(numba_flow=numba_flow)
+
+    return compiled
 
 
 def _prepare_dims_and_coords(model, shape_info, reparameterized_names):
@@ -413,6 +436,7 @@ def _compile_pymc_model_jax(
     gradient_backend=None,
     pymc_initial_point_fn: Callable[[SeedType], dict[str, np.ndarray]],
     var_names: Iterable[str] | None = None,
+    auto_reparam: bool = False,
     **kwargs,
 ):
     if find_spec("jax") is None:
@@ -504,7 +528,7 @@ def _compile_pymc_model_jax(
 
     dims, coords = _prepare_dims_and_coords(model, shape_info, reparameterized_names)
 
-    return from_pyfunc(
+    compiled = from_pyfunc(
         ndim=n_dim,
         make_logp_fn=make_logp_func,
         make_expand_fn=make_expand_func,
@@ -518,6 +542,16 @@ def _compile_pymc_model_jax(
         raw_logp_fn=orig_logp_fn,
         reparameterized_names=reparameterized_names,
     )
+
+    if auto_reparam:
+        from nutpie.flow_reparam import build_auto_flow
+
+        # None (with a warning) when the rewrite found nothing to do.
+        auto_flow = build_auto_flow(model, compiled)
+        if auto_flow is not None:
+            compiled = compiled.with_transform_adapt(auto_flow=auto_flow)
+
+    return compiled
 
 
 def compile_pymc_model(
@@ -533,6 +567,7 @@ def compile_pymc_model(
     ] = "support_point",
     var_names: Iterable[str] | None = None,
     freeze_model: bool | None = None,
+    auto_reparam: bool = False,
     **kwargs,
 ) -> CompiledModel:
     """Compile necessary functions for sampling a pymc model.
@@ -561,6 +596,18 @@ def compile_pymc_model(
     freeze_model : bool | None
         Freeze all dimensions and shared variables to treat them as compile time
         constants.
+    auto_reparam : bool
+        Automatically reparametrize free random variables (e.g. continuous
+        VIP centering of location-scale families) and attach the resulting
+        flow to the model, so that ``nutpie.sample(compiled_model,
+        adaptation="flow")`` fits the reparametrization during tuning.
+        Prints a summary of the reparametrized variables; if nothing can be
+        reparametrized, warns and attaches no flow. Requires
+        ``backend="jax"`` and ``gradient_backend="jax"``. With a flow
+        attached, only the reparametrization (plus a diagonal affine) is
+        fitted by default; further flow options (e.g. ``num_layers`` to add
+        neural coupling layers) can be set with
+        ``compiled_model.with_transform_adapt``.
 
     Returns
     -------
@@ -580,6 +627,14 @@ def compile_pymc_model(
         gradient_backend = gradient_backend.lower()  # type: ignore[assignment]
     if backend is not None:
         backend = backend.lower()  # type: ignore[assignment]
+
+    # With the jax backend the flow adapter needs the raw JAX logp function,
+    # which is only kept with the jax gradient backend. The numba backend uses
+    # the pytensor/numba adapter instead, which builds its own logp graph.
+    if auto_reparam and backend == "jax" and gradient_backend != "jax":
+        raise ValueError(
+            "auto_reparam with backend='jax' requires gradient_backend='jax'"
+        )
 
     from pymc.initial_point import make_initial_point_fn
     from pymc.model.transform.optimization import freeze_dims_and_data
@@ -610,6 +665,7 @@ def compile_pymc_model(
             model=model,
             pymc_initial_point_fn=initial_point_fn,
             var_names=var_names,
+            auto_reparam=auto_reparam,
             **kwargs,
         )
     elif backend.lower() == "jax":
@@ -618,6 +674,7 @@ def compile_pymc_model(
             gradient_backend=gradient_backend,
             pymc_initial_point_fn=initial_point_fn,
             var_names=var_names,
+            auto_reparam=auto_reparam,
             **kwargs,
         )
     else:
