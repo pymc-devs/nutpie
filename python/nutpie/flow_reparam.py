@@ -303,21 +303,21 @@ class FlowFreeRV(ModelValuedVar):
     Inputs (positional, flat so ``op.make_node(*node.inputs)`` is
     idempotent)::
 
-        (rv, value, *model_params, *hyper_shape_exprs, *dims)
+        (rv, value, *model_params, *hyper_shape_exprs)
 
     with ``len(model_params) == flow_cls.n_model_params`` and
     ``len(hyper_shape_exprs) == flow_cls.n_hyper_params``.
     """
 
-    __props__ = ("flow_cls", "transform")
+    __props__ = ("name", "dims", "transform", "flow_cls")
 
-    def __init__(self, flow_cls: type[Flow], transform=None):
+    def __init__(self, flow_cls: type[Flow], name, dims=(), transform=None):
         self.flow_cls = flow_cls
-        super().__init__(transform=transform)
+        super().__init__(name, dims, transform=transform)
 
-    def __call__(self, rv, value, *params, hyperparam_shapes=(), dims=()):
+    def __call__(self, rv, value, *params, hyperparam_shapes=()):
         # Ergonomic construction: callers group the variadic chunks by name.
-        return super().__call__(rv, value, *params, *hyperparam_shapes, *dims)
+        return super().__call__(rv, value, *params, *hyperparam_shapes)
 
     def make_node(self, rv, value, *rest):
         nm = self.flow_cls.n_model_params
@@ -384,8 +384,8 @@ def lift_xtensor_from_model_free_rv(fgraph, node):
     and value inputs, leaving plain tensors inside so downstream flow
     rewrites don't have to know about xtensor::
 
-        ModelFreeRV(XTensorFromTensor(rv), XTensorFromTensor(value), *dims)
-        -> XTensorFromTensor(ModelFreeRV(rv, aligned_value, *dims))
+        ModelFreeRV(XTensorFromTensor(rv), XTensorFromTensor(value))
+        -> XTensorFromTensor(ModelFreeRV(rv, aligned_value))
 
     Only fires on RVs with ``transform=None`` or a :class:`DimTransform`
     known to have a plain counterpart (see the ``match`` below); unknown
@@ -408,7 +408,7 @@ def lift_xtensor_from_model_free_rv(fgraph, node):
         case _:
             return None
 
-    xrv, xvalue, *dims = node.inputs
+    xrv, xvalue = node.inputs
     if not isinstance(xrv.owner.op, XTensorFromTensor):
         return None
     rv_dims = xrv.type.dims
@@ -428,9 +428,9 @@ def lift_xtensor_from_model_free_rv(fgraph, node):
     new_op = (
         node.op
         if new_transform is current_transform
-        else type(node.op)(transform=new_transform)
+        else type(node.op)(node.op.name, node.op.dims, transform=new_transform)
     )
-    new_free_rv = new_op(rv, value, *dims)
+    new_free_rv = new_op(rv, value)
     return [XTensorFromTensor(dims=rv_dims)(new_free_rv)]
 
 
@@ -459,7 +459,7 @@ def _hyper_shape(value, n_core: int = 0):
 
 @node_rewriter([ModelFreeRV])
 def loc_scale_affine_flow(fgraph, node):
-    rv, value, *dims = node.inputs
+    rv, value = node.inputs
     rv_node = rv.owner
 
     entry = LOC_SCALE_FAMILIES.get(type(rv_node.op))
@@ -488,7 +488,7 @@ def loc_scale_affine_flow(fgraph, node):
     # not qualify gets a size-0 hyper param, which the flow pins at the
     # centred no-op.
     param_shape = _hyper_shape(value)
-    flow_rv = FlowFreeRV(AffineFlow, transform=node.op.transform)(
+    flow_rv = FlowFreeRV(AffineFlow, **node.op._props_dict())(
         rv,
         value,
         loc,
@@ -497,7 +497,6 @@ def loc_scale_affine_flow(fgraph, node):
             param_shape if loc_qualifies else _empty_shape,
             param_shape if scale_qualifies else _empty_shape,
         ],
-        dims=dims,
     )
     return {node.outputs[0]: flow_rv}
 
@@ -507,7 +506,7 @@ def scale_shift_flow(fgraph, node):
     if not isinstance(node.op.transform, LogTransform):
         return None
 
-    rv, value, *dims = node.inputs
+    rv, value = node.inputs
     rv_node = rv.owner
 
     scale_idx = SCALE_SHIFT_FAMILIES.get(type(rv_node.op))
@@ -521,8 +520,8 @@ def scale_shift_flow(fgraph, node):
     # VIP shift: the parent enters the log-space value additively through
     # ``log(scale)``, so the flow shifts by ``h·log(scale)``; h = 0 is
     # centred.
-    flow_rv = FlowFreeRV(ShiftFlow, transform=node.op.transform)(
-        rv, value, pt.log(scale), hyperparam_shapes=[_hyper_shape(value)], dims=dims
+    flow_rv = FlowFreeRV(ShiftFlow, **node.op._props_dict())(
+        rv, value, pt.log(scale), hyperparam_shapes=[_hyper_shape(value)]
     )
     return {node.outputs[0]: flow_rv}
 
@@ -544,7 +543,7 @@ def zerosum_scale_flow(fgraph, node):
     if not isinstance(node.op.transform, ZeroSumTransform):
         return None
 
-    rv, value, *dims = node.inputs
+    rv, value = node.inputs
     rv_node = rv.owner
     if not isinstance(rv_node.op, ZeroSumNormalRV):
         return None
@@ -558,13 +557,12 @@ def zerosum_scale_flow(fgraph, node):
         return None
 
     n_core = rv_node.op.ndim_supp
-    flow_rv = FlowFreeRV(AffineFlow, transform=node.op.transform)(
+    flow_rv = FlowFreeRV(AffineFlow, **node.op._props_dict())(
         rv,
         value,
         pt.zeros((), dtype=value.dtype),
         sigma,
         hyperparam_shapes=[_empty_shape, _hyper_shape(value, n_core=n_core)],
-        dims=dims,
     )
     return {node.outputs[0]: flow_rv}
 
@@ -903,12 +901,27 @@ def build_flow_graph(
     return build_flow_graph_from_specs(specs, free_vars_info, n_dim)
 
 
+class VarInfo(NamedTuple):
+    name: str
+    start_idx: int
+    end_idx: int
+    shape: tuple[int, ...]
+
+
 def free_vars_info(compiled_model):
     """The compiled model's free (unconstrained) variable descriptors,
     whose ``start_idx``/``end_idx``/``shape`` define Nutpie's flat point
     vector layout."""
     n_dim = int(compiled_model.n_dim)
-    return [v for v in compiled_model._variables if v.end_idx <= n_dim]
+    if hasattr(compiled_model, "_variables"):  # pyfunc (jax) model
+        return [v for v in compiled_model._variables if v.end_idx <= n_dim]
+    # numba model: the free vars are the leading entries of the flat vector
+    names, slices, shapes = compiled_model.shape_info
+    return [
+        VarInfo(name, sl.start, sl.stop, tuple(shape))
+        for name, sl, shape in zip(names, slices, shapes, strict=True)
+        if sl.stop <= n_dim
+    ]
 
 
 def build_auto_flow(

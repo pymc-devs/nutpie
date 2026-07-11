@@ -806,11 +806,102 @@ def test_auto_reparam_compile_api(capsys):
     assert "auto_flow" not in cleared._transform_adapt_args
 
     with pytest.raises(ValueError, match="auto_reparam"):
-        nutpie.compile_pymc_model(m, auto_reparam=True)
-    with pytest.raises(ValueError, match="auto_reparam"):
         nutpie.compile_pymc_model(
             m, backend="jax", gradient_backend="pytensor", auto_reparam=True
         )
+
+
+@pytest.mark.pymc
+@pytest.mark.flow
+def test_auto_reparam_compile_api_numba(capsys):
+    from nutpie.transform_adapter_numba import NumbaAutoFlow
+
+    m, _ = _funnel_model()
+    compiled = nutpie.compile_pymc_model(m, backend="numba", auto_reparam=True)
+    summary = capsys.readouterr().out
+    assert "reparametrizing 1 of 2 free variables" in summary
+    flow = compiled._transform_adapt_args["numba_flow"]
+    assert isinstance(flow, NumbaAutoFlow)
+    assert flow.n_dim == compiled.n_dim
+    assert flow.n_params > 0
+
+
+@pytest.mark.pymc
+@pytest.mark.flow
+def test_numba_adapter_matches_jax_adapter():
+    """The pytensor/numba hook and the jax/flowjax one compute the same
+    transformed logp, logdet and gradients for the same flow parameters."""
+    import equinox as eqx
+    import jax.numpy as jnp
+    from flowjax import bijections
+
+    from nutpie.transform_adapter import make_transform_adapter
+    from nutpie.transform_adapter_numba import make_numba_transform_adapter
+
+    m, _ = _funnel_model()
+    c_jax = nutpie.compile_pymc_model(
+        m, backend="jax", gradient_backend="jax", auto_reparam=True
+    )
+    c_numba = nutpie.compile_pymc_model(m, backend="numba", auto_reparam=True)
+    n_dim = int(c_jax.n_dim)
+
+    rng = np.random.default_rng(0)
+    position = rng.normal(size=n_dim)
+    gradient = rng.normal(size=n_dim)
+
+    numba_flow = c_numba._transform_adapt_args["numba_flow"]
+    nb = make_numba_transform_adapter(numba_flow=numba_flow)(
+        seed=1, position=position, gradient=gradient, chain=0
+    )
+    h = rng.normal(size=numba_flow.n_params) * 0.3
+    loc = rng.normal(size=n_dim) * 0.1
+    scale = np.exp(rng.normal(size=n_dim) * 0.2)
+    nb._h, nb._loc, nb._scale = h, loc, scale
+
+    auto_flow = c_jax._transform_adapt_args["auto_flow"]
+    jx = make_transform_adapter(auto_flow=auto_flow)(
+        seed=1,
+        position=position,
+        gradient=gradient,
+        chain=0,
+        logp_fn=c_jax._raw_logp_fn,
+    )
+    flow_jax = eqx.tree_at(lambda f: f.params, auto_flow, jnp.asarray(h))
+    jx._bijection = bijections.Chain(
+        [bijections.Affine(jnp.asarray(loc), jnp.asarray(scale)), flow_jax]
+    )
+
+    z = rng.normal(size=n_dim)
+    nb_out = nb.init_from_transformed_position(z)
+    jx_out = jx.init_from_transformed_position(z)
+    for got, want in zip(nb_out, jx_out, strict=True):
+        np.testing.assert_allclose(got, want, rtol=1e-8, atol=1e-8)
+
+    x = rng.normal(size=n_dim)
+    for got, want in zip(
+        nb.init_from_untransformed_position(x),
+        jx.init_from_untransformed_position(x),
+        strict=True,
+    ):
+        np.testing.assert_allclose(got, want, rtol=1e-8, atol=1e-8)
+
+    gx = rng.normal(size=n_dim)
+    for got, want in zip(nb.inv_transform(x, gx), jx.inv_transform(x, gx), strict=True):
+        np.testing.assert_allclose(got, want, rtol=1e-8, atol=1e-8)
+
+
+@pytest.mark.pymc
+@pytest.mark.flow
+def test_auto_reparam_sampling_numba():
+    m, _ = _funnel_model()
+    compiled = nutpie.compile_pymc_model(m, backend="numba", auto_reparam=True)
+    trace = nutpie.sample(
+        compiled, chains=1, seed=1, adaptation="flow", tune=1000, draws=500
+    )
+    assert float(trace.sample_stats.diverging.sum()) <= 5
+    np.testing.assert_allclose(
+        float(trace.posterior.pop_sigma_log.std()), 1.0, atol=0.3
+    )
 
 
 @pytest.mark.pymc
