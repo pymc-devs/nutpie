@@ -1,3 +1,4 @@
+import json
 import time
 from importlib.util import find_spec
 
@@ -650,3 +651,52 @@ def test_unnamed_shared(backend, gradient_backend):
 
     compiled = nutpie.compile_pymc_model(model)
     nutpie.sample(compiled)
+
+
+def test_zarr_store_sample_stats_attrs(tmp_path):
+    """The zarr backend must attach the same sample_stats attrs as the arrow backend.
+
+    pymc's ``patch_nutpie_idata`` reads ``inference_library_settings`` from there, so
+    ``pm.sample(nuts_sampler="nutpie", nuts_sampler_kwargs={"zarr_store": ...})``
+    fails with a KeyError when they are missing.
+    """
+    with pm.Model() as model:
+        pm.Normal("x")
+
+    compiled = nutpie.compile_pymc_model(model, backend="numba")
+
+    path = tmp_path / "trace.zarr"
+    path.mkdir()
+    store = nutpie.zarr_store.LocalStore(str(path))
+    zarr_trace = nutpie.sample(
+        compiled, chains=1, seed=123, draws=20, tune=20, zarr_store=store
+    )
+    arrow_trace = nutpie.sample(compiled, chains=1, seed=123, draws=20, tune=20)
+
+    for key in [
+        "inference_library",
+        "inference_library_version",
+        "inference_library_settings",
+    ]:
+        assert key in zarr_trace.sample_stats.attrs, key
+        assert (
+            zarr_trace.sample_stats.attrs[key] == arrow_trace.sample_stats.attrs[key]
+        ), key
+
+    settings = json.loads(zarr_trace.sample_stats.attrs["inference_library_settings"])
+    assert settings["settings"]["num_tune"] == 20
+
+    # the store keeps every stat and both warmup groups; the settings say otherwise
+    assert set(zarr_trace.sample_stats.data_vars) == set(arrow_trace.sample_stats.data_vars)
+    assert set(zarr_trace.children) == set(arrow_trace.children)
+
+    # chain/draw carry coordinate variables, so label-based selection works
+    assert "chain" in zarr_trace.posterior.coords
+    assert "draw" in zarr_trace.posterior.coords
+    zarr_trace.posterior.sel(draw=5)
+
+    # no dict-valued attrs remain anywhere: the tree must survive to_netcdf
+    for node in zarr_trace.subtree:
+        for value in node.attrs.values():
+            assert not isinstance(value, dict)
+    zarr_trace.to_netcdf(tmp_path / "roundtrip.nc")
