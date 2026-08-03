@@ -1,20 +1,21 @@
-from typing import Any, ClassVar, Union, Literal, Callable
-import math
 import itertools
+import math
+from collections.abc import Callable
+from typing import Any, ClassVar, Literal
 
+import equinox as eqx
+import flowjax.distributions
+import flowjax.flows
+import jax
+import jax.numpy as jnp
+import numpy as np
+from equinox.nn import Linear
+from flowjax import bijections
 from flowjax.bijections.bijection import AbstractBijection
 from flowjax.bijections.coupling import get_ravelled_pytree_constructor
 from flowjax.utils import arraylike_to_array
-import jax
-import jax.numpy as jnp
-import equinox as eqx
-from flowjax import bijections
-import flowjax.distributions
-import flowjax.flows
 from jaxtyping import Array, ArrayLike, PyTree
-import numpy as np
 from paramax import NonTrainable, Parameterize, unwrap
-from equinox.nn import Linear
 from paramax.wrappers import AbstractUnwrappable
 
 
@@ -135,15 +136,15 @@ class FactoredMLP(eqx.Module, strict=True):
     final_activation: Callable
     use_bias: bool = eqx.field(static=True)
     use_final_bias: bool = eqx.field(static=True)
-    in_size: Union[int, Literal["scalar"]] = eqx.field(static=True)
-    out_size: Union[int, Literal["scalar"]] = eqx.field(static=True)
+    in_size: int | Literal["scalar"] = eqx.field(static=True)
+    out_size: int | Literal["scalar"] = eqx.field(static=True)
     width_size: tuple[int, ...] = eqx.field(static=True)
     depth: int = eqx.field(static=True)
 
     def __init__(
         self,
-        in_size: Union[int, Literal["scalar"]],
-        out_size: Union[int, Literal["scalar"]],
+        in_size: int | Literal["scalar"],
+        out_size: int | Literal["scalar"],
         width_size: int | tuple[int | tuple[int, int], ...],
         depth: int,
         activation: Callable = jax.nn.relu,
@@ -275,7 +276,8 @@ class FactoredMLP(eqx.Module, strict=True):
             else:
                 x = layer(x)
             layer_activation = jax.tree.map(
-                lambda x: x[i] if eqx.is_array(x) else x, act
+                lambda x: x[i] if eqx.is_array(x) else x,  # noqa: B023
+                act,
             )
             x = eqx.filter_vmap(lambda a, b: a(b))(layer_activation, x)
 
@@ -816,7 +818,7 @@ class MaskedCoupling(bijections.AbstractBijection):
 
     @classmethod
     def conditioner_output_size(cls, dim, transformer):
-        constructor, num_params = get_ravelled_pytree_constructor(
+        _constructor, num_params = get_ravelled_pytree_constructor(
             transformer,
             filter_spec=eqx.is_inexact_array,
             is_leaf=lambda leaf: isinstance(leaf, NonTrainable),
@@ -901,8 +903,7 @@ class MaskedCoupling(bijections.AbstractBijection):
 
 def make_mvscale(key, n_dim, size, randomize_base=False):
     def make_single_hh(key, idx):
-        key1, key2 = jax.random.split(key)
-        params = jax.random.normal(key1, (n_dim,))
+        params = jax.random.normal(key, (n_dim,))
         params = params / jnp.linalg.norm(params)
         mvscale = MvScale(params)
         return mvscale
@@ -922,8 +923,7 @@ def make_mvscale(key, n_dim, size, randomize_base=False):
 
 def make_hh(key, n_dim, size, randomize_base=False):
     def make_single_hh(key, idx):
-        key1, key2 = jax.random.split(key)
-        params = jax.random.normal(key1, (n_dim,)) * 1e-3
+        params = jax.random.normal(key, (n_dim,)) * 1e-3
         params = params.at[idx].set(1.0)
         return Householder(params)
 
@@ -951,7 +951,6 @@ def make_hh(key, n_dim, size, randomize_base=False):
 
 def make_elemwise_trafo(key, n_dim, *, count=1, vmap=True):
     def make_elemwise(key, loc):
-        key1, key2 = jax.random.split(key)
         scale = Parameterize(lambda x: x + jnp.sqrt(1 + x**2), jnp.zeros(()))
         theta = Parameterize(lambda x: x + jnp.sqrt(1 + x**2), jnp.zeros(()))
 
@@ -1636,7 +1635,7 @@ def make_flow_scan(
         return MvScale(params)
 
     def make_layer(key, mask, embed, embed_back):
-        key1, key2, key3, key4, key5 = jax.random.split(key, 5)
+        _key1, key2, key3, key4, _key5 = jax.random.split(key, 5)
         transformer = make_transformer(
             affine_transformer=affine_transformer,
             contract_transformer=contract_transformer,
@@ -1823,7 +1822,7 @@ def make_flow_loop(
 
         return flow
 
-    key, key_permute = jax.random.split(key)
+    key, _key_permute = jax.random.split(key)
     keys = jax.random.split(key, n_layers)
 
     if untransformed_dim is None:
@@ -2033,7 +2032,7 @@ def extend_flow(
     nn_depth=None,
     activation,
 ):
-    n_draws, n_dim = positions.shape
+    _n_draws, n_dim = positions.shape
 
     if n_dim < 2:
         return base

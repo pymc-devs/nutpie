@@ -576,7 +576,7 @@ def test_zarr_store(tmp_path):
     trace = nutpie.sample(
         compiled, chains=2, seed=123, draws=100, tune=100, zarr_store=store
     )
-    trace.load().posterior.x
+    _ = trace.load().posterior.x
 
     assert trace.posterior.coords["a"].dtype == np.float32
     # pandas 3.0 changes datetime64 precision

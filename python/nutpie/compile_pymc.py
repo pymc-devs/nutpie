@@ -2,12 +2,12 @@ import dataclasses
 import itertools
 import threading
 import warnings
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from functools import wraps
 from importlib.util import find_spec
 from math import prod
-from typing import TYPE_CHECKING, Any, Callable, Literal, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, Literal, Union, cast
 from uuid import uuid4
 
 import numpy as np
@@ -122,7 +122,7 @@ class CompiledPyMCModel(CompiledModel):
     expand_func: Any
     _n_dim: int
     _shapes: dict[str, tuple[int, ...]]
-    _coords: Optional[dict[str, Any]]
+    _coords: dict[str, Any] | None
     _transform_adapt_args: dict | None = None
 
     @property
@@ -485,7 +485,7 @@ def _compile_pymc_model_jax(
 
         return logp
 
-    names, slices, shapes = shape_info
+    names, _slices, shapes = shape_info
     # TODO do not cast to float64
     dtypes = [np.dtype("float64")] * len(names)
 
@@ -653,11 +653,7 @@ def _compute_shapes(model) -> dict[str, tuple[int, ...]]:
         outputs=[as_tensor(var.shape) for var in trace_vars.values()],
         givens=(
             [(obs, model.rvs_to_values[obs]) for obs in model.observed_RVs]
-            + [
-                (trace_vars[name], point[name])
-                for name in trace_vars.keys()
-                if name in point
-            ]
+            + [(trace_vars[name], point[name]) for name in trace_vars if name in point]
         ),
         mode="FAST_COMPILE",
         on_unused_input="ignore",

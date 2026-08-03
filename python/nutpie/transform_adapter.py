@@ -1,23 +1,25 @@
+from collections.abc import Callable
 from functools import partial
 from importlib.util import find_spec
-from typing import Callable
 
 if find_spec("flowjax") is None:
     raise ImportError(
         "The 'flowjax' package is required to use normalizing flow adaptation."
     )
 
-from flowjax import bijections
-from jaxtyping import ArrayLike, PyTree
-import numpy as np
-import equinox as eqx
-import jax
-import jax.numpy as jnp
-import jax.random as jr
 import traceback
+
+import equinox as eqx
 import flowjax
 import flowjax.flows
 import flowjax.train
+import jax
+import jax.numpy as jnp
+import jax.random as jr
+import numpy as np
+import optax
+import tqdm
+from flowjax import bijections
 from flowjax.train.losses import MaximumLikelihoodLoss, PRNGKeyArray
 from flowjax.train.train_utils import (
     count_fruitless,
@@ -25,11 +27,10 @@ from flowjax.train.train_utils import (
     step,
     train_val_split,
 )
-import optax
-from paramax import unwrap, NonTrainable
+from jaxtyping import ArrayLike, PyTree
+from paramax import NonTrainable, unwrap
 
 from nutpie.normalizing_flow import Coupling, Householder, Scan, extend_flow, make_flow
-import tqdm
 
 _BIJECTION_TRACE = []
 
@@ -246,7 +247,7 @@ def inverse_gradient_and_val(bijection, draw, grad, logp):
         draw, grad, logp = inverse_gradient_and_val(bijection.outer, draw, grad, logp)
         return draw, grad, logp
     # Disabeling the Coupling case for now, it slows down compile time for some reason?
-    elif False and isinstance(bijection, Coupling):
+    elif False and isinstance(bijection, Coupling):  # noqa: SIM223
         y, y_grad, y_logp = draw, grad, logp
         y_cond, y_trans = (
             y[: bijection.untransformed_dim],
@@ -426,7 +427,7 @@ def _init_from_transformed_position_part2(
     part1,
     untransformed_gradient,
 ):
-    logdet, untransformed_position, transformed_position = part1
+    logdet, _untransformed_position, transformed_position = part1
     bijection = unwrap(bijection)
     _, pull_grad = jax.vjp(bijection.transform_and_log_det, transformed_position)
     (transformed_gradient,) = pull_grad((untransformed_gradient, 1.0))

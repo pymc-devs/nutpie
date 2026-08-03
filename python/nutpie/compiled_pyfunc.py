@@ -1,7 +1,8 @@
 import dataclasses
+from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Callable
+from typing import Any
 
 import numpy as np
 
