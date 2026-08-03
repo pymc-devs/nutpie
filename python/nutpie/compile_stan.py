@@ -1,27 +1,30 @@
 import datetime
 import hashlib
 import json
+import logging
 import shutil
 import tempfile
 from dataclasses import dataclass, replace
 from importlib.util import find_spec
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from numpy.typing import NDArray
 
 from nutpie import _lib
 from nutpie.sample import CompiledModel
 
+logger = logging.getLogger("nutpie")
+
 
 @dataclass(frozen=True)
 class CompiledStanModel(CompiledModel):
-    _coords: Optional[dict[str, Any]]
+    _coords: dict[str, Any] | None
     code: str
-    data: Optional[dict[str, NDArray]]
+    data: dict[str, NDArray] | None
     library: Any
     model: Any
-    model_name: Optional[str] = None
+    model_name: str | None = None
     _transform_adapt_args: dict | None = None
 
     def with_data(self, *, seed=None, **updates):
@@ -150,8 +153,8 @@ class CompiledStanModel(CompiledModel):
 
 def _stan_cache_key(
     code: str,
-    extra_compile_args: Optional[list[str]],
-    extra_stanc_args: Optional[list[str]],
+    extra_compile_args: list[str] | None,
+    extra_stanc_args: list[str] | None,
 ) -> str:
     """Return a SHA-256 hex digest identifying a unique compilation job."""
     import bridgestan
@@ -196,7 +199,7 @@ def prune_stan_cache(
         entries exist.  Defaults to 2 weeks.
     """
     cache_dir = _stan_cache_dir()
-    now = datetime.datetime.now(tz=datetime.timezone.utc)
+    now = datetime.datetime.now(tz=datetime.UTC)
 
     # Collect all valid (marker exists) entries with their mtime.
     entries = []
@@ -206,9 +209,7 @@ def prune_stan_cache(
         marker = entry_dir / "ok"
         if not marker.exists():
             continue
-        mtime = datetime.datetime.fromtimestamp(
-            marker.stat().st_mtime, tz=datetime.timezone.utc
-        )
+        mtime = datetime.datetime.fromtimestamp(marker.stat().st_mtime, tz=datetime.UTC)
         entries.append((mtime, entry_dir))
 
     if len(entries) <= max_entries:
@@ -249,13 +250,13 @@ def _compile_stan_model(
 
 def compile_stan_model(
     *,
-    code: Optional[str] = None,
-    filename: Optional[str] = None,
-    extra_compile_args: Optional[list[str]] = None,
-    extra_stanc_args: Optional[list[str]] = None,
-    dims: Optional[dict[str, int]] = None,
-    coords: Optional[dict[str, Any]] = None,
-    model_name: Optional[str] = None,
+    code: str | None = None,
+    filename: str | None = None,
+    extra_compile_args: list[str] | None = None,
+    extra_stanc_args: list[str] | None = None,
+    dims: dict[str, int] | None = None,
+    coords: dict[str, Any] | None = None,
+    model_name: str | None = None,
     cleanup: bool = True,
     cache: bool = False,
     prune_cache: bool = True,
@@ -372,8 +373,8 @@ def compile_stan_model(
             try:
                 if cleanup:
                     basedir.cleanup()
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as e:
+                logger.warning("Could not remove stan model cache", exc_info=e)
 
     return CompiledStanModel(
         code=code,

@@ -8,8 +8,8 @@ ChainProgress = _lib.PyChainProgress
 
 __version__: str = _lib.__version__
 __all__ = [
-    "__version__",
     "ChainProgress",
+    "__version__",
     "compile_pymc_model",
     "compile_stan_model",
     "prune_stan_cache",

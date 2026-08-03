@@ -3,7 +3,7 @@ import os
 import warnings
 from dataclasses import dataclass, field
 from importlib.metadata import version
-from typing import Any, Literal, Optional, cast, get_args, overload
+from typing import Any, Literal, cast, get_args, overload
 
 import arviz
 import numpy as np
@@ -16,7 +16,7 @@ from nutpie import _lib
 
 @dataclass(frozen=True)
 class CompiledModel:
-    dims: Optional[dict[str, tuple[str, ...]]]
+    dims: dict[str, tuple[str, ...]] | None
     reparameterized_names: list[str] | None = field(default=None, kw_only=True)
 
     @property
@@ -24,7 +24,7 @@ class CompiledModel:
         raise NotImplementedError()
 
     @property
-    def shapes(self) -> Optional[dict[str, tuple[int, ...]]]:
+    def shapes(self) -> dict[str, tuple[int, ...]] | None:
         raise NotImplementedError()
 
     @property
@@ -134,12 +134,10 @@ def _arrow_to_arviz(
         )
     else:
         idata = arviz.from_dict(
-            **{
-                "posterior": data_posterior,
-                "sample_stats": stats_posterior,
-                "warmup_posterior": data_tune,
-                "warmup_sample_stats": stats_tune,
-            },  # ty:ignore[invalid-argument-type]
+            posterior=data_posterior,
+            sample_stats=stats_posterior,
+            warmup_posterior=data_tune,
+            warmup_sample_stats=stats_tune,  # ty:ignore[invalid-argument-type]
             dims=dims,
             **kwargs,
         )
@@ -550,7 +548,7 @@ class _BackgroundSampler:
                 try:
                     self._html = formatted
                     self.display_id.update(self)
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001
                     if not did_print_error:
                         did_print_error = True
                         print(f"Error updating progress display: {e}")
