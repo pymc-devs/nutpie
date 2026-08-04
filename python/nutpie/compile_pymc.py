@@ -8,7 +8,6 @@ from functools import wraps
 from importlib.util import find_spec
 from math import prod
 from typing import TYPE_CHECKING, Any, Literal, Union, cast
-from uuid import uuid4
 
 import numpy as np
 import pandas as pd
@@ -261,7 +260,11 @@ def make_user_data(shared_var_keys, shared_data):
                         ],
                     ),
                 ],
-            )
+            ),
+            # The wrappers call the compiled functions through these addresses instead of
+            # closing over the dispatchers, which would make them uncacheable.
+            ("logp_fn_addr", np.uint64),
+            ("expand_fn_addr", np.uint64),
         ],
     )
     user_data = np.zeros((), dtype=record_dtype)
@@ -307,10 +310,11 @@ def _compile_pymc_model_numba(
     shared_data = {}
     shared_var_keys = {}
     seen = set()
-    for val in [*logp_fn_pt.get_shared(), *expand_fn_pt.get_shared()]:
+    for index, val in enumerate([*logp_fn_pt.get_shared(), *expand_fn_pt.get_shared()]):
         if val in seen:
             continue
-        key = uuid4().hex
+        # Positional, not random: the keys are baked into the cached wrappers.
+        key = f"s{index:04d}"
         shared_data[key] = np.array(val.get_value(), order="C", copy=True)
         shared_var_keys[val] = key
         seen.add(val)
@@ -321,30 +325,23 @@ def _compile_pymc_model_numba(
     user_data = make_user_data(shared_var_keys, shared_data)
 
     logp_shared_keys = [shared_var_keys[var] for var in logp_fn_pt.get_shared()]
+    user_data["logp_fn_addr"] = _compile_and_get_address(
+        logp_fn, logp_shared_keys, shared_data
+    )
     logp_numba_raw, c_sig = _make_c_logp_func(
         n_dim, logp_fn, user_data, logp_shared_keys, shared_data
     )
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore",
-            message="Cannot cache compiled function .* as it uses dynamic globals",
-            category=numba.NumbaWarning,  # type: ignore
-        )
-
-        logp_numba = numba.cfunc(c_sig, **kwargs)(logp_numba_raw)
+    kwargs.setdefault("cache", True)
+    logp_numba = numba.cfunc(c_sig, **kwargs)(logp_numba_raw)
 
     expand_shared_keys = [shared_var_keys[var] for var in expand_fn_pt.get_shared()]
+    user_data["expand_fn_addr"] = _compile_and_get_address(
+        expand_fn, expand_shared_keys, shared_data
+    )
     expand_numba_raw, c_sig_expand = _make_c_expand_func(
         n_dim, n_expanded, expand_fn, user_data, expand_shared_keys, shared_data
     )
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore",
-            message="Cannot cache compiled function .* as it uses dynamic globals",
-            category=numba.NumbaWarning,  # type: ignore
-        )
-
-        expand_numba = numba.cfunc(c_sig_expand, **kwargs)(expand_numba_raw)
+    expand_numba = numba.cfunc(c_sig_expand, **kwargs)(expand_numba_raw)
 
     dims, coords = _prepare_dims_and_coords(model, shape_info, reparameterized_names)
 
@@ -867,16 +864,59 @@ def _make_functions(
     )
 
 
-def make_extraction_fn(inner, shared_data, shared_var_keys, record_dtype):
+def _compile_and_get_address(dispatcher, shared_keys, shared_data):
+    """Compile the pytensor function for the wrapper's argument types, return its address."""
+    import numba
+    from numba.experimental.function_type import _get_wrapper_address
+
+    arg_types = [numba.types.Array(numba.types.float64, 1, "C")]
+    for key in shared_keys:
+        value = shared_data[key]
+        # readonly to match the extraction function's constant prototype tuple
+        arg_types.append(
+            numba.types.Array(numba.from_dtype(value.dtype), value.ndim, "C", readonly=True)
+        )
+    dispatcher.compile((numba.types.StarArgTuple(arg_types),))
+    (signature,) = dispatcher.nopython_signatures
+    return _get_wrapper_address(dispatcher, signature)
+
+
+@intrinsic(prefer_literal=True)
+def _function_from_address(typingctx, addr, func_type_ref):
+    """Build a first-class function value from a runtime address."""
+    import numba
+    from llvmlite import ir
+    from numba.core import cgutils
+
+    func_type = func_type_ref.instance_type
+
+    def codegen(context, builder, signature, args):
+        function = cgutils.create_struct_proxy(func_type)(context, builder)
+        function.c_addr = builder.inttoptr(args[0], ir.PointerType(ir.IntType(8)))
+        return function._getvalue()
+
+    return func_type(numba.types.uint64, func_type_ref), codegen
+
+
+def make_extraction_fn(inner, shared_data, shared_var_keys, record_dtype, addr_field):
     import numba
     from numba import literal_unroll
     from numba.cpython.unsafe.tuple import alloca_once, tuple_setitem
+
+    (inner_signature,) = inner.nopython_signatures
+    # *args is typed StarArgTuple; the call site builds a plain Tuple (same ABI)
+    (star_args,) = inner_signature.args
+    inner_type = numba.types.FunctionType(
+        inner_signature.return_type(numba.types.Tuple(tuple(star_args.types)))
+    )
 
     if not shared_var_keys:
 
         @numba.njit(inline="always")
         def extract_shared(x, user_data_):
-            return inner(x)
+            user_data = numba.carray(user_data_, (), record_dtype)
+            fn = _function_from_address(user_data[addr_field][()], inner_type)
+            return fn((x,))
 
         return extract_shared
 
@@ -891,7 +931,12 @@ def make_extraction_fn(inner, shared_data, shared_var_keys, record_dtype):
     )
 
     indices = tuple(range(len(shared_var_keys)))
-    shared_tuple = tuple(shared_data[key] for key in shared_var_keys)
+    # Type prototype only, every slot is overwritten before use; zero-size stand-ins are
+    # embeddable constants where the real arrays would be uncacheable dynamic globals.
+    shared_tuple = tuple(
+        np.empty((0,) * shared_data[key].ndim, shared_data[key].dtype)
+        for key in shared_var_keys
+    )
 
     @intrinsic
     def tuple_setitem_literal(typingctx, tup, idx, val):
@@ -958,7 +1003,8 @@ def make_extraction_fn(inner, shared_data, shared_var_keys, record_dtype):
             dat = extract_array(user_data["shared"], index)
             _shared_tuple = tuple_setitem_literal(_shared_tuple, index, dat)
 
-        return inner(x, *_shared_tuple)
+        fn = _function_from_address(user_data[addr_field][()], inner_type)
+        return fn((x,) + _shared_tuple)
 
     return extract_shared
 
@@ -966,7 +1012,9 @@ def make_extraction_fn(inner, shared_data, shared_var_keys, record_dtype):
 def _make_c_logp_func(n_dim, logp_fn, user_data, shared_keys, shared_data):
     import numba
 
-    extract = make_extraction_fn(logp_fn, shared_data, shared_keys, user_data.dtype)
+    extract = make_extraction_fn(
+        logp_fn, shared_data, shared_keys, user_data.dtype, "logp_fn_addr"
+    )
 
     c_sig = numba.types.int64(
         numba.types.uint64,
@@ -1008,7 +1056,7 @@ def _make_c_expand_func(
     import numba
 
     extract = make_extraction_fn(
-        expand_fn, shared_data, shared_var_keys, user_data.dtype
+        expand_fn, shared_data, shared_var_keys, user_data.dtype, "expand_fn_addr"
     )
 
     c_sig = numba.types.int64(

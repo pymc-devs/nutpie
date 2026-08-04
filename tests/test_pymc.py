@@ -650,3 +650,48 @@ def test_unnamed_shared(backend, gradient_backend):
 
     compiled = nutpie.compile_pymc_model(model)
     nutpie.sample(compiled)
+
+
+@pytest.mark.pymc
+def test_wrapper_functions_cacheable():
+    """The wrapper cfuncs must stay free of dynamic globals, or numba silently
+    refuses to write them to (and read them from) the disk cache."""
+    rng = np.random.default_rng(42)
+    x_val = rng.normal(size=(50, 3))
+    with pm.Model() as model:
+        x = pm.Data("x", x_val)
+        a = pm.Normal("a", shape=3)
+        pm.Deterministic("a_sum", a.sum())
+        pm.Normal("obs", mu=(x * a).sum(-1), sigma=1.0, observed=rng.normal(size=50))
+
+    compiled = nutpie.compile_pymc_model(model, backend="numba")
+    assert not compiled.compiled_logp_func._library.has_dynamic_globals
+    assert not compiled.compiled_expand_func._library.has_dynamic_globals
+
+    trace = nutpie.sample(
+        compiled, draws=50, tune=50, chains=2, seed=7, progress_bar=False
+    )
+    np.testing.assert_allclose(
+        trace.posterior.a.values.sum(-1), trace.posterior.a_sum.values
+    )
+
+
+@pytest.mark.pymc
+def test_wrapper_with_data():
+    """Shapes are read from user_data at call time, so with_data works unchanged."""
+    rng = np.random.default_rng(0)
+    with pm.Model() as model:
+        x = pm.Data("x", rng.normal(size=(20, 2)))
+        a = pm.Normal("a", shape=2)
+        pm.Deterministic("pred", (x * a).sum(-1))
+        pm.Normal("obs", mu=(x * a).sum(-1), sigma=1.0, observed=rng.normal(size=20))
+
+    compiled = nutpie.compile_pymc_model(model, backend="numba")
+    new_x = rng.normal(size=(20, 2))
+    trace = nutpie.sample(
+        compiled.with_data(x=new_x), draws=20, tune=20, chains=1, seed=1, progress_bar=False
+    )
+    np.testing.assert_allclose(
+        (trace.posterior.a.values[..., None, :] * new_x).sum(-1),
+        trace.posterior.pred.values,
+    )
