@@ -687,7 +687,9 @@ def test_zarr_store_sample_stats_attrs(tmp_path):
     assert settings["settings"]["num_tune"] == 20
 
     # the store keeps every stat and both warmup groups; the settings say otherwise
-    assert set(zarr_trace.sample_stats.data_vars) == set(arrow_trace.sample_stats.data_vars)
+    assert set(zarr_trace.sample_stats.data_vars) == set(
+        arrow_trace.sample_stats.data_vars
+    )
     assert set(zarr_trace.children) == set(arrow_trace.children)
 
     # chain/draw carry coordinate variables, so label-based selection works
@@ -700,3 +702,45 @@ def test_zarr_store_sample_stats_attrs(tmp_path):
         for value in node.attrs.values():
             assert not isinstance(value, dict)
     zarr_trace.to_netcdf(tmp_path / "roundtrip.nc")
+
+
+def test_zarr_store_transformed_variables(tmp_path):
+    """Unconstrained value variables belong out of ``posterior``, on both backends.
+
+    The zarr writer stores every variable it is handed, including each free RV's
+    transformed value var; the arrow backend pops those into ``unconstrained_posterior``
+    and only keeps them when ``store_unconstrained=True``.
+    """
+    with pm.Model() as model:
+        sigma = pm.HalfNormal("sigma")  # gives a sigma_log__ value variable
+        pm.Normal("mu", 0.0, sigma)
+
+    compiled = nutpie.compile_pymc_model(model, backend="numba")
+
+    def fit(store_unconstrained, name):
+        path = tmp_path / name
+        path.mkdir()
+        kwargs = dict(
+            chains=1,
+            seed=123,
+            draws=20,
+            tune=20,
+            store_unconstrained=store_unconstrained,
+        )
+        store = nutpie.zarr_store.LocalStore(str(path))
+        return (
+            nutpie.sample(compiled, zarr_store=store, **kwargs),
+            nutpie.sample(compiled, **kwargs),
+        )
+
+    zarr_trace, arrow_trace = fit(False, "default.zarr")
+    assert set(zarr_trace.posterior.data_vars) == set(arrow_trace.posterior.data_vars)
+    assert "sigma_log__" not in zarr_trace.posterior.data_vars
+    assert "unconstrained_posterior" not in zarr_trace.children
+
+    zarr_trace, arrow_trace = fit(True, "unconstrained.zarr")
+    assert "sigma_log__" not in zarr_trace.posterior.data_vars
+    assert "sigma_log__" in zarr_trace.unconstrained_posterior.data_vars
+    assert set(zarr_trace.unconstrained_posterior.data_vars) == set(
+        arrow_trace.unconstrained_posterior.data_vars
+    )

@@ -693,6 +693,22 @@ class _BackgroundSampler:
                     for name in ("warmup_posterior", "warmup_sample_stats"):
                         if name in trace:
                             del trace[name]
+                # the zarr writer leaves the unconstrained value variables in `posterior`;
+                # the arrow backend moves them out, into their own group when asked for them
+                uc_names = self._compiled_model.reparameterized_names or []
+                for group, uc_group in (
+                    ("posterior", "unconstrained_posterior"),
+                    ("warmup_posterior", "warmup_unconstrained_posterior"),
+                ):
+                    if group not in trace:
+                        continue
+                    dataset = trace[group].dataset
+                    present = [name for name in uc_names if name in dataset.data_vars]
+                    if not present:
+                        continue
+                    if self._store_unconstrained:
+                        trace[uc_group] = xr.DataTree(dataset[present])
+                    trace[group].dataset = dataset.drop_vars(present)
                 # dict attrs have no HDF5 equivalent; keep the tree to_netcdf-able
                 for node in trace.subtree:
                     for key, value in list(node.attrs.items()):
