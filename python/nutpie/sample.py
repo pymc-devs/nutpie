@@ -623,6 +623,7 @@ class _BackgroundSampler:
                 "mass_matrix_inv",
                 "mass_matrix_eigvals",
                 "mass_matrix_stds",
+                "transformation_mu",
             ],
             "store_divergences": [
                 "divergence_start",
@@ -630,11 +631,7 @@ class _BackgroundSampler:
                 "divergence_momentum",
                 "divergence_start_gradient",
             ],
-            "store_transformed": [
-                "transformed_position",
-                "transformed_gradient",
-                "transformation_mu",
-            ],
+            "store_transformed": ["transformed_position", "transformed_gradient"],
         }
 
         def _get_nested(settings, name, default):
