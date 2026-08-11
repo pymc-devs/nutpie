@@ -744,13 +744,10 @@ def test_init_point_fn_unknown_key(backend, gradient_backend):
         init(1, 0)
 
 
+@pytest.mark.pymc
 def test_zarr_store_sample_stats_attrs(tmp_path):
-    """The zarr backend must attach the same sample_stats attrs as the arrow backend.
-
-    pymc's ``patch_nutpie_idata`` reads ``inference_library_settings`` from there, so
-    ``pm.sample(nuts_sampler="nutpie", nuts_sampler_kwargs={"zarr_store": ...})``
-    fails with a KeyError when they are missing.
-    """
+    """The zarr trace must carry the same sample_stats attrs, coords and stat set as arrow:
+    pymc's ``patch_nutpie_idata`` reads ``inference_library_settings`` from there."""
     with pm.Model() as model:
         pm.Normal("x")
 
@@ -795,13 +792,10 @@ def test_zarr_store_sample_stats_attrs(tmp_path):
     zarr_trace.to_netcdf(tmp_path / "roundtrip.nc")
 
 
+@pytest.mark.pymc
 def test_zarr_store_transformed_variables(tmp_path):
-    """Unconstrained value variables belong out of ``posterior``, on both backends.
-
-    The zarr writer stores every variable it is handed, including each free RV's
-    transformed value var; the arrow backend pops those into ``unconstrained_posterior``
-    and only keeps them when ``store_unconstrained=True``.
-    """
+    """Unconstrained value variables belong out of ``posterior`` on both backends, and in
+    ``unconstrained_posterior`` only when ``store_unconstrained=True``."""
     with pm.Model() as model:
         sigma = pm.HalfNormal("sigma")  # gives a sigma_log__ value variable
         pm.Normal("mu", 0.0, sigma)
@@ -811,13 +805,13 @@ def test_zarr_store_transformed_variables(tmp_path):
     def fit(store_unconstrained, name):
         path = tmp_path / name
         path.mkdir()
-        kwargs = dict(
-            chains=1,
-            seed=123,
-            draws=20,
-            tune=20,
-            store_unconstrained=store_unconstrained,
-        )
+        kwargs = {
+            "chains": 1,
+            "seed": 123,
+            "draws": 20,
+            "tune": 20,
+            "store_unconstrained": store_unconstrained,
+        }
         store = nutpie.zarr_store.LocalStore(str(path))
         return (
             nutpie.sample(compiled, zarr_store=store, **kwargs),
