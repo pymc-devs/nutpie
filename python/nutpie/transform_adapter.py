@@ -915,6 +915,8 @@ def make_transform_adapter(
     contract_transformer=True,
     asymmetric_transformer=False,
     reuse_embed=True,
+    order=None,
+    sparsity=None,
 ):
     if extension_windows is None:
         extension_windows = []
@@ -940,6 +942,8 @@ def make_transform_adapter(
             contract_transformer=contract_transformer,
             asymmetric_transformer=asymmetric_transformer,
             reuse_embed=reuse_embed,
+            order=order,
+            sparsity=sparsity,
         ),
         show_progress=show_progress,
         num_diag_windows=num_diag_windows,
