@@ -16,6 +16,7 @@ import flowjax.train
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import lineax as lx
 import numpy as np
 import optax
 import optimistix as optx
@@ -59,9 +60,10 @@ def fit_to_data(
     opt_state=None,
     verbose: bool = False,
     stop_value: float | None = None,
-    use_lbfgs: bool = False,
-    lbfgs_rtol: float = 1e-3,
-    lbfgs_atol: float = 1e-6,
+    method: str = "adam",
+    solver_rtol: float = 1e-3,
+    solver_atol: float = 1e-6,
+    lm_linear_steps: int = 20,
 ):
     r"""Train a distribution (e.g. a flow) to samples from the target distribution.
 
@@ -76,14 +78,15 @@ def fit_to_data(
         x: Samples from target distribution.
         condition: Conditioning variables. Defaults to None.
         loss_fn: Loss function. Defaults to MaximumLikelihoodLoss.
-        max_epochs: Maximum number of epochs. Defaults to 100. When ``use_lbfgs``
-            is True, this instead bounds the number of L-BFGS steps.
+        max_epochs: Maximum number of epochs. Defaults to 100. When ``method`` is
+            ``"lbfgs"`` or ``"lm"``, this instead bounds the number of solver steps.
         max_patience: Number of consecutive epochs with no validation loss improvement
-            after which training is terminated. Defaults to 5. Unused when
-            ``use_lbfgs`` is True.
-        batch_size: Batch size. Defaults to 100. Unused when ``use_lbfgs`` is True.
+            after which training is terminated. Defaults to 5. Unused unless
+            ``method`` is ``"adam"``.
+        batch_size: Batch size. Defaults to 100. Unused unless ``method`` is
+            ``"adam"``.
         val_prop: Proportion of data to use in validation set. Defaults to 0.1.
-            Unused when ``use_lbfgs`` is True.
+            Unused unless ``method`` is ``"adam"``.
         learning_rate: Adam learning rate. Defaults to 5e-4.
         optimizer: Optax optimizer. If provided, this overrides the default Adam
             optimizer, and the learning_rate is ignored. Defaults to None.
@@ -91,14 +94,22 @@ def fit_to_data(
             was reached (when True), or the parameters after the last update (when
             False). Defaults to True.
         show_progress: Whether to show progress bar. Defaults to True.
-        use_lbfgs: If True, fit using the L-BFGS solver from optimistix instead of
-            stochastic optax updates. L-BFGS is a full-batch, deterministic
-            optimizer, so it is run once over all of ``x`` rather than in epochs
-            of shuffled mini-batches.
-        lbfgs_rtol: Relative tolerance used by the L-BFGS solver's convergence
-            check. Only used when ``use_lbfgs`` is True.
-        lbfgs_atol: Absolute tolerance used by the L-BFGS solver's convergence
-            check. Only used when ``use_lbfgs`` is True.
+        method: One of ``"adam"`` (stochastic optax updates, the default),
+            ``"lbfgs"`` or ``"lm"`` (Levenberg-Marquardt). The latter two use
+            full-batch, deterministic solvers from optimistix, run once over all
+            of ``x`` rather than in epochs of shuffled mini-batches. ``"lm"``
+            requires ``loss_fn`` to expose a ``residuals`` method (as
+            ``FisherLoss`` does) and only supports losses that are a sum of
+            squared residuals.
+        solver_rtol: Relative tolerance used by the L-BFGS/LM solver's convergence
+            check. Only used when ``method`` is ``"lbfgs"`` or ``"lm"``.
+        solver_atol: Absolute tolerance used by the L-BFGS/LM solver's convergence
+            check. Only used when ``method`` is ``"lbfgs"`` or ``"lm"``.
+        lm_linear_steps: Number of matrix-free CG steps used to solve the
+            Gauss-Newton normal equations at each LM iteration (the Jacobian is
+            far too large to factorize explicitly, so a small fixed number of
+            Jacobian-vector-product steps is used instead). Only used when
+            ``method`` is ``"lm"``.
 
     Returns:
         A tuple containing the trained distribution and the losses.
@@ -117,21 +128,28 @@ def fit_to_data(
         is_leaf=lambda leaf: isinstance(leaf, NonTrainable),
     )
 
-    if use_lbfgs:
-        params, loss_val = _fit_lbfgs(
+    if method in ("lbfgs", "lm"):
+        fit_solver = _fit_lbfgs if method == "lbfgs" else _fit_lm
+        extra_kwargs = {"linear_steps": lm_linear_steps} if method == "lm" else {}
+        params, loss_val = fit_solver(
             params,
             static,
             data,
             loss_fn,
             max_steps=max_epochs,
-            rtol=lbfgs_rtol,
-            atol=lbfgs_atol,
+            rtol=solver_rtol,
+            atol=solver_atol,
+            **extra_kwargs,
         )
         losses = {"train": [float(loss_val)], "val": [float(loss_val)]}
         if verbose:
-            print(f"lbfgs loss: {loss_val}")
+            print(f"{method} loss: {loss_val}")
         dist = eqx.combine(params, static)
         return dist, losses, None
+    elif method != "adam":
+        raise ValueError(
+            f"Unknown method {method!r}, expected 'adam', 'lbfgs' or 'lm'."
+        )
 
     if optimizer is None:
         optimizer = optax.apply_if_finite(optax.adamw(learning_rate), 10)
@@ -221,6 +239,31 @@ def _fit_lbfgs(params, static, data, loss_fn, *, max_steps, rtol, atol):
         objective, solver, params, args=data, max_steps=max_steps, throw=False
     )
     return sol.value, objective(sol.value, data)
+
+
+@eqx.filter_jit
+def _fit_lm(params, static, data, loss_fn, *, max_steps, rtol, atol, linear_steps):
+    if not hasattr(loss_fn, "residuals"):
+        raise ValueError(
+            "method='lm' requires loss_fn to have a `residuals` method "
+            "(e.g. FisherLoss with gamma=None)."
+        )
+
+    def residual_fn(params, args):
+        return loss_fn.residuals(params, static, *args)
+
+    # The Jacobian of the flow's residuals w.r.t. its (many) parameters is far
+    # too large to form and factorize explicitly (the default QR linear
+    # solver would do exactly that). Instead, solve the Gauss-Newton normal
+    # equations matrix-free with a small, fixed number of CG steps, using
+    # only Jacobian-vector / vector-Jacobian products.
+    linear_solver = lx.Normal(lx.CG(rtol=rtol, atol=atol, max_steps=linear_steps))
+    solver = optx.LevenbergMarquardt(rtol=rtol, atol=atol, linear_solver=linear_solver)
+    sol = optx.least_squares(
+        residual_fn, solver, params, args=data, max_steps=max_steps, throw=False
+    )
+    loss_val = loss_fn(sol.value, static, *data)
+    return sol.value, loss_val
 
 
 @eqx.filter_jit
@@ -444,6 +487,32 @@ class FisherLoss(eqx.Module):
             normalized = raw / self.target_norm
             return normalized + jax.lax.stop_gradient(raw - normalized)
 
+    def residuals(self, params, static, draws, grads, logps, condition=None, key=None):
+        """Per-draw, per-dimension residuals whose sum of squares (divided by
+        ``target_norm``) equals the ``gamma=None`` loss from ``__call__``.
+
+        Used by the Levenberg-Marquardt fitting method (``optimistix.least_squares``
+        needs an actual residual vector, not just a scalar loss, to form its
+        Gauss-Newton steps).
+        """
+        if self.gamma is not None:
+            raise ValueError(
+                "FisherLoss.residuals is only defined when gamma is None, since "
+                "the variance term is not expressible as a sum of squared residuals."
+            )
+
+        flow = unwrap(eqx.combine(params, static, is_leaf=eqx.is_inexact_array))
+
+        def compute_residual(bijection, draw, grad, logp):
+            draw, grad, logp = inverse_gradient_and_val(bijection, draw, grad, logp)
+            return draw + grad
+
+        residuals = jax.vmap(compute_residual, [None, 0, 0, 0])(
+            flow.bijection, draws, grads, logps
+        )
+        n_draws = draws.shape[0]
+        return residuals / jnp.sqrt(n_draws * self.target_norm)
+
 
 def fit_flow(key, bijection, loss_fn, draws, grads, logps, **kwargs):
     flow = flowjax.flows.Transformed(
@@ -577,9 +646,10 @@ class TransformAdapter:
         make_optimizer=None,
         num_layers=9,
         max_epochs=200,
-        use_lbfgs=False,
-        lbfgs_rtol=1e-3,
-        lbfgs_atol=1e-6,
+        method="adam",
+        solver_rtol=1e-3,
+        solver_atol=1e-6,
+        lm_linear_steps=20,
     ):
         self._logp_fn = logp_fn
         self._make_flow_fn = make_flow_fn
@@ -614,9 +684,10 @@ class TransformAdapter:
         self._debug_save_bijection = debug_save_bijection
         self._layers = 0
         self._max_epochs = max_epochs
-        self._use_lbfgs = use_lbfgs
-        self._lbfgs_rtol = lbfgs_rtol
-        self._lbfgs_atol = lbfgs_atol
+        self._method = method
+        self._solver_rtol = solver_rtol
+        self._solver_atol = solver_atol
+        self._lm_linear_steps = lm_linear_steps
 
         if extension_windows is None:
             self._extension_windows = []
@@ -823,9 +894,10 @@ class TransformAdapter:
                 opt_state=self._opt_state if self._reuse_opt_state else None,
                 max_patience=self._max_patience,
                 max_epochs=self._max_epochs,
-                use_lbfgs=self._use_lbfgs,
-                lbfgs_rtol=self._lbfgs_rtol,
-                lbfgs_atol=self._lbfgs_atol,
+                method=self._method,
+                solver_rtol=self._solver_rtol,
+                solver_atol=self._solver_atol,
+                lm_linear_steps=self._lm_linear_steps,
             )
 
             flow = flowjax.flows.Transformed(
@@ -1038,9 +1110,10 @@ def make_transform_adapter(
     reuse_embed=True,
     order=None,
     sparsity=None,
-    use_lbfgs=False,
-    lbfgs_rtol=1e-3,
-    lbfgs_atol=1e-6,
+    method="adam",
+    solver_rtol=1e-3,
+    solver_atol=1e-6,
+    lm_linear_steps=20,
 ):
     if extension_windows is None:
         extension_windows = []
@@ -1089,7 +1162,8 @@ def make_transform_adapter(
         make_optimizer=make_optimizer,
         num_layers=num_layers,
         max_epochs=max_epochs,
-        use_lbfgs=use_lbfgs,
-        lbfgs_rtol=lbfgs_rtol,
-        lbfgs_atol=lbfgs_atol,
+        method=method,
+        solver_rtol=solver_rtol,
+        solver_atol=solver_atol,
+        lm_linear_steps=lm_linear_steps,
     )
