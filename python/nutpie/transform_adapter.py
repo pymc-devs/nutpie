@@ -35,6 +35,11 @@ from nutpie.normalizing_flow import Coupling, Householder, Scan, extend_flow, ma
 
 _BIJECTION_TRACE = []
 
+# Raw-fisher-divergence equivalents of the thresholds that used to be
+# compared against log(fisher_divergence).
+_LOG_STOP_VALUE = float(np.exp(-5))
+_LOG_SKIP_TRAINING_VALUE = float(np.exp(-4))
+
 
 def fit_to_data(
     key: PRNGKeyArray,
@@ -346,10 +351,27 @@ def inverse_gradient_and_val(bijection, draw, grad, logp):
         return (x, x_grad, logp + fwd_log_det)
 
 
-class FisherLoss:
-    def __init__(self, gamma=None, log_inside_batch=False):
-        self._gamma = gamma
-        self._log_inside_batch = log_inside_batch
+class FisherLoss(eqx.Module):
+    """Fisher-divergence training loss.
+
+    The returned value is always the raw Fisher divergence (previously
+    ``log(fisher_divergence)``), so it is directly comparable across calls
+    and usable for thresholds like ``stop_value``. Internally, gradients are
+    computed against the raw value divided by ``target_norm`` (a
+    straight-through estimator, via ``jax.lax.stop_gradient``), purely to
+    keep gradient magnitudes well-scaled and avoid blowups; this does not
+    change the reported loss value.
+
+    ``target_norm`` is expected to hold an exponential moving average of
+    Fisher divergence values from previous windows, updated externally (see
+    ``TransformAdapter``). It is a genuine pytree leaf (not a plain Python
+    attribute) so that updating it does not trigger recompilation of jitted
+    training steps that close over this loss.
+    """
+
+    gamma: float | None = eqx.field(static=True, default=None)
+    log_inside_batch: bool = eqx.field(static=True, default=False)
+    target_norm: jax.Array = eqx.field(converter=jnp.asarray, default=1.0)
 
     @eqx.filter_jit
     def __call__(
@@ -381,7 +403,7 @@ class FisherLoss:
             )
             return costs.mean(0)
 
-        if self._gamma is None:
+        if self.gamma is None:
 
             def compute_loss(bijection, draw, grad, logp):
                 draw, grad, logp = inverse_gradient_and_val(bijection, draw, grad, logp)
@@ -398,10 +420,14 @@ class FisherLoss:
             if return_all_costs:
                 return costs
 
-            if self._log_inside_batch:
-                return jnp.log(costs).mean()
+            if self.log_inside_batch:
+                raw = costs.mean()
+                normalized = (costs / self.target_norm).mean()
             else:
-                return jnp.log(costs.mean())
+                raw = costs.mean()
+                normalized = raw / self.target_norm
+
+            return normalized + jax.lax.stop_gradient(raw - normalized)
 
         else:
 
@@ -414,7 +440,9 @@ class FisherLoss:
             fisher_loss = ((draws + grads) ** 2).sum(1).mean(0)
             normal_logps = -(draws * draws).sum(1) / 2
             var_loss = (logps - normal_logps).var()
-            return jnp.log(fisher_loss + self._gamma * var_loss)
+            raw = fisher_loss + self.gamma * var_loss
+            normalized = raw / self.target_norm
+            return normalized + jax.lax.stop_gradient(raw - normalized)
 
 
 def fit_flow(key, bijection, loss_fn, draws, grads, logps, **kwargs):
@@ -430,7 +458,10 @@ def fit_flow(key, bijection, loss_fn, draws, grads, logps, **kwargs):
         x=(draws, grads, logps),
         loss_fn=loss_fn,
         return_best=True,
-        stop_value=-5,
+        # FisherLoss now reports the raw Fisher divergence (previously
+        # log(fisher_divergence)), so this is exp(-5), matching the old
+        # log-space threshold.
+        stop_value=_LOG_STOP_VALUE,
         **kwargs,
     )
     return fit.bijection, losses, opt_state
@@ -536,6 +567,7 @@ class TransformAdapter:
         max_patience=5,
         gamma=None,
         log_inside_batch=False,
+        fisher_ema_alpha=0.1,
         initial_skip=500,
         extension_windows=None,
         extend_dct=False,
@@ -564,6 +596,8 @@ class TransformAdapter:
             self._make_optimizer = make_optimizer
         self._optimizer = self._make_optimizer()
         self._loss_fn = FisherLoss(gamma, log_inside_batch)
+        self._fisher_ema = None
+        self._fisher_ema_alpha = fisher_ema_alpha
         self._show_progress = show_progress
         self._num_diag_windows = num_diag_windows
         self._zero_init = zero_init
@@ -601,6 +635,34 @@ class TransformAdapter:
     def transformation_id(self):
         return self.index
 
+    def _sync_loss_target_norm(self):
+        """Point ``self._loss_fn.target_norm`` at the EMA of past windows'
+        Fisher divergence (or 1.0 before any window has been measured).
+
+        This only affects the internal gradient scaling used while fitting
+        the current window; ``self._loss_fn`` still always *reports* the raw
+        Fisher divergence.
+        """
+        target_norm = 1.0 if self._fisher_ema is None else self._fisher_ema
+        self._loss_fn = eqx.tree_at(
+            lambda loss: loss.target_norm, self._loss_fn, jnp.asarray(target_norm)
+        )
+
+    def _record_fisher_divergence(self, raw_loss):
+        """Fold a newly observed raw Fisher divergence into the EMA used to
+        normalize gradients in later windows."""
+        raw_loss = float(raw_loss)
+        if not np.isfinite(raw_loss):
+            return
+        raw_loss = max(raw_loss, 1e-12)
+        if self._fisher_ema is None:
+            self._fisher_ema = raw_loss
+        else:
+            self._fisher_ema = (
+                self._fisher_ema_alpha * raw_loss
+                + (1 - self._fisher_ema_alpha) * self._fisher_ema
+            )
+
     def update(self, seed, positions, gradients, logps):
         self.index += 1
         if self._verbose:
@@ -637,7 +699,9 @@ class TransformAdapter:
                     flowjax.distributions.StandardNormal(fit.shape), fit
                 )
                 params, static = eqx.partition(flow, eqx.is_inexact_array)
+                self._sync_loss_target_norm()
                 new_loss = self._loss_fn(params, static, positions, gradients, logps)
+                self._record_fisher_divergence(new_loss)
 
                 if self._verbose:
                     print("loss from diag:", new_loss)
@@ -733,11 +797,14 @@ class TransformAdapter:
             )
             params, static = eqx.partition(flow, eqx.is_inexact_array)
 
+            self._sync_loss_target_norm()
             old_loss = self._loss_fn(
                 params, static, positions[-128:], gradients[-128:], logps[-128:]
             )
+            self._record_fisher_divergence(old_loss)
 
-            if np.isfinite(old_loss) and old_loss < -4 and self.index > 10:
+            skip_training = old_loss < _LOG_SKIP_TRAINING_VALUE and self.index > 10
+            if np.isfinite(old_loss) and skip_training:
                 if self._verbose:
                     print(f"Loss is low ({old_loss}), skipping training")
                 return
@@ -949,6 +1016,7 @@ def make_transform_adapter(
     dct_layer=False,
     gamma=None,
     log_inside_batch=False,
+    fisher_ema_alpha=0.1,
     initial_skip=120,
     extension_windows=None,
     extend_dct=False,
@@ -1011,6 +1079,7 @@ def make_transform_adapter(
         max_patience=max_patience,
         gamma=gamma,
         log_inside_batch=log_inside_batch,
+        fisher_ema_alpha=fisher_ema_alpha,
         initial_skip=initial_skip,
         extension_windows=extension_windows,
         extend_dct=extend_dct,
