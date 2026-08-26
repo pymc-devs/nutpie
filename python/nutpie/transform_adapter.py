@@ -38,9 +38,11 @@ _BIJECTION_TRACE = []
 
 # Raw-fisher-divergence equivalents of the thresholds that used to be
 # compared against log(fisher_divergence).
-_LOG_STOP_VALUE = float(np.exp(-5))
-_LOG_SKIP_TRAINING_VALUE = float(np.exp(-4))
+#_LOG_STOP_VALUE = float(np.exp(-5))
+#_LOG_SKIP_TRAINING_VALUE = float(np.exp(-4))
 
+_LOG_STOP_VALUE = -5
+_LOG_SKIP_TRAINING_VALUE = -4
 
 def fit_to_data(
     key: PRNGKeyArray,
@@ -257,8 +259,9 @@ def _fit_lm(params, static, data, loss_fn, *, max_steps, rtol, atol, linear_step
     # solver would do exactly that). Instead, solve the Gauss-Newton normal
     # equations matrix-free with a small, fixed number of CG steps, using
     # only Jacobian-vector / vector-Jacobian products.
-    linear_solver = lx.Normal(lx.CG(rtol=rtol, atol=atol, max_steps=linear_steps))
-    solver = optx.LevenbergMarquardt(rtol=rtol, atol=atol, linear_solver=linear_solver)
+    #linear_solver = lx.Normal(lx.CG(rtol=rtol, atol=atol, max_steps=linear_steps))
+    #solver = optx.LevenbergMarquardt(rtol=rtol, atol=atol, linear_solver=linear_solver)
+    solver = optx.LevenbergMarquardt(rtol=rtol, atol=atol)
     sol = optx.least_squares(
         residual_fn, solver, params, args=data, max_steps=max_steps, throw=False
     )
@@ -469,6 +472,24 @@ class FisherLoss(eqx.Module):
             else:
                 raw = costs.mean()
                 normalized = raw / self.target_norm
+
+            # stick the landing
+            if False:
+                flow = unwrap(eqx.combine(params, static, is_leaf=eqx.is_inexact_array))
+
+                def compute_residual(bijection, draw, grad, logp):
+                    draw, grad, logp = inverse_gradient_and_val(bijection, draw, grad, logp)
+                    return draw, grad
+
+                draws, grads = jax.vmap(compute_residual, [None, 0, 0, 0])(
+                    flow.bijection, draws, grads, logps
+                )
+
+                resid = jax.lax.stop_gradient(draws + grads)
+                return ((resid * draws).sum())
+
+
+            return jnp.log(raw)
 
             return normalized + jax.lax.stop_gradient(raw - normalized)
 
