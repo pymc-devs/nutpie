@@ -295,6 +295,37 @@ class FactoredMLP(eqx.Module, strict=True):
         return x
 
 
+def _scale_last_layer(mlp, scale):
+    """Return a copy of an MLP-like conditioner (``FactoredMLP`` or
+    ``eqx.nn.MLP``) with only its output layer scaled down."""
+    last = jax.tree_util.tree_map(
+        lambda x: x * scale if eqx.is_inexact_array(x) else x, mlp.layers[-1]
+    )
+    return eqx.tree_at(lambda m: m.layers[-1], mlp, last)
+
+
+def zero_init_conditioners(bijection, scale=1e-3):
+    """Shrink a freshly-initialized bijection towards the identity by
+    scaling down only the *output* layer of each conditioner MLP it
+    contains, leaving hidden layers at their normal initialization scale.
+
+    This replaces naively scaling every parameter in the bijection by
+    ``scale``: doing that shrinks every layer of a conditioner's MLP, so the
+    signal (and gradient) passing through an ``nn_depth``-layer network gets
+    attenuated roughly like ``scale ** nn_depth``, which can leave training
+    with essentially no usable gradient to start from. Scaling only the
+    final layer keeps the network at (near-)identity output while hidden
+    layers, and thus the gradients flowing back through them, stay at their
+    normal scale.
+    """
+    is_mlp = lambda x: isinstance(x, (FactoredMLP, eqx.nn.MLP))  # noqa: E731
+    return jax.tree_util.tree_map(
+        lambda leaf: _scale_last_layer(leaf, scale) if is_mlp(leaf) else leaf,
+        bijection,
+        is_leaf=is_mlp,
+    )
+
+
 class AsymmetricAffine(bijections.AbstractBijection):
     """An asymmetric bijection that applies different scaling factors for
     positive and negative inputs.
@@ -968,6 +999,25 @@ def _min_waste_buckets(counts: np.ndarray, n_buckets: int) -> np.ndarray:
     return bucket_of_item
 
 
+class SumLinearAndMlp(eqx.Module):
+    linear: eqx.nn.Linear
+    mlp: eqx.nn.MLP
+
+    def __init__(
+        self,
+        linear: eqx.nn.Linear,
+        mlp: eqx.nn.MLP,
+    ):
+        super().__init__()
+        self.linear = linear
+        self.mlp = mlp
+
+    def __call__(self, x: Array) -> Array:
+        linear_out = self.linear(x)
+        mlp_out = self.mlp(x)
+        return linear_out + mlp_out
+
+
 class SparseTriangularMap(bijections.AbstractBijection):
     """Triangular map with a caller-specified sparsity pattern.
 
@@ -996,9 +1046,9 @@ class SparseTriangularMap(bijections.AbstractBijection):
     a performance question. `blanket` is a statement about how the density
     of the *model-space* variable factorizes, ``p(m) = prod_i p(m_i |
     m_parents(i))`` -- the same role a sparse precision matrix plays for a
-    Gaussian: sparse ``Lambda`` gives a sparse, direct whitening map ``w =
-    L^T m`` (a plain matrix-vector product using the true blanket entries of
-    the actual data ``m``), whereas the reverse map ``m = L^{-T} w`` solves a
+    Gaussian: sparse ``Lambda`` gives a sparse, direct whitening map ``w = C
+    m`` (a plain matrix-vector product using the true blanket entries of the
+    actual data ``m``), whereas the reverse map ``m = C^{-1} w`` solves a
     triangular system and is generally dense/sequential, because ``w`` is
     noise and the blanket was never a statement about how noise combines. A
     conditioner only "uses the Markov blanket of ``m``" if it is literally a
@@ -1006,6 +1056,20 @@ class SparseTriangularMap(bijections.AbstractBijection):
     corresponding entries of ``w`` instead would still be invertible, but
     would no longer correspond to anything about the density we were told to
     respect.
+
+    Note the triangle convention that ``C`` implies, since it is easy to get
+    backwards. Here ``C`` is *lower* triangular (variable ``i`` sees only
+    ``j < i``), so whitening a Gaussian means factorizing its precision as
+    ``Lambda = C^T C`` -- a reverse (UL) Cholesky, not the usual ``Lambda =
+    L L^T``. The two have different fill patterns: the fill of ``C`` for a
+    given elimination order equals the fill of ``L`` for the *reversed*
+    order. So a `blanket` obtained by symbolic factorization (CHOLMOD/AMD or
+    similar) must be paired with the reverse of the elimination order it was
+    computed for -- see `make_sparse_triangular_map`'s ``order`` argument.
+    Getting this wrong yields a pattern that silently cannot represent the
+    target at all, rather than one that merely fits it badly (though it is
+    invisible for patterns that are fill-free in both directions, such as a
+    banded/tridiagonal one).
 
     Concretely: `inverse_and_log_det` takes the model-space point ``m`` (or,
     when sandwiched with a `bijections.Permute`, a reindexing of it) and
@@ -1093,7 +1157,7 @@ class SparseTriangularMap(bijections.AbstractBijection):
         dim = blanket.shape[0]
 
         if transformer is None:
-            transformer = make_transformer(asymmetric_transformer=False)
+            transformer = make_transformer(asymmetric_transformer=False, contract_transformer=True)
         if transformer.shape != () or transformer.cond_shape is not None:
             raise ValueError(
                 "Only unconditional transformers with shape () are supported."
@@ -1112,7 +1176,7 @@ class SparseTriangularMap(bijections.AbstractBijection):
         # unused (padded) slots never leak information. `max_parents` here
         # is the *global* max, only used to build a single padded array
         # that gets sliced down per-bucket below.
-        max_parents = max(1, int(n_parents.max(initial=0)))
+        max_parents = int(n_parents.max(initial=0))
         parent_indices = np.full((dim, max_parents), dim, dtype=np.int32)
         for k in range(dim):
             idx = np.flatnonzero(parent_mask[k])
@@ -1127,18 +1191,14 @@ class SparseTriangularMap(bijections.AbstractBijection):
         for k in range(dim):
             parents_k = np.flatnonzero(parent_mask[k])
             level[k] = 0 if parents_k.size == 0 else int(level[parents_k].max()) + 1
-        n_levels = int(level.max()) + 1 if dim > 0 else 0
+        n_levels = int(level.max()) + 1
 
         # Bucket variables by parent count, so that variables with few
         # parents don't pay for the conditioner width the rare
         # many-parents variable needs (see `_min_waste_buckets`).
-        n_distinct = len(np.unique(n_parents)) if dim > 0 else 0
-        n_buckets_eff = max(1, min(n_buckets, dim, n_distinct)) if dim > 0 else 0
-        bucket_of = (
-            _min_waste_buckets(n_parents, n_buckets_eff)
-            if dim > 0
-            else np.zeros(0, dtype=np.int64)
-        )
+        n_distinct = len(np.unique(n_parents))
+        n_buckets_eff = min(n_buckets, dim, n_distinct)
+        bucket_of = _min_waste_buckets(n_parents, n_buckets_eff)
 
         constructor, num_params = get_ravelled_pytree_constructor(
             transformer,
@@ -1147,7 +1207,17 @@ class SparseTriangularMap(bijections.AbstractBijection):
         )
 
         def make_net(key, in_size):
-            return eqx.nn.MLP(
+            key, key_linear = jax.random.split(key)
+            linear = eqx.nn.Linear(in_size, num_params, key=key_linear)
+
+            linear = eqx.tree_at(
+                lambda l: l.weight, linear, 1e-3 * linear.weight
+            )
+            linear = eqx.tree_at(
+                lambda l: l.bias, linear, 1e-3 * linear.bias
+            )
+
+            mlp = eqx.nn.MLP(
                 in_size=in_size,
                 out_size=num_params,
                 width_size=nn_width,
@@ -1155,6 +1225,7 @@ class SparseTriangularMap(bijections.AbstractBijection):
                 activation=nn_activation,
                 key=key,
             )
+            return SumLinearAndMlp(linear, mlp)
 
         keys = jax.random.split(key, max(n_buckets_eff, 1))
 
@@ -1166,9 +1237,10 @@ class SparseTriangularMap(bijections.AbstractBijection):
         bucket_level_parent_indices = []
 
         for b in range(n_buckets_eff):
+            print("bucket", b)
             members_b = np.flatnonzero(bucket_of == b)
             bucket_size_b = len(members_b)
-            max_parents_b = max(1, int(n_parents[members_b].max(initial=0)))
+            max_parents_b = int(n_parents[members_b].max(initial=0))
 
             net_keys = jax.random.split(keys[b], bucket_size_b)
             conditioners.append(
@@ -1190,7 +1262,7 @@ class SparseTriangularMap(bijections.AbstractBijection):
 
             levels_b = level[members_b]
             group_sizes_b = np.bincount(levels_b, minlength=n_levels)
-            max_group_b = int(group_sizes_b.max()) if n_levels > 0 else 0
+            max_group_b = int(group_sizes_b.max())
 
             lvl_members = np.full(
                 (n_levels, max(max_group_b, 1)), dim, dtype=np.int32
@@ -1842,7 +1914,7 @@ def make_transformer(
             )
             elemwises.append(bijections.Invert(affine))
 
-    if contract_transformer:
+    if isinstance(contract_transformer, bool):
         elemwises.append(
             Contract2(
                 None,
@@ -1852,6 +1924,17 @@ def make_transformer(
                 jnp.zeros(()),
             )
         )
+    if isinstance(contract_transformer, int):
+        for _ in range(contract_transformer):
+            elemwises.append(
+                Contract2(
+                    None,
+                    jnp.zeros(()),
+                    jnp.zeros(()),
+                    jnp.zeros(()),
+                    jnp.zeros(()),
+                )
+            )
 
     if len(elemwises) == 1:
         return elemwises[0]
@@ -1898,10 +1981,7 @@ def make_twin_flow_scan(
             )
 
             if zero_init:
-                coupling = jax.tree_util.tree_map(
-                    lambda x: x * 1e-3 if eqx.is_inexact_array(x) else x,
-                    coupling,
-                )
+                coupling = zero_init_conditioners(coupling)
             return coupling
 
         layers = []
@@ -2175,10 +2255,7 @@ def make_flow_loop(
         )
 
         if zero_init:
-            coupling = jax.tree_util.tree_map(
-                lambda x: x * 1e-3 if eqx.is_inexact_array(x) else x,
-                coupling,
-            )
+            coupling = zero_init_conditioners(coupling)
 
         flow = coupling
 
@@ -2254,6 +2331,8 @@ def make_sparse_triangular_map(
     nn_width=None,
     nn_depth=None,
     activation,
+    init_draws: ArrayLike | None = None,
+    init_grads: ArrayLike | None = None,
 ):
     """Build a `SparseTriangularMap` bijection for the given ordering.
 
@@ -2272,6 +2351,23 @@ def make_sparse_triangular_map(
             the original, unpermuted variable space) of the variable
             transformed at position ``k``; a variable can only depend on
             variables earlier in this order.
+
+            If `sparsity` comes from a symbolic Cholesky factorization, this
+            must be the **reverse** of the elimination order that factorization
+            used (``order = p[::-1]`` for a CHOLMOD/AMD permutation ``p``),
+            because the map is lower triangular and so factorizes the
+            precision as ``Lambda = C^T C`` rather than ``L L^T``. See
+            `SparseTriangularMap` for the full argument. Reversing costs no
+            fill: the fill count is the one the elimination order achieved.
+        init_draws: Optional ``(n_draws, n_dim)`` array of draws, in the same
+            coordinates the map itself sees (i.e. already standardized by any
+            preceding affine layer, but *not* permuted by ``order``). If
+            given, the conditioners are initialized to the exactly
+            Fisher-optimal linear map for these draws instead of to the
+            identity, see `fisher_optimal_precision`. Must be passed together
+            with `init_grads`.
+        init_grads: Gradients of the target log density at `init_draws`, in
+            the same coordinates.
         sparsity: ``(n_dim, n_dim)`` array convertible to boolean, the
             Markov-blanket adjacency matrix, see `SparseTriangularMap`.
             ``sparsity[i, j]`` being truthy means ``j`` may be used to
@@ -2309,12 +2405,279 @@ def make_sparse_triangular_map(
         nn_activation=activation,
     )
     if zero_init:
-        layer = jax.tree_util.tree_map(
-            lambda x: x * 1e-3 if eqx.is_inexact_array(x) else x,
-            layer,
+        layer = zero_init_conditioners(layer)
+
+    if init_draws is not None:
+        if init_grads is None:
+            raise ValueError("init_draws and init_grads must be given together.")
+        init_draws = np.asarray(init_draws, dtype=np.float64)
+        init_grads = np.asarray(init_grads, dtype=np.float64)
+        if init_draws.shape != init_grads.shape or init_draws.shape[1:] != (n_dim,):
+            raise ValueError(
+                "init_draws and init_grads must both have shape (n_draws, "
+                f"{n_dim}), got {init_draws.shape} and {init_grads.shape}."
+            )
+        precision, center = fisher_optimal_precision(
+            init_draws[:, order],
+            init_grads[:, order],
+            sparsity_sorted,
+        )
+        layer = init_conditioners_from_precision(layer, precision, center)
+
+    # `Sandwich(inner, outer)` computes `outer^{-1} . inner . outer`, and
+    # `Permute(p)` maps `x -> x[p]`. We need the outer permutation to move
+    # the original variables into the `order` positions the reindexed
+    # `sparsity_sorted` assumes, i.e. `x -> x[order]`, so the permutation is
+    # `order` itself (not its reverse, and not its inverse: the inverse is
+    # applied by the `Sandwich` on the way out).
+    return bijections.Sandwich(layer, bijections.Permute(jnp.asarray(order)))
+
+
+def _pattern_lower_indices(pattern):
+    """Row/column indices of the lower triangle (incl. diagonal) of `pattern`."""
+    pattern = np.asarray(pattern, dtype=bool)
+    dim = pattern.shape[0]
+    mask = np.tril(pattern | pattern.T | np.eye(dim, dtype=bool))
+    return np.nonzero(mask)
+
+
+def fisher_optimal_precision(
+    draws,
+    grads,
+    pattern,
+    *,
+    maxiter: int = 200,
+    tol: float = 1e-10,
+):
+    """Precision matrix of the Fisher-optimal linear map with a given sparsity.
+
+    A linear triangular map ``w = C s`` has whitened Fisher divergence
+
+    .. code-block:: text
+
+        E ||C s + C^-T g||^2 = tr(M Sigma) + tr(M^-1 G) - 2 dim,   M = C^T C
+
+    (the cross term is constant because ``C^T C^-T = I`` and
+    ``E[g s^T] = -I``). So the loss sees ``C`` only through ``M = C^T C``,
+    and because `pattern` is fill-completed for the map's order, ``{C^T C : C
+    lower triangular with this pattern}`` is exactly ``{M positive definite
+    with this pattern}``. The problem is therefore *convex* in ``M``:
+    ``tr(M Sigma)`` is linear, ``tr(M^-1 G)`` is convex, and the objective
+    diverges as ``M`` approaches singularity, so it is self-barriering.
+
+    Note what this is *not*. The tempting cheap alternative -- regressing
+    ``-g`` on ``s`` row by row, i.e. minimizing ``E||M s + g||^2`` -- expands
+    to ``tr(M Sigma M) - 2 tr(M) + tr(G)``, whose minimizer is ``M =
+    Sigma^-1``: the score covariance drops out entirely and the result is the
+    draw covariance in disguise. The stationarity condition here is instead
+    ``M Sigma M = G``, whose unconstrained solution is the matrix geometric
+    mean of ``Sigma^-1`` and ``G``.
+
+    Nothing dense is ever formed. The gradient is
+    ``P[Sigma - M^-1 G M^-1]``, which in sample form is a difference of two
+    empirical second moments evaluated only on the pattern,
+
+    .. code-block:: text
+
+        grad_ij = mean_k [ s_ki s_kj - y_ki y_kj ],    M y_k = g_k
+
+    so an iteration costs one sparse solve per draw plus ``O(n_draws * nnz)``
+    to accumulate the moments. With an empty pattern this reduces to
+    ``M_ii = sqrt(G_ii / Sigma_ii)``, the diagonal geometric mean `make_flow`
+    already uses.
+
+    The map has to be affine rather than merely linear, because the whitened
+    residual of a Gaussian with mean ``mu`` is ``C (s - mu)``: without an
+    intercept it is off by a constant whenever the coordinates the map sees
+    are not exactly centered, which is the normal case (`make_flow`'s
+    preceding affine layer only centers approximately). That costs nothing
+    to handle. Writing the map as ``w = C (s - c)`` and minimizing over
+    ``c`` gives ``c = mean(s) + M^-1 mean(g)``; substituting it back
+    collapses every ``c``-dependent term into ``-mean(g)^T M^-1 mean(g)``,
+    leaving exactly the objective above with **both** moments centered. So
+    the intercept is profiled out rather than iterated on: use covariances
+    instead of second moments, solve once, then read ``c`` off the result.
+
+    Args:
+        draws: ``(n_draws, dim)`` draws, in the order the map uses.
+        grads: ``(n_draws, dim)`` gradients of the target log density at
+            `draws`, in the same order.
+        pattern: ``(dim, dim)`` boolean adjacency matrix, fill-completed for
+            the map's order (see `make_sparse_triangular_map`).
+        maxiter: Maximum number of L-BFGS iterations.
+        tol: Gradient tolerance for the L-BFGS convergence check.
+
+    Returns:
+        ``(M, center)``, with ``M`` a ``scipy.sparse`` CSC matrix and
+        ``center`` the offset the map subtracts, i.e. the optimal linear map
+        is ``w = C (s - center)``.
+    """
+    import scipy.sparse as sp
+    from scipy.optimize import minimize
+    from scipy.sparse.linalg import splu
+
+    draws = np.asarray(draws, dtype=np.float64)
+    grads = np.asarray(grads, dtype=np.float64)
+    n_draws, dim = draws.shape
+
+    rows, cols = _pattern_lower_indices(pattern)
+    is_diag = rows == cols
+    # Off-diagonal entries appear twice in the symmetric matrix, so their
+    # directional derivative picks up a factor of two.
+    grad_weight = np.where(is_diag, 1.0, 2.0)
+
+    # Centered, because the intercept is profiled out (see above).
+    draw_mean = draws.mean(0)
+    grad_mean = grads.mean(0)
+    centered_draws = draws - draw_mean
+    centered_grads = grads - grad_mean
+
+    # Empirical covariance, evaluated only on the pattern.
+    sigma_vals = (
+        centered_draws[:, rows] * centered_draws[:, cols]
+    ).sum(0) / n_draws
+
+    def to_matrix(theta):
+        lower = sp.coo_matrix((theta, (rows, cols)), shape=(dim, dim))
+        strict = sp.coo_matrix(
+            (theta[~is_diag], (cols[~is_diag], rows[~is_diag])), shape=(dim, dim)
+        )
+        return (lower + strict).tocsc()
+
+    def objective(theta):
+        matrix = to_matrix(theta)
+        try:
+            # `diag_pivot_thresh=0` turns SuperLU into a Cholesky-like
+            # factorization for symmetric positive definite input; a
+            # non-positive pivot then means we left the feasible set.
+            factor = splu(matrix, diag_pivot_thresh=0, permc_spec="MMD_AT_PLUS_A")
+        except RuntimeError:
+            return np.inf, np.zeros_like(theta)
+        if not (factor.U.diagonal() > 0).all():
+            return np.inf, np.zeros_like(theta)
+
+        y = factor.solve(centered_grads.T).T
+        value = (centered_draws * (centered_draws @ matrix)).sum() / n_draws
+        value = value + (centered_grads * y).sum() / n_draws
+
+        y_vals = (y[:, rows] * y[:, cols]).sum(0) / n_draws
+        return value, (sigma_vals - y_vals) * grad_weight
+
+    # Start from the diagonal geometric mean, which is the exact solution
+    # when the pattern is empty and a feasible (positive definite) point
+    # otherwise.
+    diag0 = np.sqrt(
+        centered_grads.var(0) / np.maximum(centered_draws.var(0), 1e-300)
+    )
+    theta0 = np.where(is_diag, diag0[rows], 0.0)
+
+    result = minimize(
+        objective,
+        theta0,
+        jac=True,
+        method="L-BFGS-B",
+        options={"maxiter": maxiter, "gtol": tol, "ftol": 1e-15},
+    )
+    matrix = to_matrix(result.x)
+
+    # c = mean(s) + M^-1 mean(g), the offset that makes the whitened residual
+    # mean-free.
+    factor = splu(matrix, diag_pivot_thresh=0, permc_spec="MMD_AT_PLUS_A")
+    center = draw_mean + factor.solve(grad_mean)
+    return matrix, center
+
+
+def reverse_cholesky(matrix):
+    """Lower-triangular ``C`` with ``C.T @ C == matrix``.
+
+    This is the factorization a `SparseTriangularMap` needs (see that class's
+    note on the triangle convention), as opposed to the usual ``L @ L.T``.
+    It is computed as an ordinary Cholesky of the reversed matrix: reversing
+    a lower-triangular factor gives an upper-triangular one, and
+    ``(X[J][:, J]).T == X.T[J][:, J]``.
+    """
+    import scipy.sparse as sp
+    from sksparse.cholmod import cholesky
+
+    dim = matrix.shape[0]
+    rev = np.arange(dim)[::-1]
+    reversed_matrix = sp.csc_matrix(matrix)[rev][:, rev]
+    # `order="natural"` is essential: any fill-reducing permutation here
+    # would destroy the ordering the triangular map is built around.
+    factor, perm = cholesky(sp.csc_matrix(reversed_matrix), order="natural", lower=True)
+    assert np.array_equal(perm, np.arange(dim))
+    return sp.csc_matrix(factor).T[rev][:, rev]
+
+
+def init_conditioners_from_precision(
+    layer: SparseTriangularMap, precision, center=None
+):
+    """Set `layer`'s conditioners to the affine map with this precision.
+
+    ``layer.inverse_and_log_det`` applies, per variable ``k``,
+    ``w_k = sigma_k * s_k + mu_k`` with ``(mu_k, sigma_k)`` the first two
+    outputs of ``k``'s conditioner (`make_transformer`'s asymmetric
+    transformer is used inverted, and is affine at ``theta = 1``). Matching
+    that against ``w = C (s - center)`` gives ``sigma_k = C_kk`` and
+    ``mu_k = sum_{l<k} C_kl s_l - (C center)_k``, so the conditioner is
+    exactly affine in its parents: weight row 0 holds ``C_kl``, its bias
+    holds ``-(C center)_k``, and the scale is a bias. All remaining
+    conditioner outputs (asymmetry, and the trailing `Contract2` parameters)
+    stay at zero, where the transformer is affine.
+    """
+    factor = reverse_cholesky(precision).toarray()
+    dim = factor.shape[0]
+    if center is None:
+        center = np.zeros(dim)
+    intercept = -(factor @ np.asarray(center, dtype=np.float64))
+
+    diag = np.diag(factor)
+    if not (diag > 0).all():
+        raise ValueError("reverse Cholesky produced a non-positive diagonal.")
+    # scale = x + sqrt(1 + x**2), inverted.
+    scale_params = (diag - 1.0 / diag) / 2.0
+
+    conditioners = []
+    for bucket, conditioner in enumerate(layer.conditioners):
+        members = np.asarray(layer.bucket_members[bucket])
+        parents = np.asarray(layer.bucket_parent_indices[bucket])
+
+        linear = conditioner.linear if isinstance(conditioner, SumLinearAndMlp) else conditioner
+        weight = np.zeros(linear.weight.shape, dtype=np.float64)
+        bias = np.zeros(linear.bias.shape, dtype=np.float64)
+
+        # `dim` is the sentinel parent index reading a constant zero, so
+        # padded slots keep a zero weight.
+        valid = parents < dim
+        rows = np.broadcast_to(members[:, None], parents.shape)
+        weight[:, 0, :] = np.where(valid, factor[rows, np.minimum(parents, dim - 1)], 0.0)
+        bias[:, 0] = intercept[members]
+        bias[:, 1] = scale_params[members]
+
+        linear = eqx.tree_at(
+            lambda net: (net.weight, net.bias),
+            linear,
+            (jnp.asarray(weight, dtype=linear.weight.dtype),
+             jnp.asarray(bias, dtype=linear.bias.dtype)),
         )
 
-    return bijections.Sandwich(layer, bijections.Permute(jnp.asarray(order)))
+        if isinstance(conditioner, SumLinearAndMlp):
+            # The linear part now *is* the map we were asked to install, so
+            # the MLP has to start at exactly zero output rather than merely
+            # small (as `zero_init_conditioners` leaves it). Only the output
+            # layer is zeroed, so hidden layers -- and the gradients flowing
+            # back through them -- keep their normal scale.
+            conditioner = eqx.tree_at(
+                lambda net: net.mlp, conditioner, _scale_last_layer(conditioner.mlp, 0.0)
+            )
+            conditioner = eqx.tree_at(lambda net: net.linear, conditioner, linear)
+        else:
+            conditioner = linear
+        conditioners.append(conditioner)
+
+    return eqx.tree_at(
+        lambda layer: layer.conditioners, layer, tuple(conditioners)
+    )
 
 
 def make_flow(
@@ -2343,6 +2706,7 @@ def make_flow(
     reuse_embed=False,
     order: ArrayLike | None = None,
     sparsity: ArrayLike | None = None,
+    fisher_init: bool = True,
 ):
     if activation is None:
         activation = jax.nn.leaky_relu
@@ -2482,12 +2846,22 @@ def make_flow(
             )
         if order is None:
             order = np.arange(n_dim)
+        # `diag_affine` is applied *after* the triangular map in the forward
+        # direction, so the map itself sees standardized coordinates:
+        # `s = (m - mean) / diag`, and correspondingly `g_s = g * diag`.
+        init_draws = init_grads = None
+        if fisher_init:
+            diag_np = np.asarray(diag)
+            init_draws = (positions - np.asarray(mean)) / diag_np
+            init_grads = gradients * diag_np
         inner = make_sparse_triangular_map(
             key,
             n_dim,
             order=order,
             sparsity=sparsity,
             zero_init=zero_init,
+            init_draws=init_draws,
+            init_grads=init_grads,
             nn_width=nn_width,
             nn_depth=nn_depth,
             activation=activation,
@@ -2627,10 +3001,7 @@ def extend_flow(
             )
 
         if zero_init:
-            coupling = jax.tree_util.tree_map(
-                lambda x: x * 1e-3 if eqx.is_inexact_array(x) else x,
-                coupling,
-            )
+            coupling = zero_init_conditioners(coupling)
 
         inner = bijections.Sandwich(coupling, inner_permute)
 
@@ -2661,10 +3032,7 @@ def extend_flow(
             )
 
             if zero_init:
-                coupling = jax.tree_util.tree_map(
-                    lambda x: x * 1e-3 if eqx.is_inexact_array(x) else x,
-                    coupling,
-                )
+                coupling = zero_init_conditioners(coupling)
 
             if verbose:
                 print(costs[permute.permutation][inner.outer.permutation])
