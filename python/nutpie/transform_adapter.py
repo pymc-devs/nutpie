@@ -244,6 +244,11 @@ def _fit_lbfgs(params, static, data, loss_fn, *, max_steps, rtol, atol):
 
 
 @eqx.filter_jit
+def res_fn(params, args):
+    loss_fn, *args = args
+    return loss_fn.residuals(params, *args)
+
+#@eqx.filter_jit
 def _fit_lm(params, static, data, loss_fn, *, max_steps, rtol, atol, linear_steps):
     if not hasattr(loss_fn, "residuals"):
         raise ValueError(
@@ -251,22 +256,29 @@ def _fit_lm(params, static, data, loss_fn, *, max_steps, rtol, atol, linear_step
             "(e.g. FisherLoss with gamma=None)."
         )
 
-    def residual_fn(params, args):
-        return loss_fn.residuals(params, static, *args)
+    if False:
+        def residual_fn(params, args):
+            return loss_fn.residuals(params, static, *args)
 
-    # The Jacobian of the flow's residuals w.r.t. its (many) parameters is far
-    # too large to form and factorize explicitly (the default QR linear
-    # solver would do exactly that). Instead, solve the Gauss-Newton normal
-    # equations matrix-free with a small, fixed number of CG steps, using
-    # only Jacobian-vector / vector-Jacobian products.
-    #linear_solver = lx.Normal(lx.CG(rtol=rtol, atol=atol, max_steps=linear_steps))
-    #solver = optx.LevenbergMarquardt(rtol=rtol, atol=atol, linear_solver=linear_solver)
-    solver = optx.LevenbergMarquardt(rtol=rtol, atol=atol)
-    sol = optx.least_squares(
-        residual_fn, solver, params, args=data, max_steps=max_steps, throw=False
-    )
-    loss_val = loss_fn(sol.value, static, *data)
-    return sol.value, loss_val
+        # The Jacobian of the flow's residuals w.r.t. its (many) parameters is far
+        # too large to form and factorize explicitly (the default QR linear
+        # solver would do exactly that). Instead, solve the Gauss-Newton normal
+        # equations matrix-free with a small, fixed number of CG steps, using
+        # only Jacobian-vector / vector-Jacobian products.
+        linear_solver = lx.Normal(lx.CG(rtol=rtol, atol=atol, max_steps=linear_steps))
+        solver = optx.LevenbergMarquardt(rtol=rtol, atol=atol, linear_solver=linear_solver)
+        #solver = optx.LevenbergMarquardt(rtol=rtol, atol=atol)
+        sol = optx.least_squares(
+            residual_fn, solver, params, args=data, max_steps=max_steps, throw=False
+        )
+        loss_val = loss_fn(sol.value, static, *data)
+        return sol.value, loss_val
+
+    from nutpie.lmopt import fit
+
+    theta, hist = fit(params, res_fn, (loss_fn, static, *data), n_steps=max_steps, verbose=True, min_loss=np.exp(-3), precondition=True)
+
+    return theta, hist[-1]["F_new"]
 
 
 @eqx.filter_jit
@@ -293,14 +305,16 @@ def _step_batch_loop(params, static, opt_state, optimizer, loss_fn, key, *batche
 
 
 @eqx.filter_jit
-def inverse_gradient_and_val(bijection, draw, grad, logp):
-    if False:
+def inverse_gradient_and_val(bijection, draw, grad, logp, *, naive=False):
+    if naive:
         x = bijection.inverse(draw)
         (_, fwd_log_det), pull_grad_fn = jax.vjp(
             lambda x: bijection.transform_and_log_det(x), x
         )
         (x_grad,) = pull_grad_fn((grad, jnp.ones(())))
         return (x, x_grad, logp + fwd_log_det)
+    if hasattr(bijection, "inverse_gradient_and_val"):
+        return bijection.inverse_gradient_and_val(draw, grad, logp)
     if isinstance(bijection, bijections.Chain):
         for b in bijection.bijections[::-1]:
             draw, grad, logp = inverse_gradient_and_val(b, draw, grad, logp)
@@ -528,11 +542,12 @@ class FisherLoss(eqx.Module):
             draw, grad, logp = inverse_gradient_and_val(bijection, draw, grad, logp)
             return draw + grad
 
+        #residuals = jax.lax.map(compute_residual, [None, 0, 0, 0], batch_size=64)(
         residuals = jax.vmap(compute_residual, [None, 0, 0, 0])(
             flow.bijection, draws, grads, logps
         )
         n_draws = draws.shape[0]
-        return residuals / jnp.sqrt(n_draws * self.target_norm)
+        return residuals / jnp.sqrt(n_draws)
 
 
 def fit_flow(key, bijection, loss_fn, draws, grads, logps, **kwargs):
@@ -804,9 +819,61 @@ class TransformAdapter:
 
                 return
 
-            positions = np.array(positions[self._initial_skip :][-self._window_size :])
-            gradients = np.array(gradients[self._initial_skip :][-self._window_size :])
-            logps = np.array(logps[self._initial_skip :][-self._window_size :])
+            hist_positions = positions[self._initial_skip :]
+            hist_gradients = gradients[self._initial_skip :]
+            hist_logps = logps[self._initial_skip :]
+
+            total_hist_len = len(hist_positions)
+            if total_hist_len < 10:
+                return
+
+            # Number of draws that arrived since the previous update() call.
+            # (The cadence itself is controlled on the Rust side via
+            # transform_update_freq, not by window_size.)
+            if len(self._count_trace) >= 2:
+                stride = self._count_trace[-1] - self._count_trace[-2]
+            else:
+                stride = self._count_trace[-1]
+            new_part_size = min(max(stride, 1), total_hist_len)
+
+            window = self._window_size
+            tail_len = min(total_hist_len, new_part_size + 3 * window)
+            tail_positions = np.array(hist_positions[-tail_len:])
+            tail_gradients = np.array(hist_gradients[-tail_len:])
+            tail_logps = np.array(hist_logps[-tail_len:])
+
+            new_positions = tail_positions[-new_part_size:]
+            new_gradients = tail_gradients[-new_part_size:]
+            new_logps = tail_logps[-new_part_size:]
+
+            history_positions = tail_positions[:-new_part_size]
+            history_gradients = tail_gradients[:-new_part_size]
+            history_logps = tail_logps[:-new_part_size]
+            history_len = len(history_positions)
+
+            rng = np.random.default_rng(seed)
+
+            if history_len == 0:
+                pool_positions = new_positions
+                pool_gradients = new_gradients
+                pool_logps = new_logps
+            else:
+                # A random subset of the last three windows, equally sized
+                # to the new draws.
+                replace = history_len < new_part_size
+                idx = rng.choice(history_len, size=new_part_size, replace=replace)
+                pool_positions = np.concatenate([new_positions, history_positions[idx]])
+                pool_gradients = np.concatenate([new_gradients, history_gradients[idx]])
+                pool_logps = np.concatenate([new_logps, history_logps[idx]])
+
+            # Final subsample (with replacement if the pool is smaller than
+            # the window) down to the configured window size.
+            pool_len = len(pool_positions)
+            replace = pool_len < window
+            final_idx = rng.choice(pool_len, size=window, replace=replace)
+            positions = pool_positions[final_idx]
+            gradients = pool_gradients[final_idx]
+            logps = pool_logps[final_idx]
 
             if len(positions) < 10:
                 return
