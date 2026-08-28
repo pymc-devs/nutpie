@@ -1,3 +1,4 @@
+from nutpie.triangular import SparseTriangularMap
 import itertools
 import math
 from collections.abc import Callable
@@ -43,7 +44,6 @@ def _generate_sequences(k, r_vals):
             sequences[i, list(ones_positions)] = True
         all_sequences.append(sequences)
     return np.concatenate(all_sequences, axis=0)
-
 
 def _max_run_length(seq):
     """
@@ -932,435 +932,6 @@ class MaskedCoupling(bijections.AbstractBijection):
         )
 
 
-def _min_waste_buckets(counts: np.ndarray, n_buckets: int) -> np.ndarray:
-    """Partition `counts` into at most `n_buckets` groups, minimizing the
-    total padding waste ``sum(group_max - value)`` that results from padding
-    every value in a group up to that group's own maximum.
-
-    This is exactly the cost `SparseTriangularMap` cares about when sizing
-    conditioner-network buckets by parent count: it's the number of wasted
-    (zero-padded) conditioner input columns, summed over all variables. The
-    optimal groups are always contiguous ranges of the *sorted* values
-    (grouping a value with smaller ones it isn't padded down to never
-    helps), so this is a small, exact dynamic program -- no need for an
-    approximate heuristic or an external clustering library, and no need to
-    reach for the general (and here unnecessary) machinery of optimal
-    1D-clustering algorithms: with `n` items and `n_buckets` groups it's
-    O(n^2 * n_buckets), which is negligible at the sizes this is used for
-    (this runs once, at construction time).
-
-    Returns:
-        `(len(counts),)` int array giving each item's bucket index (0 is
-        the bucket containing the smallest values), in the same order as
-        `counts`.
-    """
-    counts = np.asarray(counts)
-    n = len(counts)
-    n_buckets = max(1, min(n_buckets, n))
-    order = np.argsort(counts, kind="stable")
-    sorted_counts = counts[order].astype(np.float64)
-    prefix = np.concatenate([[0.0], np.cumsum(sorted_counts)])
-
-    # dp[r] = min total waste covering the first r (sorted) items with the
-    # number of buckets processed so far; split[b, r] = the best boundary.
-    no_split = -1
-    prev_dp = np.full(n + 1, np.inf)
-    prev_dp[0] = 0.0
-    split = np.full((n_buckets + 1, n + 1), no_split, dtype=np.int64)
-    for b in range(1, n_buckets + 1):
-        new_dp = np.full(n + 1, np.inf)
-        for r in range(b, n + 1):
-            l_range = np.arange(b - 1, r)
-            # cost of segment [l, r): padding sorted_counts[l:r] up to
-            # sorted_counts[r - 1] (the segment's max, since sorted
-            # ascending).
-            costs = prev_dp[l_range] + (
-                sorted_counts[r - 1] * (r - l_range) - (prefix[r] - prefix[l_range])
-            )
-            best = int(np.argmin(costs))
-            new_dp[r] = costs[best]
-            split[b, r] = l_range[best]
-        prev_dp = new_dp
-
-    boundaries = []
-    r = n
-    for b in range(n_buckets, 0, -1):
-        left = int(split[b, r])
-        boundaries.append((left, r))
-        r = left
-    boundaries.reverse()
-
-    bucket_of_sorted = np.zeros(n, dtype=np.int64)
-    for bucket_idx, (left, right) in enumerate(boundaries):
-        bucket_of_sorted[left:right] = bucket_idx
-
-    bucket_of_item = np.zeros(n, dtype=np.int64)
-    bucket_of_item[order] = bucket_of_sorted
-    return bucket_of_item
-
-
-class SumLinearAndMlp(eqx.Module):
-    linear: eqx.nn.Linear
-    mlp: eqx.nn.MLP
-
-    def __init__(
-        self,
-        linear: eqx.nn.Linear,
-        mlp: eqx.nn.MLP,
-    ):
-        super().__init__()
-        self.linear = linear
-        self.mlp = mlp
-
-    def __call__(self, x: Array) -> Array:
-        linear_out = self.linear(x)
-        mlp_out = self.mlp(x)
-        return linear_out + mlp_out
-
-
-class SparseTriangularMap(bijections.AbstractBijection):
-    """Triangular map with a caller-specified sparsity pattern.
-
-    A standard masked autoregressive flow (see e.g.
-    ``flowjax.bijections.MaskedAutoregressive``) lets every transformed
-    variable depend on *all* variables preceding it. If the factorization of
-    the target distribution is (approximately) known -- for instance because
-    the Markov blanket of each variable has already been identified -- most
-    of those dependencies are unnecessary. This bijection instead gives
-    every variable its own small conditioner network that only ever sees the
-    variables in its Markov blanket that precede it. Because non-parent
-    variables never reach a variable's conditioner, the resulting Jacobian is
-    exactly triangular with the specified sparsity pattern (rather than
-    merely triangular, as for a dense MADE-style flow), and the conditioner
-    networks can be made much smaller than a dense autoregressive
-    conditioner.
-
-    This bijection treats variable ``i`` as preceding variable ``j`` whenever
-    ``i < j``, i.e. it assumes the variables are already given in the
-    desired order. To use a different variable ordering, wrap it as
-    ``bijections.Sandwich(SparseTriangularMap(...), bijections.Permute(order))``
-    (see `make_sparse_triangular_map`).
-
-    Which direction is `inverse_and_log_det` and which is
-    `transform_and_log_det` is not an arbitrary choice, and it is not merely
-    a performance question. `blanket` is a statement about how the density
-    of the *model-space* variable factorizes, ``p(m) = prod_i p(m_i |
-    m_parents(i))`` -- the same role a sparse precision matrix plays for a
-    Gaussian: sparse ``Lambda`` gives a sparse, direct whitening map ``w = C
-    m`` (a plain matrix-vector product using the true blanket entries of the
-    actual data ``m``), whereas the reverse map ``m = C^{-1} w`` solves a
-    triangular system and is generally dense/sequential, because ``w`` is
-    noise and the blanket was never a statement about how noise combines. A
-    conditioner only "uses the Markov blanket of ``m``" if it is literally a
-    function of ``m``'s actual parent values; conditioning on the
-    corresponding entries of ``w`` instead would still be invertible, but
-    would no longer correspond to anything about the density we were told to
-    respect.
-
-    Note the triangle convention that ``C`` implies, since it is easy to get
-    backwards. Here ``C`` is *lower* triangular (variable ``i`` sees only
-    ``j < i``), so whitening a Gaussian means factorizing its precision as
-    ``Lambda = C^T C`` -- a reverse (UL) Cholesky, not the usual ``Lambda =
-    L L^T``. The two have different fill patterns: the fill of ``C`` for a
-    given elimination order equals the fill of ``L`` for the *reversed*
-    order. So a `blanket` obtained by symbolic factorization (CHOLMOD/AMD or
-    similar) must be paired with the reverse of the elimination order it was
-    computed for -- see `make_sparse_triangular_map`'s ``order`` argument.
-    Getting this wrong yields a pattern that silently cannot represent the
-    target at all, rather than one that merely fits it badly (though it is
-    invisible for patterns that are fill-free in both directions, such as a
-    banded/tridiagonal one).
-
-    Concretely: `inverse_and_log_det` takes the model-space point ``m`` (or,
-    when sandwiched with a `bijections.Permute`, a reindexing of it) and
-    computes every conditioner directly from ``m`` in one parallel pass --
-    this is the "evaluate the density" direction, and it is also what
-    nutpie's transform-adapted NUTS sampler calls at every leapfrog step (see
-    ``nuts-rs``'s ``Transformation::inv_transform_normalize`` and
-    ``transform_adapter.inverse_gradient_and_val``, both of which pass in the
-    untransformed/model-space position). `transform_and_log_det` is
-    ancestral sampling from the whitened point back to ``m``: it must
-    resolve ``m`` sequentially (via `jax.lax.scan`), since each conditioner
-    needs the already-resolved *model-space* parents, not the noise.
-
-    That sequential resolution doesn't have to go variable by variable,
-    though: variables whose parents are all already resolved are mutually
-    independent and can be resolved together. `transform_and_log_det`
-    exploits this by grouping variables into "elimination levels" --
-    ``level(i)`` is the length of the longest parent-chain ending at ``i``,
-    so level 0 is every variable with no parents, level 1 is every variable
-    whose parents are all in level 0, and so on -- and scanning over levels
-    (each processed as one vmapped batch) rather than over individual
-    variables. The number of levels is the DAG's critical-path depth, the
-    minimum number of sequential stages any schedule could achieve; for a
-    fully dense `blanket` every variable ends up in its own level and this
-    degenerates to the naive per-variable scan, while a shallow/tree-like
-    `blanket` can cut the sequential depth from ``dim`` down to
-    ``O(log dim)`` or less. The tradeoff is that levels are padded to the
-    width of the widest level, so this trades sequential steps for total
-    work and is a net win only when levels are reasonably balanced.
-
-    Separately, conditioner networks are grouped into `n_buckets` buckets by
-    parent count (see `_min_waste_buckets`), each with its own (smaller)
-    input width, rather than every variable's conditioner paying for the
-    input width the single worst-connected variable needs. This matters
-    independently of the level grouping: a handful of variables with large
-    parent counts is common, and without bucketing every other variable's
-    conditioner -- whether processed in `inverse_and_log_det`'s single pass
-    or within one level of `transform_and_log_det`'s scan -- would pay for
-    that width too.
-
-    Args:
-        key: Jax key.
-        blanket: A ``(dim, dim)`` array, convertible to boolean.
-            ``blanket[i, j]`` being truthy means ``j`` is used to
-            parameterize the transform of ``i``, provided ``j < i``. The
-            matrix is symmetrized internally, so it is fine to pass e.g. an
-            undirected Markov-blanket adjacency matrix.
-        transformer: Unconditional bijection with shape ``()``, applied
-            elementwise to each variable. Defaults to this module's
-            standard elementwise transformer, see ``make_transformer``.
-        n_buckets: Number of conditioner-width buckets, see above. Capped
-            automatically at the number of distinct parent counts.
-        nn_width: Conditioner hidden layer width.
-        nn_depth: Conditioner hidden layer depth.
-        nn_activation: Conditioner activation function.
-    """
-
-    shape: tuple[int, ...]
-    cond_shape: ClassVar[None] = None
-    n_levels: int
-    conditioners: tuple[eqx.nn.MLP, ...]
-    bucket_members: tuple[Array, ...]
-    bucket_parent_indices: tuple[Array, ...]
-    bucket_level_members: tuple[Array, ...]
-    bucket_level_local_members: tuple[Array, ...]
-    bucket_level_parent_indices: tuple[Array, ...]
-    transformer_constructor: Callable
-
-    def __init__(
-        self,
-        key,
-        *,
-        blanket: ArrayLike,
-        transformer: bijections.AbstractBijection | None = None,
-        n_buckets: int = 8,
-        nn_width: int = 16,
-        nn_depth: int = 1,
-        nn_activation: Callable = jax.nn.gelu,
-    ):
-        blanket = np.asarray(blanket, dtype=bool)
-        if blanket.ndim != 2 or blanket.shape[0] != blanket.shape[1]:
-            raise ValueError(
-                f"blanket must be a square matrix, got shape {blanket.shape}."
-            )
-        dim = blanket.shape[0]
-
-        if transformer is None:
-            transformer = make_transformer(asymmetric_transformer=False, contract_transformer=True)
-        if transformer.shape != () or transformer.cond_shape is not None:
-            raise ValueError(
-                "Only unconditional transformers with shape () are supported."
-            )
-
-        blanket = blanket | blanket.T
-
-        # Only keep edges that point from an earlier to a later index, so
-        # that the resulting transform is guaranteed to be triangular.
-        strictly_lower = np.tril(np.ones((dim, dim), dtype=bool), k=-1)
-        parent_mask = blanket & strictly_lower
-
-        n_parents = parent_mask.sum(axis=1)
-
-        # Sentinel index `dim` always reads a constant zero appended to x, so
-        # unused (padded) slots never leak information. `max_parents` here
-        # is the *global* max, only used to build a single padded array
-        # that gets sliced down per-bucket below.
-        max_parents = int(n_parents.max(initial=0))
-        parent_indices = np.full((dim, max_parents), dim, dtype=np.int32)
-        for k in range(dim):
-            idx = np.flatnonzero(parent_mask[k])
-            parent_indices[k, : len(idx)] = idx
-
-        # Elimination levels: level(i) is the length of the longest
-        # parent-chain ending at i, so all variables sharing a level are
-        # mutually independent given earlier levels (see the class
-        # docstring). This is the minimum possible number of sequential
-        # stages for any valid schedule.
-        level = np.zeros(dim, dtype=np.int64)
-        for k in range(dim):
-            parents_k = np.flatnonzero(parent_mask[k])
-            level[k] = 0 if parents_k.size == 0 else int(level[parents_k].max()) + 1
-        n_levels = int(level.max()) + 1
-
-        # Bucket variables by parent count, so that variables with few
-        # parents don't pay for the conditioner width the rare
-        # many-parents variable needs (see `_min_waste_buckets`).
-        n_distinct = len(np.unique(n_parents))
-        n_buckets_eff = min(n_buckets, dim, n_distinct)
-        bucket_of = _min_waste_buckets(n_parents, n_buckets_eff)
-
-        constructor, num_params = get_ravelled_pytree_constructor(
-            transformer,
-            filter_spec=eqx.is_inexact_array,
-            is_leaf=lambda leaf: isinstance(leaf, NonTrainable),
-        )
-
-        def make_net(key, in_size):
-            key, key_linear = jax.random.split(key)
-            linear = eqx.nn.Linear(in_size, num_params, key=key_linear)
-
-            linear = eqx.tree_at(
-                lambda l: l.weight, linear, 1e-3 * linear.weight
-            )
-            linear = eqx.tree_at(
-                lambda l: l.bias, linear, 1e-3 * linear.bias
-            )
-
-            mlp = eqx.nn.MLP(
-                in_size=in_size,
-                out_size=num_params,
-                width_size=nn_width,
-                depth=nn_depth,
-                activation=nn_activation,
-                key=key,
-            )
-            return SumLinearAndMlp(linear, mlp)
-
-        keys = jax.random.split(key, max(n_buckets_eff, 1))
-
-        conditioners = []
-        bucket_members = []
-        bucket_parent_indices = []
-        bucket_level_members = []
-        bucket_level_local_members = []
-        bucket_level_parent_indices = []
-
-        for b in range(n_buckets_eff):
-            print("bucket", b)
-            members_b = np.flatnonzero(bucket_of == b)
-            bucket_size_b = len(members_b)
-            max_parents_b = int(n_parents[members_b].max(initial=0))
-
-            net_keys = jax.random.split(keys[b], bucket_size_b)
-            conditioners.append(
-                eqx.filter_vmap(
-                    lambda k, mp=max_parents_b: make_net(k, mp),
-                    axis_size=bucket_size_b,
-                )(net_keys)
-            )
-            bucket_members.append(members_b.astype(np.int32))
-            bucket_parent_indices.append(
-                parent_indices[members_b][:, :max_parents_b].astype(np.int32)
-            )
-
-            # local position of each global variable index within this
-            # bucket's own (bucket_size_b,)-shaped ensemble/member list, so
-            # that a level's subset of this bucket can be gathered from it.
-            local_of_global = np.zeros(dim, dtype=np.int32)
-            local_of_global[members_b] = np.arange(bucket_size_b, dtype=np.int32)
-
-            levels_b = level[members_b]
-            group_sizes_b = np.bincount(levels_b, minlength=n_levels)
-            max_group_b = int(group_sizes_b.max())
-
-            lvl_members = np.full(
-                (n_levels, max(max_group_b, 1)), dim, dtype=np.int32
-            )
-            lvl_local = np.zeros((n_levels, max(max_group_b, 1)), dtype=np.int32)
-            for lvl in range(n_levels):
-                idx = members_b[levels_b == lvl]
-                lvl_members[lvl, : len(idx)] = idx
-                lvl_local[lvl, : len(idx)] = local_of_global[idx]
-
-            lvl_gather = np.clip(lvl_members, 0, max(dim - 1, 0))
-            lvl_parent_idx = parent_indices[lvl_gather][:, :, :max_parents_b]
-
-            bucket_level_members.append(lvl_members)
-            bucket_level_local_members.append(lvl_local)
-            bucket_level_parent_indices.append(lvl_parent_idx)
-
-        self.conditioners = tuple(conditioners)
-        self.transformer_constructor = constructor
-        self.bucket_members = tuple(jnp.asarray(m) for m in bucket_members)
-        self.bucket_parent_indices = tuple(
-            jnp.asarray(m) for m in bucket_parent_indices
-        )
-        self.bucket_level_members = tuple(
-            jnp.asarray(m) for m in bucket_level_members
-        )
-        self.bucket_level_local_members = tuple(
-            jnp.asarray(m) for m in bucket_level_local_members
-        )
-        self.bucket_level_parent_indices = tuple(
-            jnp.asarray(m) for m in bucket_level_parent_indices
-        )
-        self.n_levels = n_levels
-        self.shape = (dim,)
-
-    def _flat_params_to_transformer(self, params: Array):
-        """Reshape to n x params_per_dim, then vmap."""
-        transformer = eqx.filter_vmap(self.transformer_constructor)(params)
-        return bijections.Vmap(transformer, in_axes=eqx.if_array(0))
-
-    def inverse_and_log_det(self, y, condition=None):
-        dim = self.shape[0]
-        y_padded = jnp.concatenate([y, jnp.zeros((1,), dtype=y.dtype)])
-        x = jnp.zeros((dim,), dtype=y.dtype)
-        log_det = jnp.zeros(())
-        for b in range(len(self.conditioners)):
-            members = self.bucket_members[b]
-            parents = y_padded[self.bucket_parent_indices[b]]
-            params = eqx.filter_vmap(lambda net, inp: net(inp))(
-                self.conditioners[b], parents
-            )
-            transformer = self._flat_params_to_transformer(params)
-            x_b, logdet_b = transformer.inverse_and_log_det(y[members])
-            x = x.at[members].set(x_b)
-            log_det = log_det + logdet_b
-        return x, log_det
-
-    def transform_and_log_det(self, x, condition=None):
-        dim = self.shape[0]
-        n_buckets = len(self.conditioners)
-
-        def step(y, level_data):
-            y_padded = jnp.concatenate([y, jnp.zeros((1,), dtype=y.dtype)])
-            y_next = y
-            for b in range(n_buckets):
-                members, local_members, parent_idx = level_data[b]
-                # Clipping/local-index-0 are only for indexing safety;
-                # results for padding slots (where `members == dim`) are
-                # discarded below via the `mode="drop"` scatter. Parents are
-                # read from `y_padded` as of the *start* of this level (safe
-                # -- variables in the same level never depend on each
-                # other), so buckets within a level can be processed in any
-                # order.
-                gather_idx = jnp.clip(members, 0, max(dim - 1, 0))
-                parents = y_padded[parent_idx]
-                conditioner_group = jax.tree.map(
-                    lambda leaf: leaf[local_members] if eqx.is_array(leaf) else leaf,
-                    self.conditioners[b],
-                )
-                params = eqx.filter_vmap(lambda net, inp: net(inp))(
-                    conditioner_group, parents
-                )
-                transformer = self._flat_params_to_transformer(params)
-                y_group, _ = transformer.transform_and_log_det(x[gather_idx])
-                y_next = y_next.at[members].set(y_group, mode="drop")
-            return y_next, None
-
-        level_data = tuple(
-            (
-                self.bucket_level_members[b],
-                self.bucket_level_local_members[b],
-                self.bucket_level_parent_indices[b],
-            )
-            for b in range(n_buckets)
-        )
-        y, _ = jax.lax.scan(step, x, level_data)
-        _, log_det = self.inverse_and_log_det(y, condition)
-        return y, -log_det
 
 
 def make_mvscale(key, n_dim, size, randomize_base=False):
@@ -1713,12 +1284,15 @@ class Contract2(bijections.AbstractBijection):
           (note: z = exp(asinh(x/2))).
 
         """
+        eps = 1e-4
         if self.alpha is not None:
-            gamma = jnp.exp(self.alpha)
+            #gamma = jnp.exp(self.alpha)
+            gamma = self.alpha + jnp.sqrt(1 + self.alpha * self.alpha) + eps
         else:
             gamma = 1
-        delta = jnp.exp(self.beta)
-        sigma_mod = self.sigma + jnp.sqrt(1 + self.sigma * self.sigma)
+        #delta = jnp.exp(self.beta)
+        delta = self.beta + jnp.sqrt(1 + self.beta * self.beta) + eps
+        sigma_mod = self.sigma + jnp.sqrt(1 + self.sigma * self.sigma) + eps
         mu = self.mu
         nu = self.nu
 
@@ -1754,12 +1328,15 @@ class Contract2(bijections.AbstractBijection):
               4. Recover z = w^(1/gamma).
               5. Then, x = z - 1/z.
         """
+        eps = 1e-4
         if self.alpha is not None:
-            gamma = jnp.exp(self.alpha)
+            #gamma = jnp.exp(self.alpha)
+            gamma = self.alpha + jnp.sqrt(1 + self.alpha * self.alpha) + eps
         else:
             gamma = 1
-        delta = jnp.exp(self.beta)
-        sigma_mod = self.sigma + jnp.sqrt(1 + self.sigma * self.sigma)
+        #delta = jnp.exp(self.beta)
+        delta = self.beta + jnp.sqrt(1 + self.beta * self.beta) + eps
+        sigma_mod = self.sigma + jnp.sqrt(1 + self.sigma * self.sigma) + eps
         mu = self.mu
         nu = self.nu
 
@@ -1772,6 +1349,97 @@ class Contract2(bijections.AbstractBijection):
 
         x, det = jax.jvp(inv_trafo, [y], [jnp.ones(())])
         return x, jnp.log(det)
+
+
+
+def _log_cosh(v):
+    """log(cosh(v)), stable for large |v|."""
+    a = jnp.abs(v)
+    return a + jnp.log1p(jnp.exp(-2.0 * a)) - jnp.log(2.0)
+
+
+class Contract2(bijections.AbstractBijection):
+    shape: tuple[int, ...]
+    alpha: Array | None
+    beta: Array
+    sigma: Array
+    mu: Array
+    nu: Array
+    cond_shape: tuple[int, ...] | None = None
+
+    def __init__(self, alpha, beta, sigma, mu, nu):
+        if alpha is not None:
+            self.alpha = jnp.array(alpha)
+        else:
+            self.alpha = None
+        self.beta = jnp.array(beta)
+        self.sigma = jnp.array(sigma)
+        self.mu = jnp.array(mu)
+        self.nu = jnp.array(nu)
+        self.shape = beta.shape
+        assert self.shape == ()
+
+    def _log_params(self):
+        """log gamma, log delta, log sigma_mod.
+
+        The original computes gamma = alpha + sqrt(1 + alpha**2), which is
+        exp(asinh(alpha)); taking the log directly is exact everywhere.
+        """
+        if self.alpha is not None:
+            log_gamma = jnp.arcsinh(self.alpha)
+        else:
+            log_gamma = jnp.zeros_like(self.beta)
+        return log_gamma, jnp.arcsinh(self.beta), jnp.arcsinh(self.sigma)
+
+    def transform_and_log_det(
+        self, x: ArrayLike, condition: ArrayLike | None = None
+    ) -> tuple[Array, Array]:
+        """Forward transformation:
+
+            T(x) = (2*sigma_mod/gamma) * sinh(gamma*u + 2*log(delta)) + mu,
+            u    = asinh((x - nu)/2),
+
+        which is the original expression with z = exp(u) and
+        delta**2 * z**gamma - delta**(-2) * z**(-gamma) = 2*sinh(gamma*u + 2*log(delta)).
+
+            log T'(x) = log(sigma_mod) + logcosh(gamma*u + 2*log(delta)) - logcosh(u)
+        """
+        log_gamma, log_delta, log_sigma = self._log_params()
+        gamma = jnp.exp(log_gamma)
+
+        centred = x - self.nu
+        u = jnp.arcsinh(centred / 2)
+        arg = gamma * u + 2.0 * log_delta
+
+        y = 2.0 * jnp.exp(log_sigma - log_gamma) * jnp.sinh(arg) + self.mu
+        log_det = log_sigma + _log_cosh(arg) - _log_cosh(u)
+        return y, log_det
+
+    def inverse_and_log_det(
+        self, y: ArrayLike, condition: ArrayLike | None = None
+    ) -> tuple[Array, Array]:
+        """Inverse transformation.
+
+        With A = gamma*(y - mu)/sigma_mod, the forward relation is
+        sinh(gamma*u + 2*log(delta)) = A/2, so
+
+            gamma*u + 2*log(delta) = asinh(A/2),
+            x = 2*sinh(u) + nu.
+
+        asinh(A/2) replaces (A + sqrt(A**2 + 4))/2, which cancels for A << 0.
+        """
+        log_gamma, log_delta, log_sigma = self._log_params()
+        gamma = jnp.exp(log_gamma)
+
+        half_a = jnp.exp(log_gamma - log_sigma) * (y - self.mu) / 2.0
+        arg = jnp.arcsinh(half_a)  # == gamma*u + 2*log(delta)
+        u = (arg - 2.0 * log_delta) / gamma
+
+        x = 2.0 * jnp.sinh(u) + self.nu
+        # logcosh(asinh(half_a)) = 0.5*log1p(half_a**2)
+        log_det = _log_cosh(u) - log_sigma - 0.5 * jnp.log1p(half_a * half_a)
+        return x, log_det
+
 
 
 class DipBij(bijections.AbstractBijection):
@@ -1917,7 +1585,7 @@ def make_transformer(
     if isinstance(contract_transformer, bool):
         elemwises.append(
             Contract2(
-                None,
+                jnp.zeros(()),
                 jnp.zeros(()),
                 jnp.zeros(()),
                 jnp.zeros(()),
@@ -2326,7 +1994,7 @@ def make_sparse_triangular_map(
     *,
     order: ArrayLike,
     sparsity: ArrayLike,
-    zero_init=False,
+    zero_init=True,
     n_buckets=8,
     nn_width=None,
     nn_depth=None,
@@ -2685,7 +2353,7 @@ def make_flow(
     positions,
     gradients,
     *,
-    zero_init=False,
+    zero_init=True,
     householder_layer=False,
     dct_layer=False,
     untransformed_dim: int | list[int | None] | None = None,
@@ -2706,7 +2374,7 @@ def make_flow(
     reuse_embed=False,
     order: ArrayLike | None = None,
     sparsity: ArrayLike | None = None,
-    fisher_init: bool = True,
+    fisher_init: bool = False,
 ):
     if activation is None:
         activation = jax.nn.leaky_relu
