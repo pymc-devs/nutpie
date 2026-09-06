@@ -1,0 +1,43 @@
+name: Experimental browser adapter
+on:
+  pull_request:
+    paths:
+      - 'examples/browser/**'
+      - '.github/workflows/browser-example.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build pinned Rust adapter
+        run: |
+          rustup toolchain install 1.94.0 --profile minimal --component rustfmt
+          rustup target add --toolchain 1.94.0 wasm32-unknown-unknown
+          cargo +1.94.0 fmt --manifest-path examples/browser/adapter/Cargo.toml --check
+          cargo +1.94.0 build --locked --release --target wasm32-unknown-unknown --manifest-path examples/browser/adapter/Cargo.toml
+      - name: Test sampler and memory bridge
+        run: node examples/browser/test_bridge.mjs
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - name: Test PyMC callback compiler
+        env:
+          PYTENSOR_FLAGS: cxx=,blas__ldflags=,numba__cache=False
+          OPENBLAS_NUM_THREADS: '1'
+        run: |
+          python -m pip install 'pymc==6.2.0' 'pytensor==3.2.4' 'numba==0.66.0'
+          python examples/browser/test_compile.py
+      - name: Assemble experimental static files
+        run: |
+          mkdir -p browser-artifact
+          cp examples/browser/adapter/target/wasm32-unknown-unknown/release/nuts_browser_adapter.wasm browser-artifact/
+          cp examples/browser/bridge.mjs examples/browser/compile_model.py examples/browser/README.md LICENSE browser-artifact/
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: experimental-browser-adapter
+          path: browser-artifact/
