@@ -605,6 +605,48 @@ class _BackgroundSampler:
         results = self._sampler.take_results()
         return self._extract(results)
 
+    def _sample_stats_attrs(self):
+        from nutpie import __version__
+
+        return {
+            "inference_library": "nutpie",
+            "inference_library_version": __version__,
+            "inference_library_settings": json.dumps(self._settings.as_dict()),
+        }
+
+    def _skipped_stats(self, settings_dict):
+        """Sampler stats the settings say not to store, and so should not reach the trace."""
+        skips = {
+            "store_gradient": ["gradient"],
+            "store_unconstrained": ["unconstrained_draw"],
+            "adapt_options.mass_matrix_options.store_mass_matrix": [
+                "mass_matrix_inv",
+                "mass_matrix_eigvals",
+                "mass_matrix_stds",
+                "transformation_mu",
+            ],
+            "store_divergences": [
+                "divergence_start",
+                "divergence_end",
+                "divergence_momentum",
+                "divergence_start_gradient",
+            ],
+            "store_transformed": ["transformed_position", "transformed_gradient"],
+        }
+
+        def _get_nested(settings, name, default):
+            for part in name.split("."):
+                if part not in settings:
+                    return default
+                settings = settings[part]
+            return settings
+
+        skip_vars = []
+        for setting, names in skips.items():
+            if not _get_nested(settings_dict["settings"], setting, False):
+                skip_vars.extend(names)
+        return skip_vars
+
     def _extract(self, results):
         settings_dict = self._settings.as_dict()
         if self._return_raw_trace:
@@ -622,52 +664,61 @@ class _BackgroundSampler:
                 store = cls(*args, **kwargs)
 
                 obj_store = ObjectStore(store, read_only=True)
-                return xr.open_datatree(obj_store, engine="zarr", consolidated=False)  # ty:ignore[invalid-argument-type]
+                trace = xr.open_datatree(obj_store, engine="zarr", consolidated=False)  # ty:ignore[invalid-argument-type]
+                # match the arrow backend, pymc reads these from sample_stats
+                if "sample_stats" in trace:
+                    trace["sample_stats"].attrs.update(self._sample_stats_attrs())
+                # the settings say which stats to store; the zarr writer stores them all
+                skip_vars = set(self._skipped_stats(settings_dict))
+                # label chain/draw as the arrow backend does (assigning in place stays lazy and
+                # keeps each node's children)
+                for node in trace.subtree:
+                    dataset = node.dataset
+                    missing = {
+                        dim: np.arange(dataset.sizes[dim])
+                        for dim in ("chain", "draw")
+                        if dim in dataset.dims and dim not in dataset.coords
+                    }
+                    stale = (
+                        skip_vars & set(dataset.data_vars)
+                        if (node.name or "").endswith("sample_stats")
+                        else set()
+                    )
+                    if missing or stale:
+                        node.dataset = dataset.drop_vars(stale).assign_coords(missing)
+                if not self._save_warmup:
+                    for name in ("warmup_posterior", "warmup_sample_stats"):
+                        if name in trace:
+                            del trace[name]
+                # the zarr writer leaves the unconstrained value variables in `posterior`;
+                # the arrow backend moves them out, into their own group when asked for them
+                uc_names = self._compiled_model.reparameterized_names or []
+                for group, uc_group in (
+                    ("posterior", "unconstrained_posterior"),
+                    ("warmup_posterior", "warmup_unconstrained_posterior"),
+                ):
+                    if group not in trace:
+                        continue
+                    dataset = trace[group].dataset
+                    present = [name for name in uc_names if name in dataset.data_vars]
+                    if not present:
+                        continue
+                    if self._store_unconstrained:
+                        trace[uc_group] = xr.DataTree(dataset[present])
+                    trace[group].dataset = dataset.drop_vars(present)
+                # dict attrs have no HDF5 equivalent; keep the tree to_netcdf-able
+                for node in trace.subtree:
+                    for key, value in list(node.attrs.items()):
+                        if isinstance(value, dict):
+                            node.attrs[key] = json.dumps(value)
+                return trace
 
             elif results.is_arrow():
-                skip_vars = []
-                skips = {
-                    "store_gradient": ["gradient"],
-                    "store_unconstrained": ["unconstrained_draw"],
-                    "adapt_options.mass_matrix_options.store_mass_matrix": [
-                        "mass_matrix_inv",
-                        "mass_matrix_eigvals",
-                        "mass_matrix_stds",
-                    ],
-                    "store_divergences": [
-                        "divergence_start",
-                        "divergence_end",
-                        "divergence_momentum",
-                        "divergence_start_gradient",
-                    ],
-                    "store_transformed": [
-                        "transformed_position",
-                        "transformed_gradient",
-                        "transformation_mu",
-                    ],
-                }
-
-                def _get_nested(settings, name, default):
-                    parts = name.split(".")
-                    for part in parts:
-                        if part not in settings:
-                            return default
-                        settings = settings[part]
-                    return settings
-
-                for setting, names in skips.items():
-                    if not _get_nested(settings_dict["settings"], setting, False):
-                        skip_vars.extend(names)
+                skip_vars = self._skipped_stats(settings_dict)
 
                 draw_batches, stat_batches = results.get_arrow_trace()
 
-                from nutpie import __version__
-
-                attrs = {
-                    "inference_library": "nutpie",
-                    "inference_library_version": __version__,
-                    "inference_library_settings": json.dumps(self._settings.as_dict()),
-                }
+                attrs = self._sample_stats_attrs()
 
                 return _arrow_to_arviz(
                     draw_batches,
