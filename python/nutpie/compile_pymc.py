@@ -15,8 +15,8 @@ import pandas as pd
 from numpy.typing import NDArray
 
 from nutpie import _lib
+from nutpie.compiled_model import CompiledModel
 from nutpie.compiled_pyfunc import SeedType, from_pyfunc
-from nutpie.sample import CompiledModel
 
 try:
     from numba.extending import intrinsic
@@ -968,8 +968,8 @@ def _make_c_logp_func(n_dim, logp_fn, user_data, shared_keys, shared_data):
 
     extract = make_extraction_fn(logp_fn, shared_data, shared_keys, user_data.dtype)
 
-    c_sig = numba.types.int64(
-        numba.types.uint64,
+    c_sig = numba.types.intc(
+        numba.types.uintp,
         numba.types.CPointer(numba.types.double),
         numba.types.CPointer(numba.types.double),
         numba.types.CPointer(numba.types.double),
@@ -1011,9 +1011,9 @@ def _make_c_expand_func(
         expand_fn, shared_data, shared_var_keys, user_data.dtype
     )
 
-    c_sig = numba.types.int64(
-        numba.types.uint64,
-        numba.types.uint64,
+    c_sig = numba.types.intc(
+        numba.types.uintp,
+        numba.types.uintp,
         numba.types.CPointer(numba.types.double),
         numba.types.CPointer(numba.types.double),
         numba.types.voidptr,

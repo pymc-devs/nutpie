@@ -7,7 +7,7 @@ from typing import Any
 import numpy as np
 
 from nutpie import _lib  # type: ignore
-from nutpie.sample import CompiledModel
+from nutpie.compiled_model import CompiledModel
 
 SeedType = int
 

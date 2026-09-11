@@ -15,7 +15,7 @@ use thiserror::Error;
 
 use crate::{
     common::{PyValue, PyVariable},
-    wrapper::PyTransformAdapt,
+    transform::PyTransformAdapt,
 };
 
 type UserData = *const std::ffi::c_void;
