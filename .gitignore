@@ -35,3 +35,5 @@ reports*
 results*
 
 wasm/node_modules/
+!wasm/benchmarks/
+!wasm/benchmarks/**

@@ -17,7 +17,8 @@ const kernel = createSampler({runtimeUrl: './runtime/', environment: 'pymc-marke
 kernel.handlers = {onOutput: write};
 try {
   await kernel.initialize();
-  const response = await fetch('./probe.py');
+  const script = new URLSearchParams(location.search).get('script') || 'probe.py';
+  const response = await fetch('./' + script);
   if (!response.ok) throw Error(`Probe download failed: ${response.status}`);
   const source = await response.text();
   const code = 'try:\n' + source.split('\n').map(s => '    ' + s).join('\n')

@@ -4,8 +4,10 @@ if sys.platform == "emscripten":
     from nutpie import _lib
     from nutpie._lib import sample_pymc as sample_raw
     from nutpie.compile_pymc import compile_pymc_model
+    from nutpie.wasm import sample
+
     __version__ = _lib.__version__
-    __all__ = ["compile_pymc_model", "sample_raw"]
+    __all__ = ["compile_pymc_model", "sample", "sample_raw"]
 else:
     from nutpie import _lib
     from nutpie._lib import store as zarr_store

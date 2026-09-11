@@ -5,14 +5,32 @@ This branch builds a real `nutpie._lib` Python extension for
 `PyMcModel`, shared-data ownership and the nuts-rs sampler. It does not use the
 independent-memory nuts-rs-wasm logp/gradient bridge.
 
-This is an experimental PyMC-only execution path, not a complete port of
-`nutpie.sample`. The WASM exports are `sample_raw(native_model, ...)` and
-`_lib.evaluate_pymc(native_model, position)`. `native_model` is obtained with
-`compiled._make_model(None)` for this probe. Raw results are nested
-chain/draw/variable dictionaries of flattened float64 values. There is no Arrow,
-Zarr, ArviZ conversion, progress, cancellation, initialization retry policy,
-parallel chains, Stan or flow support in this path. Terminating its worker is
-still possible. Native builds retain the existing sampler and dependencies.
+This is an experimental PyMC-only execution path. On Emscripten:
+
+```python
+import nutpie
+
+compiled = nutpie.compile_pymc_model(model)
+idata = nutpie.sample(compiled, chains=2, tune=750, draws=500, seed=42)
+idata.posterior
+idata.sample_stats
+```
+
+The result is Nutpie's usual ArviZ/xarray object (a DataTree with ArviZ 1).
+Native and WASM sampling share the same `_dict_to_arviz` implementation. Only
+storage decoding differs: native results arrive through Arrow; the prototype
+currently materializes flattened float64 values from Rust dictionaries.
+Named dimensions, string coordinates, deterministic variables and optional
+`store_unconstrained=True` are preserved. Sample stats currently contain only
+`diverging`, `n_steps` and `step_size`; total gradient evaluations and leapfrog
+steps are recorded as attributes.
+
+This is a limited synchronous `sample`, not the full native API. No Arrow/Zarr
+storage, progress, cancellation, warmup storage, initialization retry policy,
+parallel chains, Stan or flow support is provided. Unsupported keyword options
+raise errors. Terminating the worker remains possible. `sample_raw` and
+`_lib.evaluate_pymc` remain available for low-level probes. Native builds retain
+the existing sampler and dependencies.
 
 ## Changes and observed blockers
 
@@ -40,6 +58,9 @@ Other necessary changes:
   require PyArrow or the native storage classes. The native `sample` module
   still imports/re-exports that same class. The browser runtime has neither
   PyArrow nor arro3 installed.
+- The final ArviZ/xarray conversion moved from `sample.py` into `result.py`.
+  Both the native Arrow path and the WASM decoder call this same function;
+  xarray does not require PyArrow.
 - Package initialization selects the limited WASM exports on Emscripten.
 - Coordinate extraction accepts pandas `StringArray` alongside
   `ArrowStringArray`. Without this, even the generated
@@ -61,9 +82,19 @@ rustup component add rust-src --toolchain nightly
 bash wasm/build.sh
 ```
 
-This produces `target/nutpie-probe.zip` containing the Python sources and the
-WASM side module named `nutpie/_lib.so`. It is a probe archive, not an installable
-wheel; this bypasses the full package's native dependency installation.
+This produces a **release** extension plus `target/nutpie-probe.zip`. To package
+an ABI-tagged experimental wheel, first commit the source and run:
+
+```sh
+python3 wasm/make_wheel.py
+```
+
+The wheel, `manifest.json` and `SHA256SUMS` appear in `target/wasm-dist`.
+The package is `nutpie==0.16.12+wasm.1`, tagged
+`cp313-cp313-emscripten_4_0_9_wasm32`. It contains the Python sources, the WASM
+side module named `nutpie/_lib.so`, dependency license notices and build metadata.
+`--allow-dirty` is only for local probes; released artifacts must have
+`source_dirty: false` in their manifest.
 
 Download and extract `nuts-rs-wasm-runtime-v0.1.0.tar.gz` from the
 [nuts-rs-wasm release](https://github.com/pymc-labs/nuts-rs-wasm/releases/tag/v0.1.0)
@@ -109,16 +140,21 @@ The complete checked-in browser harness passed on September 11, 2026. See
   after garbage collection, and runtime-managed memory growth passed.
 - MMM: 15 unconstrained parameters, 100 warmup steps and 50 retained draws;
   finite outputs and three density/gradient comparisons passed.
-- `cargo check --locked` passed for the native target; native runtime regression
-  tests were not run. The existing unused-mut warning in Stan remains.
+- Native `cargo check --locked`, a built native extension and six existing
+  PyMC/Numba tests passed. Those cover float32, no-prior models, coordinates,
+  extra variables and shared data. The six tests passed again after sharing
+  the result converter; a separate transformed/shared-data regression passed.
+  This is not the full Stan/JAX suite.
 
-Recorded timings are from a debug build and different test scopes. They are not
-an end-to-end performance comparison against the existing browser adapter.
+The original `validation.json` records the initial debug smoke test. Release
+performance and packaging checks are documented in [evaluation.md](evaluation.md).
+The benchmark separates compilation, sampling/materialization and diagnostics;
+output behavior differs, so it does not isolate JavaScript call overhead.
 
 ## Remaining work before an upstream-ready port
 
-Agree on feature flags and a public synchronous sampling API, reuse/extend the
-nuts-rs execution helpers, define output/storage and progress behavior, produce
-an ABI-tagged package, and add native runtime regression coverage and browser CI.
+Agree on feature flags and the public synchronous sampling API, reuse/extend
+nuts-rs execution helpers, define output/storage and progress behavior, complete
+native regression coverage and add browser CI.
 The separation of the Python frontend can still be useful, but `_lib` itself is
 not fundamentally excluded from WASM.

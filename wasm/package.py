@@ -9,6 +9,6 @@ with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
     for path in sorted((root / "python/nutpie").rglob("*.py")):
         archive.write(path, str(path.relative_to(root / "python")))
     archive.write(
-        root / "target/wasm32-unknown-emscripten/debug/_lib.wasm", "nutpie/_lib.so"
+        root / "target/wasm32-unknown-emscripten/release/_lib.wasm", "nutpie/_lib.so"
     )
 print(output)

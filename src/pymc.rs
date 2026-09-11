@@ -195,6 +195,8 @@ impl CpuLogpFunc for PyMcModelRef<'_> {
     }
 
     fn logp(&mut self, position: &[f64], gradient: &mut [f64]) -> Result<f64, Self::LogpError> {
+        #[cfg(target_os = "emscripten")]
+        crate::wasm::record_evaluation();
         let mut logp = 0f64;
         let logp_ptr = (&mut logp) as *mut f64;
         assert!(position.len() == self.model.dim);
