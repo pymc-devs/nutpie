@@ -1,0 +1,37 @@
+{
+  "test": "wheel-install-and-public-xarray-api",
+  "manifest": {
+    "source_revision": "3a158e91a751e3b8650c68a5ecb65202820b606f",
+    "source_dirty": true,
+    "version": "0.16.12+wasm.1",
+    "tag": "cp313-cp313-emscripten_4_0_9_wasm32",
+    "emscripten": "4.0.9",
+    "rust": "rustc 1.96.0-nightly (3102493c7 2026-03-12)",
+    "profile": "release",
+    "runtime_sha256": "dc73b5f69ef1946e3409f3ab0884a2b17a3f4d1956069ce0b70f0fc51665a6f4",
+    "filename": "nutpie-0.16.12+wasm.1-cp313-cp313-emscripten_4_0_9_wasm32.whl",
+    "sha256": "cec2d8a46e6025b554f345d1a1b8c6f079fbd9bf041e880b6255d4fca521924e",
+    "bytes": 1236690,
+    "status": "experimental",
+    "api": "compile_pymc_model, limited sample (ArviZ/xarray), sample_raw; no drop-in JS sampler API"
+  },
+  "posterior_shape": [
+    2,
+    200,
+    3
+  ],
+  "coords": [
+    "a",
+    "b",
+    "c"
+  ],
+  "groups": [
+    "posterior",
+    "sample_stats",
+    "unconstrained_posterior"
+  ],
+  "sample_seconds": 0.0884999999999998,
+  "max_rhat": 1.010023971239718,
+  "min_ess": 191.17475160465338,
+  "note": "Local pre-release candidate; clean-commit wheel is validated again before publication."
+}

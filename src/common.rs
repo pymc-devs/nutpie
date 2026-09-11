@@ -183,10 +183,12 @@ impl<'a, 'py> FromPyObject<'a, 'py> for PyValue {
                 .collect::<Result<_, _>>()?;
             return Ok(PyValue(Value::Strings(vals_as_str)));
         }
-        if ob.get_type().name()? == "ArrowStringArray" {
-            let list: Bound<PyList> = ob.call_method0("tolist")?.extract().map_err(|_| {
-                PyRuntimeError::new_err("Could not convert ArrowStringArray to list")
-            })?;
+        let type_name = ob.get_type().name()?;
+        if type_name == "ArrowStringArray" || type_name == "StringArray" {
+            let list: Bound<PyList> = ob
+                .call_method0("tolist")?
+                .extract()
+                .map_err(|_| PyRuntimeError::new_err("Could not convert string array to list"))?;
             let vec: Vec<String> = list
                 .iter()
                 .map(|item| {

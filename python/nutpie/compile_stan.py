@@ -12,7 +12,7 @@ from typing import Any
 from numpy.typing import NDArray
 
 from nutpie import _lib
-from nutpie.sample import CompiledModel
+from nutpie.compiled_model import CompiledModel
 
 logger = logging.getLogger("nutpie")
 

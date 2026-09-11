@@ -1,0 +1,36 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Nutpie extension WASM probe</title>
+<pre id="log">Loading Xeus…
+</pre>
+<script type="module">
+import {createSampler} from './client.mjs';
+window.output = [];
+const write = text => {
+  window.output.push(text);
+  document.querySelector('#log').textContent += text;
+  console.log(text);
+};
+const kernel = createSampler({runtimeUrl: './runtime/', environment: 'pymc-marketing-wasm'});
+// Only initialize and execute Python; none of this client's compilation,
+// Rust sampling, or logp/gradient bridge methods are used.
+kernel.handlers = {onOutput: write};
+try {
+  await kernel.initialize();
+  const script = new URLSearchParams(location.search).get('script') || 'probe.py';
+  const response = await fetch('./' + script);
+  if (!response.ok) throw Error(`Probe download failed: ${response.status}`);
+  const source = await response.text();
+  const code = 'try:\n' + source.split('\n').map(s => '    ' + s).join('\n')
+    + '\nexcept BaseException:\n    import traceback\n    traceback.print_exc()\n    raise\n';
+  await kernel.execute(code);
+  window.probePassed = window.output.join('').includes('NUTPIE_WASM_PROBE_PASSED ');
+  if (!window.probePassed) throw Error('Probe finished without success marker');
+} catch (error) {
+  window.probeError = String(error);
+  write(window.probeError + '\n');
+} finally {
+  kernel.close();
+  window.probeDone = true;
+}
+</script>

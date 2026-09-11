@@ -1,62 +1,16 @@
 import json
 import os
 import warnings
-from dataclasses import dataclass, field
-from importlib.metadata import version
 from typing import Any, Literal, cast, get_args, overload
 
-import arviz
 import numpy as np
 import pandas as pd
 import pyarrow
 import xarray as xr
 
 from nutpie import _lib
-
-
-@dataclass(frozen=True)
-class CompiledModel:
-    dims: dict[str, tuple[str, ...]] | None
-    reparameterized_names: list[str] | None = field(default=None, kw_only=True)
-
-    @property
-    def n_dim(self) -> int:
-        raise NotImplementedError()
-
-    @property
-    def shapes(self) -> dict[str, tuple[int, ...]] | None:
-        raise NotImplementedError()
-
-    @property
-    def coords(self):
-        raise NotImplementedError()
-
-    def _make_sampler(self, *args, **kwargs):
-        raise NotImplementedError()
-
-    def _make_model(self, *args, **kwargs):
-        raise NotImplementedError()
-
-    def benchmark_logp(self, point, num_evals, cores):
-        """Time how long the logp gradient evaluation takes.
-
-        # Parameters
-        """
-        model = self._make_model(point)
-        times = []
-        if isinstance(cores, int):
-            cores = [cores]
-        for num_cores in cores:
-            if num_cores == 0:
-                continue
-            flat = model.benchmark_logp(point, num_cores, num_evals)
-            data = pd.DataFrame(flat)
-            data.index = pd.MultiIndex.from_product(
-                [range(num_cores), [num_cores]], names=["thread", "concurrent_cores"]
-            )
-            data = data.rename_axis(columns="evaluation")
-            times.append(data)
-        return pd.concat(times)
+from nutpie.compiled_model import CompiledModel
+from nutpie.result import _dict_to_arviz
 
 
 def _arrow_to_arviz(
@@ -110,56 +64,16 @@ def _arrow_to_arviz(
             stats_posterior, max_posterior, stat_posterior, i, n_chains, dims, skip_vars
         )
 
-    uc_data_posterior = {
-        name: data_posterior.pop(name)
-        for name in reparameterized_names
-        if name in data_posterior
-    }
-    uc_data_tune = {
-        name: data_tune.pop(name) for name in reparameterized_names if name in data_tune
-    }
-
-    arviz_version = version("arviz")
-    use_datatree = tuple(map(int, arviz_version.split(".")[:2])) >= (1, 0)
-    if use_datatree:
-        idata = arviz.from_dict(
-            {
-                "posterior": data_posterior,
-                "sample_stats": stats_posterior,
-                "warmup_posterior": data_tune,
-                "warmup_sample_stats": stats_tune,
-            },
-            dims=dims,
-            **kwargs,
-        )
-    else:
-        idata = arviz.from_dict(
-            posterior=data_posterior,
-            sample_stats=stats_posterior,
-            warmup_posterior=data_tune,
-            warmup_sample_stats=stats_tune,  # ty:ignore[invalid-argument-type]
-            dims=dims,
-            **kwargs,
-        )
-
-    if keep_unconstrained_draw and uc_data_posterior:
-        coords = kwargs.get("coords")
-        uc_dims = {name: dims.get(name, []) for name in uc_data_posterior}
-        groups = {
-            "unconstrained_posterior": arviz.dict_to_dataset(
-                uc_data_posterior, coords=coords, dims=uc_dims
-            )
-        }
-        if uc_data_tune:
-            groups["warmup_unconstrained_posterior"] = arviz.dict_to_dataset(
-                uc_data_tune, coords=coords, dims=uc_dims
-            )
-        if use_datatree:
-            idata = idata.assign(**{k: xr.DataTree(v) for k, v in groups.items()})
-        else:
-            idata.add_groups(groups)
-
-    return idata
+    return _dict_to_arviz(
+        data_posterior,
+        stats_posterior,
+        data_tune,
+        stats_tune,
+        dims,
+        reparameterized_names,
+        keep_unconstrained_draw,
+        **kwargs,
+    )
 
 
 def _add_arrow_data(data_dict, max_length, batch, chain, n_chains, dims, skip_vars):

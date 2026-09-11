@@ -1,0 +1,35 @@
+{
+  "python": "3.13.1 (main, Feb 18 2026, 20:57:27) [Clang 21.0.0git (https:/github.com/llvm/llvm-project 2f05451198e2f222ec66cec489",
+  "nutpie": "0.16.12",
+  "extension": "/tmp/nutpie-probe/nutpie/_lib.so",
+  "gaussian": {
+    "shape": [
+      2,
+      500
+    ],
+    "mean": -0.08180182140567091,
+    "std": 0.9558430036282342,
+    "seconds": 0.013400000000000745
+  },
+  "transforms": {
+    "draws": 100,
+    "density_gradient_checks": 3
+  },
+  "mutable_data": {
+    "old_gradient": [
+      5.0
+    ],
+    "new_gradient": [
+      14.0
+    ],
+    "ownership_and_memory_growth": true
+  },
+  "mmm_compile_seconds": 44.7342,
+  "mmm": {
+    "dimensions": 15,
+    "draws": 50,
+    "tune": 100,
+    "density_gradient_checks": 3,
+    "seconds": 1.3982999999999919
+  }
+}
