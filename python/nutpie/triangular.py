@@ -164,9 +164,7 @@ def _build_layout(bucket_members, bucket_parent_indices, level_of_variable, dim)
 
     return _SparseTriangularLayout(
         bucket_value_gather=tuple(jnp.asarray(g) for g in bucket_value_gather),
-        edge_child_index=jnp.asarray(
-            np.append(edge_child, dim).astype(np.int32)
-        ),
+        edge_child_index=jnp.asarray(np.append(edge_child, dim).astype(np.int32)),
         level_members=jnp.asarray(level_members),
         level_edge_index=jnp.asarray(level_edge_index),
         level_edge_target_slot=jnp.asarray(level_edge_target_slot),
@@ -213,9 +211,7 @@ def _solve_triangular_sparse(edge_values, jacobian_diagonal, layout, rhs):
     # Sentinel row: rhs 0 and diagonal 1, so padded lanes stay finite. Their
     # values are discarded, but a NaN would still poison a cotangent.
     rhs_padded = jnp.concatenate([rhs, jnp.zeros((1,), rhs.dtype)])
-    diagonal_padded = jnp.concatenate(
-        [jacobian_diagonal, jnp.ones((1,), rhs.dtype)]
-    )
+    diagonal_padded = jnp.concatenate([jacobian_diagonal, jnp.ones((1,), rhs.dtype)])
 
     @jax.profiler.annotate_function
     def eliminate_level(solution, level_data):
@@ -228,16 +224,16 @@ def _solve_triangular_sparse(edge_values, jacobian_diagonal, layout, rhs):
         # Sum contributions into the slot of the parent they belong to.
         # Padding edges target slot `max_level_size`, which is out of bounds
         # and dropped.
-        child_sum = jnp.zeros((max_level_size,), rhs.dtype).at[target_slots].add(
-            edge_contributions, mode="drop"
+        child_sum = (
+            jnp.zeros((max_level_size,), rhs.dtype)
+            .at[target_slots]
+            .add(edge_contributions, mode="drop")
         )
 
         updated = (rhs_padded[members] - child_sum) / diagonal_padded[members]
         # Each variable belongs to exactly one level, so the in-bounds
         # indices here are unique.
-        solution = solution.at[members].set(
-            updated, mode="drop", unique_indices=True
-        )
+        solution = solution.at[members].set(updated, mode="drop", unique_indices=True)
         return solution, None
 
     solution, _ = jax.lax.scan(
@@ -410,8 +406,16 @@ class SparseTriangularMap(bijections.AbstractBijection):
         if transformer is None:
             from nutpie.normalizing_flow import make_transformer
 
-            transformer = make_transformer(asymmetric_transformer=False, contract_transformer=True)
-            #transformer = make_transformer(asymmetric_transformer=True, contract_transformer=False)
+            transformer = make_transformer(
+                asymmetric_transformer=False, contract_transformer=True
+            )
+            """
+            transformer = make_transformer(
+                affine_transformer=True,
+                asymmetric_transformer=False,
+                contract_transformer=False,
+            )
+            """
         if transformer.shape != () or transformer.cond_shape is not None:
             raise ValueError(
                 "Only unconditional transformers with shape () are supported."
@@ -464,12 +468,8 @@ class SparseTriangularMap(bijections.AbstractBijection):
             key, key_linear = jax.random.split(key)
             linear = eqx.nn.Linear(in_size, num_params, key=key_linear)
 
-            linear = eqx.tree_at(
-                lambda l: l.weight, linear, 1e-3 * linear.weight
-            )
-            linear = eqx.tree_at(
-                lambda l: l.bias, linear, 1e-3 * linear.bias
-            )
+            linear = eqx.tree_at(lambda l: l.weight, linear, 1e-3 * linear.weight)
+            linear = eqx.tree_at(lambda l: l.bias, linear, 1e-3 * linear.bias)
 
             mlp = eqx.nn.MLP(
                 in_size=in_size,
@@ -479,7 +479,7 @@ class SparseTriangularMap(bijections.AbstractBijection):
                 activation=nn_activation,
                 key=key,
             )
-            return mlp  #SumLinearAndMlp(linear, mlp)
+            return mlp  # SumLinearAndMlp(linear, mlp)
 
         keys = jax.random.split(key, max(n_buckets_eff, 1))
 
@@ -517,9 +517,7 @@ class SparseTriangularMap(bijections.AbstractBijection):
             group_sizes_b = np.bincount(levels_b, minlength=n_levels)
             max_group_b = int(group_sizes_b.max())
 
-            lvl_members = np.full(
-                (n_levels, max(max_group_b, 1)), dim, dtype=np.int32
-            )
+            lvl_members = np.full((n_levels, max(max_group_b, 1)), dim, dtype=np.int32)
             lvl_local = np.zeros((n_levels, max(max_group_b, 1)), dtype=np.int32)
             for lvl in range(n_levels):
                 idx = members_b[levels_b == lvl]
@@ -539,9 +537,7 @@ class SparseTriangularMap(bijections.AbstractBijection):
         self.bucket_parent_indices = tuple(
             jnp.asarray(m) for m in bucket_parent_indices
         )
-        self.bucket_level_members = tuple(
-            jnp.asarray(m) for m in bucket_level_members
-        )
+        self.bucket_level_members = tuple(jnp.asarray(m) for m in bucket_level_members)
         self.bucket_level_local_members = tuple(
             jnp.asarray(m) for m in bucket_level_local_members
         )
@@ -551,7 +547,9 @@ class SparseTriangularMap(bijections.AbstractBijection):
         self.n_levels = n_levels
         self.shape = (dim,)
 
-        self.jacobian_layout = _build_layout(self.bucket_members, self.bucket_parent_indices, level, dim)
+        self.jacobian_layout = _build_layout(
+            self.bucket_members, self.bucket_parent_indices, level, dim
+        )
 
     def _flat_params_to_transformer(self, params: Array):
         """Reshape to n x params_per_dim, then vmap."""
@@ -577,10 +575,14 @@ class SparseTriangularMap(bijections.AbstractBijection):
 
     def inverse_gradient_and_val(self, draw, grad, logp):
         def inverse_wrapper(y):
-            x, log_det, bucket_jacobian_rows, jacobian_diagonal = self.inverse_and_log_det_and_jacobian(y)
+            x, log_det, bucket_jacobian_rows, jacobian_diagonal = (
+                self.inverse_and_log_det_and_jacobian(y)
+            )
             return log_det, (x, bucket_jacobian_rows, jacobian_diagonal)
 
-        ((log_det, (x, bucket_jacobian_rows, jacobian_diagonal)), log_det_grad) = jax.value_and_grad(inverse_wrapper, has_aux=True)(draw)
+        ((log_det, (x, bucket_jacobian_rows, jacobian_diagonal)), log_det_grad) = (
+            jax.value_and_grad(inverse_wrapper, has_aux=True)(draw)
+        )
 
         edge_values = _flatten_edge_values(bucket_jacobian_rows, self.jacobian_layout)
 
@@ -602,7 +604,6 @@ class SparseTriangularMap(bijections.AbstractBijection):
         y_padded = jnp.concatenate([y, jnp.zeros((1,), y.dtype)])
 
         def differentiate_one_variable(conditioner, parent_values, own_value):
-
             @jax.profiler.annotate_function
             def transform_element(parents, value):
                 params = conditioner(parents)
