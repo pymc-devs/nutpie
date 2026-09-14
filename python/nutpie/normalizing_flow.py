@@ -933,8 +933,6 @@ class MaskedCoupling(bijections.AbstractBijection):
         )
 
 
-
-
 def make_mvscale(key, n_dim, size, randomize_base=False):
     def make_single_hh(key, idx):
         params = jax.random.normal(key, (n_dim,))
@@ -1266,8 +1264,7 @@ class Contract2(bijections.AbstractBijection):
         self.sigma = jnp.array(sigma)
         self.mu = jnp.array(mu)
         self.nu = jnp.array(nu)
-        self.shape = beta.shape
-        assert self.shape == ()
+        self.shape = ()
 
     def transform_and_log_det(
         self, x: ArrayLike, condition: ArrayLike | None = None
@@ -1287,11 +1284,11 @@ class Contract2(bijections.AbstractBijection):
         """
         eps = 1e-4
         if self.alpha is not None:
-            #gamma = jnp.exp(self.alpha)
+            # gamma = jnp.exp(self.alpha)
             gamma = self.alpha + jnp.sqrt(1 + self.alpha * self.alpha) + eps
         else:
             gamma = 1
-        #delta = jnp.exp(self.beta)
+        # delta = jnp.exp(self.beta)
         delta = self.beta + jnp.sqrt(1 + self.beta * self.beta) + eps
         sigma_mod = self.sigma + jnp.sqrt(1 + self.sigma * self.sigma) + eps
         mu = self.mu
@@ -1331,11 +1328,11 @@ class Contract2(bijections.AbstractBijection):
         """
         eps = 1e-4
         if self.alpha is not None:
-            #gamma = jnp.exp(self.alpha)
+            # gamma = jnp.exp(self.alpha)
             gamma = self.alpha + jnp.sqrt(1 + self.alpha * self.alpha) + eps
         else:
             gamma = 1
-        #delta = jnp.exp(self.beta)
+        # delta = jnp.exp(self.beta)
         delta = self.beta + jnp.sqrt(1 + self.beta * self.beta) + eps
         sigma_mod = self.sigma + jnp.sqrt(1 + self.sigma * self.sigma) + eps
         mu = self.mu
@@ -1350,7 +1347,6 @@ class Contract2(bijections.AbstractBijection):
 
         x, det = jax.jvp(inv_trafo, [y], [jnp.ones(())])
         return x, jnp.log(det)
-
 
 
 def _log_cosh(v):
@@ -1373,12 +1369,23 @@ class Contract2(bijections.AbstractBijection):
             self.alpha = jnp.array(alpha)
         else:
             self.alpha = None
-        self.beta = jnp.array(beta)
-        self.sigma = jnp.array(sigma)
-        self.mu = jnp.array(mu)
-        self.nu = jnp.array(nu)
-        self.shape = beta.shape
-        assert self.shape == ()
+        if beta is not None:
+            self.beta = jnp.array(beta)
+        else:
+            self.beta = None
+        if sigma is not None:
+            self.sigma = jnp.array(sigma)
+        else:
+            self.sigma = None
+        if mu is not None:
+            self.mu = jnp.array(mu)
+        else:
+            self.mu = None
+        if nu is not None:
+            self.nu = jnp.array(nu)
+        else:
+            self.nu = None
+        self.shape = ()
 
     def _log_params(self):
         """log gamma, log delta, log sigma_mod.
@@ -1389,8 +1396,17 @@ class Contract2(bijections.AbstractBijection):
         if self.alpha is not None:
             log_gamma = jnp.arcsinh(self.alpha)
         else:
-            log_gamma = jnp.zeros_like(self.beta)
-        return log_gamma, jnp.arcsinh(self.beta), jnp.arcsinh(self.sigma)
+            log_gamma = jnp.zeros(())
+        if self.beta is not None:
+            log_beta = jnp.arcsinh(self.beta)
+        else:
+            log_beta = jnp.zeros(())
+        if self.sigma is not None:
+            log_sigma = jnp.arcsinh(self.sigma)
+        else:
+            log_sigma = jnp.zeros(())
+
+        return log_gamma, log_beta, log_sigma
 
     def transform_and_log_det(
         self, x: ArrayLike, condition: ArrayLike | None = None
@@ -1408,11 +1424,17 @@ class Contract2(bijections.AbstractBijection):
         log_gamma, log_delta, log_sigma = self._log_params()
         gamma = jnp.exp(log_gamma)
 
-        centred = x - self.nu
+        if self.nu is not None:
+            centred = x - self.nu
+        else:
+            centred = x
         u = jnp.arcsinh(centred / 2)
         arg = gamma * u + 2.0 * log_delta
 
-        y = 2.0 * jnp.exp(log_sigma - log_gamma) * jnp.sinh(arg) + self.mu
+        y = 2.0 * jnp.exp(log_sigma - log_gamma) * jnp.sinh(arg)
+
+        if self.mu is not None:
+            y = y + self.mu
         log_det = log_sigma + _log_cosh(arg) - _log_cosh(u)
         return y, log_det
 
@@ -1432,15 +1454,24 @@ class Contract2(bijections.AbstractBijection):
         log_gamma, log_delta, log_sigma = self._log_params()
         gamma = jnp.exp(log_gamma)
 
-        half_a = jnp.exp(log_gamma - log_sigma) * (y - self.mu) / 2.0
+        if self.nu is None:
+            nu = jnp.zeros(())
+        else:
+            nu = self.nu
+
+        if self.mu is None:
+            mu = jnp.zeros(())
+        else:
+            mu = self.mu
+
+        half_a = jnp.exp(log_gamma - log_sigma) * (y - mu) / 2.0
         arg = jnp.arcsinh(half_a)  # == gamma*u + 2*log(delta)
         u = (arg - 2.0 * log_delta) / gamma
 
-        x = 2.0 * jnp.sinh(u) + self.nu
+        x = 2.0 * jnp.sinh(u) + nu
         # logcosh(asinh(half_a)) = 0.5*log1p(half_a**2)
         log_det = _log_cosh(u) - log_sigma - 0.5 * jnp.log1p(half_a * half_a)
         return x, log_det
-
 
 
 class DipBij(bijections.AbstractBijection):
@@ -2093,13 +2124,18 @@ def make_sparse_triangular_map(
         )
         layer = init_conditioners_from_precision(layer, precision, center)
 
-    # `Sandwich(inner, outer)` computes `outer^{-1} . inner . outer`, and
-    # `Permute(p)` maps `x -> x[p]`. We need the outer permutation to move
-    # the original variables into the `order` positions the reindexed
-    # `sparsity_sorted` assumes, i.e. `x -> x[order]`, so the permutation is
-    # `order` itself (not its reverse, and not its inverse: the inverse is
-    # applied by the `Sandwich` on the way out).
-    return bijections.Sandwich(layer, bijections.Permute(jnp.asarray(order)))
+    layer = bijections.Sandwich(layer, bijections.Permute(jnp.asarray(order)))
+
+    #"""
+    contract = eqx.filter_vmap(
+        #lambda: Contract2(jnp.zeros(()), jnp.zeros(()), jnp.zeros(()), jnp.zeros(()), jnp.zeros(())),
+        lambda: Contract2(None, jnp.zeros(()), None, None, None),
+        axis_size=len(order),
+    )()
+    contract = bijections.Vmap(contract, in_axes=eqx.if_array(0))
+    contract = bijections.Invert(contract)
+    #"""
+    return bijections.Chain([layer, contract])
 
 
 def _pattern_lower_indices(pattern):
