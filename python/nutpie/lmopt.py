@@ -36,13 +36,32 @@ def codec(block):
 
 def blocks_of(tree):
     """Parameter blocks: one per conditioner bucket, plus the affine tail."""
-    return list(tree.bijection.bijections[0].inner.conditioners) + [tree.bijection.bijections[1]]
+    # return list(tree.bijection.bijections[0].inner.conditioners) + [tree.bijection.bijections[1]]
+    return [
+        *tree.bijection.bijections[0].bijections[0].inner.conditioners,
+        (
+            tree.bijection.bijections[1],
+            tree.bijection.bijections[0].bijections[1],
+        ),
+    ]
 
 
 def rebuild(tree, blocks):
     """Inverse of blocks_of."""
-    tree = eqx.tree_at(lambda t: t.bijection.bijections[0].inner.conditioners,
-                       tree, tuple(blocks[:-1]))
+    tree = eqx.tree_at(
+        lambda t: t.bijection.bijections[0].bijections[0].inner.conditioners,
+        tree,
+        tuple(blocks[:-1]),
+    )
+    tree = eqx.tree_at(lambda t: t.bijection.bijections[1], tree, blocks[-1][0])
+    tree = eqx.tree_at(
+        lambda t: t.bijection.bijections[0].bijections[1], tree, blocks[-1][1]
+    )
+    return tree
+
+    tree = eqx.tree_at(
+        lambda t: t.bijection.bijections[0].inner.conditioners, tree, tuple(blocks[:-1])
+    )
     return eqx.tree_at(lambda t: t.bijection.bijections[1], tree, blocks[-1])
 
 
@@ -315,8 +334,12 @@ def get_plans(params, m=128, q_min=16):
     key = _plans_signature(params, m, q_min)
     if key not in _plans_cache:
         bs = blocks_of(params)
-        label_fns = [mlp_unit_labels] * (len(bs) - 1) + [None]   # affine tail: no units
-        _plans_cache[key] = [make_plan(b, m, lf, q_min) for b, lf in zip(bs, label_fns)]
+        label_fns = [mlp_unit_labels] * (len(bs) - 1) + [
+            None,
+            #None,
+        ]  # affine tail: no units
+
+        _plans_cache[key] = [make_plan(b, m, lf, q_min) for b, lf in zip(bs, label_fns, strict=True)]
     return _plans_cache[key]
 
 
