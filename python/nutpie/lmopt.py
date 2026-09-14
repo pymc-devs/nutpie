@@ -41,7 +41,7 @@ def blocks_of(tree):
         *tree.bijection.bijections[0].bijections[0].inner.conditioners,
         (
             tree.bijection.bijections[1],
-            tree.bijection.bijections[0].bijections[1],
+            #tree.bijection.bijections[0].bijections[1],
         ),
     ]
 
@@ -54,9 +54,9 @@ def rebuild(tree, blocks):
         tuple(blocks[:-1]),
     )
     tree = eqx.tree_at(lambda t: t.bijection.bijections[1], tree, blocks[-1][0])
-    tree = eqx.tree_at(
-        lambda t: t.bijection.bijections[0].bijections[1], tree, blocks[-1][1]
-    )
+    #tree = eqx.tree_at(
+    #    lambda t: t.bijection.bijections[0].bijections[1], tree, blocks[-1][1]
+    #)
     return tree
 
     tree = eqx.tree_at(

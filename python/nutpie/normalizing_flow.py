@@ -2126,16 +2126,16 @@ def make_sparse_triangular_map(
 
     layer = bijections.Sandwich(layer, bijections.Permute(jnp.asarray(order)))
 
-    #"""
+    """
     contract = eqx.filter_vmap(
-        #lambda: Contract2(jnp.zeros(()), jnp.zeros(()), jnp.zeros(()), jnp.zeros(()), jnp.zeros(())),
-        lambda: Contract2(None, jnp.zeros(()), None, None, None),
+        lambda: Contract2(jnp.zeros(()), jnp.zeros(()), jnp.zeros(()), jnp.zeros(()), jnp.zeros(())),
+        #lambda: Contract2(None, None, None, None, jnp.zeros(())),
         axis_size=len(order),
     )()
     contract = bijections.Vmap(contract, in_axes=eqx.if_array(0))
-    contract = bijections.Invert(contract)
-    #"""
-    return bijections.Chain([layer, contract])
+    #contract = bijections.Invert(contract)
+    """
+    return bijections.Chain([layer])
 
 
 def _pattern_lower_indices(pattern):
