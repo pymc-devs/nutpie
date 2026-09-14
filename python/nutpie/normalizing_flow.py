@@ -45,6 +45,7 @@ def _generate_sequences(k, r_vals):
         all_sequences.append(sequences)
     return np.concatenate(all_sequences, axis=0)
 
+
 def _max_run_length(seq):
     """
     Given a 1D boolean NumPy array 'seq', compute the maximum run length of consecutive
@@ -1582,7 +1583,7 @@ def make_transformer(
             )
             elemwises.append(bijections.Invert(affine))
 
-    if isinstance(contract_transformer, bool):
+    if isinstance(contract_transformer, bool) and contract_transformer:
         elemwises.append(
             Contract2(
                 jnp.zeros(()),
@@ -2201,9 +2202,7 @@ def fisher_optimal_precision(
     centered_grads = grads - grad_mean
 
     # Empirical covariance, evaluated only on the pattern.
-    sigma_vals = (
-        centered_draws[:, rows] * centered_draws[:, cols]
-    ).sum(0) / n_draws
+    sigma_vals = (centered_draws[:, rows] * centered_draws[:, cols]).sum(0) / n_draws
 
     def to_matrix(theta):
         lower = sp.coo_matrix((theta, (rows, cols)), shape=(dim, dim))
@@ -2234,9 +2233,7 @@ def fisher_optimal_precision(
     # Start from the diagonal geometric mean, which is the exact solution
     # when the pattern is empty and a feasible (positive definite) point
     # otherwise.
-    diag0 = np.sqrt(
-        centered_grads.var(0) / np.maximum(centered_draws.var(0), 1e-300)
-    )
+    diag0 = np.sqrt(centered_grads.var(0) / np.maximum(centered_draws.var(0), 1e-300))
     theta0 = np.where(is_diag, diag0[rows], 0.0)
 
     result = minimize(
@@ -2310,7 +2307,11 @@ def init_conditioners_from_precision(
         members = np.asarray(layer.bucket_members[bucket])
         parents = np.asarray(layer.bucket_parent_indices[bucket])
 
-        linear = conditioner.linear if isinstance(conditioner, SumLinearAndMlp) else conditioner
+        linear = (
+            conditioner.linear
+            if isinstance(conditioner, SumLinearAndMlp)
+            else conditioner
+        )
         weight = np.zeros(linear.weight.shape, dtype=np.float64)
         bias = np.zeros(linear.bias.shape, dtype=np.float64)
 
@@ -2318,15 +2319,19 @@ def init_conditioners_from_precision(
         # padded slots keep a zero weight.
         valid = parents < dim
         rows = np.broadcast_to(members[:, None], parents.shape)
-        weight[:, 0, :] = np.where(valid, factor[rows, np.minimum(parents, dim - 1)], 0.0)
+        weight[:, 0, :] = np.where(
+            valid, factor[rows, np.minimum(parents, dim - 1)], 0.0
+        )
         bias[:, 0] = intercept[members]
         bias[:, 1] = scale_params[members]
 
         linear = eqx.tree_at(
             lambda net: (net.weight, net.bias),
             linear,
-            (jnp.asarray(weight, dtype=linear.weight.dtype),
-             jnp.asarray(bias, dtype=linear.bias.dtype)),
+            (
+                jnp.asarray(weight, dtype=linear.weight.dtype),
+                jnp.asarray(bias, dtype=linear.bias.dtype),
+            ),
         )
 
         if isinstance(conditioner, SumLinearAndMlp):
@@ -2336,16 +2341,16 @@ def init_conditioners_from_precision(
             # layer is zeroed, so hidden layers -- and the gradients flowing
             # back through them -- keep their normal scale.
             conditioner = eqx.tree_at(
-                lambda net: net.mlp, conditioner, _scale_last_layer(conditioner.mlp, 0.0)
+                lambda net: net.mlp,
+                conditioner,
+                _scale_last_layer(conditioner.mlp, 0.0),
             )
             conditioner = eqx.tree_at(lambda net: net.linear, conditioner, linear)
         else:
             conditioner = linear
         conditioners.append(conditioner)
 
-    return eqx.tree_at(
-        lambda layer: layer.conditioners, layer, tuple(conditioners)
-    )
+    return eqx.tree_at(lambda layer: layer.conditioners, layer, tuple(conditioners))
 
 
 def make_flow(
