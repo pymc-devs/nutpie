@@ -10,6 +10,9 @@ from flowjax import bijections
 import equinox as eqx
 
 
+CHECKPOINT_LEVEL_SCAN = True
+
+
 def _min_waste_buckets(counts: np.ndarray, n_buckets: int) -> np.ndarray:
     """Partition `counts` into at most `n_buckets` groups, minimizing the
     total padding waste ``sum(group_max - value)`` that results from padding
@@ -236,8 +239,13 @@ def _solve_triangular_sparse(edge_values, jacobian_diagonal, layout, rhs):
         solution = solution.at[members].set(updated, mode="drop", unique_indices=True)
         return solution, None
 
+    # Reverse-mode through this scan stacks one carry per elimination level, so
+    # the tape grows with the DAG's critical-path depth. Remat keeps only the
+    # per-level inputs and replays the body, at one extra forward sweep.
+    body = jax.checkpoint(eliminate_level) if CHECKPOINT_LEVEL_SCAN else eliminate_level
+
     solution, _ = jax.lax.scan(
-        eliminate_level,
+        body,
         jnp.zeros_like(rhs),
         (layout.level_members, layout.level_edge_index, layout.level_edge_target_slot),
         reverse=True,
@@ -407,15 +415,11 @@ class SparseTriangularMap(bijections.AbstractBijection):
             from nutpie.normalizing_flow import make_transformer
 
             transformer = make_transformer(
-                asymmetric_transformer=False, contract_transformer=True
-            )
-            """
-            transformer = make_transformer(
-                affine_transformer=True,
+                affine_transformer=False,
                 asymmetric_transformer=False,
-                contract_transformer=False,
+                contract_transformer=1,
+                #log_gamma_bounds=(-3, 3),
             )
-            """
         if transformer.shape != () or transformer.cond_shape is not None:
             raise ValueError(
                 "Only unconditional transformers with shape () are supported."
