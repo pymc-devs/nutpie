@@ -44,6 +44,9 @@ _BIJECTION_TRACE = []
 _LOG_STOP_VALUE = -5
 _LOG_SKIP_TRAINING_VALUE = -4
 
+# Remat toggle for the per-draw residual, see `FisherLoss.residuals`.
+CHECKPOINT_RESIDUAL = True
+
 def fit_to_data(
     key: PRNGKeyArray,
     dist: PyTree,  # Custom losses may support broader types than AbstractDistribution
@@ -65,7 +68,9 @@ def fit_to_data(
     method: str = "adam",
     solver_rtol: float = 1e-3,
     solver_atol: float = 1e-6,
-    lm_linear_steps: int = 20,
+    lm_linear_steps: int = 300,
+    lm_min_loss: float = float(np.exp(-3)),
+    lm_probe_batch: int = 32,
 ):
     r"""Train a distribution (e.g. a flow) to samples from the target distribution.
 
@@ -107,11 +112,27 @@ def fit_to_data(
             check. Only used when ``method`` is ``"lbfgs"`` or ``"lm"``.
         solver_atol: Absolute tolerance used by the L-BFGS/LM solver's convergence
             check. Only used when ``method`` is ``"lbfgs"`` or ``"lm"``.
-        lm_linear_steps: Number of matrix-free CG steps used to solve the
+        lm_linear_steps: Cap on the matrix-free CG steps used to solve the
             Gauss-Newton normal equations at each LM iteration (the Jacobian is
-            far too large to factorize explicitly, so a small fixed number of
-            Jacobian-vector-product steps is used instead). Only used when
-            ``method`` is ``"lm"``.
+            far too large to factorize explicitly, so Jacobian-vector-product
+            steps are used instead). This is `lmopt.step`'s ``cg_max``: CG stops
+            earlier when it converges, so raising it costs nothing on the steps
+            that do converge. Steps that hit the cap are solving a system they
+            did not finish, and show as ``cg=<n>*`` in the fit log. Only used
+            when ``method`` is ``"lm"``.
+        lm_probe_batch: How many of the Rademacher probes used to estimate the
+            block preconditioner are taken at once. This is the main memory
+            knob of an LM step: each concurrent probe carries a full reverse
+            pass through the residual function, so peak memory scales with it
+            (and multiplies with the residual function's own internal
+            batching). Lowering it trades sequential chunks for peak memory at
+            no extra FLOPs. Only used when ``method`` is ``"lm"``.
+        lm_min_loss: Stop the LM fit once the Fisher divergence falls below
+            this. Note that the divergence is a *sum* over dimensions, so this
+            is an absolute, dimension-independent target: it bounds each
+            individual direction's misfit regardless of model size, and a
+            larger model therefore has to work harder to reach it. Only used
+            when ``method`` is ``"lm"``.
 
     Returns:
         A tuple containing the trained distribution and the losses.
@@ -132,7 +153,15 @@ def fit_to_data(
 
     if method in ("lbfgs", "lm"):
         fit_solver = _fit_lbfgs if method == "lbfgs" else _fit_lm
-        extra_kwargs = {"linear_steps": lm_linear_steps} if method == "lm" else {}
+        extra_kwargs = (
+            {
+                "linear_steps": lm_linear_steps,
+                "min_loss": lm_min_loss,
+                "probe_batch": lm_probe_batch,
+            }
+            if method == "lm"
+            else {}
+        )
         params, loss_val = fit_solver(
             params,
             static,
@@ -249,34 +278,38 @@ def res_fn(params, args):
     return loss_fn.residuals(params, *args)
 
 #@eqx.filter_jit
-def _fit_lm(params, static, data, loss_fn, *, max_steps, rtol, atol, linear_steps):
+def _fit_lm(
+    params,
+    static,
+    data,
+    loss_fn,
+    *,
+    max_steps,
+    rtol,
+    atol,
+    linear_steps,
+    min_loss,
+    probe_batch,
+):
     if not hasattr(loss_fn, "residuals"):
         raise ValueError(
             "method='lm' requires loss_fn to have a `residuals` method "
             "(e.g. FisherLoss with gamma=None)."
         )
 
-    if False:
-        def residual_fn(params, args):
-            return loss_fn.residuals(params, static, *args)
-
-        # The Jacobian of the flow's residuals w.r.t. its (many) parameters is far
-        # too large to form and factorize explicitly (the default QR linear
-        # solver would do exactly that). Instead, solve the Gauss-Newton normal
-        # equations matrix-free with a small, fixed number of CG steps, using
-        # only Jacobian-vector / vector-Jacobian products.
-        linear_solver = lx.Normal(lx.CG(rtol=rtol, atol=atol, max_steps=linear_steps))
-        solver = optx.LevenbergMarquardt(rtol=rtol, atol=atol, linear_solver=linear_solver)
-        #solver = optx.LevenbergMarquardt(rtol=rtol, atol=atol)
-        sol = optx.least_squares(
-            residual_fn, solver, params, args=data, max_steps=max_steps, throw=False
-        )
-        loss_val = loss_fn(sol.value, static, *data)
-        return sol.value, loss_val
-
     from nutpie.lmopt import fit
 
-    theta, hist = fit(params, res_fn, (loss_fn, static, *data), n_steps=max_steps, verbose=True, min_loss=np.exp(-3), precondition=True)
+    theta, hist = fit(
+        params,
+        res_fn,
+        (loss_fn, static, *data),
+        n_steps=max_steps,
+        verbose=True,
+        min_loss=min_loss,
+        cg_max=linear_steps,
+        batch=probe_batch,
+        precondition=True,
+    )
 
     return theta, hist[-1]["F_new"]
 
@@ -411,6 +444,42 @@ def inverse_gradient_and_val(bijection, draw, grad, logp, *, naive=False):
         return (x, x_grad, logp + fwd_log_det)
 
 
+def _huberise(residuals, delta):
+    """Rescale each draw's residual vector so its squared norm is Huber's.
+
+    The Fisher divergence is a sum of squares, so a draw whose whitened
+    residual norm is ``s`` contributes ``s**2`` -- one draw at ``s = 1e6``
+    outweighs a million draws at ``s = 1``, and the fit ends up describing the
+    outliers rather than the posterior. This rescales each draw's residual
+    vector by ``sqrt(2 * huber(s)) / s``, so its squared norm becomes exactly
+    ``2 * huber(s)``: unchanged below ``delta``, and growing linearly in ``s``
+    rather than quadratically above it.
+
+    Differentiating through the rescaled vector gives the *exact* Huber
+    gradient -- from ``||r_tilde||**2 == 2 huber(s)`` it follows that
+    ``r_tilde . dr_tilde/ds == huber'(s)`` -- while the Gauss-Newton model
+    built from the rescaled Jacobian is the usual IRLS approximation, which is
+    what LM wants anyway.
+
+    Robustness is per *draw*, not per coordinate, because that is the failure
+    mode: a draw deep in a funnel neck has a large residual in many
+    coordinates at once. Note the cost -- those draws are exactly the hard
+    region of the posterior, so a ``delta`` set too low buys a well-behaved
+    fit that ignores the part of the space the sampler most needs help with.
+    """
+    square_norm = jnp.sum(residuals**2, axis=-1, keepdims=True)
+    # Clamped from below so the `otherwise` branch stays finite (and carries
+    # zero gradient) wherever `where` discards it; an unclamped sqrt at
+    # ``s = 0`` would put a NaN into the cotangent regardless of the branch.
+    norm = jnp.sqrt(jnp.maximum(square_norm, delta**2))
+    scale = jnp.where(
+        square_norm <= delta**2,
+        1.0,
+        jnp.sqrt(2.0 * delta * norm - delta**2) / norm,
+    )
+    return residuals * scale
+
+
 class FisherLoss(eqx.Module):
     """Fisher-divergence training loss.
 
@@ -427,11 +496,25 @@ class FisherLoss(eqx.Module):
     ``TransformAdapter``). It is a genuine pytree leaf (not a plain Python
     attribute) so that updating it does not trigger recompilation of jitted
     training steps that close over this loss.
+
+    ``residual_batch_size`` chunks `residuals` over draws: it is the memory
+    knob of the LM path's residual evaluation, and it *multiplies* with
+    `lmopt.build_blocks`' own probe batching, since each concurrent probe
+    carries a full reverse pass through this function. ``None`` restores the
+    unchunked `jax.vmap`, which is fastest and uses the most memory. It is a
+    static field, so changing it triggers a recompile.
+
+    ``huber_delta`` optionally robustifies `residuals` against draws that
+    dominate the fit, see `_huberise`. ``__call__`` deliberately keeps
+    reporting the *raw* divergence either way, so numbers stay comparable
+    across windows and across the setting; only what LM minimises changes.
     """
 
     gamma: float | None = eqx.field(static=True, default=None)
     log_inside_batch: bool = eqx.field(static=True, default=False)
     target_norm: jax.Array = eqx.field(converter=jnp.asarray, default=1.0)
+    residual_batch_size: int | None = eqx.field(static=True, default=256)
+    huber_delta: float | None = eqx.field(static=True, default=None)
 
     @eqx.filter_jit
     def __call__(
@@ -545,10 +628,33 @@ class FisherLoss(eqx.Module):
             )
             return draw + grad
 
-        #residuals = jax.vmap(compute_residual)((draws, grads, logps))
-        residuals = jax.lax.map(
-            compute_residual, (draws, grads, logps), batch_size=256
+        # `jax.vjp(res_fn, theta)` in `lmopt.step` otherwise saves every draw's
+        # intermediates, and `inverse_gradient_and_val` nests autodiff (an inner
+        # `value_and_grad` w.r.t. the draw inside the outer one w.r.t. the
+        # parameters), so the tape holds the inner forward *and* backward. That
+        # is `O(n_draws * n_dim * c)` and -- unlike peak working memory -- it
+        # does not shrink with `residual_batch_size`, because reverse-mode
+        # through `lax.map` stacks residuals across all chunks. Remat trades it
+        # for one extra forward per draw.
+        #
+        # Note the cost here is not the usual ~1.3x: `vjpf` is built once and
+        # applied `m` times in `build_blocks` plus once per CG iteration, and
+        # each application re-runs the checkpointed forward rather than reusing
+        # a saved tape.
+        compute = (
+            jax.checkpoint(compute_residual)
+            if CHECKPOINT_RESIDUAL
+            else compute_residual
         )
+
+        if self.residual_batch_size is None:
+            residuals = jax.vmap(compute)((draws, grads, logps))
+        else:
+            residuals = jax.lax.map(
+                compute,
+                (draws, grads, logps),
+                batch_size=self.residual_batch_size,
+            )
         n_draws = draws.shape[0]
         return residuals / jnp.sqrt(n_draws)
 
@@ -688,7 +794,10 @@ class TransformAdapter:
         method="adam",
         solver_rtol=1e-3,
         solver_atol=1e-6,
-        lm_linear_steps=20,
+        lm_linear_steps=300,
+        lm_min_loss=float(np.exp(-3)),
+        lm_probe_batch=32,
+        lm_residual_batch=256,
     ):
         self._logp_fn = logp_fn
         self._make_flow_fn = make_flow_fn
@@ -704,7 +813,9 @@ class TransformAdapter:
         else:
             self._make_optimizer = make_optimizer
         self._optimizer = self._make_optimizer()
-        self._loss_fn = FisherLoss(gamma, log_inside_batch)
+        self._loss_fn = FisherLoss(
+            gamma, log_inside_batch, residual_batch_size=lm_residual_batch
+        )
         self._fisher_ema = None
         self._fisher_ema_alpha = fisher_ema_alpha
         self._show_progress = show_progress
@@ -727,6 +838,8 @@ class TransformAdapter:
         self._solver_rtol = solver_rtol
         self._solver_atol = solver_atol
         self._lm_linear_steps = lm_linear_steps
+        self._lm_min_loss = lm_min_loss
+        self._lm_probe_batch = lm_probe_batch
 
         if extension_windows is None:
             self._extension_windows = []
@@ -989,6 +1102,8 @@ class TransformAdapter:
                 solver_rtol=self._solver_rtol,
                 solver_atol=self._solver_atol,
                 lm_linear_steps=self._lm_linear_steps,
+                lm_min_loss=self._lm_min_loss,
+                lm_probe_batch=self._lm_probe_batch,
             )
 
             flow = flowjax.flows.Transformed(
@@ -1204,7 +1319,10 @@ def make_transform_adapter(
     method="adam",
     solver_rtol=1e-3,
     solver_atol=1e-6,
-    lm_linear_steps=20,
+    lm_linear_steps=300,
+    lm_min_loss=float(np.exp(-3)),
+    lm_probe_batch=32,
+    lm_residual_batch=256,
 ):
     if extension_windows is None:
         extension_windows = []
@@ -1257,4 +1375,7 @@ def make_transform_adapter(
         solver_rtol=solver_rtol,
         solver_atol=solver_atol,
         lm_linear_steps=lm_linear_steps,
+        lm_min_loss=lm_min_loss,
+        lm_probe_batch=lm_probe_batch,
+        lm_residual_batch=lm_residual_batch,
     )

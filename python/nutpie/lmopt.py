@@ -173,7 +173,57 @@ def pcg(Av, Minv, b, x0, tol, maxiter):
 # and can't trigger a recompile.
 
 
-def build_blocks(vjpf, shape, key, plans, m, batch=32):
+def capture_fractions(Gs, m):
+    """Fraction of ``||J^T J||_F^2`` that each level of blocking captures.
+
+    Answers whether the block-diagonal preconditioner is leaving anything on
+    the table, and if so *where*, by splitting the mass three ways:
+
+    * ``sub_block`` -- what `apply_Minvs` actually uses today, one block per
+      (conditioner, sub-block).
+    * ``conditioner`` -- what it would capture with ``G = 1``, i.e. if `m` were
+      raised until `make_plan` stopped splitting conditioners. The gap to
+      ``sub_block`` is exactly what removing the split would buy.
+    * the remainder up to 1 is coupling *between* conditioners, which no
+      block-diagonal preconditioner can see at any `m`; that is the part a
+      low-rank/Nystrom correction would have to supply.
+
+    The naive estimate is badly biased: ``Hhat`` is a Hutchinson average, so
+    its off-diagonal mass contains estimator noise of order ``tr(H)^2 / m``,
+    which at this parameter count swamps the signal and would make the block
+    diagonal look far worse than it is. So the probes are split into
+    independent halves and the cross term ``tr(Hhat_1 Hhat_2)`` is used, which
+    is unbiased for ``||H||_F^2`` because the halves are independent.
+
+    Everything is computed from the ``m x m`` cross-Gram of the two halves
+    rather than from ``P x P`` blocks: ``tr(Hhat_1 Hhat_2) = ||A_1 A_2^T||_F^2
+    / (m_1 m_2)``, and the ``1 / (m_1 m_2)`` cancels in the ratios. Summing
+    that cross-Gram over sub-blocks gives the conditioner level and over
+    everything gives the total, so one einsum per bucket yields all three.
+
+    Both ratios are non-negative (each level is a trace of a product of PSD
+    matrices) but are estimates, so they can exceed 1 by noise.
+    """
+    half = m // 2
+    sub_mass = jnp.zeros(())
+    conditioner_mass = jnp.zeros(())
+    total_cross = jnp.zeros((half, half))
+    for G in Gs:
+        first, second = G[:half], G[half : 2 * half]
+        # (n, G, m_1, m_2); the largest array here, so this is a diagnostic to
+        # run occasionally rather than every step.
+        cross = jnp.einsum("sngi,tngi->ngst", first, second)
+        sub_mass = sub_mass + jnp.sum(cross**2)
+        conditioner_mass = conditioner_mass + jnp.sum(jnp.sum(cross, axis=1) ** 2)
+        total_cross = total_cross + jnp.sum(cross, axis=(0, 1))
+    total = jnp.sum(total_cross**2)
+    return {
+        "sub_block": sub_mass / total,
+        "conditioner": conditioner_mass / total,
+    }
+
+
+def build_blocks(vjpf, shape, key, plans, m, batch=32, capture=False):
     """[ (n_j, G_j, q_j, q_j) ] per bucket, estimated from m VJPs.
 
     E[(G^T w)(G^T w)^T] = G^T G for isotropic w, so a single VJP updates every
@@ -182,6 +232,20 @@ def build_blocks(vjpf, shape, key, plans, m, batch=32):
     it here too would make XLA build and optimize a second, identical copy of
     the residual function's forward+backward graph, which measurably bloats
     compile time.
+
+    The Gram is accumulated chunk by chunk rather than by stacking every probe
+    and contracting once at the end. `jax.lax.map`'s ``batch_size`` bounds how
+    many probes are *computed* concurrently but still materializes all ``m`` of
+    them, so the stacked probes cost ``m * P`` -- twice the blocks they are
+    only an intermediate for, and the largest array in a step. Accumulating
+    reduces that to ``batch * P`` transient, leaving the blocks themselves as
+    the peak. Note this means ``batch`` now bounds peak memory properly;
+    before, lowering it capped concurrency while the ``m * P`` stack remained.
+
+    `capture` needs the individual probes, since `capture_fractions` cross-
+    multiplies two independent halves, so it takes the stacking path and pays
+    the ``m * P``. That is the diagnostic's price, and another reason to run it
+    occasionally rather than on every step.
     """
 
     def one(k):
@@ -189,8 +253,38 @@ def build_blocks(vjpf, shape, key, plans, m, batch=32):
         g = vjpf(w)[0]
         return [_gather(p["flatten"](b), p) for b, p in zip(blocks_of(g), plans)]
 
-    Gs = jax.lax.map(one, jr.split(key, m), batch_size=batch)
-    return [jnp.einsum("tngi,tngj->ngij", G, G) / m for G in Gs]
+    keys = jr.split(key, m)
+
+    if capture:
+        Gs = jax.lax.map(one, keys, batch_size=batch)
+        blocks = [jnp.einsum("tngi,tngj->ngij", G, G) / m for G in Gs]
+        return blocks, capture_fractions(Gs, m)
+
+    def chunk_gram(chunk_keys):
+        return [
+            jnp.einsum("tngi,tngj->ngij", G, G) for G in jax.vmap(one)(chunk_keys)
+        ]
+
+    # (n, G, q) per bucket -> (n, G, q, q) accumulators, from shapes alone.
+    totals = [
+        jnp.zeros(spec.shape + spec.shape[-1:], spec.dtype)
+        for spec in jax.eval_shape(one, keys[0])
+    ]
+
+    n_chunks, remainder = divmod(m, batch)
+    if n_chunks:
+
+        def accumulate(carry, chunk_keys):
+            return [c + g for c, g in zip(carry, chunk_gram(chunk_keys))], None
+
+        totals, _ = jax.lax.scan(
+            accumulate, totals, keys[: n_chunks * batch].reshape(n_chunks, batch)
+        )
+    if remainder:
+        tail = chunk_gram(keys[n_chunks * batch :])
+        totals = [c + g for c, g in zip(totals, tail)]
+
+    return [total / m for total in totals], None
 
 
 def block_diagonal(blocks, plans, template):
@@ -323,7 +417,7 @@ def step(
     r,
     lam,
     key,
-    m=128,
+    m=256,
     batch=32,
     precondition=True,
     cg_tol=1e-2,
@@ -333,9 +427,10 @@ def step(
     good_rho=0.75,
     lam_down=3.0,
     lam_up=4.0,
-    lam_min=1e-10,
+    lam_min=None,
     lam_max=1e10,
     damping="marquardt",
+    capture_diagnostic=False,
 ):
     """One LM step.  res_fn and plans are static under eqx.filter_jit; plans
     is built once via get_plans and cached by parameter structure, so its
@@ -350,9 +445,17 @@ def step(
         raise ValueError(
             f"Unknown damping {damping!r}, expected 'marquardt' or 'absolute'."
         )
+    if lam_min is None:
+        # Under Marquardt damping `lam` is dimensionless -- a fraction of each
+        # block's own curvature -- so the 1e-10 that made sense for absolute
+        # damping means "undamped to well below double precision", and CG ends
+        # up solving a near-singular system to a tolerance it cannot reach.
+        lam_min = 1e-6 if damping == "marquardt" else 1e-10
 
     if precondition:
-        Hb = build_blocks(vjpf, r.shape, key, plans, m, batch)
+        Hb, capture = build_blocks(
+            vjpf, r.shape, key, plans, m, batch, capture=capture_diagnostic
+        )
         if damping == "marquardt":
             D = block_diagonal(Hb, plans, theta)
             floor = marquardt_floor(D)
@@ -364,7 +467,7 @@ def step(
     else:
         # Without the block estimates there is no per-parameter curvature to
         # scale by, so Marquardt damping is not available here.
-        Hb = D = None
+        Hb = D = capture = None
         Minv = lambda v: v
 
     jvp = lambda v: jax.jvp(res_fn_args, (theta,), (v,))[1]
@@ -418,6 +521,8 @@ def step(
         "step_norm": tnorm(p),
         "finite": ok,
     }
+    if capture is not None:
+        info["capture"] = capture
     # Diagnostics only -- `fit` never prints these -- but a second full batched
     # eigendecomposition per step, hitting the same cuSOLVER workspace limit as
     # `_block_inv` used to. Off by default; flip to re-enable.
@@ -488,7 +593,11 @@ def fit(
     verbose=True,
     precondition=True,
     min_loss=None,
+    cg_max=300,
+    batch=32,
     damping="marquardt",
+    lam_min=None,
+    capture_diagnostic=False,
 ):
     """Levenberg-Marquardt fit.
 
@@ -498,6 +607,13 @@ def fit(
     different things under the two -- under ``"marquardt"`` `lam` is
     dimensionless, scaled by each block's own curvature -- so `lam` traces are
     not comparable across the choice and `lam0` may want retuning.
+
+    `batch` is `build_blocks`' probe concurrency: how many of the `m` Rademacher
+    VJPs are taken at once. It is the main memory knob of a step, because each
+    concurrent probe carries a full reverse pass through the residual function,
+    and that cost multiplies with whatever batching the residual function does
+    internally. Lowering it trades sequential chunks (`m / batch`) for peak
+    memory at no extra FLOPs.
     """
     if precondition:
         plans = setup(params, m)
@@ -532,7 +648,11 @@ def fit(
             m=m,
             precondition=precondition,
             p_prev=p_prev,
+            cg_max=cg_max,
+            batch=batch,
             damping=damping,
+            lam_min=lam_min,
+            capture_diagnostic=capture_diagnostic,
         )
         hist.append(info)
         if verbose:
@@ -542,7 +662,14 @@ def fit(
                 f"rho={float(info['rho']):+.2f}  lam={float(info['lam_out']):.1e}  "
                 f"cg={int(info['n_cg']):3d}{'' if info['cg_converged'] else '*'}  "
                 f"|g|={float(info['grad_norm']):.2e}"
-                f"{'' if info['accept'] else '   REJECT'}"
+                + (
+                    "  capture sub/cond="
+                    f"{float(info['capture']['sub_block']):.2f}/"
+                    f"{float(info['capture']['conditioner']):.2f}"
+                    if "capture" in info
+                    else ""
+                )
+                + f"{'' if info['accept'] else '   REJECT'}"
             )
 
         if not np.isfinite(info["grad_norm"]):
