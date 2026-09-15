@@ -615,7 +615,11 @@ def compile_pymc_model(
         freeze_model = backend == "jax"
 
     if freeze_model:
+        # The fgraph roundtrip in freeze_dims_and_data does not carry over
+        # check_bounds, so restore it explicitly.
+        check_bounds = model.check_bounds
         model = freeze_dims_and_data(model)
+        model.check_bounds = check_bounds
 
     if default_initialization_strategy == "support_point" and jitter_rvs is None:
         jitter_rvs = set(model.free_RVs)
