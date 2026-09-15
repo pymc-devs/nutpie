@@ -538,13 +538,16 @@ class FisherLoss(eqx.Module):
 
         flow = unwrap(eqx.combine(params, static, is_leaf=eqx.is_inexact_array))
 
-        def compute_residual(bijection, draw, grad, logp):
-            draw, grad, logp = inverse_gradient_and_val(bijection, draw, grad, logp)
+        def compute_residual(draw_grad_logp):
+            draw, grad, logp = draw_grad_logp
+            draw, grad, logp = inverse_gradient_and_val(
+                flow.bijection, draw, grad, logp
+            )
             return draw + grad
 
-        #residuals = jax.lax.map(compute_residual, [None, 0, 0, 0], batch_size=64)(
-        residuals = jax.vmap(compute_residual, [None, 0, 0, 0])(
-            flow.bijection, draws, grads, logps
+        #residuals = jax.vmap(compute_residual)((draws, grads, logps))
+        residuals = jax.lax.map(
+            compute_residual, (draws, grads, logps), batch_size=256
         )
         n_draws = draws.shape[0]
         return residuals / jnp.sqrt(n_draws)
