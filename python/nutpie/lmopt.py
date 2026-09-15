@@ -104,7 +104,8 @@ def make_plan(block, m, label_fn=None, q_min=16):
         if (label_fn is not None and Pb > 0)
         else np.arange(Pb)
     )
-    q = int(min(Pb, max(q_min, m // 2))) if Pb else 1
+    #q = int(min(Pb, max(q_min, m // 2))) if Pb else 1
+    q = int(min(Pb, max(q_min, 2 * m))) if Pb else 1
     G = -(-Pb // q) if Pb else 1
     idx = np.full(G * q, Pb, dtype=int)
     idx[:Pb] = perm  # column Pb = dummy sink
@@ -158,19 +159,6 @@ def pcg(Av, Minv, b, x0, tol, maxiter):
 
     x, r, _, _, _, k = jax.lax.while_loop(cond, body, (x0, r0, z0, z0, tdot(r0, z0), 0))
     return x, k
-
-
-# ============================================================ build and apply
-#
-# These used to be factories that returned a fresh closure on every call
-# (make_block_builder/make_apply -> build/Minv).  Those closures were then
-# passed into `lm_step` as arguments, and since `setup` (and therefore these
-# factories) ran again on every `fit` call, `step = eqx.filter_jit(lm_step)`
-# saw a brand-new, unequal static argument each time and recompiled even when
-# nothing about the problem had changed.  They're now plain functions that
-# `lm_step` calls directly; the only closures that remain (`Minv` below) are
-# created *inside* the traced function, so they never cross the jit boundary
-# and can't trigger a recompile.
 
 
 def capture_fractions(Gs, m):
@@ -421,6 +409,7 @@ def step(
     batch=32,
     precondition=True,
     cg_tol=1e-2,
+    cg_eta_max=0.5,
     cg_max=300,
     p_prev=None,
     accept_rho=0.1,
@@ -482,7 +471,25 @@ def step(
     rhs = jax.tree.map(jnp.negative, g)
     x0 = jax.tree.map(jnp.zeros_like, theta) if p_prev is None else p_prev
 
-    p, ncg = pcg(Av, Minv, rhs, x0, cg_tol * tnorm(rhs), cg_max)
+    # Inexact-Newton forcing term (Dembo/Eisenstat/Steihaug; the
+    # `min(eta_max, sqrt(||g||))` rule from the trust-region Newton line).
+    # `eta -> 0` as the gradient does, which keeps the superlinear rate, while
+    # staying loose early where an accurate solve buys nothing. It reads only
+    # the current gradient, so it carries no state and is unchanged across a
+    # rejected step -- it cannot interact with the `lam` update.
+    #
+    # `cg_tol` is the floor: setting `cg_eta_max = cg_tol` recovers the old
+    # fixed-tolerance behaviour exactly.
+    residual_norm = tnorm(rhs)
+    if False:
+        # Fixed relative tolerance. Near convergence this shrinks in lockstep
+        # with the gradient while the system gets no easier, so CG burns
+        # `cg_max` on steps whose truncated solution already gives rho ~ 1.
+        eta = cg_tol
+    else:
+        eta = jnp.clip(jnp.sqrt(residual_norm), cg_tol, cg_eta_max)
+
+    p, ncg = pcg(Av, Minv, rhs, x0, eta * residual_norm, cg_max)
 
     theta_new = jax.tree.map(jnp.add, theta, p)
     r_new = res_fn_args(theta_new)
@@ -494,7 +501,10 @@ def step(
     rho = actual / jnp.where(jnp.abs(pred) < 1e-30, 1e-30, pred)
 
     ok = jnp.isfinite(F_new) & jnp.isfinite(rho)
-    accept = (rho > accept_rho) & ok
+    # `pred > 0` is not implied by `rho > accept_rho`: `pred < 0` means `p` is
+    # not a descent direction, `actual` is then negative too, and the signs
+    # cancel into a large positive `rho`.
+    accept = (rho > accept_rho) & (pred > 0) & ok
 
     pick = lambda a, b: jax.tree.map(lambda x, y: jnp.where(accept, x, y), a, b)
     theta_out, r_out = pick(theta_new, theta), pick(r_new, r)
@@ -516,6 +526,7 @@ def step(
         "lam_in": lam,
         "lam_out": lam_out,
         "n_cg": ncg,
+        "cg_eta": eta,
         "cg_converged": ncg < cg_max,
         "grad_norm": tnorm(g),
         "step_norm": tnorm(p),
@@ -586,7 +597,7 @@ def fit(
     params,
     res_fn,
     args,
-    m=128 + 64,
+    m=64,
     n_steps=60,
     lam0=1e-2,
     seed=0,
@@ -594,6 +605,7 @@ def fit(
     precondition=True,
     min_loss=None,
     cg_max=300,
+    cg_eta_max=0.5,
     batch=32,
     damping="marquardt",
     lam_min=None,
@@ -649,6 +661,7 @@ def fit(
             precondition=precondition,
             p_prev=p_prev,
             cg_max=cg_max,
+            cg_eta_max=cg_eta_max,
             batch=batch,
             damping=damping,
             lam_min=lam_min,
@@ -660,7 +673,8 @@ def fit(
                 f"{i:3d}  F={float(info['F_new']):.4e}  "
                 f"log(F)={float(np.log(info['F_new'])):+.2f} "
                 f"rho={float(info['rho']):+.2f}  lam={float(info['lam_out']):.1e}  "
-                f"cg={int(info['n_cg']):3d}{'' if info['cg_converged'] else '*'}  "
+                f"cg={int(info['n_cg']):3d}{'' if info['cg_converged'] else '*'} "
+                f"eta={float(info['cg_eta']):.2f}  "
                 f"|g|={float(info['grad_norm']):.2e}"
                 + (
                     "  capture sub/cond="

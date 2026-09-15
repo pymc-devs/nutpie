@@ -10,8 +10,6 @@ from flowjax import bijections
 import equinox as eqx
 
 
-CHECKPOINT_LEVEL_SCAN = True
-
 
 def _min_waste_buckets(counts: np.ndarray, n_buckets: int) -> np.ndarray:
     """Partition `counts` into at most `n_buckets` groups, minimizing the
@@ -83,12 +81,18 @@ def _min_waste_buckets(counts: np.ndarray, n_buckets: int) -> np.ndarray:
 class _SparseTriangularLayout(eqx.Module):
     """Static sparsity structure of the Jacobian. Built once, outside jit.
 
-    Laid out for the *transposed* solve: `_solve_triangular_sparse` computes
-    J^T w = rhs by back-substitution, resolving levels last-to-first and, for
-    each variable, summing contributions from its already-resolved children
-    (rather than its parents, as a forward solve for J would). We only ever
-    need this transposed direction (see `inverse_gradient_and_val`), so there
-    is no separate forward-solve layout.
+    `inverse_gradient_and_val` only ever needs ``J^T w = rhs``, resolved by
+    back-substitution: levels last-to-first, each variable summing
+    contributions from its already-resolved children. That is what the
+    ``level_*`` arrays below are grouped for -- by the level of each edge's
+    *parent*.
+
+    Differentiating that solve needs the other direction too: the cotangent of
+    ``A^-1 rhs`` involves ``A^-T``, i.e. forward substitution on ``J`` itself,
+    where a variable sums over its *parents* and levels run first-to-last. The
+    ``child_level_*`` arrays are the same edges regrouped by the level of each
+    edge's child, which is what that traversal gathers on. Both groupings are
+    pure index arrays built once, outside jit.
     """
 
     # Per bucket: flat positions within bucket_jacobian_rows[bucket].ravel()
@@ -98,6 +102,8 @@ class _SparseTriangularLayout(eqx.Module):
     # sentinel, which reads the constant zero appended to the solution
     # during the solve.
     edge_child_index: jnp.ndarray
+    # (n_edges + 1,) parent variable of each edge, same sentinel convention.
+    edge_parent_index: jnp.ndarray
     # (n_levels, max_level_size) variables at each level, padded with `dim`.
     level_members: jnp.ndarray
     # (n_levels, max_edges_per_level) edges whose *parent* sits at that level.
@@ -106,6 +112,10 @@ class _SparseTriangularLayout(eqx.Module):
     # edge's parent occupies; padding entries use max_level_size, which is
     # dropped.
     level_edge_target_slot: jnp.ndarray
+    # The same two arrays for the transposed direction: edges grouped by the
+    # level of their *child*, and the slot that child occupies.
+    child_level_edge_index: jnp.ndarray
+    child_level_edge_target_slot: jnp.ndarray
 
     n_variables: int = eqx.field(static=True)
     n_edges: int = eqx.field(static=True)
@@ -165,12 +175,34 @@ def _build_layout(bucket_members, bucket_parent_indices, level_of_variable, dim)
             edge_parent[edges_at_level]
         ]
 
+    # Same edges, regrouped by the level of their child, for the transposed
+    # (forward-substitution) solve the VJP needs.
+    level_of_edge_child = level_of_variable[edge_child]
+    max_edges_per_child_level = int(
+        np.bincount(level_of_edge_child, minlength=n_levels).max(initial=0)
+    )
+    child_level_edge_index = np.full(
+        (n_levels, max(max_edges_per_child_level, 1)), n_edges, np.int32
+    )
+    child_level_edge_target_slot = np.full(
+        (n_levels, max(max_edges_per_child_level, 1)), max_level_size, np.int32
+    )
+    for level in range(n_levels):
+        edges_at_level = np.flatnonzero(level_of_edge_child == level)
+        child_level_edge_index[level, : len(edges_at_level)] = edges_at_level
+        child_level_edge_target_slot[level, : len(edges_at_level)] = slot_within_level[
+            edge_child[edges_at_level]
+        ]
+
     return _SparseTriangularLayout(
         bucket_value_gather=tuple(jnp.asarray(g) for g in bucket_value_gather),
         edge_child_index=jnp.asarray(np.append(edge_child, dim).astype(np.int32)),
+        edge_parent_index=jnp.asarray(np.append(edge_parent, dim).astype(np.int32)),
         level_members=jnp.asarray(level_members),
         level_edge_index=jnp.asarray(level_edge_index),
         level_edge_target_slot=jnp.asarray(level_edge_target_slot),
+        child_level_edge_index=jnp.asarray(child_level_edge_index),
+        child_level_edge_target_slot=jnp.asarray(child_level_edge_target_slot),
         n_variables=dim,
         n_edges=n_edges,
         max_level_size=max_level_size,
@@ -193,21 +225,23 @@ def _flatten_edge_values(bucket_jacobian_rows, layout):
 
 
 @jax.profiler.annotate_function
-def _solve_triangular_sparse(edge_values, jacobian_diagonal, layout, rhs):
-    """Back substitution for J^T w = rhs, one elimination level per scan step,
-    last level first.
+def _sweep_levels(
+    edge_values,
+    jacobian_diagonal,
+    layout,
+    rhs,
+    edge_endpoint_index,
+    level_edge_index,
+    level_edge_target_slot,
+    reverse,
+):
+    """One triangular solve as a scan over elimination levels.
 
-    For each variable i at the current level:
-        w[i] = (rhs[i] - sum_{j: i is a parent of j} J[j, i] w[j]) / J[i, i]
-
-    This is `inverse_gradient_and_val`'s only use of the sparse Jacobian: it
-    never solves the forward system J u = rhs, only its transpose (pulling a
-    model-space cotangent back through the parallel m -> w map, see that
-    method's docstring), so there is only this one solve direction. It is
-    the transpose of forward substitution for J: a variable's contribution
-    now comes from its *children* (all of which sit at strictly later
-    levels, hence already solved once levels are visited last-to-first),
-    rather than from its parents.
+    Both directions are the same sweep with the edges grouped differently, so
+    they share this body. `edge_endpoint_index` says which endpoint of each
+    edge supplies the already-solved value (the child for back substitution,
+    the parent for forward substitution), and the level arrays say which
+    edges land on which level and in whose slot.
     """
     max_level_size = layout.max_level_size
 
@@ -219,38 +253,90 @@ def _solve_triangular_sparse(edge_values, jacobian_diagonal, layout, rhs):
     @jax.profiler.annotate_function
     def eliminate_level(solution, level_data):
         members, edge_indices, target_slots = level_data
-        # Children live at strictly later levels, so they are already solved.
+        # The endpoint each edge reads from always sits at an already-visited
+        # level, by construction of the level numbering.
         solution_padded = jnp.concatenate([solution, jnp.zeros((1,), rhs.dtype)])
-        child_values = solution_padded[layout.edge_child_index[edge_indices]]
-        edge_contributions = edge_values[edge_indices] * child_values
+        solved_values = solution_padded[edge_endpoint_index[edge_indices]]
+        edge_contributions = edge_values[edge_indices] * solved_values
 
-        # Sum contributions into the slot of the parent they belong to.
+        # Sum contributions into the slot of the variable they belong to.
         # Padding edges target slot `max_level_size`, which is out of bounds
         # and dropped.
-        child_sum = (
+        neighbour_sum = (
             jnp.zeros((max_level_size,), rhs.dtype)
             .at[target_slots]
             .add(edge_contributions, mode="drop")
         )
 
-        updated = (rhs_padded[members] - child_sum) / diagonal_padded[members]
+        updated = (rhs_padded[members] - neighbour_sum) / diagonal_padded[members]
         # Each variable belongs to exactly one level, so the in-bounds
         # indices here are unique.
         solution = solution.at[members].set(updated, mode="drop", unique_indices=True)
         return solution, None
 
-    # Reverse-mode through this scan stacks one carry per elimination level, so
-    # the tape grows with the DAG's critical-path depth. Remat keeps only the
-    # per-level inputs and replays the body, at one extra forward sweep.
-    body = jax.checkpoint(eliminate_level) if CHECKPOINT_LEVEL_SCAN else eliminate_level
-
     solution, _ = jax.lax.scan(
-        body,
+        eliminate_level,
         jnp.zeros_like(rhs),
-        (layout.level_members, layout.level_edge_index, layout.level_edge_target_slot),
-        reverse=True,
+        (layout.level_members, level_edge_index, level_edge_target_slot),
+        reverse=reverse,
     )
     return solution
+
+
+def _solve_triangular_sparse(edge_values, jacobian_diagonal, layout, rhs):
+    """Solve ``J^T w = rhs`` for the sparse triangular Jacobian ``J``.
+
+    `inverse_gradient_and_val` only ever needs this transposed direction
+    (pulling a model-space cotangent back through the parallel m -> w map, see
+    that method's docstring), which is back substitution: levels last-to-first,
+    each variable summing over its *children*, all of which sit at strictly
+    later levels and so are already solved.
+
+    Wrapped in `jax.lax.custom_linear_solve` rather than left to autodiff.
+    Differentiating the scan directly stacks one carry -- a full ``(dim,)``
+    solution -- per elimination level, so the tape is ``n_levels * dim`` per
+    draw. That is not a corner case: `SparseTriangularMap`'s level grouping
+    degenerates to one level per variable for a *dense* blanket and equally for
+    a banded one, so ``n_levels == dim`` is the common case and the tape is
+    quadratic in the dimension. Measured on a 1600-dim banded model it was a
+    156 MB ``f64[n_levels, batch, dim]`` buffer dominating the whole step.
+    """
+
+    def matvec(w):
+        """``J^T w``, from the same edge list -- one scatter, no sweep."""
+        w_padded = jnp.concatenate([w, jnp.zeros((1,), w.dtype)])
+        contributions = edge_values * w_padded[layout.edge_child_index]
+        return jacobian_diagonal * w + jnp.zeros_like(w).at[
+            layout.edge_parent_index
+        ].add(contributions, mode="drop")
+
+    def back_substitute(_, b):
+        return _sweep_levels(
+            edge_values,
+            jacobian_diagonal,
+            layout,
+            b,
+            layout.edge_child_index,
+            layout.level_edge_index,
+            layout.level_edge_target_slot,
+            reverse=True,
+        )
+
+    def forward_substitute(_, b):
+        return _sweep_levels(
+            edge_values,
+            jacobian_diagonal,
+            layout,
+            b,
+            layout.edge_parent_index,
+            layout.child_level_edge_index,
+            layout.child_level_edge_target_slot,
+            reverse=False,
+        )
+
+    return jax.lax.custom_linear_solve(
+        matvec, rhs, back_substitute, transpose_solve=forward_substitute
+    )
 
 
 class SumLinearAndMlp(eqx.Module):
@@ -390,7 +476,14 @@ class SparseTriangularMap(bijections.AbstractBijection):
     bucket_level_local_members: tuple[Array, ...]
     bucket_level_parent_indices: tuple[Array, ...]
     transformer_constructor: Callable
-    jacobian_layout: _SparseTriangularLayout = eqx.field(static=True)
+    # A normal pytree field, not `static=True`. Its leaves are index arrays, so
+    # marking them static made them pytree *metadata*, which JAX compares for
+    # equality -- comparing arrays yields an array, not a bool, so anything that
+    # triggers that comparison raises (and it is what the "A JAX array is being
+    # set as static!" warning was about). As leaves they are integer arrays, so
+    # `eqx.partition(flow, eqx.is_inexact_array)` still keeps them out of the
+    # parameters and they stay compile-time constants in practice.
+    jacobian_layout: _SparseTriangularLayout
     cond_shape = None
 
     def __init__(

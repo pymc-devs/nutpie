@@ -36,20 +36,15 @@ from nutpie.normalizing_flow import Coupling, Householder, Scan, extend_flow, ma
 
 _BIJECTION_TRACE = []
 
-# Raw-fisher-divergence equivalents of the thresholds that used to be
-# compared against log(fisher_divergence).
-#_LOG_STOP_VALUE = float(np.exp(-5))
-#_LOG_SKIP_TRAINING_VALUE = float(np.exp(-4))
-
 _LOG_STOP_VALUE = -5
 _LOG_SKIP_TRAINING_VALUE = -4
 
 # Remat toggle for the per-draw residual, see `FisherLoss.residuals`.
-CHECKPOINT_RESIDUAL = True
+CHECKPOINT_RESIDUAL = False
 
 def fit_to_data(
     key: PRNGKeyArray,
-    dist: PyTree,  # Custom losses may support broader types than AbstractDistribution
+    dist: PyTree,
     x,
     *,
     condition: ArrayLike | None = None,
@@ -71,6 +66,7 @@ def fit_to_data(
     lm_linear_steps: int = 300,
     lm_min_loss: float = float(np.exp(-3)),
     lm_probe_batch: int = 32,
+    lm_probes: int = 64,
 ):
     r"""Train a distribution (e.g. a flow) to samples from the target distribution.
 
@@ -120,6 +116,14 @@ def fit_to_data(
             that do converge. Steps that hit the cap are solving a system they
             did not finish, and show as ``cg=<n>*`` in the fit log. Only used
             when ``method`` is ``"lm"``.
+        lm_probes: Number of Rademacher probes used to estimate the block
+            preconditioner at each LM step. The estimate is a Hutchinson
+            average, so its noise falls like ``1/sqrt(lm_probes)`` while the
+            cost is one reverse pass each -- it is the dominant per-step cost
+            once CG is cheap. It also sets where `lmopt.make_plan` splits a
+            conditioner into sub-blocks (``q`` is capped relative to it), so
+            raising it both sharpens the estimate and keeps large conditioners
+            unsplit. Only used when ``method`` is ``"lm"``.
         lm_probe_batch: How many of the Rademacher probes used to estimate the
             block preconditioner are taken at once. This is the main memory
             knob of an LM step: each concurrent probe carries a full reverse
@@ -158,6 +162,7 @@ def fit_to_data(
                 "linear_steps": lm_linear_steps,
                 "min_loss": lm_min_loss,
                 "probe_batch": lm_probe_batch,
+                "probes": lm_probes,
             }
             if method == "lm"
             else {}
@@ -277,7 +282,7 @@ def res_fn(params, args):
     loss_fn, *args = args
     return loss_fn.residuals(params, *args)
 
-#@eqx.filter_jit
+
 def _fit_lm(
     params,
     static,
@@ -290,6 +295,7 @@ def _fit_lm(
     linear_steps,
     min_loss,
     probe_batch,
+    probes,
 ):
     if not hasattr(loss_fn, "residuals"):
         raise ValueError(
@@ -307,6 +313,7 @@ def _fit_lm(
         verbose=True,
         min_loss=min_loss,
         cg_max=linear_steps,
+        m=probes,
         batch=probe_batch,
         precondition=True,
     )
@@ -672,9 +679,6 @@ def fit_flow(key, bijection, loss_fn, draws, grads, logps, **kwargs):
         x=(draws, grads, logps),
         loss_fn=loss_fn,
         return_best=True,
-        # FisherLoss now reports the raw Fisher divergence (previously
-        # log(fisher_divergence)), so this is exp(-5), matching the old
-        # log-space threshold.
         stop_value=_LOG_STOP_VALUE,
         **kwargs,
     )
@@ -797,6 +801,7 @@ class TransformAdapter:
         lm_linear_steps=300,
         lm_min_loss=float(np.exp(-3)),
         lm_probe_batch=32,
+        lm_probes=64,
         lm_residual_batch=256,
     ):
         self._logp_fn = logp_fn
@@ -840,6 +845,7 @@ class TransformAdapter:
         self._lm_linear_steps = lm_linear_steps
         self._lm_min_loss = lm_min_loss
         self._lm_probe_batch = lm_probe_batch
+        self._lm_probes = lm_probes
 
         if extension_windows is None:
             self._extension_windows = []
@@ -1104,6 +1110,7 @@ class TransformAdapter:
                 lm_linear_steps=self._lm_linear_steps,
                 lm_min_loss=self._lm_min_loss,
                 lm_probe_batch=self._lm_probe_batch,
+                lm_probes=self._lm_probes,
             )
 
             flow = flowjax.flows.Transformed(
@@ -1322,6 +1329,7 @@ def make_transform_adapter(
     lm_linear_steps=300,
     lm_min_loss=float(np.exp(-3)),
     lm_probe_batch=32,
+    lm_probes=64,
     lm_residual_batch=256,
 ):
     if extension_windows is None:
@@ -1377,5 +1385,6 @@ def make_transform_adapter(
         lm_linear_steps=lm_linear_steps,
         lm_min_loss=lm_min_loss,
         lm_probe_batch=lm_probe_batch,
+        lm_probes=lm_probes,
         lm_residual_batch=lm_residual_batch,
     )
