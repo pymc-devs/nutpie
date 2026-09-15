@@ -1,6 +1,7 @@
 import jax, jax.numpy as jnp, numpy as np, equinox as eqx
 from jax import random as jr
 from jax.flatten_util import ravel_pytree
+from jax.scipy.linalg import solve_triangular
 
 
 # ============================================================ pytree helpers
@@ -184,7 +185,7 @@ def build_blocks(vjpf, shape, key, plans, m, batch=32):
     """
 
     def one(k):
-        w = jr.rademacher(k, shape).astype("float32")
+        w = jr.rademacher(k, shape).astype("float64")
         g = vjpf(w)[0]
         return [_gather(p["flatten"](b), p) for b, p in zip(blocks_of(g), plans)]
 
@@ -192,20 +193,116 @@ def build_blocks(vjpf, shape, key, plans, m, batch=32):
     return [jnp.einsum("tngi,tngj->ngij", G, G) / m for G in Gs]
 
 
-def _block_inv(H, lam):
-    """eigh with clamping rather than Cholesky: blocks are small, some are
-    structurally singular (a conditioner with in_features=0 has a
-    draw-independent Jacobian), and eigh avoids the static `lower` flag that
-    breaks under vmap."""
-    w, V = jnp.linalg.eigh(H)
-    return jnp.einsum("ij,j,kj->ik", V, 1.0 / (jnp.maximum(w, 0.0) + lam), V)
+def block_diagonal(blocks, plans, template):
+    """`diag(J^T J)` as a pytree shaped like `template`.
+
+    Free: `build_blocks` already estimates each block's Gram matrix, and its
+    diagonal is exactly the corresponding run of `diag(J^T J)` -- a plan's
+    column index is a permutation, so every live parameter sits in exactly one
+    sub-block, in exactly one position.
+    """
+    out = [
+        p["unflatten"](_scatter(jnp.diagonal(H, axis1=-2, axis2=-1), p))
+        for p, H in zip(plans, blocks)
+    ]
+    # `unflatten` recombines each block's static leaves, which `template` (a
+    # filtered params pytree) does not carry; drop them again so the result can
+    # be tree_map'd against tangents leaf-for-leaf.
+    return eqx.filter(rebuild(template, out), eqx.is_inexact_array)
 
 
-def precompute_Minvs(blocks, lam):
+# Fraction of the largest curvature below which Marquardt damping is floored.
+# Must not be tiny: `zero_init` sets each conditioner's last layer to zero, so
+# the first-layer parameters start with *exactly* zero gradient and curvature,
+# and an unfloored `lam * diag(J^T J)` leaves them undamped -- both in CG and,
+# far worse, in the block preconditioner, whose inverse then carries entries of
+# order `1 / (lam * floor)`.
+#
+# Measured on the 10-dim funnel (arrow pattern, 10 LM steps, final F / steps
+# accepted): 1e-8 -> 1.6e+02, 1/10 (diverges); 1e-4 -> 1.4e-02, 8/10;
+# 1e-2 -> 4.8e-02, 9/10; 1e-1 -> 8.9e-02, 10/10. Too low and the flat
+# directions blow up; too high and this degrades towards absolute damping,
+# which is what it exists to avoid.
+MARQUARDT_FLOOR = 1e-4
+
+
+def marquardt_floor(D):
+    """Smallest damping scale allowed, from the largest curvature seen.
+
+    Marquardt damping is `lam * diag(J^T J)`, which vanishes wherever the
+    curvature does -- a conditioner with `in_features=0` has a draw-independent
+    Jacobian, so its Gram block is exactly zero and an unfloored `lam * diag`
+    would leave that block undamped and singular. Flooring at `1e-8` of the
+    global maximum only bites on blocks that far below scale, so it rescues the
+    degenerate ones without flattening the per-block scaling everywhere else.
+    """
+    # Empty leaves are skipped: the zero-parent conditioner's first layer has
+    # `in_features=0`, so its weight is a genuine zero-size array, and `max`
+    # over it has no identity.
+    leaves = [l for l in jax.tree.leaves(D) if eqx.is_inexact_array(l) and l.size]
+    if not leaves:
+        return jnp.asarray(1e-300)
+    dmax = jnp.maximum(jnp.max(jnp.stack([jnp.max(leaf) for leaf in leaves])), 1e-300)
+    return MARQUARDT_FLOOR * dmax
+
+
+def _block_inv(H, lam, floor):
+    """Inverse of the damped block, via Cholesky.
+
+    `floor is None` selects absolute (Levenberg) damping, `lam * I`; otherwise
+    damping is Marquardt's `lam * diag(H)`, floored at `floor`. With one block
+    per conditioner, an absolute `lam` is a single trust region shared by
+    thousands of blocks whose curvature scales have no reason to agree -- the
+    conditioners and the affine tail least of all -- so it ends up set by
+    whichever block wants the smallest step, and every other block takes a step
+    far shorter than it could. Scaling by each block's own diagonal makes `lam`
+    dimensionless per block. Which is better is problem-dependent, hence
+    `step`'s `damping` argument; whichever is chosen, `floor` must match the
+    one `step` applies in `Av`, or the preconditioner would approximate a
+    different operator than CG is solving.
+
+    `H` is a Gram matrix (see `build_blocks`), hence PSD, so `H + lam D` with
+    `D` a positive diagonal is positive definite; the extra ridge keeps that
+    true *numerically* once `lam` has decayed towards `lam_min`. Since this is
+    only a preconditioner, perturbing it costs CG iterations, never
+    correctness.
+
+    Cholesky rather than `eigh` because cuSOLVER's batched `syev` allocates a
+    device workspace proportional to the entire batch, and the batch here is
+    one block per conditioner per sub-block -- so it grows with the model while
+    `q` stays fixed, and it is the first thing to exhaust device memory on a
+    large model. Cholesky needs no such workspace.
+    """
+    if False:
+        # eigh with clamping rather than Cholesky: blocks are small, some are
+        # structurally singular (a conditioner with in_features=0 has a
+        # draw-independent Jacobian), and eigh avoids the static `lower` flag
+        # that breaks under vmap.
+        w, V = jnp.linalg.eigh(H)
+        return jnp.einsum("ij,j,kj->ik", V, 1.0 / (jnp.maximum(w, 0.0) + lam), V)
+
+    q = H.shape[-1]
+    eye = jnp.eye(q, dtype=H.dtype)
+    if floor is None:
+        damped = H + (lam + 1e-12 * jnp.maximum(jnp.mean(jnp.diagonal(H)), 1.0)) * eye
+    else:
+        diag = lam * jnp.maximum(jnp.diagonal(H), floor) + 1e-4 * floor
+        damped = H + jnp.diag(diag)
+    factor = jnp.linalg.cholesky(damped)
+    inv_factor = solve_triangular(factor, eye, lower=True)
+    return inv_factor.T @ inv_factor
+
+
+def precompute_Minvs(blocks, lam, floor):
     """(n, G, q, q) per bucket.  Computed once per lm_step call and reused
-    across every Minv(v) call inside that step's PCG loop."""
-    vinv = jax.vmap(jax.vmap(_block_inv, in_axes=(0, None)), in_axes=(0, None))
-    return [vinv(H, lam) for H in blocks]
+    across every Minv(v) call inside that step's PCG loop.
+
+    `lam` and `floor` are closed over rather than passed through `in_axes`, so
+    that `floor=None` (absolute damping) stays a plain trace-time branch inside
+    `_block_inv` instead of something vmap has to map over.
+    """
+    vinv = jax.vmap(jax.vmap(lambda H: _block_inv(H, lam, floor)))
+    return [vinv(H) for H in blocks]
 
 
 def apply_Minvs(Minvs, plans, v):
@@ -238,6 +335,7 @@ def step(
     lam_up=4.0,
     lam_min=1e-10,
     lam_max=1e10,
+    damping="marquardt",
 ):
     """One LM step.  res_fn and plans are static under eqx.filter_jit; plans
     is built once via get_plans and cached by parameter structure, so its
@@ -248,16 +346,34 @@ def step(
     _, vjpf = jax.vjp(res_fn_args, theta)
     vjp = lambda w: vjpf(w)[0]
 
+    if damping not in ("marquardt", "absolute"):
+        raise ValueError(
+            f"Unknown damping {damping!r}, expected 'marquardt' or 'absolute'."
+        )
+
     if precondition:
         Hb = build_blocks(vjpf, r.shape, key, plans, m, batch)
-        Minvs = precompute_Minvs(Hb, lam)
+        if damping == "marquardt":
+            D = block_diagonal(Hb, plans, theta)
+            floor = marquardt_floor(D)
+            D = jax.tree.map(lambda d: jnp.maximum(d, floor), D)
+        else:
+            D = floor = None
+        Minvs = precompute_Minvs(Hb, lam, floor)
         Minv = lambda v: apply_Minvs(Minvs, plans, v)
     else:
-        Hb = None
+        # Without the block estimates there is no per-parameter curvature to
+        # scale by, so Marquardt damping is not available here.
+        Hb = D = None
         Minv = lambda v: v
 
     jvp = lambda v: jax.jvp(res_fn_args, (theta,), (v,))[1]
-    Av = lambda v: jax.tree.map(lambda a, b: a + lam * b, vjp(jvp(v)), v)
+    if D is None:
+        Av = lambda v: jax.tree.map(lambda a, b: a + lam * b, vjp(jvp(v)), v)
+    else:
+        Av = lambda v: jax.tree.map(
+            lambda a, d, b: a + lam * d * b, vjp(jvp(v)), D, v
+        )
 
     g = vjp(r)
     rhs = jax.tree.map(jnp.negative, g)
@@ -302,7 +418,10 @@ def step(
         "step_norm": tnorm(p),
         "finite": ok,
     }
-    if plans is not None:
+    # Diagnostics only -- `fit` never prints these -- but a second full batched
+    # eigendecomposition per step, hitting the same cuSOLVER workspace limit as
+    # `_block_inv` used to. Off by default; flip to re-enable.
+    if False and plans is not None:
         info["block_min_eig"] = jnp.stack([jnp.min(jnp.linalg.eigvalsh(H)) for H in Hb])
         info["block_max_eig"] = jnp.stack([jnp.max(jnp.linalg.eigvalsh(H)) for H in Hb])
     return theta_out, r_out, lam_out, p_out, info
@@ -369,7 +488,17 @@ def fit(
     verbose=True,
     precondition=True,
     min_loss=None,
+    damping="marquardt",
 ):
+    """Levenberg-Marquardt fit.
+
+    `damping` selects the trust region: ``"marquardt"`` damps with
+    ``lam * diag(J^T J)``, ``"absolute"`` with the classical ``lam * I`` (see
+    `_block_inv`). Note that `lam0` and the `lam_min`/`lam_max` bounds mean
+    different things under the two -- under ``"marquardt"`` `lam` is
+    dimensionless, scaled by each block's own curvature -- so `lam` traces are
+    not comparable across the choice and `lam0` may want retuning.
+    """
     if precondition:
         plans = setup(params, m)
 
@@ -403,6 +532,7 @@ def fit(
             m=m,
             precondition=precondition,
             p_prev=p_prev,
+            damping=damping,
         )
         hist.append(info)
         if verbose:
