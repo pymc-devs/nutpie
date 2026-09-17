@@ -967,6 +967,7 @@ impl PySampler {
         let extra_rate = Duration::from_millis(extra_callback_rate);
         let callback = progress_type.into_callback(extra_callback, extra_rate)?;
         let tokio_rt = Runtime::new().context("Failed to create Tokio runtime")?;
+        let model = Arc::new(model);
         match &mut store.0 {
             InnerPyStorage::Arrow => {
                 let storage_config = ArrowConfig::default();
@@ -1569,13 +1570,14 @@ impl PyTransformAdapt {
         untransformed_gradient: &mut [f64],
         transformed_position: &[f64],
         transformed_gradient: &mut [f64],
+        clip: Option<f64>,
     ) -> Result<(f64, f64)> {
         Python::attach(|py| {
             let transformed_position = PyArray1::from_slice(py, transformed_position);
 
             let output = params
                 .getattr(py, intern!(py, "init_from_transformed_position"))?
-                .call1(py, (transformed_position,))?;
+                .call1(py, (transformed_position, clip))?;
             let (
                 logp,
                 logdet,
@@ -1645,6 +1647,7 @@ impl PyTransformAdapt {
         untransformed_gradient: &mut [f64],
         transformed_position: &mut [f64],
         transformed_gradient: &mut [f64],
+        clip: Option<f64>,
     ) -> Result<(f64, f64)> {
         Python::attach(|py| {
             let untransformed_position = PyArray1::from_slice(py, untransformed_position);
@@ -1652,7 +1655,7 @@ impl PyTransformAdapt {
             let output = params
                 .getattr(py, intern!(py, "init_from_untransformed_position"))
                 .context("No attribute init_from_untransformed_position")?
-                .call1(py, (untransformed_position,))
+                .call1(py, (untransformed_position, clip))
                 .context("Failed adapter.init_from_untransformed_position")?;
             let (
                 logp,
