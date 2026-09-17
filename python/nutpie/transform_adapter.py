@@ -74,6 +74,7 @@ def fit_to_data(
     lm_line_search: bool = False,
     lm_forcing: str = "residual",
     lm_lam0: float | None = None,
+    lm_exact_blocks: bool = False,
 ):
     r"""Train a distribution (e.g. a flow) to samples from the target distribution.
 
@@ -168,6 +169,11 @@ def fit_to_data(
             The damping the fit ends with is returned as
             ``losses["lm_lam"]``, so a caller refitting on similar data can
             carry it over. Only used when ``method`` is ``"lm"``.
+        lm_exact_blocks: Compute the LM preconditioner's Gauss-Newton blocks
+            exactly (see `FisherLoss.gauss_newton_factors`) instead of
+            estimating them from ``lm_probes`` Rademacher probes, which then
+            only sets the sub-block size. Needs ``lm_fit_affine=False``.
+            Only used when ``method`` is ``"lm"``.
         lm_min_loss: Stop the LM fit once the Fisher divergence falls below
             this. Note that the divergence is a *sum* over dimensions, so this
             is an absolute, dimension-independent target: it bounds each
@@ -207,6 +213,7 @@ def fit_to_data(
                 "line_search": lm_line_search,
                 "forcing": lm_forcing,
                 "lam0": lm_lam0,
+                "exact_blocks": lm_exact_blocks,
             }
             if method == "lm"
             else {}
@@ -330,6 +337,13 @@ def res_fn(params, args):
     return loss_fn.residuals(params, *args)
 
 
+def gn_factor_fn(params, args, draw_data):
+    """`lmopt.fit`'s `factor_fn` for `res_fn`: one draw's exact Gauss-Newton
+    block factors, see `FisherLoss.gauss_newton_factors`."""
+    loss_fn, static = args
+    return loss_fn.gauss_newton_factors(params, static, *draw_data)
+
+
 def _fit_lm(
     params,
     static,
@@ -350,6 +364,7 @@ def _fit_lm(
     line_search,
     forcing,
     lam0,
+    exact_blocks,
 ):
     if not hasattr(loss_fn, "residuals"):
         raise ValueError(
@@ -372,6 +387,7 @@ def _fit_lm(
         line_search=line_search,
         forcing=forcing,
         **({} if lam0 is None else {"lam0": lam0}),
+        factor_fn=gn_factor_fn if exact_blocks else None,
         n_steps=max_steps,
         verbose=True,
         min_loss=min_loss,
@@ -728,6 +744,27 @@ class FisherLoss(eqx.Module):
         n_draws = draws.shape[0]
         return residuals / jnp.sqrt(n_draws)
 
+    def gauss_newton_factors(self, params, static, draw, grad, logp):
+        """One draw's factors of the exact Gauss-Newton blocks of `residuals`,
+        per conditioner bucket of the flow's `SparseTriangularMap` (see its
+        `gauss_newton_factors`). Unscaled: `residuals` divides by
+        ``sqrt(n_draws)``, which the caller applies to the summed blocks.
+
+        Only the triangular map's conditioners get blocks. Everything else in
+        the flow must be frozen: the diagonal affine before the map just
+        changes the data it sees, and the permutation after it is orthogonal,
+        so neither changes the blocks. This mirrors `inverse_gradient_and_val`
+        on the flow `make_flow(kind="triangular")` builds.
+        """
+        flow = unwrap(eqx.combine(params, static, is_leaf=eqx.is_inexact_array))
+        sandwich = flow.bijection.bijections[0].bijections[0]
+        affine = flow.bijection.bijections[1]
+        draw, grad, _ = inverse_gradient_and_val(affine, draw, grad, logp)
+        draw, grad, _ = inverse_gradient_and_val(
+            bijections.Invert(sandwich.outer), draw, grad, logp
+        )
+        return sandwich.inner.gauss_newton_factors(draw, grad)
+
 
 def fit_flow(key, bijection, loss_fn, draws, grads, logps, **kwargs):
     flow = flowjax.flows.Transformed(
@@ -872,6 +909,7 @@ class TransformAdapter:
         lm_patience=5,
         lm_line_search=False,
         lm_forcing="residual",
+        lm_exact_blocks=False,
     ):
         self._logp_fn = logp_fn
         self._make_flow_fn = make_flow_fn
@@ -921,6 +959,7 @@ class TransformAdapter:
         self._lm_patience = lm_patience
         self._lm_line_search = lm_line_search
         self._lm_forcing = lm_forcing
+        self._lm_exact_blocks = lm_exact_blocks
         # Damping the previous LM fit ended with, to start the next one from:
         # consecutive windows fit nearly the same problem, and restarting from
         # `lam0` makes each fit rediscover the scale, typically overshooting on
@@ -1198,6 +1237,7 @@ class TransformAdapter:
                 lm_line_search=self._lm_line_search,
                 lm_forcing=self._lm_forcing,
                 lm_lam0=self._lm_lam,
+                lm_exact_blocks=self._lm_exact_blocks,
             )
             # Kept even if the fit is discarded below: the damping scale says
             # something about the problem, whether or not this fit won.
@@ -1428,6 +1468,7 @@ def make_transform_adapter(
     lm_patience=5,
     lm_line_search=False,
     lm_forcing="residual",
+    lm_exact_blocks=False,
 ):
     if extension_windows is None:
         extension_windows = []
@@ -1491,4 +1532,5 @@ def make_transform_adapter(
         lm_patience=lm_patience,
         lm_line_search=lm_line_search,
         lm_forcing=lm_forcing,
+        lm_exact_blocks=lm_exact_blocks,
     )

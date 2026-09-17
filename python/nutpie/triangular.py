@@ -1,6 +1,7 @@
 from paramax import NonTrainable
 from flowjax.utils import get_ravelled_pytree_constructor
 import jax
+import jax.flatten_util
 from jax.typing import ArrayLike
 from typing import Callable, ClassVar
 import numpy as np
@@ -445,6 +446,145 @@ def _solve_triangular_sparse(edge_values, jacobian_diagonal, layout, rhs):
     )
 
 
+class _SelectedInverseLayout(eqx.Module):
+    """Static index structure for `_selected_inverse`. Built once, outside jit.
+
+    `Sigma = (J^T J)^{-1} = J^{-1} J^{-T}` is dense, but the exact Gauss-Newton
+    blocks only read it on each variable's `{i} + parents(i)`. From `J Sigma =
+    J^{-T}`, whose strictly lower part is zero and whose diagonal is `1 /
+    delta`, row `i` of `Sigma` left of the diagonal follows from rows of its
+    parents (Takahashi's recurrence):
+
+        Sigma[i, j] = ([i == j] / delta_i - sum_{p in P(i)} A[i, p] Sigma[p, j]) / delta_i
+
+    Closing it needs `Sigma[p, j]` for every pair of `i`'s parents, i.e. the
+    parents must form a clique. That holds for a pattern from symbolic
+    Cholesky; for any other, `P*(i)` below adds the fill that makes it hold
+    -- for this computation only, the map itself keeps its own parents.
+
+    Entries are kept in one flat store: the diagonal at `[0, dim)`, then one
+    slot per `(i, j in P*(i))`, then a constant zero (`sentinel`) that padded
+    reads hit and a scratch slot (`dump`) that padded writes go to. Rows are
+    grouped into levels of the `P*` graph, each padded to rectangular shape,
+    exactly as for `_sweep_levels`.
+
+    level_rows:   (levels, R)          row indices, padded with `dim`
+    a_edge:       (levels, R, K)       edge index of `A[i, p]`, padded with `n_edges`
+    lookup:       (levels, R, K, K*)   store index of `Sigma[p, j]`, padded with `sentinel`
+    out:          (levels, R, K*)      store index of `Sigma[i, j]`, padded with `dump`
+    diag_from:    (levels, R, K)       position of `p` within `P*(i)`, padded with `K*`
+    """
+
+    level_rows: Array
+    a_edge: Array
+    lookup: Array
+    out: Array
+    diag_from: Array
+    store_size: int = eqx.field(static=True)
+
+
+def _build_selected_inverse(edge_child, edge_parent, dim):
+    """`_SelectedInverseLayout` plus a `store_index(a, b)` for `Sigma[a, b]`."""
+    edge_child = np.asarray(edge_child)[:-1]  # drop the sentinel edge
+    edge_parent = np.asarray(edge_parent)[:-1]
+    n_edges = len(edge_child)
+
+    parents = [[] for _ in range(dim)]
+    edge_of = {}
+    for edge, (child, parent) in enumerate(zip(edge_child, edge_parent)):
+        parents[int(child)].append(int(parent))
+        edge_of[(int(child), int(parent))] = edge
+
+    # Symbolic fill of the recurrence: every `p` in `P*(i)` must see the part of
+    # `P*(i)` before it. Rows only receive from later rows, so walking
+    # backwards finalizes each `P*(i)` before it is propagated.
+    filled = [set(ps) for ps in parents]
+    for i in reversed(range(dim)):
+        members = sorted(filled[i])
+        for p in members:
+            filled[p].update(q for q in members if q < p)
+    filled = [sorted(s) for s in filled]
+
+    slot = {}
+    for i in range(dim):
+        for j in filled[i]:
+            slot[(i, j)] = dim + len(slot)
+    sentinel = dim + len(slot)
+    dump = sentinel + 1
+
+    def store_index(a, b):
+        if a == b:
+            return a
+        return slot[(max(a, b), min(a, b))]
+
+    level = np.zeros(dim, dtype=np.int64)
+    for i in range(dim):
+        if filled[i]:
+            level[i] = 1 + max(level[j] for j in filled[i])
+    n_levels = int(level.max(initial=0)) + 1
+    by_level = [np.flatnonzero(level == lvl) for lvl in range(n_levels)]
+    R = max(len(rows) for rows in by_level)
+    K = max(1, max((len(ps) for ps in parents), default=0))
+    K_star = max(1, max((len(s) for s in filled), default=0))
+
+    level_rows = np.full((n_levels, R), dim, np.int32)
+    a_edge = np.full((n_levels, R, K), n_edges, np.int32)
+    lookup = np.full((n_levels, R, K, K_star), sentinel, np.int32)
+    out = np.full((n_levels, R, K_star), dump, np.int32)
+    diag_from = np.full((n_levels, R, K), K_star, np.int32)
+    for lvl, rows in enumerate(by_level):
+        for r, i in enumerate(rows):
+            level_rows[lvl, r] = i
+            for m, j in enumerate(filled[i]):
+                out[lvl, r, m] = slot[(i, j)]
+            for k, p in enumerate(parents[i]):
+                a_edge[lvl, r, k] = edge_of[(i, p)]
+                diag_from[lvl, r, k] = filled[i].index(p)
+                for m, j in enumerate(filled[i]):
+                    lookup[lvl, r, k, m] = store_index(p, j)
+
+    layout = _SelectedInverseLayout(
+        level_rows=jnp.asarray(level_rows),
+        a_edge=jnp.asarray(a_edge),
+        lookup=jnp.asarray(lookup),
+        out=jnp.asarray(out),
+        diag_from=jnp.asarray(diag_from),
+        store_size=dump + 1,
+    )
+    return layout, store_index, sentinel
+
+
+def _selected_inverse(edge_values, jacobian_diagonal, layout):
+    """`(J^T J)^{-1}` on the filled pattern, as the flat store described in
+    `_SelectedInverseLayout`: one sweep, first level to last."""
+    diagonal = jnp.concatenate([jacobian_diagonal, jnp.ones((1,), edge_values.dtype)])
+    store = jnp.zeros((layout.store_size,), edge_values.dtype)
+
+    def row_level(store, level_data):
+        rows, a_edge, lookup, out, diag_from = level_data
+        delta = diagonal[rows]  # (R,)
+        a = edge_values[a_edge]  # (R, K)
+        # Sigma[i, j] for j in P*(i): all read entries sit at earlier levels.
+        off = -jnp.einsum("rk,rkm->rm", a, store[lookup]) / delta[:, None]
+        store = store.at[out].set(off)
+        # Sigma[i, i] needs Sigma[i, p] for p in P(i), just computed.
+        off_padded = jnp.concatenate([off, jnp.zeros((off.shape[0], 1), off.dtype)], 1)
+        sigma_ip = jnp.take_along_axis(off_padded, diag_from, axis=1)
+        diag = (1.0 / delta - jnp.sum(a * sigma_ip, axis=1)) / delta
+        # Padded rows are `dim`, which lands in the store's fill region; send
+        # them to the scratch slot instead.
+        diag_out = jnp.where(rows < jacobian_diagonal.shape[0], rows, layout.store_size - 1)
+        store = store.at[diag_out].set(diag)
+        return store, None
+
+    store, _ = jax.lax.scan(
+        row_level,
+        store,
+        (layout.level_rows, layout.a_edge, layout.lookup, layout.out, layout.diag_from),
+    )
+    return store
+
+
 class LocationSkipMlp(eqx.Module):
     """Conditioner MLP plus a direct linear map from the parents to the
     transformer's location parameter.
@@ -635,6 +775,9 @@ class SparseTriangularMap(bijections.AbstractBijection):
     # `eqx.partition(flow, eqx.is_inexact_array)` still keeps them out of the
     # parameters and they stay compile-time constants in practice.
     jacobian_layout: _SparseTriangularLayout
+    # See `gauss_newton_factors`.
+    selected_inverse: _SelectedInverseLayout
+    bucket_sigma_index: tuple[Array, ...]
     cond_shape = None
 
     def __init__(
@@ -844,6 +987,27 @@ class SparseTriangularMap(bijections.AbstractBijection):
             self.bucket_members, self.bucket_parent_indices, level, dim, n_buckets
         )
 
+        # For `gauss_newton_factors`: the selected-inverse sweep, and per bucket
+        # where each member's `Sigma` block over `[i, parents...]` sits in its
+        # store. Padded parent slots point at the store's zero sentinel.
+        self.selected_inverse, store_index, sentinel = _build_selected_inverse(
+            self.jacobian_layout.edge_child_index,
+            self.jacobian_layout.edge_parent_index,
+            dim,
+        )
+        bucket_sigma_index = []
+        for members, parent_indices in zip(bucket_members, bucket_parent_indices):
+            k = parent_indices.shape[1]
+            index = np.full((len(members), k + 1, k + 1), sentinel, np.int32)
+            for local, variable in enumerate(members):
+                block = [int(variable)] + [int(p) for p in parent_indices[local]]
+                for a, u in enumerate(block):
+                    for b, v in enumerate(block):
+                        if u < dim and v < dim:
+                            index[local, a, b] = store_index(u, v)
+            bucket_sigma_index.append(jnp.asarray(index))
+        self.bucket_sigma_index = tuple(bucket_sigma_index)
+
     def _flat_params_to_transformer(self, params: Array):
         """Reshape to n x params_per_dim, then vmap."""
         transformer = eqx.filter_vmap(self.transformer_constructor)(params)
@@ -883,6 +1047,112 @@ class SparseTriangularMap(bijections.AbstractBijection):
             edge_values, jacobian_diagonal, self.jacobian_layout, grad - log_det_grad
         )
         return x, grad_x, logp - log_det
+
+    def gauss_newton_factors(self, y, grad):
+        """Per-draw factors of the exact Gauss-Newton blocks of the Fisher
+        residual ``r = x + w``, ``J^T w = grad - grad_y log_det``.
+
+        Returns, per bucket, ``V`` of shape ``(bucket_size, k + 2, n_params)``
+        with ``k`` the bucket's parent slots and `n_params` the flattened
+        parameters of one conditioner (in `ravel_pytree` order of its inexact
+        leaves), such that the Gauss-Newton block of variable `i`'s parameters
+        is ``sum_draws V_i^T V_i``.
+
+        Variable `i`'s parameters reach `r` through its own `x_i` and through
+        one shared `J^{-T}` (see `notes/lm_derivatives.md`):
+
+            dr/dtheta_i = e_i a + J^{-T} E_i B,
+
+        `a = dx_i/dtheta_i`, and `B` the local Jacobian of
+        ``q = -(d log_det_i/dy) - (dx_i/dy) w_i`` over `S_i = {i} + P(i)`, which
+        `E_i` embeds. Since `J^{-1}` is lower triangular, `e_i^T J^{-T} E_i` is
+        `e_0 / delta_i`, and the block is
+
+            a^T a + (a^T b + b^T a) / delta_i + B^T K B,
+
+        `b` the first row of `B` and `K = (J^T J)^{-1}` on `S_i x S_i`, read off
+        `_selected_inverse`. Folded into one factor with `K = L L^T` and `c =
+        e_0 / delta_i`:
+
+            V = [ sqrt(1 - |L^{-1} c|^2) a ;  L^T B + (L^{-1} c) a ].
+
+        The `sqrt` argument is the part of `e_i` outside the span of `J^{-T}
+        E_i`, so it is non-negative; it is exactly zero for a variable with no
+        ancestors.
+        """
+        dim = self.shape[0]
+
+        def log_det_with_aux(y):
+            x, log_det, rows, diagonal = self.inverse_and_log_det_and_jacobian(y)
+            return log_det, (rows, diagonal)
+
+        (_, (rows, diagonal)), log_det_grad = jax.value_and_grad(
+            log_det_with_aux, has_aux=True
+        )(y)
+        edge_values = _flatten_edge_values(rows, self.jacobian_layout)
+        w = _solve_triangular_sparse(
+            edge_values, diagonal, self.jacobian_layout, grad - log_det_grad
+        )
+        store = _selected_inverse(edge_values, diagonal, self.selected_inverse)
+
+        y_padded = jnp.concatenate([y, jnp.zeros((1,), y.dtype)])
+
+        def factor(net, parents, real, value, w_i, delta_i, sigma):
+            arrays, static = eqx.partition(net, eqx.is_inexact_array)
+            flat, unravel = jax.flatten_util.ravel_pytree(arrays)
+
+            def local(flat):
+                net = eqx.combine(unravel(flat), static)
+
+                def element(parents, value):
+                    transformer = self.transformer_constructor(net(parents))
+                    return transformer.inverse_and_log_det(value)
+
+                x_i, _ = element(parents, value)
+                (dx_dp, dx_dy), (dl_dp, dl_dy) = jax.jacrev(element, argnums=(0, 1))(
+                    parents, value
+                )
+                q_own = -dl_dy - dx_dy * w_i
+                q_parents = -dl_dp - dx_dp * w_i
+                return jnp.concatenate([x_i[None], q_own[None], q_parents])
+
+            jac = jax.jacrev(local)(flat)  # (k + 2, n_params)
+            a = jac[0]
+            # Padded parent slots read a constant, not a variable: no row.
+            B = jac[1:] * real[:, None]
+            # Their `Sigma` rows are the sentinel zero; an identity there keeps
+            # `K` factorable without touching the real block.
+            pad = ~real
+            K = jnp.where(pad[:, None] | pad[None, :], jnp.eye(real.shape[0]), sigma)
+            L = jnp.linalg.cholesky(K)
+            c = jnp.zeros(real.shape[0], a.dtype).at[0].set(1.0 / delta_i)
+            Linv_c = jax.scipy.linalg.solve_triangular(L, c, lower=True)
+            s = jnp.sqrt(jnp.maximum(1.0 - Linv_c @ Linv_c, 0.0))
+            return jnp.concatenate([(s * a)[None], L.T @ B + jnp.outer(Linv_c, a)])
+
+        factors = []
+        for bucket, conditioner in enumerate(self.conditioners):
+            members = self.bucket_members[bucket]
+            parent_indices = self.bucket_parent_indices[bucket]
+            real = jnp.concatenate(
+                [
+                    jnp.ones((members.shape[0], 1), bool),
+                    parent_indices < dim,
+                ],
+                axis=1,
+            )
+            factors.append(
+                eqx.filter_vmap(factor)(
+                    conditioner,
+                    y_padded[parent_indices],
+                    real,
+                    y[members],
+                    w[members],
+                    diagonal[members],
+                    store[self.bucket_sigma_index[bucket]],
+                )
+            )
+        return factors
 
     def inverse_and_log_det_and_jacobian(self, y, condition=None):
         """Parallel y -> x pass returning x, log|det J|, and the sparse J.
