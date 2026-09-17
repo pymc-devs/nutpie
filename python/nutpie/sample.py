@@ -1,6 +1,7 @@
 import dataclasses
 import json
 import os
+import threading
 import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -170,6 +171,14 @@ class CompiledModel:
             unconstrained_parameters=parameters,
             variables=variables,
         )
+
+    def _adapter_kwargs(self, settings, stop_event) -> dict:
+        """Extra arguments for the transform adapter of one sampler run.
+
+        `stop_event` is set when sampling is aborted, so that a flow fit that
+        is running in a chain's thread can stop early.
+        """
+        return {**self._flow_structure_kwargs(settings), "stop_event": stop_event}
 
     def _flow_structure_kwargs(self, settings) -> dict:
         """Order and sparsity for the triangular flow, if it is used.
@@ -864,6 +873,8 @@ class _BackgroundSampler:
         else:
             progress_type = _lib.ProgressType.indicatif(progress_rate)
 
+        # Tells flow fits in the chain threads to stop, see `abort`
+        self._stop_event = threading.Event()
         self._sampler = compiled_model._make_sampler(
             settings,
             cores,
@@ -871,6 +882,7 @@ class _BackgroundSampler:
             progress_callback,
             progress_rate,
             self._store,
+            stop_event=self._stop_event,
         )
 
     def wait(self, *, timeout=None):
@@ -986,12 +998,16 @@ class _BackgroundSampler:
 
     def abort(self):
         """Abort sampling and return the trace produced so far."""
+        # Set before the chains are joined, so that a running flow fit
+        # doesn't delay the abort until it is done.
+        self._stop_event.set()
         self._sampler.abort()
         results = self._sampler.take_results()
         return self._extract(results)
 
     def cancel(self):
         """Abort sampling and discard progress."""
+        self._stop_event.set()
         self._sampler.abort()
 
     def __del__(self):

@@ -186,8 +186,9 @@ class CompiledPyMCModel(CompiledModel):
         extra_callback,
         extra_callback_rate,
         store,
+        stop_event=None,
     ):
-        model = self._make_model(self._flow_structure_kwargs(settings))
+        model = self._make_model(self._adapter_kwargs(settings, stop_event))
         return _lib.PySampler.from_pymc(
             settings,
             cores,
@@ -198,7 +199,7 @@ class CompiledPyMCModel(CompiledModel):
             store,
         )
 
-    def _make_model(self, flow_structure_kwargs=None):
+    def _make_model(self, adapter_kwargs=None):
         expand_fn = _lib.ExpandFunc(
             self.n_dim,
             self.n_expanded,
@@ -226,7 +227,7 @@ class CompiledPyMCModel(CompiledModel):
 
         outer_kwargs = {
             **(self._transform_adapt_args or {}),
-            **(flow_structure_kwargs or {}),
+            **(adapter_kwargs or {}),
         }
 
         def make_adapter(*args, **kwargs):
