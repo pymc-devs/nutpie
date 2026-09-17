@@ -89,20 +89,23 @@ def test_location_skip_can_be_disabled():
 
 
 @pytest.mark.parametrize(
-    "nn_width",
+    ("nn_width", "feature_degree"),
     [
-        4,
-        0,
+        (4, None),
+        (0, None),
         # More than one SIMD block of hidden units: exercised the forward
         # kernel's blocked loop on the parentless first variable.
-        32,
+        (32, None),
+        (4, 3),
+        (32, 1),
     ],
 )
-def test_native_flow_transform_matches_jax(nn_width):
+def test_native_flow_transform_matches_jax(nn_width, feature_degree):
     """The sampler's native leapfrog transform against the JAX bijection: the
     whole `make_flow(kind="triangular")` flow -- permutation, map and affine --
     forward, log det, and the gradient pulled back with a unit log det
-    cotangent."""
+    cotangent. With parent features, their marginal maps are fitted to the
+    draws and then perturbed like every other parameter."""
     import flowjax
     from paramax import unwrap
 
@@ -127,6 +130,7 @@ def test_native_flow_transform_matches_jax(nn_width):
         activation=jax.nn.softplus,
         nn_width=nn_width,
         zero_init=False,
+        feature_degree=feature_degree,
     )
     # Off the initialization, so every parameter matters.
     params, static = eqx.partition(bijection, eqx.is_inexact_array)

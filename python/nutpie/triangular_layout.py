@@ -48,6 +48,11 @@ class TriangularLayout:
         skip_weight, skip_index: `LocationSkipMlp` weights, aligned with
             `parent_index`, added to conditioner output `skip_index`. Zeros if
             there is no skip.
+        feature_degree, feature_params: Parent features of the map. With
+            degree ``K > 0`` the MLPs see ``K`` Hermite features per parent,
+            parent-major, of the parent through its `marginal_to_normal` map
+            with parameters ``feature_params[parent]`` (``(n_variables, 5)``).
+            Degree 0: the MLPs see the raw parents.
         level_ptr, level_vars: Elimination levels as CSR. Variables within a
             level are independent.
         level_work: Estimated cost of each level, in multiply-adds.
@@ -61,6 +66,8 @@ class TriangularLayout:
     layer_out: np.ndarray
     skip_weight: np.ndarray
     skip_index: int
+    feature_degree: int
+    feature_params: np.ndarray
     activation: str
     transformer: tuple[Contract2Spec, ...]
     level_ptr: np.ndarray
@@ -229,6 +236,14 @@ def extract_layout(flow_map) -> TriangularLayout:
     (skip_index,) = skip_indices
     skip_index = 0 if skip_index is None else int(skip_index)
 
+    feature_degree = flow_map.feature_degree or 0
+    features_per_parent = max(feature_degree, 1)
+    feature_params = (
+        np.zeros((dim, 5))
+        if feature_degree == 0
+        else np.asarray(flow_map.feature_params, dtype=np.float64)
+    )
+
     reference = mlps[0]
     n_layers = len(reference.layers)
     activation = _activation_name(reference.activation)
@@ -299,7 +314,7 @@ def extract_layout(flow_map) -> TriangularLayout:
             for layer_index, (weight, bias) in enumerate(layers):
                 w = weight[local]
                 if layer_index == 0:
-                    w = w[:, : len(real)]
+                    w = w[:, : len(real) * features_per_parent]
                 # Transposed to (n_in, n_out); see `TriangularLayout.blob`.
                 parts.append(np.ascontiguousarray(w.T).ravel())
                 parts.append(bias[local])
@@ -327,7 +342,13 @@ def extract_layout(flow_map) -> TriangularLayout:
         dim, parent_indptr, parent_index, sizes, len(transformer)
     )
 
-    buffer_size = int(max(layer_out.max(initial=1), n_parents.max(initial=0), 1))
+    buffer_size = int(
+        max(
+            layer_out.max(initial=1),
+            n_parents.max(initial=0) * features_per_parent,
+            1,
+        )
+    )
     return TriangularLayout(
         n_variables=dim,
         parent_indptr=parent_indptr,
@@ -337,6 +358,8 @@ def extract_layout(flow_map) -> TriangularLayout:
         layer_out=layer_out,
         skip_weight=skip_weight,
         skip_index=skip_index,
+        feature_degree=int(feature_degree),
+        feature_params=feature_params,
         activation=activation,
         transformer=transformer,
         level_ptr=level_ptr,

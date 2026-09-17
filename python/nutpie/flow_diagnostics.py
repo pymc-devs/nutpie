@@ -332,12 +332,13 @@ def fisher_influence(bijection, trace, *, num_nodes=16, batch_size=256):
     dim = tmap.shape[0]
     constructor = tmap.transformer_constructor
 
-    def speeds(net, parents):
+    def speeds(net, parents, parent_indices):
         """Squared speeds per parent slot, for one conditioner and draw:
         total, even (location and skew) and odd (scale and tails) part."""
         nodes, weights = _quadrature(num_nodes, parents.dtype)
-        theta = net(parents)
-        G = jax.jacfwd(net)(parents)  # (num_params, num_parents)
+        condition = lambda p: tmap._condition(net, p, parent_indices)
+        theta = condition(parents)
+        G = jax.jacfwd(condition)(parents)  # (num_params, num_parents)
         V, dV = latent_velocities(constructor, theta, nodes)
         V, dV = V @ G, dV @ G  # per parent slot, (nodes, num_parents)
         # The nodes are symmetric, so reversing them gives V(-x).
@@ -351,10 +352,12 @@ def fisher_influence(bijection, trace, *, num_nodes=16, batch_size=256):
         return even_part + odd_part, even_part, odd_part
 
     @eqx.filter_jit
-    def bucket_sums(conditioner, parent_values):
+    def bucket_sums(conditioner, parent_values, parent_indices):
         # vmap over the draws, then over the conditioners of the bucket
         per_draw = jax.vmap(
-            lambda values: eqx.filter_vmap(speeds)(conditioner, values)
+            lambda values: eqx.filter_vmap(speeds)(
+                conditioner, values, parent_indices
+            )
         )(parent_values)
         return [part.sum(0) for part in per_draw]
 
@@ -367,7 +370,7 @@ def fisher_influence(bijection, trace, *, num_nodes=16, batch_size=256):
 
         sums = None
         for parents in _parent_batches(tmap, bucket, draws, to_map, batch_size):
-            batch = bucket_sums(conditioner, parents)
+            batch = bucket_sums(conditioner, parents, parent_indices)
             sums = batch if sums is None else [s + b for s, b in zip(sums, batch)]
 
         # Padded parent slots read a constant and have no influence.
@@ -502,9 +505,10 @@ class ConditionerCapacity:
         )
 
 
-def _unit_features(net):
-    """Features of one conditioner at its parent values: its last hidden
-    layer, then the parent values that feed the location skip."""
+def _unit_features(tmap, net):
+    """Features of one conditioner of `tmap` at its parent values and
+    indices: its last hidden layer, then the parent values that feed the
+    location skip."""
     import equinox as eqx
     import jax.numpy as jnp
 
@@ -515,8 +519,9 @@ def _unit_features(net):
         raise ValueError("The conditioners have no hidden layer (nn_depth=0).")
     hidden_fn = eqx.tree_at(lambda m: m.layers[-1], mlp, eqx.nn.Identity())
 
-    def features(parents):
-        hidden = hidden_fn(parents)
+    def features(parents, parent_indices):
+        inputs = tmap.mlp_inputs(parents, parent_indices)
+        hidden = hidden_fn(parents if inputs is None else inputs)
         if isinstance(net, LocationSkipMlp):
             return jnp.concatenate([hidden, parents])
         return hidden
@@ -655,12 +660,14 @@ def conditioner_capacity(
         return draw, grad
 
     @eqx.filter_jit
-    def feature_sums(conditioner, parent_values):
+    def feature_sums(conditioner, parent_values, parent_indices):
         # vmap over the draws, then over the conditioners of the bucket
         per_draw = jax.vmap(
             lambda values: eqx.filter_vmap(
-                lambda net, parents: _unit_features(net)(parents)
-            )(conditioner, values)
+                lambda net, parents, indices: _unit_features(tmap, net)(
+                    parents, indices
+                )
+            )(conditioner, values, parent_indices)
         )(parent_values)
         return per_draw.sum(0)
 
@@ -679,8 +686,9 @@ def conditioner_capacity(
     # First pass: the mean output of each unit, absorbed by the bias
     directions = []
     for bucket, conditioner in enumerate(tmap.conditioners):
+        parent_indices = tmap.bucket_parent_indices[bucket]
         sums = sum(
-            feature_sums(conditioner, parents)
+            feature_sums(conditioner, parents, parent_indices)
             for parents in _parent_batches(tmap, bucket, draws, to_map, batch_size)
         )
         directions.append(
