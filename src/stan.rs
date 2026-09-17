@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use std::{ffi::CString, path::PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -456,8 +457,13 @@ impl StanModel {
             seed: rng.next_u64(),
         };
         let inner = &self.inner;
-        let pattern =
-            py.detach(|| hessian_sparsity(&mut StanHessian { inner }, &points, &options))?;
+        let pattern = py.detach(|| {
+            let mut hessian = StanHessian {
+                inner,
+                last_signal_check: Instant::now(),
+            };
+            hessian_sparsity(&mut hessian, &points, &options)
+        })?;
 
         let (indptr, indices) = pattern.to_csr();
         Ok((
@@ -987,6 +993,7 @@ impl StanModel {
             if points.len() == num_points {
                 break;
             }
+            py.check_signals()?;
             let mut position = vec![0f64; n];
             match self.init_position(rng, points.len() as u64, &mut position) {
                 Ok(()) => {}
@@ -1028,8 +1035,26 @@ impl StanModel {
     }
 }
 
+/// How often the Hessian sparsity detection checks for a KeyboardInterrupt.
+const SIGNAL_CHECK_INTERVAL: Duration = Duration::from_millis(100);
+
 struct StanHessian<'a> {
     inner: &'a InnerModel,
+    last_signal_check: Instant,
+}
+
+impl StanHessian<'_> {
+    /// Let Python handle signals, since the detection runs without the GIL.
+    /// A KeyboardInterrupt is returned as the plain `PyErr`, so that pyo3
+    /// raises it unchanged.
+    fn check_signals(&mut self) -> Result<()> {
+        if self.last_signal_check.elapsed() < SIGNAL_CHECK_INTERVAL {
+            return Ok(());
+        }
+        self.last_signal_check = Instant::now();
+        Python::attach(|py| py.check_signals())?;
+        Ok(())
+    }
 }
 
 impl HessianVectorProduct for StanHessian<'_> {
@@ -1038,6 +1063,7 @@ impl HessianVectorProduct for StanHessian<'_> {
     }
 
     fn hvp(&mut self, point: &[f64], vector: &[f64], out: &mut [f64]) -> Result<()> {
+        self.check_signals()?;
         self.inner
             .log_density_hessian_vector_product(point, vector, true, true, out)
             .context("Failed to compute Hessian-vector product")?;
