@@ -39,10 +39,10 @@ import numpy as np
 from nutpie.triangular_layout import TriangularLayout, extract_layout
 
 __all__ = [
-    "compile_transform",
-    "flow_transform_layout",
     "DEFAULT_MIN_PARALLEL_WORK",
     "SCHEDULES",
+    "compile_transform",
+    "flow_transform_layout",
 ]
 
 
@@ -159,19 +159,19 @@ def _transform_kwargs(layout, schedule, min_parallel_work):
             if entry is not None:
                 layer[field] = {"index": int(entry[0]), "offset": float(entry[1])}
 
-    return dict(
-        parent_indptr=np.asarray(layout.parent_indptr, dtype=np.int64),
-        parent_index=np.asarray(layout.parent_index, dtype=np.int64),
-        blob=np.asarray(layout.blob, dtype=np.float64),
-        blob_offset=np.asarray(layout.blob_offset, dtype=np.int64),
-        layer_out=np.asarray(layout.layer_out, dtype=np.int64),
-        skip_weight=np.asarray(layout.skip_weight, dtype=np.float64),
-        skip_index=int(layout.skip_index),
-        activation=layout.activation,
-        transformer=transformer,
-        level_ptr=np.asarray(layout.level_ptr, dtype=np.int64),
-        level_vars=np.asarray(layout.level_vars, dtype=np.int64),
-        level_work=np.asarray(layout.level_work, dtype=np.int64),
-        min_parallel_work=int(min_parallel_work),
-        schedule=schedule,
-    )
+    return {
+        "parent_indptr": np.asarray(layout.parent_indptr, dtype=np.int64),
+        "parent_index": np.asarray(layout.parent_index, dtype=np.int64),
+        "blob": np.asarray(layout.blob, dtype=np.float64),
+        "blob_offset": np.asarray(layout.blob_offset, dtype=np.int64),
+        "layer_out": np.asarray(layout.layer_out, dtype=np.int64),
+        "skip_weight": np.asarray(layout.skip_weight, dtype=np.float64),
+        "skip_index": int(layout.skip_index),
+        "activation": layout.activation,
+        "transformer": transformer,
+        "level_ptr": np.asarray(layout.level_ptr, dtype=np.int64),
+        "level_vars": np.asarray(layout.level_vars, dtype=np.int64),
+        "level_work": np.asarray(layout.level_work, dtype=np.int64),
+        "min_parallel_work": int(min_parallel_work),
+        "schedule": schedule,
+    }

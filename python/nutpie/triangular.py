@@ -1,14 +1,15 @@
-from paramax import NonTrainable
-from flowjax.utils import get_ravelled_pytree_constructor
+from collections.abc import Callable
+
+import equinox as eqx
 import jax
 import jax.flatten_util
-from jax.typing import ArrayLike
-from typing import Callable, ClassVar
-import numpy as np
 import jax.numpy as jnp
-from jax import Array
+import numpy as np
 from flowjax import bijections
-import equinox as eqx
+from flowjax.utils import get_ravelled_pytree_constructor
+from jax import Array
+from jax.typing import ArrayLike
+from paramax import NonTrainable
 
 
 def _min_waste_segments(
@@ -188,9 +189,7 @@ def _build_layout(
 
     def group_edges(level_of_edge, endpoint_of_edge, segments):
         """Per-segment (edge index, target slot) arrays."""
-        by_level = [
-            np.flatnonzero(level_of_edge == level) for level in range(n_levels)
-        ]
+        by_level = [np.flatnonzero(level_of_edge == level) for level in range(n_levels)]
         index_segments, slot_segments = [], []
         for start, stop in segments:
             width = max((len(by_level[l]) for l in range(start, stop)), default=0)
@@ -474,7 +473,9 @@ def _selected_inverse(edge_values, jacobian_diagonal, layout):
         sigma_ip = jnp.take_along_axis(off_padded, diag_from, axis=1)
         diag = (1.0 / delta - jnp.sum(a * sigma_ip, axis=1)) / delta
         # Padded rows (`dim`) go to the scratch slot.
-        diag_out = jnp.where(rows < jacobian_diagonal.shape[0], rows, layout.store_size - 1)
+        diag_out = jnp.where(
+            rows < jacobian_diagonal.shape[0], rows, layout.store_size - 1
+        )
         store = store.at[diag_out].set(diag)
         return store, None
 
@@ -613,7 +614,7 @@ class SparseTriangularMap(bijections.AbstractBijection):
                 affine_transformer=False,
                 asymmetric_transformer=False,
                 contract_transformer=2,
-                #log_gamma_bounds=(-1, 1),
+                # log_gamma_bounds=(-1, 1),
             )
         if transformer.shape != () or transformer.cond_shape is not None:
             raise ValueError(
@@ -858,7 +859,7 @@ class SparseTriangularMap(bijections.AbstractBijection):
         dim = self.shape[0]
 
         def log_det_with_aux(y):
-            x, log_det, rows, diagonal = self.inverse_and_log_det_and_jacobian(y)
+            _, log_det, rows, diagonal = self.inverse_and_log_det_and_jacobian(y)
             return log_det, (rows, diagonal)
 
         (_, (rows, diagonal)), log_det_grad = jax.value_and_grad(
@@ -987,9 +988,9 @@ class SparseTriangularMap(bijections.AbstractBijection):
                     parent_idx = self.bucket_parent_indices[bucket][local_members]
                     parents = y.at[parent_idx].get(mode="fill", fill_value=0.0)
                     conditioner_group = jax.tree.map(
-                        lambda leaf: leaf[local_members]
-                        if eqx.is_array(leaf)
-                        else leaf,
+                        lambda leaf: (
+                            leaf[local_members] if eqx.is_array(leaf) else leaf
+                        ),
                         self.conditioners[bucket],
                     )
 
