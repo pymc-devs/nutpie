@@ -555,13 +555,17 @@ def in_notebook():
         return False  # Probably standard Python interpreter
 
 
-_ZarrStoreType = (
-    _lib.store.S3Store
-    | _lib.store.LocalStore
-    | _lib.store.HTTPStore
-    | _lib.store.GCSStore
-    | _lib.store.AzureStore
-)
+# Builds without the `zarr` feature (e.g. wasm) have no store module.
+if hasattr(_lib, "store"):
+    _ZarrStoreType = (
+        _lib.store.S3Store
+        | _lib.store.LocalStore
+        | _lib.store.HTTPStore
+        | _lib.store.GCSStore
+        | _lib.store.AzureStore
+    )
+else:
+    _ZarrStoreType = Any
 
 
 class _BackgroundSampler:
@@ -1041,7 +1045,8 @@ def sample(
 
         The callback fires at the same rate as the progress bar
         (``progress_rate`` ms). It runs on a background thread, so it must
-        be thread-safe. Exceptions raised inside it are printed to stderr
+        be thread-safe. (Builds without threads, e.g. on wasm, call it from
+        inside ``wait`` instead.) Exceptions raised inside it are printed to stderr
         and otherwise silently swallowed so that sampling is not interrupted.
         The built-in progress bar is still shown regardless of whether this
         callback is set.

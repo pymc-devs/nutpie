@@ -19,7 +19,6 @@ use nuts_rs::{
     ArrowConfig, ArrowTrace, ChainProgress, DiagMclmcSettings, DiagNutsSettings, FlowMclmcSettings,
     FlowNutsSettings, KineticEnergyKind, LowRankMclmcSettings, LowRankNutsSettings,
     MclmcTrajectoryKind, Model, ProgressCallback, Sampler, SamplerWaitResult, StepSizeAdaptMethod,
-    ZarrAsyncConfig,
 };
 use pyo3::{
     exceptions::{PyAttributeError, PyTimeoutError, PyValueError},
@@ -28,12 +27,24 @@ use pyo3::{
     types::{PyDict, PyList},
 };
 use pyo3_arrow::PyRecordBatch;
-use pyo3_object_store::AnyObjectStore;
 use pythonize::{depythonize, pythonize};
 use rand::{rng, Rng};
 use serde_json::Value as JsonValue;
+
+#[cfg(feature = "zarr")]
+use nuts_rs::ZarrAsyncConfig;
+#[cfg(feature = "zarr")]
+use pyo3_object_store::AnyObjectStore;
+#[cfg(feature = "zarr")]
 use tokio::runtime::Runtime;
+#[cfg(feature = "zarr")]
 use zarrs_object_store::{object_store::limit::LimitStore, AsyncObjectStore};
+
+/// Keeps the runtime that drives zarr writes alive for as long as the sampler.
+#[cfg(feature = "zarr")]
+type StoreRuntime = Option<Runtime>;
+#[cfg(not(feature = "zarr"))]
+type StoreRuntime = ();
 
 #[pyclass]
 pub struct PyChainProgress(ChainProgress);
@@ -930,6 +941,7 @@ impl ProgressType {
 }
 
 enum InnerPyStorage {
+    #[cfg(feature = "zarr")]
     Zarr(Option<AnyObjectStore>),
     Arrow,
 }
@@ -939,6 +951,7 @@ struct PyStorage(InnerPyStorage);
 
 #[pymethods]
 impl PyStorage {
+    #[cfg(feature = "zarr")]
     #[staticmethod]
     fn zarr(object_store: AnyObjectStore) -> Self {
         Self(InnerPyStorage::Zarr(Some(object_store)))
@@ -950,8 +963,59 @@ impl PyStorage {
     }
 }
 
-#[pyclass]
-struct PySampler(Mutex<(SamplerState, Runtime)>);
+// Without `parallel` the chains live in the sampler and are not `Send`, so it
+// has to stay on the thread that created it.
+#[cfg_attr(feature = "parallel", pyclass)]
+#[cfg_attr(not(feature = "parallel"), pyclass(unsendable))]
+struct PySampler(Mutex<(SamplerState, StoreRuntime)>);
+
+/// Release the GIL while the sampler works on this thread.
+#[cfg(feature = "parallel")]
+fn detach<T: Send, F: Send + FnOnce() -> T>(py: Python<'_>, f: F) -> T {
+    py.detach(f)
+}
+
+/// Without `parallel` the sampler is not `Send`, so it can not cross `detach`.
+/// Nothing else runs meanwhile anyway, the chains sample on this thread.
+///
+/// On stable pyo3 `Ungil` is just `Send`. If it becomes an auto trait that only
+/// excludes GIL-bound types (as with pyo3's `nightly` feature), this helper can
+/// go and we can call `py.detach` directly again.
+#[cfg(not(feature = "parallel"))]
+fn detach<T, F: FnOnce() -> T>(_py: Python<'_>, f: F) -> T {
+    f()
+}
+
+/// Start a sampler for whichever settings kind was requested, wrapped in the
+/// `SamplerState` variant `$running` of the storage backend.
+macro_rules! start_sampler {
+    ($model:expr, $settings:expr, $storage:expr, $cores:expr, $callback:expr, $running:path) => {
+        match $settings {
+            PySamplerSettings::Nuts(settings) => match settings.inner {
+                NutsSettingsKind::LowRank(settings) => {
+                    $running(Sampler::new($model, settings, $storage, $cores, $callback)?)
+                }
+                NutsSettingsKind::Diag(settings) => {
+                    $running(Sampler::new($model, settings, $storage, $cores, $callback)?)
+                }
+                NutsSettingsKind::Flow(settings) => {
+                    $running(Sampler::new($model, settings, $storage, $cores, $callback)?)
+                }
+            },
+            PySamplerSettings::Mclmc(settings) => match settings.inner {
+                MclmcSettingsKind::LowRank(settings) => {
+                    $running(Sampler::new($model, settings, $storage, $cores, $callback)?)
+                }
+                MclmcSettingsKind::Diag(settings) => {
+                    $running(Sampler::new($model, settings, $storage, $cores, $callback)?)
+                }
+                MclmcSettingsKind::Flow(settings) => {
+                    $running(Sampler::new($model, settings, $storage, $cores, $callback)?)
+                }
+            },
+        }
+    };
+}
 
 impl PySampler {
     fn new<M: Model>(
@@ -966,67 +1030,23 @@ impl PySampler {
         let extra_callback = extra_callback.map(Arc::new);
         let extra_rate = Duration::from_millis(extra_callback_rate);
         let callback = progress_type.into_callback(extra_callback, extra_rate)?;
-        let tokio_rt = Runtime::new().context("Failed to create Tokio runtime")?;
         let model = Arc::new(model);
         match &mut store.0 {
             InnerPyStorage::Arrow => {
                 let storage_config = ArrowConfig::default();
-                match settings {
-                    PySamplerSettings::Nuts(settings) => match settings.inner {
-                        NutsSettingsKind::LowRank(settings) => {
-                            let sampler =
-                                Sampler::new(model, settings, storage_config, cores, callback)?;
-                            Ok(PySampler(Mutex::new((
-                                SamplerState::RunningArrow(sampler).into(),
-                                tokio_rt,
-                            ))))
-                        }
-                        NutsSettingsKind::Diag(settings) => {
-                            let sampler =
-                                Sampler::new(model, settings, storage_config, cores, callback)?;
-                            Ok(PySampler(Mutex::new((
-                                SamplerState::RunningArrow(sampler).into(),
-                                tokio_rt,
-                            ))))
-                        }
-                        NutsSettingsKind::Flow(settings) => {
-                            let sampler =
-                                Sampler::new(model, settings, storage_config, cores, callback)?;
-                            Ok(PySampler(Mutex::new((
-                                SamplerState::RunningArrow(sampler).into(),
-                                tokio_rt,
-                            ))))
-                        }
-                    },
-                    PySamplerSettings::Mclmc(settings) => match settings.inner {
-                        MclmcSettingsKind::LowRank(settings) => {
-                            let sampler =
-                                Sampler::new(model, settings, storage_config, cores, callback)?;
-                            Ok(PySampler(Mutex::new((
-                                SamplerState::RunningArrow(sampler).into(),
-                                tokio_rt,
-                            ))))
-                        }
-                        MclmcSettingsKind::Diag(settings) => {
-                            let sampler =
-                                Sampler::new(model, settings, storage_config, cores, callback)?;
-                            Ok(PySampler(Mutex::new((
-                                SamplerState::RunningArrow(sampler).into(),
-                                tokio_rt,
-                            ))))
-                        }
-                        MclmcSettingsKind::Flow(settings) => {
-                            let sampler =
-                                Sampler::new(model, settings, storage_config, cores, callback)?;
-                            Ok(PySampler(Mutex::new((
-                                SamplerState::RunningArrow(sampler).into(),
-                                tokio_rt,
-                            ))))
-                        }
-                    },
-                }
+                let state = start_sampler!(
+                    model,
+                    settings,
+                    storage_config,
+                    cores,
+                    callback,
+                    SamplerState::RunningArrow
+                );
+                Ok(PySampler(Mutex::new((state, Default::default()))))
             }
+            #[cfg(feature = "zarr")]
             InnerPyStorage::Zarr(store) => {
+                let tokio_rt = Runtime::new().context("Failed to create Tokio runtime")?;
                 zarrs::config::global_config_mut().set_include_zarrs_metadata(false);
                 let object_store = store
                     .take()
@@ -1037,60 +1057,15 @@ impl PySampler {
                 let store = Arc::new(store);
                 let storage_config = ZarrAsyncConfig::new(tokio_rt.handle().clone(), store);
                 let storage_config = storage_config.with_chunk_size(16);
-                match settings {
-                    PySamplerSettings::Nuts(settings) => match settings.inner {
-                        NutsSettingsKind::LowRank(settings) => {
-                            let sampler =
-                                Sampler::new(model, settings, storage_config, cores, callback)?;
-                            Ok(PySampler(Mutex::new((
-                                SamplerState::RunningZarr(sampler).into(),
-                                tokio_rt,
-                            ))))
-                        }
-                        NutsSettingsKind::Diag(settings) => {
-                            let sampler =
-                                Sampler::new(model, settings, storage_config, cores, callback)?;
-                            Ok(PySampler(Mutex::new((
-                                SamplerState::RunningZarr(sampler).into(),
-                                tokio_rt,
-                            ))))
-                        }
-                        NutsSettingsKind::Flow(settings) => {
-                            let sampler =
-                                Sampler::new(model, settings, storage_config, cores, callback)?;
-                            Ok(PySampler(Mutex::new((
-                                SamplerState::RunningZarr(sampler).into(),
-                                tokio_rt,
-                            ))))
-                        }
-                    },
-                    PySamplerSettings::Mclmc(settings) => match settings.inner {
-                        MclmcSettingsKind::LowRank(settings) => {
-                            let sampler =
-                                Sampler::new(model, settings, storage_config, cores, callback)?;
-                            Ok(PySampler(Mutex::new((
-                                SamplerState::RunningZarr(sampler).into(),
-                                tokio_rt,
-                            ))))
-                        }
-                        MclmcSettingsKind::Diag(settings) => {
-                            let sampler =
-                                Sampler::new(model, settings, storage_config, cores, callback)?;
-                            Ok(PySampler(Mutex::new((
-                                SamplerState::RunningZarr(sampler).into(),
-                                tokio_rt,
-                            ))))
-                        }
-                        MclmcSettingsKind::Flow(settings) => {
-                            let sampler =
-                                Sampler::new(model, settings, storage_config, cores, callback)?;
-                            Ok(PySampler(Mutex::new((
-                                SamplerState::RunningZarr(sampler).into(),
-                                tokio_rt,
-                            ))))
-                        }
-                    },
-                }
+                let state = start_sampler!(
+                    model,
+                    settings,
+                    storage_config,
+                    cores,
+                    callback,
+                    SamplerState::RunningZarr
+                );
+                Ok(PySampler(Mutex::new((state, Some(tokio_rt)))))
             }
         }
     }
@@ -1252,7 +1227,7 @@ impl PySampler {
 
     fn is_finished(&mut self, py: Python<'_>) -> PyResult<bool> {
         self.wait(py, Some(0.001))?;
-        py.detach(|| {
+        detach(py, || {
             let guard = &mut self.0.lock().expect("Poisoned sampler state mutex");
             Ok(matches!(
                 guard.deref_mut().0,
@@ -1262,7 +1237,7 @@ impl PySampler {
     }
 
     fn pause(&mut self, py: Python<'_>) -> PyResult<()> {
-        py.detach(|| {
+        detach(py, || {
             match self
                 .0
                 .lock()
@@ -1283,7 +1258,7 @@ impl PySampler {
     }
 
     fn resume(&mut self, py: Python<'_>) -> PyResult<()> {
-        py.detach(|| {
+        detach(py, || {
             match self
                 .0
                 .lock()
@@ -1305,7 +1280,7 @@ impl PySampler {
 
     #[pyo3(signature = (timeout_seconds=None))]
     fn wait(&mut self, py: Python<'_>, timeout_seconds: Option<f64>) -> PyResult<()> {
-        py.detach(|| {
+        detach(py, || {
             let guard = &mut self.0.lock().expect("Poisoned sampler state mutex");
             let slot = guard.deref_mut();
             let slot = &mut slot.0;
@@ -1331,7 +1306,7 @@ impl PySampler {
     }
 
     fn abort(&mut self, py: Python<'_>) -> PyResult<()> {
-        py.detach(|| {
+        detach(py, || {
             let guard = &mut self.0.lock().expect("Poisoned sampler state mutex");
             let slot = guard.deref_mut();
             let slot = &mut slot.0;
@@ -1389,11 +1364,11 @@ impl PySampler {
             SamplerState::FinishedArrow(_) => Ok(()),
             SamplerState::Empty => Ok(()),
             SamplerState::RunningZarr(ref mut control) => {
-                py.detach(|| control.flush())?;
+                detach(py, || control.flush())?;
                 Ok(())
             }
             SamplerState::RunningArrow(ref mut control) => {
-                py.detach(|| control.flush())?;
+                detach(py, || control.flush())?;
                 Ok(())
             }
         }
@@ -1413,14 +1388,14 @@ impl PySampler {
             }
             SamplerState::Empty => Ok(None),
             SamplerState::RunningZarr(control) => {
-                let (res, _) = py.detach(|| control.inspect())?;
+                let (res, _) = detach(py, || control.inspect())?;
                 if let Some(err) = res {
                     return Err(err.into());
                 }
                 Ok(Some(PyTrace(InnerPyTrace::Zarr)))
             }
             SamplerState::RunningArrow(control) => {
-                let (res, trace) = py.detach(|| control.inspect())?;
+                let (res, trace) = detach(py, || control.inspect())?;
                 if let Some(err) = res {
                     return Err(err.into());
                 }
@@ -1755,7 +1730,10 @@ pub fn _lib(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyStorage>()?;
     m.add_class::<PyTrace>()?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
-    pyo3_object_store::register_store_module(m.py(), m, "_lib", "store")?;
-    pyo3_object_store::register_exceptions_module(m.py(), m, "_lib", "exceptions")?;
+    #[cfg(feature = "zarr")]
+    {
+        pyo3_object_store::register_store_module(m.py(), m, "_lib", "store")?;
+        pyo3_object_store::register_exceptions_module(m.py(), m, "_lib", "exceptions")?;
+    }
     Ok(())
 }
