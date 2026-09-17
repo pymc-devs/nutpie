@@ -2399,6 +2399,7 @@ dependencies = [
  "arrow",
  "bridgestan",
  "criterion",
+ "faer",
  "indicatif",
  "itertools 0.15.0",
  "numpy",

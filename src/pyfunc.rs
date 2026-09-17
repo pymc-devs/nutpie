@@ -31,12 +31,14 @@ pub struct PyModel {
     ndim: usize,
     dim_sizes: HashMap<String, u64>,
     coords: HashMap<String, Value>,
+    /// Labels of the `unconstrained_parameter` dim of the sampler stats
+    unconstrained_names: Option<Vec<String>>,
 }
 
 #[pymethods]
 impl PyModel {
     #[new]
-    #[pyo3(signature = (make_logp_func, make_expand_func, variables, ndim, dim_sizes, coords, *, init_point_func=None, transform_adapter=None))]
+    #[pyo3(signature = (make_logp_func, make_expand_func, variables, ndim, dim_sizes, coords, *, init_point_func=None, transform_adapter=None, unconstrained_names=None))]
     fn new<'py>(
         py: Python<'py>,
         make_logp_func: Py<PyAny>,
@@ -47,6 +49,7 @@ impl PyModel {
         coords: Py<PyDict>,
         init_point_func: Option<Py<PyAny>>,
         transform_adapter: Option<Py<PyAny>>,
+        unconstrained_names: Option<Vec<String>>,
     ) -> Result<Self> {
         let dim_sizes = dim_sizes
             .bind(py)
@@ -81,6 +84,7 @@ impl PyModel {
             transform_adapter: transform_adapter.map(PyTransformAdapt::new),
             dim_sizes,
             coords,
+            unconstrained_names,
         })
     }
 }
@@ -125,6 +129,7 @@ pub struct PyDensity {
     variables: Arc<Vec<PyVariable>>,
     dim_sizes: HashMap<String, u64>,
     coords: HashMap<String, Value>,
+    unconstrained_names: Option<Vec<String>>,
     native_flow: NativeFlow,
 }
 
@@ -137,6 +142,7 @@ impl PyDensity {
         variables: Arc<Vec<PyVariable>>,
         dim_sizes: HashMap<String, u64>,
         coords: HashMap<String, Value>,
+        unconstrained_names: Option<Vec<String>>,
     ) -> Result<Self> {
         let logp_func = Python::attach(|py| logp_clone_func.call0(py))?;
         let expand_func = Python::attach(|py| expand_clone_func.call1(py, (0u64, 0u64, 0u64)))?;
@@ -149,6 +155,7 @@ impl PyDensity {
             variables,
             dim_sizes,
             coords,
+            unconstrained_names,
             native_flow: NativeFlow::default(),
         })
     }
@@ -235,6 +242,10 @@ impl CpuLogpFunc for PyDensity {
 
     fn dim(&self) -> usize {
         self.dim
+    }
+
+    fn vector_coord(&self) -> Option<Value> {
+        self.unconstrained_names.clone().map(Value::Strings)
     }
 
     fn expand_vector<R>(
@@ -558,6 +569,7 @@ impl Model for PyModel {
             self.variables.clone(),
             self.dim_sizes.clone(),
             self.coords.clone(),
+            self.unconstrained_names.clone(),
         )?))
     }
 
