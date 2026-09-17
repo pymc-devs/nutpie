@@ -14,32 +14,12 @@ import equinox as eqx
 def _min_waste_segments(
     counts: np.ndarray, n_segments: int, weights: np.ndarray | None = None
 ) -> list:
-    """Split `counts` into at most `n_segments` *contiguous* runs, minimizing
-    ``sum(run_max * len(run))`` -- the number of padded slots when each run is
-    stored as one rectangular array of its own width.
+    """Split `counts` into at most `n_segments` contiguous runs, minimizing
+    padding ``sum(len(run) * run_max)``; returns ``(start, stop)`` pairs.
 
-    This is `_min_waste_buckets`' objective (the two differ by ``sum(counts)``,
-    a constant) under one extra constraint: the runs must be contiguous in the
-    *given* order, not in sorted order. Elimination levels cannot be reordered,
-    since back substitution needs level ``l + 1`` resolved before level ``l``,
-    so the sortedness that lets `_min_waste_buckets` read a group's maximum off
-    its last element is unavailable and the maximum is carried explicitly.
-
-    Splitting matters whenever the per-level edge counts are skewed, which a
-    single variable that parents many others is enough to cause: one level then
-    sizes the array for all of them.
-
-    `counts` may also be ``(n, n_groups)``, for the case where each level is
-    stored as one rectangular array *per group* -- one per conditioner bucket
-    in `SparseTriangularMap.transform_and_log_det`. Each group is then padded
-    to its own per-run maximum and the run's cost is the weighted sum over
-    groups, ``len(run) * sum_g weights[g] * run_max[g]``. `weights` is the
-    relative cost of one padded slot in each group (a bucket whose conditioner
-    reads 200 parents wastes far more per slot than one that reads 1), and
-    defaults to uniform.
-
-    Returns:
-        List of ``(start, stop)`` index pairs covering ``range(len(counts))``.
+    Like `_min_waste_buckets`, but the order is fixed: levels cannot be
+    reordered. For ``(n, n_groups)`` counts each group is padded separately,
+    and the cost is ``len(run) * sum_g weights[g] * run_max[g]``.
     """
     counts = np.asarray(counts, dtype=np.int64)
     if counts.ndim == 1:
@@ -81,26 +61,11 @@ def _min_waste_segments(
 
 
 def _min_waste_buckets(counts: np.ndarray, n_buckets: int) -> np.ndarray:
-    """Partition `counts` into at most `n_buckets` groups, minimizing the
-    total padding waste ``sum(group_max - value)`` that results from padding
-    every value in a group up to that group's own maximum.
+    """Partition `counts` into at most `n_buckets` groups, minimizing padding
+    ``sum(group_max - value)``; returns each item's bucket (0 = smallest).
 
-    This is exactly the cost `SparseTriangularMap` cares about when sizing
-    conditioner-network buckets by parent count: it's the number of wasted
-    (zero-padded) conditioner input columns, summed over all variables. The
-    optimal groups are always contiguous ranges of the *sorted* values
-    (grouping a value with smaller ones it isn't padded down to never
-    helps), so this is a small, exact dynamic program -- no need for an
-    approximate heuristic or an external clustering library, and no need to
-    reach for the general (and here unnecessary) machinery of optimal
-    1D-clustering algorithms: with `n` items and `n_buckets` groups it's
-    O(n^2 * n_buckets), which is negligible at the sizes this is used for
-    (this runs once, at construction time).
-
-    Returns:
-        `(len(counts),)` int array giving each item's bucket index (0 is
-        the bucket containing the smallest values), in the same order as
-        `counts`.
+    Optimal groups are contiguous in sorted order, so this is an exact
+    ``O(n^2 * n_buckets)`` dynamic program.
     """
     counts = np.asarray(counts)
     n = len(counts)
@@ -148,20 +113,11 @@ def _min_waste_buckets(counts: np.ndarray, n_buckets: int) -> np.ndarray:
 
 
 class _SparseTriangularLayout(eqx.Module):
-    """Static sparsity structure of the Jacobian. Built once, outside jit.
+    """Static sparsity structure of the Jacobian, built once outside jit.
 
-    `inverse_gradient_and_val` only ever needs ``J^T w = rhs``, resolved by
-    back-substitution: levels last-to-first, each variable summing
-    contributions from its already-resolved children. That is what the
-    ``level_*`` arrays below are grouped for -- by the level of each edge's
-    *parent*.
-
-    Differentiating that solve needs the other direction too: the cotangent of
-    ``A^-1 rhs`` involves ``A^-T``, i.e. forward substitution on ``J`` itself,
-    where a variable sums over its *parents* and levels run first-to-last. The
-    ``child_level_*`` arrays are the same edges regrouped by the level of each
-    edge's child, which is what that traversal gathers on. Both groupings are
-    pure index arrays built once, outside jit.
+    ``level_*`` groups edges by their parent's level, for back substitution
+    (``J^T w = rhs``). ``child_level_*`` groups them by their child's level,
+    for forward substitution, which differentiating that solve needs.
     """
 
     # Per bucket: flat positions within bucket_jacobian_rows[bucket].ravel()
@@ -173,14 +129,8 @@ class _SparseTriangularLayout(eqx.Module):
     edge_child_index: jnp.ndarray
     # (n_edges + 1,) parent variable of each edge, same sentinel convention.
     edge_parent_index: jnp.ndarray
-    # The level arrays are split into contiguous segments of levels, each
-    # stored at its own width (see `_min_waste_segments`). A single array over
-    # all levels would be padded to the widest level's edge count, and one
-    # variable that parents many others makes that the whole dimension.
-    #
-    # Segments are in level order, so a sweep runs one scan per segment,
-    # visiting them last-to-first for back substitution and first-to-last for
-    # its transpose. Each entry below is a tuple with one array per segment.
+    # Tuples with one array per contiguous segment of levels, each at its own
+    # width (see `_min_waste_segments`), in level order.
     #
     # level_members:           (levels_in_segment, max_level_size), padded with `dim`
     # *_edge_index:            (levels_in_segment, width) edges landing on that level
@@ -206,14 +156,7 @@ def _build_layout(
     dim,
     n_level_segments,
 ):
-    """Derive the static edge layout from the model's bucket and level data.
-
-    Edges are grouped by the level of their *parent*, not their child,
-    because the solve this feeds (`_solve_triangular_sparse`) is the
-    transpose of a forward triangular solve: it resolves each variable from
-    the contributions of its children, which requires visiting levels
-    last-to-first (see that function's docstring).
-    """
+    """Build the `_SparseTriangularLayout` from the bucket and level data."""
     edge_child, edge_parent, bucket_value_gather = [], [], []
 
     for bucket in range(len(bucket_members)):
@@ -244,8 +187,7 @@ def _build_layout(
         slot_within_level[members_at_level] = np.arange(len(members_at_level))
 
     def group_edges(level_of_edge, endpoint_of_edge, segments):
-        """Per-segment (edge index, target slot) arrays at each segment's own
-        width, together with the edges' owning level."""
+        """Per-segment (edge index, target slot) arrays."""
         by_level = [
             np.flatnonzero(level_of_edge == level) for level in range(n_levels)
         ]
@@ -263,9 +205,7 @@ def _build_layout(
             slot_segments.append(jnp.asarray(slot))
         return tuple(index_segments), tuple(slot_segments)
 
-    # Segment the level range so that one wide level does not size the arrays
-    # for all of them; both groupings get their own segmentation, since their
-    # per-level edge counts are unrelated.
+    # Each grouping gets its own segmentation; their per-level counts differ.
     level_of_edge_parent = level_of_variable[edge_parent]
     level_of_edge_child = level_of_variable[edge_child]
     parent_counts = np.bincount(level_of_edge_parent, minlength=n_levels)
@@ -304,11 +244,7 @@ def _build_layout(
 
 @jax.profiler.annotate_function
 def _flatten_edge_values(bucket_jacobian_rows, layout):
-    """Ragged per-bucket derivative rows -> flat (n_edges + 1,) edge values.
-
-    The loop runs once per bucket (a handful of iterations) and is pure
-    gather; it sits outside the level scan.
-    """
+    """Per-bucket Jacobian rows -> flat ``(n_edges + 1,)`` edge values."""
     per_bucket = [
         rows.ravel()[gather]
         for rows, gather in zip(bucket_jacobian_rows, layout.bucket_value_gather)
@@ -329,38 +265,26 @@ def _sweep_levels(
     level_edge_target_slot,
     reverse,
 ):
-    """One triangular solve as a scan over elimination levels.
+    """One triangular solve, as one scan per level segment.
 
-    Both directions are the same sweep with the edges grouped differently, so
-    they share this body. `edge_endpoint_index` says which endpoint of each
-    edge supplies the already-solved value (the child for back substitution,
-    the parent for forward substitution), and the level arrays say which
-    edges land on which level and in whose slot.
-
-    The level arrays arrive as one array per contiguous segment of levels, each
-    at its own width, so this runs one scan per segment rather than one over
-    all levels at the widest level's width. Segments are visited in the sweep's
-    own direction, and `reverse` applies within each.
+    `edge_endpoint_index` picks the already-solved endpoint of each edge: the
+    child for back substitution, the parent for forward substitution.
     """
     max_level_size = layout.max_level_size
 
-    # Sentinel row: rhs 0 and diagonal 1, so padded lanes stay finite. Their
-    # values are discarded, but a NaN would still poison a cotangent.
+    # Sentinel row: rhs 0 and diagonal 1, so padded lanes cannot produce NaNs
+    # that would reach a cotangent.
     rhs_padded = jnp.concatenate([rhs, jnp.zeros((1,), rhs.dtype)])
     diagonal_padded = jnp.concatenate([jacobian_diagonal, jnp.ones((1,), rhs.dtype)])
 
     @jax.profiler.annotate_function
     def eliminate_level(solution, level_data):
         members, edge_indices, target_slots = level_data
-        # The endpoint each edge reads from always sits at an already-visited
-        # level, by construction of the level numbering.
         solution_padded = jnp.concatenate([solution, jnp.zeros((1,), rhs.dtype)])
         solved_values = solution_padded[edge_endpoint_index[edge_indices]]
         edge_contributions = edge_values[edge_indices] * solved_values
 
-        # Sum contributions into the slot of the variable they belong to.
-        # Padding edges target slot `max_level_size`, which is out of bounds
-        # and dropped.
+        # Padding edges target the out-of-bounds slot `max_level_size`.
         neighbour_sum = (
             jnp.zeros((max_level_size,), rhs.dtype)
             .at[target_slots]
@@ -368,8 +292,6 @@ def _sweep_levels(
         )
 
         updated = (rhs_padded[members] - neighbour_sum) / diagonal_padded[members]
-        # Each variable belongs to exactly one level, so the in-bounds
-        # indices here are unique.
         solution = solution.at[members].set(updated, mode="drop", unique_indices=True)
         return solution, None
 
@@ -389,26 +311,14 @@ def _sweep_levels(
 
 
 def _solve_triangular_sparse(edge_values, jacobian_diagonal, layout, rhs):
-    """Solve ``J^T w = rhs`` for the sparse triangular Jacobian ``J``.
+    """Solve ``J^T w = rhs`` by back substitution.
 
-    `inverse_gradient_and_val` only ever needs this transposed direction
-    (pulling a model-space cotangent back through the parallel m -> w map, see
-    that method's docstring), which is back substitution: levels last-to-first,
-    each variable summing over its *children*, all of which sit at strictly
-    later levels and so are already solved.
-
-    Wrapped in `jax.lax.custom_linear_solve` rather than left to autodiff.
-    Differentiating the scan directly stacks one carry -- a full ``(dim,)``
-    solution -- per elimination level, so the tape is ``n_levels * dim`` per
-    draw. That is not a corner case: `SparseTriangularMap`'s level grouping
-    degenerates to one level per variable for a *dense* blanket and equally for
-    a banded one, so ``n_levels == dim`` is the common case and the tape is
-    quadratic in the dimension. Measured on a 1600-dim banded model it was a
-    156 MB ``f64[n_levels, batch, dim]`` buffer dominating the whole step.
+    Uses `jax.lax.custom_linear_solve`: autodiff through the scan would store
+    one ``(dim,)`` carry per level, and ``n_levels == dim`` is common.
     """
 
     def matvec(w):
-        """``J^T w``, from the same edge list -- one scatter, no sweep."""
+        """``J^T w`` as one scatter over the edges."""
         w_padded = jnp.concatenate([w, jnp.zeros((1,), w.dtype)])
         contributions = edge_values * w_padded[layout.edge_child_index]
         return jacobian_diagonal * w + jnp.zeros_like(w).at[
@@ -447,26 +357,19 @@ def _solve_triangular_sparse(edge_values, jacobian_diagonal, layout, rhs):
 
 
 class _SelectedInverseLayout(eqx.Module):
-    """Static index structure for `_selected_inverse`. Built once, outside jit.
+    """Static index structure for `_selected_inverse`, built once outside jit.
 
-    `Sigma = (J^T J)^{-1} = J^{-1} J^{-T}` is dense, but the exact Gauss-Newton
-    blocks only read it on each variable's `{i} + parents(i)`. From `J Sigma =
-    J^{-T}`, whose strictly lower part is zero and whose diagonal is `1 /
-    delta`, row `i` of `Sigma` left of the diagonal follows from rows of its
-    parents (Takahashi's recurrence):
+    ``Sigma = (J^T J)^{-1}`` is needed only on each ``{i} + P(i)``. From
+    ``J Sigma = J^{-T}`` (Takahashi's recurrence):
 
         Sigma[i, j] = ([i == j] / delta_i - sum_{p in P(i)} A[i, p] Sigma[p, j]) / delta_i
 
-    Closing it needs `Sigma[p, j]` for every pair of `i`'s parents, i.e. the
-    parents must form a clique. That holds for a pattern from symbolic
-    Cholesky; for any other, `P*(i)` below adds the fill that makes it hold
-    -- for this computation only, the map itself keeps its own parents.
+    This closes only if each ``P(i)`` is a clique; ``P*(i)`` adds the fill
+    that makes it one.
 
-    Entries are kept in one flat store: the diagonal at `[0, dim)`, then one
-    slot per `(i, j in P*(i))`, then a constant zero (`sentinel`) that padded
-    reads hit and a scratch slot (`dump`) that padded writes go to. Rows are
-    grouped into levels of the `P*` graph, each padded to rectangular shape,
-    exactly as for `_sweep_levels`.
+    Store layout: the diagonal at ``[0, dim)``, one slot per
+    ``(i, j in P*(i))``, a zero `sentinel` for padded reads, and a `dump`
+    slot for padded writes.
 
     level_rows:   (levels, R)          row indices, padded with `dim`
     a_edge:       (levels, R, K)       edge index of `A[i, p]`, padded with `n_edges`
@@ -495,9 +398,8 @@ def _build_selected_inverse(edge_child, edge_parent, dim):
         parents[int(child)].append(int(parent))
         edge_of[(int(child), int(parent))] = edge
 
-    # Symbolic fill of the recurrence: every `p` in `P*(i)` must see the part of
-    # `P*(i)` before it. Rows only receive from later rows, so walking
-    # backwards finalizes each `P*(i)` before it is propagated.
+    # Symbolic fill: each `p` in `P*(i)` must see the earlier part of `P*(i)`.
+    # Walking backwards finalizes `P*(i)` before it propagates.
     filled = [set(ps) for ps in parents]
     for i in reversed(range(dim)):
         members = sorted(filled[i])
@@ -555,8 +457,8 @@ def _build_selected_inverse(edge_child, edge_parent, dim):
 
 
 def _selected_inverse(edge_values, jacobian_diagonal, layout):
-    """`(J^T J)^{-1}` on the filled pattern, as the flat store described in
-    `_SelectedInverseLayout`: one sweep, first level to last."""
+    """``(J^T J)^{-1}`` on the filled pattern, as `_SelectedInverseLayout`'s
+    flat store."""
     diagonal = jnp.concatenate([jacobian_diagonal, jnp.ones((1,), edge_values.dtype)])
     store = jnp.zeros((layout.store_size,), edge_values.dtype)
 
@@ -571,8 +473,7 @@ def _selected_inverse(edge_values, jacobian_diagonal, layout):
         off_padded = jnp.concatenate([off, jnp.zeros((off.shape[0], 1), off.dtype)], 1)
         sigma_ip = jnp.take_along_axis(off_padded, diag_from, axis=1)
         diag = (1.0 / delta - jnp.sum(a * sigma_ip, axis=1)) / delta
-        # Padded rows are `dim`, which lands in the store's fill region; send
-        # them to the scratch slot instead.
+        # Padded rows (`dim`) go to the scratch slot.
         diag_out = jnp.where(rows < jacobian_diagonal.shape[0], rows, layout.store_size - 1)
         store = store.at[diag_out].set(diag)
         return store, None
@@ -586,14 +487,11 @@ def _selected_inverse(edge_values, jacobian_diagonal, layout):
 
 
 class LocationSkipMlp(eqx.Module):
-    """Conditioner MLP plus a direct linear map from the parents to the
-    transformer's location parameter.
+    """Conditioner MLP plus a linear skip from the parents to the transformer's
+    location.
 
-    Linear dependence of the conditional mean on the parents is the bulk of
-    the structure in most posteriors, and an MLP only represents it through
-    the product of its layers -- which, zero-initialized, starts with almost no
-    curvature in the first layer. The skip weights enter linearly and do not
-    depend on any other parameter, so they are well conditioned from the start.
+    The skip weights enter linearly, so the dominant linear dependence on the
+    parents is well conditioned from the start.
     """
 
     mlp: eqx.nn.MLP
@@ -605,12 +503,8 @@ class LocationSkipMlp(eqx.Module):
 
 
 def _location_index(transformer, constructor, num_params):
-    """Which flat conditioner output drives `transformer`'s location, or
-    `None` if it has none.
-
-    Measured by probing `constructor`, the same unravelling the conditioners
-    feed, rather than derived from the pytree flattening order.
-    """
+    """Index of the conditioner output that drives the location, or `None`.
+    Found by probing `constructor`."""
     from nutpie.normalizing_flow import ElementwiseTransformer
 
     if not isinstance(transformer, ElementwiseTransformer):
@@ -632,119 +526,39 @@ def _location_index(transformer, constructor, num_params):
 
 
 class SparseTriangularMap(bijections.AbstractBijection):
-    """Triangular map with a caller-specified sparsity pattern.
+    """Triangular map whose sparsity follows a given Markov blanket.
 
-    A standard masked autoregressive flow (see e.g.
-    ``flowjax.bijections.MaskedAutoregressive``) lets every transformed
-    variable depend on *all* variables preceding it. If the factorization of
-    the target distribution is (approximately) known -- for instance because
-    the Markov blanket of each variable has already been identified -- most
-    of those dependencies are unnecessary. This bijection instead gives
-    every variable its own small conditioner network that only ever sees the
-    variables in its Markov blanket that precede it. Because non-parent
-    variables never reach a variable's conditioner, the resulting Jacobian is
-    exactly triangular with the specified sparsity pattern (rather than
-    merely triangular, as for a dense MADE-style flow), and the conditioner
-    networks can be made much smaller than a dense autoregressive
-    conditioner.
+    Variable ``i`` is conditioned on its parents ``j < i`` with
+    ``blanket[i, j]``, through its own small MLP. Variables are taken in index
+    order; reorder with ``Sandwich(..., Permute(order))`` (see
+    `make_sparse_triangular_map`).
 
-    This bijection treats variable ``i`` as preceding variable ``j`` whenever
-    ``i < j``, i.e. it assumes the variables are already given in the
-    desired order. To use a different variable ordering, wrap it as
-    ``bijections.Sandwich(SparseTriangularMap(...), bijections.Permute(order))``
-    (see `make_sparse_triangular_map`).
+    `inverse_and_log_det` (model space -> whitened) reads the actual parent
+    values, so it is one parallel pass. `transform_and_log_det` is ancestral
+    sampling: one scan over elimination levels, where ``level(i)`` is the
+    longest parent chain ending at ``i``.
 
-    Which direction is `inverse_and_log_det` and which is
-    `transform_and_log_det` is not an arbitrary choice, and it is not merely
-    a performance question. `blanket` is a statement about how the density
-    of the *model-space* variable factorizes, ``p(m) = prod_i p(m_i |
-    m_parents(i))`` -- the same role a sparse precision matrix plays for a
-    Gaussian: sparse ``Lambda`` gives a sparse, direct whitening map ``w = C
-    m`` (a plain matrix-vector product using the true blanket entries of the
-    actual data ``m``), whereas the reverse map ``m = C^{-1} w`` solves a
-    triangular system and is generally dense/sequential, because ``w`` is
-    noise and the blanket was never a statement about how noise combines. A
-    conditioner only "uses the Markov blanket of ``m``" if it is literally a
-    function of ``m``'s actual parent values; conditioning on the
-    corresponding entries of ``w`` instead would still be invertible, but
-    would no longer correspond to anything about the density we were told to
-    respect.
+    The map is lower triangular, so a Gaussian precision factors as
+    ``Lambda = C^T C``. A `blanket` from a symbolic Cholesky needs the reverse
+    of that elimination order.
 
-    Note the triangle convention that ``C`` implies, since it is easy to get
-    backwards. Here ``C`` is *lower* triangular (variable ``i`` sees only
-    ``j < i``), so whitening a Gaussian means factorizing its precision as
-    ``Lambda = C^T C`` -- a reverse (UL) Cholesky, not the usual ``Lambda =
-    L L^T``. The two have different fill patterns: the fill of ``C`` for a
-    given elimination order equals the fill of ``L`` for the *reversed*
-    order. So a `blanket` obtained by symbolic factorization (CHOLMOD/AMD or
-    similar) must be paired with the reverse of the elimination order it was
-    computed for -- see `make_sparse_triangular_map`'s ``order`` argument.
-    Getting this wrong yields a pattern that silently cannot represent the
-    target at all, rather than one that merely fits it badly (though it is
-    invisible for patterns that are fill-free in both directions, such as a
-    banded/tridiagonal one).
-
-    Concretely: `inverse_and_log_det` takes the model-space point ``m`` (or,
-    when sandwiched with a `bijections.Permute`, a reindexing of it) and
-    computes every conditioner directly from ``m`` in one parallel pass --
-    this is the "evaluate the density" direction, and it is also what
-    nutpie's transform-adapted NUTS sampler calls at every leapfrog step (see
-    ``nuts-rs``'s ``Transformation::inv_transform_normalize`` and
-    ``transform_adapter.inverse_gradient_and_val``, both of which pass in the
-    untransformed/model-space position). `transform_and_log_det` is
-    ancestral sampling from the whitened point back to ``m``: it must
-    resolve ``m`` sequentially (via `jax.lax.scan`), since each conditioner
-    needs the already-resolved *model-space* parents, not the noise.
-
-    That sequential resolution doesn't have to go variable by variable,
-    though: variables whose parents are all already resolved are mutually
-    independent and can be resolved together. `transform_and_log_det`
-    exploits this by grouping variables into "elimination levels" --
-    ``level(i)`` is the length of the longest parent-chain ending at ``i``,
-    so level 0 is every variable with no parents, level 1 is every variable
-    whose parents are all in level 0, and so on -- and scanning over levels
-    (each processed as one vmapped batch) rather than over individual
-    variables. The number of levels is the DAG's critical-path depth, the
-    minimum number of sequential stages any schedule could achieve; for a
-    fully dense `blanket` every variable ends up in its own level and this
-    degenerates to the naive per-variable scan, while a shallow/tree-like
-    `blanket` can cut the sequential depth from ``dim`` down to
-    ``O(log dim)`` or less. The tradeoff is that levels are padded to a
-    common width, so this trades sequential steps for total work and is a
-    net win only when levels are reasonably balanced. The padding is kept
-    to what the imbalance really costs by splitting the level range into
-    contiguous segments, each bucket sized per segment and skipped over the
-    segments where it has no members (see `_min_waste_segments`).
-
-    Separately, conditioner networks are grouped into `n_buckets` buckets by
-    parent count (see `_min_waste_buckets`), each with its own (smaller)
-    input width, rather than every variable's conditioner paying for the
-    input width the single worst-connected variable needs. This matters
-    independently of the level grouping: a handful of variables with large
-    parent counts is common, and without bucketing every other variable's
-    conditioner -- whether processed in `inverse_and_log_det`'s single pass
-    or within one level of `transform_and_log_det`'s scan -- would pay for
-    that width too.
+    Conditioners are bucketed by parent count (`_min_waste_buckets`) and levels
+    are split into segments (`_min_waste_segments`) to limit padding.
 
     Args:
         key: Jax key.
-        blanket: A ``(dim, dim)`` array, convertible to boolean.
-            ``blanket[i, j]`` being truthy means ``j`` is used to
-            parameterize the transform of ``i``, provided ``j < i``. The
-            matrix is symmetrized internally, so it is fine to pass e.g. an
-            undirected Markov-blanket adjacency matrix.
-        transformer: Unconditional bijection with shape ``()``, applied
-            elementwise to each variable. Defaults to this module's
-            standard elementwise transformer, see ``make_transformer``.
-        n_buckets: Number of conditioner-width buckets, see above. Capped
-            automatically at the number of distinct parent counts.
+        blanket: ``(dim, dim)`` boolean adjacency; symmetrized internally.
+        transformer: Unconditional scalar bijection. Defaults to
+            ``make_transformer``'s.
+        n_buckets: Number of conditioner-width buckets, capped at the number
+            of distinct parent counts.
+        n_level_segments: Number of level segments, i.e. scans per sweep,
+            capped at the number of levels.
         nn_width: Conditioner hidden layer width.
         nn_depth: Conditioner hidden layer depth.
         nn_activation: Conditioner activation function.
-        location_skip: Give every conditioner a linear map from its parents
-            straight to the transformer's location, see `LocationSkipMlp`.
-            Only takes effect if `transformer` is an `ElementwiseTransformer`
-            with a location; otherwise the conditioners are plain MLPs.
+        location_skip: Wrap conditioners in `LocationSkipMlp`. Ignored if the
+            transformer has no location.
     """
 
     shape: tuple[int, ...]
@@ -752,11 +566,8 @@ class SparseTriangularMap(bijections.AbstractBijection):
     conditioners: tuple[eqx.nn.MLP | LocationSkipMlp, ...]
     bucket_members: tuple[Array, ...]
     bucket_parent_indices: tuple[Array, ...]
-    # Layout of `transform_and_log_det`'s level scan, one entry per contiguous
-    # segment of levels (see `_min_waste_segments`). Within a segment, only the
-    # buckets that actually have members there are listed, each padded to its
-    # own width over that segment's levels -- rather than every bucket being
-    # evaluated at every level, at its global maximum level occupancy.
+    # Layout of `transform_and_log_det`'s scan, one entry per level segment,
+    # listing only the buckets with members there.
     #
     # level_segment_buckets[s]:            tuple of bucket indices active in s
     # level_segment_members[s][i]:         (levels_in_segment, width) global
@@ -767,13 +578,8 @@ class SparseTriangularMap(bijections.AbstractBijection):
     level_segment_members: tuple[tuple[Array, ...], ...]
     level_segment_local_members: tuple[tuple[Array, ...], ...]
     transformer_constructor: Callable
-    # A normal pytree field, not `static=True`. Its leaves are index arrays, so
-    # marking them static made them pytree *metadata*, which JAX compares for
-    # equality -- comparing arrays yields an array, not a bool, so anything that
-    # triggers that comparison raises (and it is what the "A JAX array is being
-    # set as static!" warning was about). As leaves they are integer arrays, so
-    # `eqx.partition(flow, eqx.is_inexact_array)` still keeps them out of the
-    # parameters and they stay compile-time constants in practice.
+    # Integer arrays, so not static (metadata must be hashable) and never
+    # picked up as parameters by `eqx.is_inexact_array`.
     jacobian_layout: _SparseTriangularLayout
     # See `gauss_newton_factors`.
     selected_inverse: _SelectedInverseLayout
@@ -787,6 +593,7 @@ class SparseTriangularMap(bijections.AbstractBijection):
         blanket: ArrayLike,
         transformer: bijections.AbstractBijection | None = None,
         n_buckets: int = 8,
+        n_level_segments: int = 8,
         nn_width: int = 16,
         nn_depth: int = 1,
         nn_activation: Callable = jax.nn.gelu,
@@ -815,37 +622,27 @@ class SparseTriangularMap(bijections.AbstractBijection):
 
         blanket = blanket | blanket.T
 
-        # Only keep edges that point from an earlier to a later index, so
-        # that the resulting transform is guaranteed to be triangular.
+        # Keep only edges from earlier to later indices.
         strictly_lower = np.tril(np.ones((dim, dim), dtype=bool), k=-1)
         parent_mask = blanket & strictly_lower
 
         n_parents = parent_mask.sum(axis=1)
 
-        # Sentinel index `dim` always reads a constant zero appended to x, so
-        # unused (padded) slots never leak information. `max_parents` here
-        # is the *global* max, only used to build a single padded array
-        # that gets sliced down per-bucket below.
+        # Padded slots hold `dim`, which reads a zero appended to the input.
+        # Sliced to each bucket's own width below.
         max_parents = int(n_parents.max(initial=0))
         parent_indices = np.full((dim, max_parents), dim, dtype=np.int32)
         for k in range(dim):
             idx = np.flatnonzero(parent_mask[k])
             parent_indices[k, : len(idx)] = idx
 
-        # Elimination levels: level(i) is the length of the longest
-        # parent-chain ending at i, so all variables sharing a level are
-        # mutually independent given earlier levels (see the class
-        # docstring). This is the minimum possible number of sequential
-        # stages for any valid schedule.
+        # level(i): longest parent chain ending at i.
         level = np.zeros(dim, dtype=np.int64)
         for k in range(dim):
             parents_k = np.flatnonzero(parent_mask[k])
             level[k] = 0 if parents_k.size == 0 else int(level[parents_k].max()) + 1
         n_levels = int(level.max()) + 1
 
-        # Bucket variables by parent count, so that variables with few
-        # parents don't pay for the conditioner width the rare
-        # many-parents variable needs (see `_min_waste_buckets`).
         n_distinct = len(np.unique(n_parents))
         n_buckets_eff = min(n_buckets, dim, n_distinct)
         bucket_of = _min_waste_buckets(n_parents, n_buckets_eff)
@@ -873,13 +670,11 @@ class SparseTriangularMap(bijections.AbstractBijection):
             )
             if location_index is None:
                 return mlp
-            # Starts at exactly zero: its curvature does not depend on its
-            # value, so there is nothing to gain from a random start.
+            # Zero init: the skip is linear, so a random start gains nothing.
             return LocationSkipMlp(mlp, jnp.zeros((in_size,)), location_index)
 
         def net_cost(in_size):
-            """Rough cost of one conditioner evaluation, used to weight the
-            padding waste of a bucket against the other buckets'."""
+            """Rough cost of one conditioner evaluation, to weight padding."""
             if nn_depth == 0:
                 return max(in_size, 1) * num_params
             return (
@@ -894,8 +689,7 @@ class SparseTriangularMap(bijections.AbstractBijection):
         bucket_members = []
         bucket_parent_indices = []
         bucket_net_costs = []
-        # Per bucket, the bucket's members at each level, as global indices and
-        # as positions within the bucket's own ensemble.
+        # Per bucket and level: members, as global and as ensemble indices.
         bucket_members_by_level = []
         bucket_local_members_by_level = []
 
@@ -917,9 +711,6 @@ class SparseTriangularMap(bijections.AbstractBijection):
             )
             bucket_net_costs.append(net_cost(max_parents_b))
 
-            # local position of each global variable index within this
-            # bucket's own (bucket_size_b,)-shaped ensemble/member list, so
-            # that a level's subset of this bucket can be gathered from it.
             local_of_global = np.zeros(dim, dtype=np.int32)
             local_of_global[members_b] = np.arange(bucket_size_b, dtype=np.int32)
 
@@ -930,12 +721,7 @@ class SparseTriangularMap(bijections.AbstractBijection):
                 [local_of_global[idx] for idx in members_at_level]
             )
 
-        # The level scan is sequential in the levels but not in the buckets, so
-        # a naive layout evaluates every bucket at every level, padded to that
-        # bucket's widest level. Splitting the level range into contiguous
-        # segments lets each bucket be sized per segment instead -- and lets a
-        # bucket be skipped entirely over the levels where it has no members at
-        # all, which is the common case for the few-but-wide buckets.
+        # Size each bucket per level segment, and skip it where it is empty.
         level_bucket_counts = np.array(
             [
                 [len(bucket_members_by_level[b][lvl]) for b in range(n_buckets_eff)]
@@ -945,7 +731,7 @@ class SparseTriangularMap(bijections.AbstractBijection):
         ).reshape(n_levels, n_buckets_eff)
         segments = _min_waste_segments(
             level_bucket_counts,
-            n_buckets,
+            n_level_segments,
             weights=np.asarray(bucket_net_costs, dtype=np.float64),
         )
 
@@ -984,12 +770,15 @@ class SparseTriangularMap(bijections.AbstractBijection):
         self.shape = (dim,)
 
         self.jacobian_layout = _build_layout(
-            self.bucket_members, self.bucket_parent_indices, level, dim, n_buckets
+            self.bucket_members,
+            self.bucket_parent_indices,
+            level,
+            dim,
+            n_level_segments,
         )
 
-        # For `gauss_newton_factors`: the selected-inverse sweep, and per bucket
-        # where each member's `Sigma` block over `[i, parents...]` sits in its
-        # store. Padded parent slots point at the store's zero sentinel.
+        # For `gauss_newton_factors`: per bucket, the store index of each
+        # member's `Sigma` block over `[i, parents...]`; padding -> sentinel.
         self.selected_inverse, store_index, sentinel = _build_selected_inverse(
             self.jacobian_layout.edge_child_index,
             self.jacobian_layout.edge_parent_index,
@@ -1009,7 +798,7 @@ class SparseTriangularMap(bijections.AbstractBijection):
         self.bucket_sigma_index = tuple(bucket_sigma_index)
 
     def _flat_params_to_transformer(self, params: Array):
-        """Reshape to n x params_per_dim, then vmap."""
+        """``(n, num_params)`` params -> vmapped transformer."""
         transformer = eqx.filter_vmap(self.transformer_constructor)(params)
         return bijections.Vmap(transformer, in_axes=eqx.if_array(0))
 
@@ -1050,35 +839,16 @@ class SparseTriangularMap(bijections.AbstractBijection):
 
     def gauss_newton_factors(self, y, grad):
         """Per-draw factors of the exact Gauss-Newton blocks of the Fisher
-        residual ``r = x + w``, ``J^T w = grad - grad_y log_det``.
+        residual ``r = x + w``, with ``J^T w = grad - grad_y log_det``.
 
-        Returns, per bucket, ``V`` of shape ``(bucket_size, k + 2, n_params)``
-        with ``k`` the bucket's parent slots and `n_params` the flattened
-        parameters of one conditioner (in `ravel_pytree` order of its inexact
-        leaves), such that the Gauss-Newton block of variable `i`'s parameters
-        is ``sum_draws V_i^T V_i``.
-
-        Variable `i`'s parameters reach `r` through its own `x_i` and through
-        one shared `J^{-T}` (see `notes/lm_derivatives.md`):
-
-            dr/dtheta_i = e_i a + J^{-T} E_i B,
-
-        `a = dx_i/dtheta_i`, and `B` the local Jacobian of
-        ``q = -(d log_det_i/dy) - (dx_i/dy) w_i`` over `S_i = {i} + P(i)`, which
-        `E_i` embeds. Since `J^{-1}` is lower triangular, `e_i^T J^{-T} E_i` is
-        `e_0 / delta_i`, and the block is
-
-            a^T a + (a^T b + b^T a) / delta_i + B^T K B,
-
-        `b` the first row of `B` and `K = (J^T J)^{-1}` on `S_i x S_i`, read off
-        `_selected_inverse`. Folded into one factor with `K = L L^T` and `c =
-        e_0 / delta_i`:
+        Returns per bucket ``V`` of shape ``(bucket_size, k + 2, n_params)``,
+        ``n_params`` in `ravel_pytree` order, such that variable ``i``'s block
+        is ``sum_draws V_i^T V_i``. With ``a = dx_i/dtheta_i``, ``B`` the
+        Jacobian of ``q = -(d log_det_i/dy) - (dx_i/dy) w_i`` over
+        ``{i} + P(i)``, ``K = (J^T J)^{-1} = L L^T`` on that set and
+        ``c = e_0 / delta_i`` (see `notes/lm_derivatives.md`):
 
             V = [ sqrt(1 - |L^{-1} c|^2) a ;  L^T B + (L^{-1} c) a ].
-
-        The `sqrt` argument is the part of `e_i` outside the span of `J^{-T}
-        E_i`, so it is non-negative; it is exactly zero for a variable with no
-        ancestors.
         """
         dim = self.shape[0]
 
@@ -1120,8 +890,7 @@ class SparseTriangularMap(bijections.AbstractBijection):
             a = jac[0]
             # Padded parent slots read a constant, not a variable: no row.
             B = jac[1:] * real[:, None]
-            # Their `Sigma` rows are the sentinel zero; an identity there keeps
-            # `K` factorable without touching the real block.
+            # Identity on padded slots keeps `K` factorable.
             pad = ~real
             K = jnp.where(pad[:, None] | pad[None, :], jnp.eye(real.shape[0]), sigma)
             L = jnp.linalg.cholesky(K)
@@ -1155,14 +924,8 @@ class SparseTriangularMap(bijections.AbstractBijection):
         return factors
 
     def inverse_and_log_det_and_jacobian(self, y, condition=None):
-        """Parallel y -> x pass returning x, log|det J|, and the sparse J.
-
-        `apply_transformer(params, value) -> (x_i, log_det_i)` is the scalar
-        transformer in the same direction the parallel map uses.
-
-        Returns the Jacobian as (bucket_jacobian_rows, jacobian_diagonal), where
-        bucket_jacobian_rows[bucket] has shape (bucket_size, max_parents_in_bucket).
-        """
+        """Parallel y -> x pass returning ``x``, ``log|det J|``, and ``J`` as
+        per-bucket rows ``(bucket_size, max_parents)`` plus its diagonal."""
         (dim,) = self.shape
         y_padded = jnp.concatenate([y, jnp.zeros((1,), y.dtype)])
 
@@ -1183,8 +946,6 @@ class SparseTriangularMap(bijections.AbstractBijection):
         log_det = jnp.zeros((), y.dtype)
         bucket_jacobian_rows = []
 
-        # One iteration per bucket. Ensembles have different input widths, so they
-        # cannot be merged; all iterations are independent and depth stays 1.
         for bucket in range(len(self.conditioners)):
             members = self.bucket_members[bucket]
             parent_indices = self.bucket_parent_indices[bucket]
@@ -1201,13 +962,7 @@ class SparseTriangularMap(bijections.AbstractBijection):
         return x, log_det, tuple(bucket_jacobian_rows), jacobian_diagonal
 
     def transform_and_log_det(self, x, condition=None):
-        """Ancestral x -> y pass: one scan per level segment, log det included.
-
-        The log det comes out of the same conditioner evaluations that resolve
-        `y`, since the scalar transformer returns it anyway; running the
-        parallel y -> x pass afterwards just to obtain it would evaluate every
-        conditioner a second time.
-        """
+        """Ancestral x -> y pass: one scan per level segment."""
         dim = self.shape[0]
 
         def make_step(buckets):
@@ -1218,12 +973,8 @@ class SparseTriangularMap(bijections.AbstractBijection):
                 for bucket, members, local_members in zip(
                     buckets, members_of_level, local_members_of_level
                 ):
-                    # Parents are read from `y` as of the *start* of this level
-                    # (safe -- variables in the same level never depend on each
-                    # other), so buckets within a level can be processed in any
-                    # order. Padding slots (`members == dim`) read zeros, and
-                    # their results are discarded by the `mode="drop"` scatter
-                    # and the `where` on the log det.
+                    # Parents come from `y` at the start of the level. Padding
+                    # (`members == dim`) is dropped by the scatter and `where`.
                     parent_idx = self.bucket_parent_indices[bucket][local_members]
                     parents = y.at[parent_idx].get(mode="fill", fill_value=0.0)
                     conditioner_group = jax.tree.map(

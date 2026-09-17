@@ -1,20 +1,8 @@
-"""Flattened, backend-agnostic form of a `SparseTriangularMap`.
+"""Flattened form of a `SparseTriangularMap` for the compiled backends.
 
-`SparseTriangularMap` stores its conditioners the way JAX needs them: bucketed
-by parent count so that equal-width ensembles can be vmapped, padded to
-rectangular levels so that a `lax.scan` can walk them. Neither is intrinsic to
-the computation -- both exist to turn a ragged, sequential problem into dense
-array ops.
-
-A compiled backend (see `nutpie.triangular_numba` and
-`nutpie.triangular_rust`) wants the opposite: every conditioner at its own true
-input width, every parent list ragged, and the level structure kept only as
-scheduling information rather than as array shape. This module performs that
-translation once, so the backends only differ in how they run the resulting
-loop.
-
-Everything here is float64 and plain numpy; nothing below depends on JAX at
-call time.
+Drops the JAX layout's bucketing and padding: each conditioner gets its own
+input width and a ragged parent list, and levels are only a schedule.
+Plain float64 numpy.
 """
 
 from __future__ import annotations
@@ -28,22 +16,14 @@ __all__ = ["Contract2Spec", "TriangularLayout", "extract_layout"]
 
 _FIELDS = ("alpha", "beta", "sigma", "mu", "nu")
 
-# Rough cost of one elementwise transformer evaluation relative to one
-# multiply-add of the conditioner, used only to decide which levels are worth
-# handing to a thread pool. The transformer is a handful of transcendentals per
-# `Contract2` layer, which dominate the little GEMVs around them.
+# Rough cost of one `Contract2` layer, in multiply-adds, for scheduling.
 _TRANSFORMER_WORK_PER_LAYER = 100
 
 
 @dataclass(frozen=True)
 class Contract2Spec:
-    """One `Contract2` layer of the elementwise transformer chain.
-
-    Each field is either `None` (the layer does not have that parameter) or a
-    ``(index, offset)`` pair meaning ``field = conditioner_output[index] +
-    offset``. The offset is the layer's own initial value, which
-    `get_ravelled_pytree_constructor` folds into the unravelling.
-    """
+    """One `Contract2` layer. Each field is `None` or ``(index, offset)``,
+    meaning ``field = conditioner_output[index] + offset``."""
 
     alpha: tuple[int, float] | None
     beta: tuple[int, float] | None
@@ -58,37 +38,19 @@ class TriangularLayout:
     """A `SparseTriangularMap` flattened into ragged, per-variable arrays.
 
     Attributes:
-        parent_indptr, parent_index: CSR parent lists. Variable ``i``'s parents
-            are ``parent_index[parent_indptr[i]:parent_indptr[i + 1]]``, in the
-            order the conditioner expects them, with the padded slots (which
-            always read a constant zero) removed.
-        blob, blob_offset: all conditioner weights, concatenated. Variable
-            ``i``'s MLP occupies ``blob[blob_offset[i]:blob_offset[i + 1]]``,
-            laid out layer by layer as a **transposed**, row-major
-            ``(n_in, n_out)`` weight followed by an ``(n_out,)`` bias. The
-            first layer's ``n_in`` is the variable's own parent count.
-
-            The transpose is deliberate and is what makes the backends fast.
-            Stored the natural way round, evaluating a layer is ``n_out`` dot
-            products, each a ``+=`` reduction whose order floating point
-            forbids reassociating -- so the compiler vectorizes the multiply
-            and then unwinds it with shuffles to run a serial scalar add chain,
-            measured at ~2.5 cycles per multiply-add. With one contiguous row
-            of ``n_out`` weights per input, the inner loop is instead an AXPY
-            into ``n_out`` independent accumulators, each with its own
-            dependency chain, which vectorizes directly.
-        layer_out: output width of each MLP layer; the last one is the number
-            of transformer parameters.
-        skip_weight, skip_index: the conditioners' linear skip to the
-            transformer location (see `LocationSkipMlp`), one weight per
-            parent, aligned with `parent_index`: variable ``i`` adds
-            ``skip_weight[j] * y[parent_index[j]]`` over its parents ``j`` to
-            conditioner output `skip_index`. All zeros (and `skip_index` 0)
-            for conditioners without one, which leaves the output unchanged.
-        level_ptr, level_vars: elimination levels, as a second CSR. Variables
-            within a level are mutually independent and may be evaluated in any
-            order or in parallel; levels must be visited in order.
-        level_work: estimated cost of each level, in multiply-adds.
+        parent_indptr, parent_index: CSR parent lists, in conditioner input
+            order, without padding.
+        blob, blob_offset: Conditioner weights; variable ``i``'s MLP is
+            ``blob[blob_offset[i]:blob_offset[i + 1]]``, per layer a
+            transposed ``(n_in, n_out)`` weight then an ``(n_out,)`` bias.
+            Transposed so the inner loop is a vectorizable AXPY.
+        layer_out: Output width of each MLP layer.
+        skip_weight, skip_index: `LocationSkipMlp` weights, aligned with
+            `parent_index`, added to conditioner output `skip_index`. Zeros if
+            there is no skip.
+        level_ptr, level_vars: Elimination levels as CSR. Variables within a
+            level are independent.
+        level_work: Estimated cost of each level, in multiply-adds.
     """
 
     n_variables: int
@@ -116,12 +78,7 @@ class TriangularLayout:
 
 
 def _activation_name(fn) -> str:
-    """Identify the conditioner activation.
-
-    Matched on function identity rather than on behaviour, so an unsupported
-    activation fails loudly here instead of silently sampling the wrong
-    distribution.
-    """
+    """Name of the conditioner activation, matched by identity."""
     import jax
     import jax.numpy as jnp
 
@@ -242,14 +199,9 @@ def _probe_transformer(constructor, num_params):
 
 
 def extract_layout(flow_map) -> TriangularLayout:
-    """Flatten a `SparseTriangularMap` into a `TriangularLayout`.
+    """Flatten an unwrapped (`paramax.unwrap`) `SparseTriangularMap`.
 
-    `flow_map` must have its parameters already in place -- call
-    `paramax.unwrap` first if the flow still carries
-    `Parameterize`/`NonTrainable` wrappers.
-
-    Raises `NotImplementedError` if the map uses a transformer or activation
-    the compiled backends do not know how to reproduce.
+    Raises `NotImplementedError` for unsupported transformers or activations.
     """
     from nutpie.triangular import LocationSkipMlp, SparseTriangularMap
 
@@ -307,10 +259,7 @@ def extract_layout(flow_map) -> TriangularLayout:
 
     transformer = _probe_transformer(flow_map.transformer_constructor, num_params)
 
-    # Buckets exist only so that JAX can batch conditioners of equal input
-    # width; here each variable gets its own ragged slice, so the bucketing is
-    # flattened away and the padded parent slots (which read a constant zero,
-    # and so contribute exactly nothing) are dropped with it.
+    # Unbucket, dropping padded parent slots (they read a constant zero).
     n_parents = np.zeros(dim, dtype=np.int64)
     parents_of: list[np.ndarray | None] = [None] * dim
     weights_of: list[np.ndarray | None] = [None] * dim
@@ -350,8 +299,6 @@ def extract_layout(flow_map) -> TriangularLayout:
             for layer_index, (weight, bias) in enumerate(layers):
                 w = weight[local]
                 if layer_index == 0:
-                    # Trailing columns belong to padded parent slots, whose
-                    # input is the constant zero, so dropping them is exact.
                     w = w[:, : len(real)]
                 # Transposed to (n_in, n_out); see `TriangularLayout.blob`.
                 parts.append(np.ascontiguousarray(w.T).ravel())
@@ -400,13 +347,8 @@ def extract_layout(flow_map) -> TriangularLayout:
 
 
 def _build_levels(dim, parent_indptr, parent_index, sizes, n_transformer_layers):
-    """Elimination levels, recomputed from the flattened parent lists.
-
-    Same definition as `SparseTriangularMap` uses (``level(i)`` is the longest
-    parent chain ending at ``i``), but derived here so the layout is
-    self-contained and the level numbering is guaranteed to agree with the
-    parent lists the backends actually read.
-    """
+    """Elimination levels (longest parent chain), recomputed from the
+    flattened parent lists."""
     level_of = np.zeros(dim, dtype=np.int64)
     for i in range(dim):
         parents = parent_index[parent_indptr[i] : parent_indptr[i + 1]]
@@ -419,8 +361,6 @@ def _build_levels(dim, parent_indptr, parent_index, sizes, n_transformer_layers)
     level_ptr = np.zeros(n_levels + 1, dtype=np.int64)
     np.cumsum(counts, out=level_ptr[1:])
 
-    # `sizes` counts weights *and* biases, which is close enough to a
-    # multiply-add count for a scheduling heuristic.
     work = sizes + _TRANSFORMER_WORK_PER_LAYER * n_transformer_layers
     level_work = np.zeros(n_levels, dtype=np.int64)
     np.add.at(level_work, level_of, work)

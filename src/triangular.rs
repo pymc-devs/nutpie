@@ -27,6 +27,7 @@ use anyhow::{bail, Result};
 use numpy::{PyArray1, PyReadonlyArray1};
 use pulp::{Arch, WithSimd};
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 use rayon::prelude::*;
 use serde::Deserialize;
 use smallvec::SmallVec;
@@ -1095,7 +1096,11 @@ impl<'a> WithSimd for EvalMlp<'a> {
             let columns = &weights[offset..bias_at];
             let values = &inputs[..n_in];
 
-            {
+            // With no inputs -- a variable without parents, or a layer after a
+            // zero-width one -- the output is just the bias. The blocked loop
+            // below walks the *outputs*, and would slice the then empty
+            // `columns` past its end from the second block on.
+            if n_in > 0 {
                 let (acc_head, acc_tail) = S::as_mut_simd_f64s(&mut acc[..n_out]);
 
                 // Full blocks first, then whatever is left over: a layer is
@@ -1485,6 +1490,12 @@ impl TriangularTransform {
     }
 
     fn effective_schedule(&self) -> Schedule {
+        // Without threads there is no pool to hand levels to. rayon would fall
+        // back to the current thread only if spawning reports `Unsupported`,
+        // which emscripten does not.
+        if !cfg!(feature = "parallel") {
+            return Schedule::Serial;
+        }
         match self.schedule {
             Schedule::Auto => {
                 if self.level_parallel.iter().any(|p| *p) {
@@ -1638,6 +1649,274 @@ impl TriangularTransform {
     }
 }
 
+/// Build a transform from `nutpie.triangular_layout.extract_layout`'s arrays.
+/// Shared by the Python constructor and by [`FlowTransform::from_layout`].
+#[allow(clippy::too_many_arguments)]
+fn build_transform(
+    parent_indptr: &[i64],
+    parent_index: &[i64],
+    blob: &[f64],
+    blob_offset: &[i64],
+    layer_out: &[i64],
+    skip_weight: &[f64],
+    skip_index: i64,
+    activation: &str,
+    transformer: &Bound<'_, PyAny>,
+    level_ptr: &[i64],
+    level_vars: &[i64],
+    level_work: &[i64],
+    min_parallel_work: i64,
+    schedule: &str,
+) -> Result<TriangularTransform> {
+    let activation: Activation = from_tag(activation)
+        .map_err(|_| anyhow::anyhow!("unknown activation {activation:?}"))?;
+    let schedule: Schedule =
+        from_tag(schedule).map_err(|_| anyhow::anyhow!("unknown schedule {schedule:?}"))?;
+
+    let specs: Vec<Contract2Spec> = pythonize::depythonize(transformer)?;
+    let layers = specs
+        .into_iter()
+        .map(Contract2::new)
+        .collect::<Result<Vec<_>>>()?;
+
+    let parent_indptr: Vec<usize> = as_usize(parent_indptr)?;
+    let parent_index: Vec<u32> = as_u32(parent_index)?;
+    let blob_offset: Vec<usize> = as_usize(blob_offset)?;
+    let layer_out: Vec<usize> = as_usize(layer_out)?;
+    let level_ptr: Vec<usize> = as_usize(level_ptr)?;
+    let level_vars: Vec<u32> = as_u32(level_vars)?;
+    let blob = blob.to_vec();
+    let skip_weight = skip_weight.to_vec();
+
+    let n_variables = parent_indptr.len().saturating_sub(1);
+    if blob_offset.len() != n_variables + 1 {
+        bail!("blob_offset must have one more entry than there are variables");
+    }
+    if level_vars.len() != n_variables {
+        bail!("level_vars must list every variable exactly once");
+    }
+    if level_ptr.len() != level_work.len() + 1 {
+        bail!("level_ptr must have one more entry than level_work");
+    }
+    if layer_out.is_empty() {
+        bail!("conditioners must have at least one layer");
+    }
+    if parent_index.iter().any(|&p| p as usize >= n_variables) {
+        bail!("parent_index contains an out of range variable");
+    }
+    if level_vars.iter().any(|&v| v as usize >= n_variables) {
+        bail!("level_vars contains an out of range variable");
+    }
+
+    let (child_indptr, child_index, child_edge) =
+        invert_edges(n_variables, &parent_indptr, &parent_index);
+
+    let num_params = *layer_out.last().expect("checked non-empty");
+    if skip_weight.len() != parent_index.len() {
+        bail!("skip_weight must have one entry per parent_index entry");
+    }
+    let skip_index = usize::try_from(skip_index)
+        .ok()
+        .filter(|&index| index < num_params)
+        .ok_or_else(|| anyhow::anyhow!("skip_index {skip_index} is out of range"))?;
+    let max_parents = parent_indptr
+        .windows(2)
+        .map(|w| w[1] - w[0])
+        .max()
+        .unwrap_or(0);
+    let act_deriv_len: usize = layer_out[..layer_out.len() - 1].iter().sum();
+    let buffer_size = layer_out
+        .iter()
+        .copied()
+        .chain(std::iter::once(max_parents))
+        .max()
+        .unwrap_or(1)
+        .max(1);
+
+    let level_parallel = level_work
+        .iter()
+        .enumerate()
+        .map(|(level, &work)| {
+            let size = level_ptr[level + 1] - level_ptr[level];
+            size > 1 && work >= min_parallel_work
+        })
+        .collect();
+
+    let n_edges = parent_index.len();
+    Ok(TriangularTransform {
+        n_variables,
+        parent_indptr,
+        parent_index,
+        child_indptr,
+        child_index,
+        child_edge,
+        blob,
+        blob_offset,
+        layer_out,
+        skip_weight,
+        skip_index,
+        activation,
+        layers,
+        level_ptr,
+        level_vars,
+        level_parallel,
+        schedule,
+        buffer_size,
+        num_params,
+        max_parents,
+        act_deriv_len,
+        arch: Arch::new(),
+        tape: Tape::new(n_variables, n_edges),
+    })
+}
+
+/// The whole flow `make_flow(kind="triangular")` builds, for the leapfrog
+/// step: `z -> y` with its log determinant, and the pullback of a gradient in
+/// `y` back to `z`.
+///
+/// That flow is `Chain([Sandwich(map, Permute(p)), Affine(loc, scale)])`, and
+/// `Sandwich` is `Chain([outer, inner, Invert(outer)])`, so
+///
+/// ```text
+/// u = z[p],   v = map(u),   w = v[p^-1],   y = loc + scale * w
+/// ```
+///
+/// with log determinant `log_det(map) + sum(log |scale|)`. Built from the dict
+/// `nutpie.triangular_rust.flow_transform_layout` returns; like
+/// [`TriangularTransform`], only valid for the parameters it was built from.
+pub struct FlowTransform {
+    /// `None` for the diagonal-only flow of the early windows, `Affine`
+    /// alone: then `map` and the permutation are the identity.
+    map: Option<TriangularTransform>,
+    permutation: Vec<usize>,
+    inverse_permutation: Vec<usize>,
+    loc: Vec<f64>,
+    scale: Vec<f64>,
+    log_det_affine: f64,
+    buffer: Vec<f64>,
+}
+
+impl FlowTransform {
+    pub fn from_layout(layout: &Bound<'_, PyDict>) -> Result<Self> {
+        fn item<'py>(layout: &Bound<'py, PyDict>, key: &str) -> Result<Bound<'py, PyAny>> {
+            layout
+                .get_item(key)?
+                .ok_or_else(|| anyhow::anyhow!("flow transform layout is missing {key:?}"))
+        }
+        fn ints(layout: &Bound<'_, PyDict>, key: &str) -> Result<Vec<i64>> {
+            Ok(item(layout, key)?
+                .extract::<PyReadonlyArray1<i64>>()
+                .map_err(PyErr::from)?
+                .as_slice()?
+                .to_vec())
+        }
+        fn floats(layout: &Bound<'_, PyDict>, key: &str) -> Result<Vec<f64>> {
+            Ok(item(layout, key)?
+                .extract::<PyReadonlyArray1<f64>>()
+                .map_err(PyErr::from)?
+                .as_slice()?
+                .to_vec())
+        }
+
+        let has_map = layout.contains("parent_indptr")?;
+        let map = has_map
+            .then(|| {
+                build_transform(
+            &ints(layout, "parent_indptr")?,
+            &ints(layout, "parent_index")?,
+            &floats(layout, "blob")?,
+            &ints(layout, "blob_offset")?,
+            &ints(layout, "layer_out")?,
+            &floats(layout, "skip_weight")?,
+            item(layout, "skip_index")?.extract()?,
+            &item(layout, "activation")?.extract::<String>()?,
+            &item(layout, "transformer")?,
+            &ints(layout, "level_ptr")?,
+            &ints(layout, "level_vars")?,
+            &ints(layout, "level_work")?,
+            item(layout, "min_parallel_work")?.extract()?,
+            &item(layout, "schedule")?.extract::<String>()?,
+                )
+            })
+            .transpose()?;
+
+        let loc = floats(layout, "loc")?;
+        let scale = floats(layout, "scale")?;
+        let n = loc.len();
+        let permutation = if has_map {
+            as_usize(&ints(layout, "permutation")?)?
+        } else {
+            (0..n).collect()
+        };
+        if map.as_ref().is_some_and(|map| map.n_variables != n) {
+            bail!("loc must have one entry per variable of the map");
+        }
+        if permutation.len() != n || loc.len() != n || scale.len() != n {
+            bail!("permutation, loc and scale must each have one entry per variable");
+        }
+        let mut inverse_permutation = vec![usize::MAX; n];
+        for (position, &variable) in permutation.iter().enumerate() {
+            if variable >= n || inverse_permutation[variable] != usize::MAX {
+                bail!("permutation is not a permutation of 0..{n}");
+            }
+            inverse_permutation[variable] = position;
+        }
+        let log_det_affine = scale.iter().map(|s| s.abs().ln()).sum();
+
+        Ok(Self {
+            map,
+            permutation,
+            inverse_permutation,
+            loc,
+            scale,
+            log_det_affine,
+            buffer: vec![0.0; n],
+        })
+    }
+
+    pub fn n_variables(&self) -> usize {
+        self.loc.len()
+    }
+
+    /// `z -> y`, returning the log determinant. Records the tape `pullback`
+    /// needs.
+    pub fn transform_and_log_det(&mut self, z: &[f64], y: &mut [f64]) -> Result<f64> {
+        for (slot, &source) in self.buffer.iter_mut().zip(&self.permutation) {
+            *slot = z[source];
+        }
+        let Some(map) = self.map.as_mut() else {
+            for (k, out) in y.iter_mut().enumerate() {
+                *out = self.loc[k] + self.scale[k] * self.buffer[k];
+            }
+            return Ok(self.log_det_affine);
+        };
+        let (v, log_det) = map.transform_and_log_det(&self.buffer, true)?;
+        for (k, out) in y.iter_mut().enumerate() {
+            *out = self.loc[k] + self.scale[k] * v[self.inverse_permutation[k]];
+        }
+        Ok(log_det + self.log_det_affine)
+    }
+
+    /// Pull `grad_y` (with a unit log determinant cotangent) back to `z`,
+    /// through the point the last `transform_and_log_det` recorded.
+    pub fn pullback(&mut self, grad_y: &[f64], grad_z: &mut [f64]) -> Result<()> {
+        // `w = v[p^-1]` gathers, so its pullback scatters back: `g_v = g_w[p]`.
+        for (slot, &source) in self.buffer.iter_mut().zip(&self.permutation) {
+            *slot = grad_y[source] * self.scale[source];
+        }
+        let Some(map) = self.map.as_ref() else {
+            grad_z.copy_from_slice(&self.buffer);
+            return Ok(());
+        };
+        let grad_u = map.pullback(&self.buffer, 1.0)?;
+        // `u = z[p]`, likewise.
+        for (k, &target) in self.permutation.iter().enumerate() {
+            grad_z[target] = grad_u[k];
+        }
+        Ok(())
+    }
+}
+
 /// Compiled forward transform for one `SparseTriangularMap`.
 ///
 /// Built from the arrays of `nutpie.triangular_layout.extract_layout`, which
@@ -1687,108 +1966,23 @@ impl PySparseTriangularTransform {
         min_parallel_work: i64,
         schedule: &str,
     ) -> Result<Self> {
-        let activation: Activation = from_tag(activation)
-            .map_err(|_| anyhow::anyhow!("unknown activation {activation:?}"))?;
-        let schedule: Schedule =
-            from_tag(schedule).map_err(|_| anyhow::anyhow!("unknown schedule {schedule:?}"))?;
-
-        let specs: Vec<Contract2Spec> = pythonize::depythonize(transformer)?;
-        let layers = specs
-            .into_iter()
-            .map(Contract2::new)
-            .collect::<Result<Vec<_>>>()?;
-
-        let parent_indptr: Vec<usize> = as_usize(parent_indptr.as_slice()?)?;
-        let parent_index: Vec<u32> = as_u32(parent_index.as_slice()?)?;
-        let blob_offset: Vec<usize> = as_usize(blob_offset.as_slice()?)?;
-        let layer_out: Vec<usize> = as_usize(layer_out.as_slice()?)?;
-        let level_ptr: Vec<usize> = as_usize(level_ptr.as_slice()?)?;
-        let level_vars: Vec<u32> = as_u32(level_vars.as_slice()?)?;
-        let level_work = level_work.as_slice()?;
-        let blob = blob.as_slice()?.to_vec();
-        let skip_weight = skip_weight.as_slice()?.to_vec();
-
-        let n_variables = parent_indptr.len().saturating_sub(1);
-        if blob_offset.len() != n_variables + 1 {
-            bail!("blob_offset must have one more entry than there are variables");
-        }
-        if level_vars.len() != n_variables {
-            bail!("level_vars must list every variable exactly once");
-        }
-        if level_ptr.len() != level_work.len() + 1 {
-            bail!("level_ptr must have one more entry than level_work");
-        }
-        if layer_out.is_empty() {
-            bail!("conditioners must have at least one layer");
-        }
-        if parent_index.iter().any(|&p| p as usize >= n_variables) {
-            bail!("parent_index contains an out of range variable");
-        }
-        if level_vars.iter().any(|&v| v as usize >= n_variables) {
-            bail!("level_vars contains an out of range variable");
-        }
-
-        let (child_indptr, child_index, child_edge) =
-            invert_edges(n_variables, &parent_indptr, &parent_index);
-
-        let num_params = *layer_out.last().expect("checked non-empty");
-        if skip_weight.len() != parent_index.len() {
-            bail!("skip_weight must have one entry per parent_index entry");
-        }
-        let skip_index = usize::try_from(skip_index)
-            .ok()
-            .filter(|&index| index < num_params)
-            .ok_or_else(|| anyhow::anyhow!("skip_index {skip_index} is out of range"))?;
-        let max_parents = parent_indptr
-            .windows(2)
-            .map(|w| w[1] - w[0])
-            .max()
-            .unwrap_or(0);
-        let act_deriv_len: usize = layer_out[..layer_out.len() - 1].iter().sum();
-        let buffer_size = layer_out
-            .iter()
-            .copied()
-            .chain(std::iter::once(max_parents))
-            .max()
-            .unwrap_or(1)
-            .max(1);
-
-        let level_parallel = level_work
-            .iter()
-            .enumerate()
-            .map(|(level, &work)| {
-                let size = level_ptr[level + 1] - level_ptr[level];
-                size > 1 && work >= min_parallel_work
-            })
-            .collect();
-
-        let n_edges = parent_index.len();
         Ok(Self {
-            inner: TriangularTransform {
-                n_variables,
-                parent_indptr,
-                parent_index,
-                child_indptr,
-                child_index,
-                child_edge,
-                blob,
-                blob_offset,
-                layer_out,
-                skip_weight,
+            inner: build_transform(
+                parent_indptr.as_slice()?,
+                parent_index.as_slice()?,
+                blob.as_slice()?,
+                blob_offset.as_slice()?,
+                layer_out.as_slice()?,
+                skip_weight.as_slice()?,
                 skip_index,
                 activation,
-                layers,
-                level_ptr,
-                level_vars,
-                level_parallel,
+                transformer,
+                level_ptr.as_slice()?,
+                level_vars.as_slice()?,
+                level_work.as_slice()?,
+                min_parallel_work,
                 schedule,
-                buffer_size,
-                num_params,
-                max_parents,
-                act_deriv_len,
-                arch: Arch::new(),
-                tape: Tape::new(n_variables, n_edges),
-            },
+            )?,
         })
     }
 
@@ -1846,6 +2040,47 @@ impl PySparseTriangularTransform {
         let grad_y = grad_y.as_slice()?.to_vec();
         let grad_x = py.detach(|| self.inner.pullback(&grad_y, log_det_bar))?;
         Ok(PyArray1::from_vec(py, grad_x))
+    }
+}
+
+/// The sampler's native flow transform, exposed for testing it against the
+/// JAX bijection. Built from `nutpie.triangular_rust.flow_transform_layout`.
+#[pyclass(name = "FlowTransform")]
+pub struct PyFlowTransform {
+    inner: FlowTransform,
+}
+
+#[pymethods]
+impl PyFlowTransform {
+    #[new]
+    fn new(layout: &Bound<'_, PyDict>) -> Result<Self> {
+        Ok(Self {
+            inner: FlowTransform::from_layout(layout)?,
+        })
+    }
+
+    /// `z -> (y, log_det)`, recording the tape `pullback` needs.
+    fn transform_and_log_det<'py>(
+        &mut self,
+        py: Python<'py>,
+        z: PyReadonlyArray1<'py, f64>,
+    ) -> Result<(Bound<'py, PyArray1<f64>>, f64)> {
+        let z = z.as_slice()?.to_vec();
+        let mut y = vec![0.0; z.len()];
+        let log_det = py.detach(|| self.inner.transform_and_log_det(&z, &mut y))?;
+        Ok((PyArray1::from_vec(py, y), log_det))
+    }
+
+    /// Pull `grad_y` (with a unit log determinant cotangent) back to `z`.
+    fn pullback<'py>(
+        &mut self,
+        py: Python<'py>,
+        grad_y: PyReadonlyArray1<'py, f64>,
+    ) -> Result<Bound<'py, PyArray1<f64>>> {
+        let grad_y = grad_y.as_slice()?.to_vec();
+        let mut grad_z = vec![0.0; grad_y.len()];
+        py.detach(|| self.inner.pullback(&grad_y, &mut grad_z))?;
+        Ok(PyArray1::from_vec(py, grad_z))
     }
 }
 

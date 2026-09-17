@@ -21,7 +21,7 @@ use smallvec::{SmallVec, ToSmallVec};
 use thiserror::Error;
 
 use crate::common::{copy_init_point, ItemType, PyValue, PyVariable};
-use crate::wrapper::PyTransformAdapt;
+use crate::wrapper::{soft_clip, NativeFlow, PyTransformAdapt};
 
 type InnerModel = bridgestan::Model<Arc<bridgestan::StanLibrary>>;
 
@@ -472,6 +472,7 @@ pub struct StanDensity {
     rng: bridgestan::Rng<Arc<bridgestan::StanLibrary>>,
     transform_adapter: Option<PyTransformAdapt>,
     expanded_buffer: Vec<f64>,
+    native_flow: NativeFlow,
 }
 
 #[derive(Debug, Error)]
@@ -632,6 +633,28 @@ impl CpuLogpFunc for StanDensity {
         transformed_gradient: &mut [f64],
         clip: Option<f64>,
     ) -> std::result::Result<(f64, f64), Self::LogpError> {
+        // Native path: no Python at all. `native_flow` is moved out for the
+        // call so the logp closure can borrow `self`.
+        let adapter = self
+            .transform_adapter
+            .clone()
+            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?;
+        let mut native = std::mem::take(&mut self.native_flow);
+        let result = native.init_from_transformed_position(
+            &adapter,
+            params,
+            untransformed_position,
+            untransformed_gradient,
+            transformed_position,
+            transformed_gradient,
+            clip,
+            |y, grad| self.logp(y, grad),
+        );
+        self.native_flow = native;
+        if let Some(out) = result? {
+            return Ok(out);
+        }
+
         let adapter = self
             .transform_adapter
             .as_mut()
@@ -646,7 +669,7 @@ impl CpuLogpFunc for StanDensity {
             .context("Failed init_from_transformed_position_part1")?;
 
         let logp = self.logp(untransformed_position, untransformed_gradient)?;
-        // TODO: softclip
+        soft_clip(untransformed_gradient, clip);
 
         let adapter = self
             .transform_adapter
@@ -676,7 +699,7 @@ impl CpuLogpFunc for StanDensity {
         let logp = self
             .logp(untransformed_position, untransformed_gradient)
             .context("Failed to call stan logp function")?;
-        // TODO: softclip
+        soft_clip(untransformed_gradient, clip);
 
         let logdet = self
             .transform_adapter
@@ -701,6 +724,7 @@ impl CpuLogpFunc for StanDensity {
         untransformed_logp: impl ExactSizeIterator<Item = &'a f64>,
         params: &'a mut Py<PyAny>,
     ) -> std::result::Result<(), Self::LogpError> {
+        self.native_flow.invalidate();
         self.transform_adapter
             .as_mut()
             .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?
@@ -722,6 +746,7 @@ impl CpuLogpFunc for StanDensity {
         untransformed_gradient: &[f64],
         chain: u64,
     ) -> std::result::Result<Py<PyAny>, Self::LogpError> {
+        self.native_flow.invalidate();
         let trafo = self
             .transform_adapter
             .as_mut()
@@ -877,6 +902,7 @@ impl Model for StanModel {
             rng,
             transform_adapter: self.transform_adapter.clone(),
             expanded_buffer: vec![0f64; num_expanded],
+            native_flow: NativeFlow::default(),
         }))
     }
 

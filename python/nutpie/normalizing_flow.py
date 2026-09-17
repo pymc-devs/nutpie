@@ -2173,10 +2173,14 @@ def make_sparse_triangular_map(
     sparsity: ArrayLike,
     zero_init=True,
     n_buckets=8,
+    n_level_segments=8,
     nn_width=None,
     nn_depth=None,
     activation,
     location_skip=True,
+    affine_transformer=False,
+    contract_transformer=False,
+    asymmetric_transformer=False,
 ):
     """Build a `SparseTriangularMap` bijection for the given ordering.
 
@@ -2210,6 +2214,10 @@ def make_sparse_triangular_map(
             ``i`` in ``order``.
         location_skip: Linear map from each variable's parents straight to
             its transformer location, see `SparseTriangularMap`.
+        affine_transformer, contract_transformer, asymmetric_transformer:
+            Layer counts of the elementwise transformer, see
+            `make_transformer`. If all are zero, `SparseTriangularMap`'s own
+            default transformer is used.
     """
     if nn_width is None:
         nn_width = 16
@@ -2233,10 +2241,20 @@ def make_sparse_triangular_map(
     # precedes variable `j` whenever `i < j`) can be used unchanged.
     sparsity_sorted = sparsity[np.ix_(order, order)]
 
+    transformer = None
+    if affine_transformer or contract_transformer or asymmetric_transformer:
+        transformer = make_transformer(
+            affine_transformer=affine_transformer,
+            contract_transformer=contract_transformer,
+            asymmetric_transformer=asymmetric_transformer,
+        )
+
     layer = SparseTriangularMap(
         key,
         blanket=sparsity_sorted,
+        transformer=transformer,
         n_buckets=n_buckets,
+        n_level_segments=n_level_segments,
         nn_width=nn_width,
         nn_depth=nn_depth,
         nn_activation=activation,
@@ -2607,6 +2625,9 @@ def make_flow(
             nn_depth=nn_depth,
             activation=activation,
             location_skip=location_skip,
+            affine_transformer=affine_transformer,
+            contract_transformer=contract_transformer,
+            asymmetric_transformer=asymmetric_transformer,
         )
     else:
         raise ValueError(f"Unknown flow kind: {kind}")
