@@ -671,6 +671,7 @@ def step(
         & jnp.isfinite(F_new)
         & jnp.isfinite(rho_full)
     )
+    full_step_norm = tnorm(p)
 
     if line_search:
         # On large-residual problems GN underestimates curvature and
@@ -757,6 +758,8 @@ def step(
         "F_out": jnp.where(accept, F_new, F),
         "accept": accept,
         "rho": rho,
+        # Of the full GN step, before the line search; drives `lam`.
+        "rho_full": rho_full,
         "actual": actual,
         "pred": pred,
         "lam_in": lam,
@@ -770,6 +773,8 @@ def step(
         "cg_converged": ncg < cg_max,
         "grad_norm": tnorm(g),
         "step_norm": tnorm(p),
+        # The line search shortens this to `step_length * full_step_norm`.
+        "full_step_norm": full_step_norm,
         "finite": ok,
         "rebuilt_blocks": rebuild_blocks,
         "step_length": step_length,
@@ -982,11 +987,13 @@ def fit(
             print(
                 f"{i:3d}  log F={float(np.log(info['F_new'])):+.2f}  "
                 f"rho={float(info['rho']):+.2f}  "
+                f"rho_full={float(info['rho_full']):+.2f}  "
                 f"lam={float(info['lam_out']):.1e}  "
                 f"cg={int(info['n_cg']):3d}{' ' if info['cg_converged'] else '*'} "
                 f"eta={float(info['cg_eta']):.2f}"
                 f"{' ' if info['rebuilt_blocks'] else '~'}  "
-                f"|g|={float(info['grad_norm']):.2e}"
+                f"|g|={float(info['grad_norm']):.2e}  "
+                f"|p|={float(info['full_step_norm']):.2e}"
                 + (f"  a={float(info['step_length']):.2f}" if line_search else "")
                 + (
                     "  capture sub/cond="
