@@ -300,3 +300,184 @@ def test_deterministic_sampling_stan():
     np.testing.assert_array_max_ulp(trace.posterior.a.values, trace2.posterior.a.values)
     np.testing.assert_array_max_ulp(trace.posterior.b.values, trace2.posterior.b.values)
     return trace.posterior.a.isel(draw=slice(None, 10)).values
+
+
+@pytest.mark.stan
+def test_stan_init_point_fn():
+    model = """
+    parameters {
+        real a;
+        vector[2] b;
+    }
+    model {
+        a ~ normal(0, 1);
+        b ~ normal(0, 1);
+    }
+    """
+
+    compiled_model = nutpie.compile_stan_model(code=model)
+
+    calls = []
+
+    def init_point(model, rng, chain_id):
+        assert isinstance(rng, np.random.Generator)
+        calls.append(chain_id)
+        return rng.normal(size=model.n_dim)
+
+    compiled_model = compiled_model.with_init_point_fn(init_point)
+    trace = nutpie.sample(compiled_model, chains=3, tune=50, draws=50)
+    assert sorted(calls) == [0, 1, 2]
+    trace.posterior.b  # noqa: B018
+
+    # The init function survives later data updates
+    calls.clear()
+    nutpie.sample(compiled_model.with_data(), chains=2, tune=50, draws=50)
+    assert sorted(calls) == [0, 1]
+
+
+@pytest.mark.stan
+def test_stan_init_point_fn_dict():
+    model = """
+    parameters {
+        real<lower=0> sigma;
+        matrix[2, 3] m;
+    }
+    model {
+        sigma ~ normal(0, 1);
+        to_vector(m) ~ normal(0, sigma);
+    }
+    """
+
+    compiled_model = nutpie.compile_stan_model(code=model)
+
+    calls = []
+
+    def init_point(model, rng, chain_id):
+        calls.append(chain_id)
+        return {"sigma": 1.5, "m": rng.normal(size=(2, 3))}
+
+    compiled_model = compiled_model.with_init_point_fn(init_point)
+    nutpie.sample(compiled_model, chains=2, tune=50, draws=50)
+    assert sorted(calls) == [0, 1]
+
+
+@pytest.mark.stan
+def test_stan_init_point_fn_partial_dict():
+    model = """
+    parameters {
+        real<lower=0> sigma;
+        matrix[2, 3] m;
+    }
+    model {
+        sigma ~ normal(0, 1);
+        to_vector(m) ~ normal(0, sigma);
+    }
+    """
+
+    compiled_model = nutpie.compile_stan_model(code=model)
+
+    compiled_model = compiled_model.with_init_point_fn(
+        lambda model, rng, chain_id: {"sigma": 1.5}
+    )
+    trace = nutpie.sample(compiled_model, chains=2, tune=50, draws=50)
+    trace.posterior.m  # noqa: B018
+
+
+@pytest.mark.stan
+def test_stan_init_point_fn_retry():
+    model = """
+    parameters {
+        real a;
+    }
+    model {
+        // Half of the random initial points have an infinite log density
+        if (a < 0)
+            target += negative_infinity();
+        a ~ normal(0, 1);
+    }
+    """
+
+    compiled_model = nutpie.compile_stan_model(code=model)
+    compiled_model = compiled_model.with_init_point_fn(lambda model, rng, chain_id: {})
+    trace = nutpie.sample(compiled_model, chains=4, tune=50, draws=50)
+    assert (trace.posterior.a >= 0).all()
+
+
+@pytest.mark.stan
+def test_stan_init_point_fn_errors():
+    model = """
+    parameters {
+        real<lower=0> sigma;
+    }
+    model {
+        sigma ~ normal(0, 1);
+    }
+    """
+
+    compiled_model = nutpie.compile_stan_model(code=model)
+
+    # Values outside of the constraints are retried, and eventually fail
+    bad_value = compiled_model.with_init_point_fn(
+        lambda model, rng, chain_id: {"sigma": -1.0}
+    )
+    with pytest.raises(RuntimeError, match="initialization"):
+        nutpie.sample(bad_value, chains=1, tune=10, draws=10)
+
+    # Unknown names are fatal
+    unknown = compiled_model.with_init_point_fn(
+        lambda model, rng, chain_id: {"sgima": 1.0}
+    )
+    with pytest.raises(RuntimeError, match="sgima"):
+        nutpie.sample(unknown, chains=1, tune=10, draws=10)
+
+
+@pytest.mark.stan
+def test_stan_constrain_unconstrain():
+    model = """
+    parameters {
+        real<lower=0> sigma;
+        matrix[2, 3] m;
+    }
+    transformed parameters {
+        real sigma2 = sigma^2;
+    }
+    model {
+        sigma ~ normal(0, 1);
+        to_vector(m) ~ normal(0, sigma);
+    }
+    generated quantities {
+        real draw = normal_rng(0, 1);
+    }
+    """
+
+    compiled_model = nutpie.compile_stan_model(code=model)
+
+    m = np.arange(6.0).reshape(2, 3)
+    point = compiled_model.unconstrain(sigma=2.0, m=m)
+    assert point.shape == (compiled_model.n_dim,)
+    np.testing.assert_allclose(point[0], np.log(2.0))
+
+    values = compiled_model.constrain(point)
+    assert set(values) == {"sigma", "m"}
+    np.testing.assert_allclose(values["sigma"], 2.0)
+    np.testing.assert_allclose(values["m"], m)
+
+    values = compiled_model.constrain(point, include_tp=True, include_gq=True, seed=1)
+    assert set(values) == {"sigma", "m", "sigma2", "draw"}
+    np.testing.assert_allclose(values["sigma2"], 4.0)
+
+
+@pytest.mark.stan
+def test_stan_init_mean_deprecated():
+    model = """
+    parameters {
+        real a;
+    }
+    model {
+        a ~ normal(0, 1);
+    }
+    """
+
+    compiled_model = nutpie.compile_stan_model(code=model)
+    with pytest.warns(FutureWarning, match="init_mean"):
+        nutpie.sample(compiled_model, init_mean=np.zeros(1), tune=10, draws=10)

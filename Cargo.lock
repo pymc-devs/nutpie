@@ -2415,7 +2415,7 @@ dependencies = [
 
 [[package]]
 name = "nuts-rs"
-version = "0.18.3"
+version = "0.19.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -2428,11 +2428,11 @@ dependencies = [
  "pulp",
  "rand 0.10.2",
  "rand_distr",
- "rayon",
  "serde",
  "serde_json",
  "thiserror 2.0.19",
  "tokio",
+ "web-time",
  "zarrs",
 ]
 

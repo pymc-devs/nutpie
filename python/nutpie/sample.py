@@ -1,8 +1,10 @@
 import json
 import os
 import warnings
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from importlib.metadata import version
+from math import prod
 from typing import Any, Literal, cast, get_args, overload
 
 import arviz
@@ -37,12 +39,27 @@ class CompiledModel:
     def _make_model(self, *args, **kwargs):
         raise NotImplementedError()
 
+    def with_init_point_fn(self, init_point_fn):
+        """Use a custom function to generate the initial point of each chain.
+
+        Parameters
+        ----------
+        init_point_fn : Callable[[CompiledModel, np.random.Generator, int], np.ndarray]
+            Called as ``init_point_fn(model, rng, chain_id)``, where ``model``
+            is the compiled model that is sampled. Must return a point on the
+            unconstrained space with shape ``(n_dim,)``. Some backends also
+            accept a dict of values, see their documentation. If the log
+            density is not finite at the returned point, the function is
+            called again with a new ``rng``.
+        """
+        raise NotImplementedError()
+
     def benchmark_logp(self, point, num_evals, cores):
         """Time how long the logp gradient evaluation takes.
 
         # Parameters
         """
-        model = self._make_model(point)
+        model = self._make_model()
         times = []
         if isinstance(cores, int):
             cores = [cores]
@@ -57,6 +74,77 @@ class CompiledModel:
             data = data.rename_axis(columns="evaluation")
             times.append(data)
         return pd.concat(times)
+
+
+def _flatten_point(values, names, shapes, base=None):
+    """Concatenate a dict of arrays into one flat float64 array, in the
+    order given by ``names``.
+
+    Variables missing from ``values`` are taken from the flat array
+    ``base``. If ``base`` is None, all variables must be given.
+    """
+    unknown = [
+        name for name in values if name not in names and np.size(values[name]) > 0
+    ]
+    if unknown:
+        raise KeyError(
+            f"Unknown variables in initial point: {unknown}. "
+            f"Expected a subset of {list(names)}."
+        )
+
+    total_size = sum(prod(shape) for shape in shapes)
+    if base is None:
+        flat_array = np.empty(total_size, dtype="float64", order="C")
+    else:
+        flat_array = np.array(base, dtype="float64", order="C", copy=True)
+        if flat_array.shape != (total_size,):
+            raise ValueError(
+                f"Default initial point has shape {flat_array.shape}, "
+                f"expected {(total_size,)}"
+            )
+    cursor = 0
+
+    for name, shape in zip(names, shapes, strict=True):
+        n = prod(shape)
+        if name not in values:
+            if base is None:
+                raise KeyError(f"Initial point is missing a value for {name}")
+            cursor += n
+            continue
+        value = np.asarray(values[name])
+        if tuple(value.shape) != tuple(shape):
+            raise ValueError(
+                f"Size of initial value for {name} is {value.shape}, "
+                f"expected {tuple(shape)}"
+            )
+        flat_array[cursor : cursor + n] = value.ravel().astype("float64")
+        cursor += n
+
+    return flat_array
+
+
+def _wrap_init_point_fn(init_point_fn, model, convert_dict=None):
+    """Adapt a user ``fn(model, rng, chain_id)`` to the ``fn(seed, chain_id)``
+    signature the rust models call.
+
+    If ``convert_dict`` is given, the user function may also return a
+    dict, which is converted with ``convert_dict(values, seed, chain_id)``.
+    The seed passed there is independent of the user's rng, and can be
+    used to fill in missing values.
+    """
+
+    def init_point(seed, chain_id):
+        user_seed, fill_seed = np.random.SeedSequence(seed).spawn(2)
+        point = init_point_fn(model, np.random.default_rng(user_seed), chain_id)
+        if isinstance(point, Mapping):
+            if convert_dict is None:
+                raise TypeError(
+                    "The init point function must return an array for this model."
+                )
+            return convert_dict(point, int(fill_seed.generate_state(1)[0]), chain_id)
+        return np.ascontiguousarray(point, dtype=np.float64)
+
+    return init_point
 
 
 def _arrow_to_arviz(
@@ -492,7 +580,6 @@ class _BackgroundSampler:
         self,
         compiled_model,
         settings,
-        init_mean,
         cores,
         *,
         progress_bar=True,
@@ -583,7 +670,6 @@ class _BackgroundSampler:
 
         self._sampler = compiled_model._make_sampler(
             settings,
-            init_mean,
             cores,
             progress_type,
             progress_callback,
@@ -871,9 +957,9 @@ def sample(
     progress_bar: bool
         If true, display the progress bar (default)
     init_mean: ndarray
-        Initialize the chains using jittered values around this
-        point on the transformed parameter space. Defaults to
-        zeros.
+        Deprecated and ignored. Use
+        ``compiled_model.with_init_point_fn`` to control the initial
+        points of the chains.
     store_unconstrained: bool
         If True, store the unconstrained (transformed) draws in two forms:
         a flat ``unconstrained_draw`` vector in ``sample_stats`` and a
@@ -1067,13 +1153,17 @@ def sample(
         else:
             cores = min(chains, cast(int, available))
 
-    if init_mean is None:
-        init_mean = np.zeros(compiled_model.n_dim)
+    if init_mean is not None:
+        warnings.warn(
+            "`init_mean` is deprecated and has no effect. Use "
+            "`compiled_model.with_init_point_fn` to set initial points.",
+            FutureWarning,
+            stacklevel=2,
+        )
 
     background_sampler = _BackgroundSampler(
         compiled_model,
         settings,
-        init_mean,
         cores,
         progress_bar=progress_bar,
         progress_callback=progress_callback,
