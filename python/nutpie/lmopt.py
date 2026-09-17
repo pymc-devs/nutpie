@@ -313,11 +313,20 @@ def _accumulate_grams(one, items, batch, capture):
         return totals, capture_fractions(Gs, n_items)
 
     def chunk_gram(chunk):
-        return [jnp.einsum("tngi,tngj->ngij", G, G) for G in jax.vmap(one)(chunk)]
+        # An item may contribute several rows (leading axes before `(n, G, q)`),
+        # as `build_blocks_exact`'s factors do; all of them are summed over.
+        return [
+            jnp.einsum(
+                "tngi,tngj->ngij",
+                G.reshape((-1,) + G.shape[-3:]),
+                G.reshape((-1,) + G.shape[-3:]),
+            )
+            for G in jax.vmap(one)(chunk)
+        ]
 
     # (n, G, q) per bucket -> (n, G, q, q) accumulators, from shapes alone.
     totals = [
-        jnp.zeros(spec.shape + spec.shape[-1:], spec.dtype)
+        jnp.zeros(spec.shape[-3:] + spec.shape[-1:], spec.dtype)
         for spec in jax.eval_shape(one, jax.tree.map(lambda a: a[0], items))
     ]
 
@@ -337,6 +346,29 @@ def _accumulate_grams(one, items, batch, capture):
         totals = [c + g for c, g in zip(totals, tail)]
 
     return totals, None
+
+
+def build_blocks_exact(factor, data, plans, batch=32):
+    """[ (n_j, G_j, q_j, q_j) ] per bucket: the exact Gauss-Newton blocks.
+
+    `factor(draw_data)` returns one draw's factors, per bucket ``(n_j, r_j,
+    Pb_j)`` with the block ``sum_draws V^T V`` (see
+    `SparseTriangularMap.gauss_newton_factors`). No probes, so no estimator
+    noise and no rank limit: the blocks are what `build_blocks` estimates, up
+    to floating point. They are accumulated `batch` draws at a time, in the
+    plans' sub-block layout, and scaled by ``1 / n_draws`` for `residuals`'
+    ``1 / sqrt(n_draws)``.
+    """
+    n = jax.tree.leaves(data)[0].shape[0]
+
+    def one(draw_data):
+        return [
+            _gather(jnp.swapaxes(V, 0, 1), p)  # (r, n_j, G, q)
+            for V, p in zip(factor(draw_data), plans)
+        ]
+
+    totals, _ = _accumulate_grams(one, data, batch, capture=False)
+    return [total / n for total in totals], None
 
 
 def build_blocks_grouped(
@@ -613,6 +645,7 @@ def step(
     line_search=False,
     ls_min_fraction=0.1,
     forcing="residual",
+    factor_fn=None,
 ):
     """One LM step.  res_fn and plans are static under eqx.filter_jit; plans
     is built once via get_plans and cached by parameter structure, so its
@@ -665,7 +698,20 @@ def step(
         lam_min = 1e-6 if damping == "marquardt" else 1e-10
 
     if precondition:
-        if n_groups is None:
+        if factor_fn is not None:
+            if capture_diagnostic:
+                raise ValueError(
+                    "capture_diagnostic needs probe-based blocks, not factor_fn."
+                )
+            # Exact, so nothing to shrink towards the diagonal.
+            n_samples = float("inf")
+            estimate = lambda capture: build_blocks_exact(
+                lambda d: factor_fn(merge_frozen(theta, frozen), args, d),
+                data,
+                plans,
+                batch,
+            )
+        elif n_groups is None:
             n_samples = m
             estimate = lambda capture: build_blocks(
                 vjpf, r.shape, key, plans, m, batch, capture=capture
@@ -978,8 +1024,14 @@ def fit(
     patience=5,
     line_search=False,
     forcing="residual",
+    factor_fn=None,
 ):
     """Levenberg-Marquardt fit.
+
+    `factor_fn(params, args, draw_data)`, if given, supplies one draw's exact
+    Gauss-Newton block factors (see `build_blocks_exact`), replacing the
+    probe estimates: `m` then only sets the sub-block size, and nothing is
+    shrunk. It covers the conditioners only, so it needs `fit_affine=False`.
 
     `line_search` shortens each step to the minimizer of a parabola fitted
     along it, which counters the Gauss-Newton overshoot on large-residual
@@ -1026,6 +1078,14 @@ def fit(
     data = tuple(data)
     if n_groups is not None and not data:
         raise ValueError("n_groups needs the per-draw arrays passed as `data`.")
+    if factor_fn is not None:
+        if not data:
+            raise ValueError("factor_fn needs the per-draw arrays passed as `data`.")
+        if fit_affine:
+            raise ValueError(
+                "factor_fn only gives blocks for the conditioners; use "
+                "fit_affine=False with it."
+            )
 
     if precondition:
         plans = setup(params, m)
@@ -1106,6 +1166,7 @@ def fit(
             rounds=rounds,
             line_search=line_search,
             forcing=forcing,
+            factor_fn=factor_fn,
         )
         if rebuild_blocks:
             accepted_since_build = 0
