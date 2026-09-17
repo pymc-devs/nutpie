@@ -634,8 +634,8 @@ class SparseTriangularMap(bijections.AbstractBijection):
             transformer = make_transformer(
                 affine_transformer=False,
                 asymmetric_transformer=False,
-                contract_transformer=1,
-                #log_gamma_bounds=(-3, 3),
+                contract_transformer=2,
+                #log_gamma_bounds=(-1, 1),
             )
         if transformer.shape != () or transformer.cond_shape is not None:
             raise ValueError(
