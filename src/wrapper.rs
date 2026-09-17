@@ -1729,6 +1729,11 @@ pub fn _lib(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyVariable>()?;
     m.add_class::<PyStorage>()?;
     m.add_class::<PyTrace>()?;
+    m.add_class::<crate::triangular::PySparseTriangularTransform>()?;
+    m.add_function(wrap_pyfunction!(
+        crate::triangular::activation_for_testing,
+        m
+    )?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     #[cfg(feature = "zarr")]
     {
