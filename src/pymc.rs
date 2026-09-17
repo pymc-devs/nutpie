@@ -97,7 +97,7 @@ impl ExpandFunc {
 unsafe impl Send for ExpandFunc {}
 unsafe impl Sync for ExpandFunc {}
 
-impl HasDims for PyMcModelRef<'_> {
+impl HasDims for PyMcModelRef {
     fn dim_sizes(&self) -> HashMap<String, u64> {
         self.model.dim_sizes.clone()
     }
@@ -109,8 +109,8 @@ impl HasDims for PyMcModelRef<'_> {
 
 pub struct ExpandedVector(Vec<Option<nuts_rs::Value>>);
 
-impl<'f> Storable<PyMcModelRef<'f>> for ExpandedVector {
-    fn names<'a>(parent: &'a PyMcModelRef<'f>) -> Vec<&'a str> {
+impl Storable<PyMcModelRef> for ExpandedVector {
+    fn names<'a>(parent: &'a PyMcModelRef) -> Vec<&'a str> {
         parent
             .model
             .variables
@@ -119,7 +119,7 @@ impl<'f> Storable<PyMcModelRef<'f>> for ExpandedVector {
             .collect()
     }
 
-    fn item_type(parent: &PyMcModelRef<'f>, item: &str) -> nuts_rs::ItemType {
+    fn item_type(parent: &PyMcModelRef, item: &str) -> nuts_rs::ItemType {
         parent
             .model
             .variables
@@ -129,7 +129,7 @@ impl<'f> Storable<PyMcModelRef<'f>> for ExpandedVector {
             .expect("Item not found")
     }
 
-    fn dims<'a>(parent: &'a PyMcModelRef<'f>, item: &str) -> Vec<&'a str> {
+    fn dims<'a>(parent: &'a PyMcModelRef, item: &str) -> Vec<&'a str> {
         parent
             .model
             .variables
@@ -141,7 +141,7 @@ impl<'f> Storable<PyMcModelRef<'f>> for ExpandedVector {
 
     fn get_all<'a>(
         &'a mut self,
-        parent: &'a PyMcModelRef<'f>,
+        parent: &'a PyMcModelRef,
     ) -> Vec<(&'a str, Option<nuts_rs::Value>)> {
         self.0
             .iter_mut()
@@ -180,12 +180,12 @@ impl LogpError for PyMcLogpError {
     }
 }
 
-pub struct PyMcModelRef<'a> {
-    model: &'a PyMcModel,
+pub struct PyMcModelRef {
+    model: Arc<PyMcModel>,
     transform_adapter: Option<PyTransformAdapt>,
 }
 
-impl CpuLogpFunc for PyMcModelRef<'_> {
+impl CpuLogpFunc for PyMcModelRef {
     type LogpError = PyMcLogpError;
     type FlowParameters = Py<PyAny>;
     type ExpandedVector = ExpandedVector;
@@ -313,6 +313,7 @@ impl CpuLogpFunc for PyMcModelRef<'_> {
         untransformed_gradient: &mut [f64],
         transformed_position: &[f64],
         transformed_gradient: &mut [f64],
+        clip: Option<f64>,
     ) -> std::result::Result<(f64, f64), Self::LogpError> {
         let (logp, logdet) = self
             .transform_adapter
@@ -324,6 +325,7 @@ impl CpuLogpFunc for PyMcModelRef<'_> {
                 untransformed_gradient,
                 transformed_position,
                 transformed_gradient,
+                clip,
             )?;
         Ok((logp, logdet))
     }
@@ -335,6 +337,7 @@ impl CpuLogpFunc for PyMcModelRef<'_> {
         untransformed_gradient: &mut [f64],
         transformed_position: &mut [f64],
         transformed_gradient: &mut [f64],
+        clip: Option<f64>,
     ) -> std::result::Result<(f64, f64), Self::LogpError> {
         let (logp, logdet) = self
             .transform_adapter
@@ -346,6 +349,7 @@ impl CpuLogpFunc for PyMcModelRef<'_> {
                 untransformed_gradient,
                 transformed_position,
                 transformed_gradient,
+                clip,
             )?;
         Ok((logp, logdet))
     }
@@ -493,11 +497,11 @@ impl PyMcModel {
 }
 
 impl Model for PyMcModel {
-    type Math<'model> = CpuMath<PyMcModelRef<'model>>;
+    type Math = CpuMath<PyMcModelRef>;
 
-    fn math<R: Rng + ?Sized>(&self, _rng: &mut R) -> Result<Self::Math<'_>> {
+    fn math<R: Rng + ?Sized>(self: Arc<PyMcModel>, _rng: &mut R) -> Result<Self::Math> {
         Ok(CpuMath::new(PyMcModelRef {
-            model: self,
+            model: self.clone(),
             transform_adapter: self.transform_adapter.clone(),
         }))
     }
@@ -505,6 +509,7 @@ impl Model for PyMcModel {
     fn init_position<R: rand::Rng + ?Sized>(
         &self,
         rng: &mut R,
+        _chain_id: u64,
         position: &mut [f64],
     ) -> Result<()> {
         let seed = rng.next_u64();
