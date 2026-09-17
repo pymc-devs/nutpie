@@ -424,6 +424,29 @@ def apply_Minvs(Minvs, plans, v):
     return rebuild(v, out)
 
 
+def blocks_zeros(theta, plans):
+    """Zero accumulators shaped exactly like `build_blocks`' output.
+
+    Only needed so that `blocks` has a stable pytree structure across `step`
+    calls: handing it `None` on the first step and a list of arrays afterwards
+    means the second call sees a different argument structure and retraces,
+    recompiling the whole step -- CG loop, probe map and the residual function's
+    forward and backward graph with it.
+
+    The shapes come from `_gather` alone, mirroring how `build_blocks` derives
+    its own accumulators, and the VJP that produces the real values has the same
+    structure as `theta`, so `theta` stands in for it here. That keeps this off
+    `res_fn` entirely: no VJP is traced and nothing is compiled. Should the two
+    ever disagree, `step`'s `lax.cond` fails loudly rather than silently, since
+    its branches must return matching shapes.
+    """
+    spec = jax.eval_shape(
+        lambda t: [_gather(p["flatten"](b), p) for b, p in zip(blocks_of(t), plans)],
+        theta,
+    )
+    return [jnp.zeros(s.shape + s.shape[-1:], s.dtype) for s in spec]
+
+
 @eqx.filter_jit
 def step(
     res_fn,
@@ -437,6 +460,7 @@ def step(
     rebuild_blocks: jax.Array,
     p_prev: jax.Array,
     eta_in: jax.Array,
+    nu_in: jax.Array,
     m=256,
     batch=32,
     precondition=True,
@@ -446,9 +470,7 @@ def step(
     cg_alpha=1.618,
     cg_max=300,
     accept_rho=0.1,
-    good_rho=0.75,
-    lam_down=3.0,
-    lam_up=4.0,
+    nu0=2.0,
     lam_min=None,
     lam_max=1e10,
     damping="marquardt",
@@ -476,7 +498,8 @@ def step(
     `eta_in` is the CG forcing term this step should use, proposed by the
     previous step (see the Eisenstat-Walker comment below); the successor is
     returned as ``info["cg_eta_next"]`` for `fit` to feed back. It is traced,
-    like `rebuild_blocks`.
+    like `rebuild_blocks`. `nu_in` is the companion state for the `lam` update,
+    returned as ``info["lam_nu_next"]``.
     """
     res_fn_args = lambda p: res_fn(p, args)
     _, vjpf = jax.vjp(res_fn_args, theta)
@@ -557,11 +580,28 @@ def step(
 
     pick = lambda a, b: jax.tree.map(lambda x, y: jnp.where(accept, x, y), a, b)
     theta_out, r_out = pick(theta_new, theta), pick(r_new, r)
+
+    # Nielsen's damping update (Madsen/Nielsen/Tingleff), in place of a fixed
+    # decrease/increase pair. Two properties matter here.
+    #
+    # The decrease is graded by `rho` and capped at 3x, so a step that only
+    # just cleared `accept_rho` *raises* `lam` (the factor exceeds 1 below
+    # `rho = 0.5`) instead of leaving it put -- a fixed `lam / lam_down` on
+    # every good step keeps proposing a trust region the problem has already
+    # refused.
+    #
+    # The increase escalates: `nu` doubles on each consecutive failure and
+    # resets on acceptance. A fixed multiplier produces a limit cycle here --
+    # accept at `rho ~ 0.9`, divide `lam`, get `rho < 0` at the smaller value,
+    # multiply back to almost exactly the `lam` that just worked, repeat -- and
+    # each of those probes costs a full CG solve plus a residual and Jacobian
+    # evaluation. Escalating means a second consecutive failure leaves the
+    # interval instead of retracing it.
+    lam_decrease = jnp.maximum(1.0 / 3.0, 1.0 - (2.0 * rho - 1.0) ** 3)
     lam_out = jnp.clip(
-        jnp.where(accept, jnp.where(rho > good_rho, lam / lam_down, lam), lam * lam_up),
-        lam_min,
-        lam_max,
+        jnp.where(accept, lam * lam_decrease, lam * nu_in), lam_min, lam_max
     )
+    nu_out = jnp.where(accept, nu0, 2.0 * nu_in)
     # a rejected step's p solves a system with a different lambda: discard it
     p_out = jax.tree.map(lambda a: jnp.where(accept, a, jnp.zeros_like(a)), p)
 
@@ -607,6 +647,8 @@ def step(
         "pred": pred,
         "lam_in": lam,
         "lam_out": lam_out,
+        "lam_nu": nu_in,
+        "lam_nu_next": nu_out,
         "n_cg": ncg,
         "cg_eta": eta,
         "cg_eta_next": eta_next,
@@ -695,8 +737,9 @@ def fit(
     batch=32,
     damping="marquardt",
     lam_min=None,
+    nu0=2.0,
     capture_diagnostic=False,
-    rebuild_every=3,
+    rebuild_every=1,
 ):
     """Levenberg-Marquardt fit.
 
@@ -727,16 +770,25 @@ def fit(
 
     key = jax.random.key(0)
 
-    theta, r, lam = params, res_fn(params, args), jnp.asarray(lam0)
+    theta, r = params, res_fn(params, args)
     # Seed with real zeros (not None) so p_prev's pytree structure is the
     # same on every iteration -- else step 0 (p_prev=None) and step 1
     # (p_prev=<pytree>) are different input structures and each triggers its
     # own trace of lm_step (and the pcg while_loop inside it).
     p_prev = jax.tree.map(jnp.zeros_like, params)
+    # Every scalar carried into `step` is seeded at `r`'s dtype rather than left
+    # to `jnp.asarray(<python float>)`, which produces a *weakly* typed array.
+    # What `step` returns is arithmetic on `r` and so is strongly typed, and a
+    # weak -> strong flip is a different input aval: it retraces and recompiles
+    # the whole step, CG loop included, on the second call.
+    #
     # Forcing term (see `step`): each step proposes the next one's, so all this
     # carries is the seed. `cg_eta_max` is the usual Eisenstat-Walker `eta_0` --
-    # there is no model-quality measurement yet to derive one from.
-    eta_prev = jnp.asarray(cg_eta_max)
+    # there is no model-quality measurement yet to derive one from. `nu` is the
+    # companion seed for Nielsen's `lam` update.
+    lam = jnp.asarray(lam0, dtype=r.dtype)
+    eta_prev = jnp.asarray(cg_eta_max, dtype=r.dtype)
+    nu_prev = jnp.asarray(nu0, dtype=r.dtype)
     key, hist = jr.key(seed), []
     # The Gram estimate is a function of `theta` alone, so it stays exactly
     # valid across a rejected step -- `theta` did not move. Between accepted
@@ -744,7 +796,11 @@ def fit(
     # preconditioner (which costs CG iterations, never correctness) against `m`
     # reverse passes. Counting only accepted steps makes the reuse on rejection
     # exact rather than an approximation.
-    blocks = None
+    # Placeholder with the right structure rather than `None`, see
+    # `blocks_zeros`. The values are never read: `rebuild_blocks` is true on the
+    # first step. Without preconditioning `step` ignores the argument entirely,
+    # and `None` is then stable across calls.
+    blocks = blocks_zeros(theta, plans) if precondition else None
     accepted_since_build = rebuild_every  # build on the first step
     for i in range(n_steps):
         key, sk = jr.split(key)
@@ -761,6 +817,8 @@ def fit(
             precondition=precondition,
             p_prev=p_prev,
             eta_in=eta_prev,
+            nu_in=nu_prev,
+            nu0=nu0,
             cg_max=cg_max,
             cg_eta_max=cg_eta_max,
             cg_gamma=cg_gamma,
@@ -776,6 +834,7 @@ def fit(
             accepted_since_build = 0
         accepted_since_build += int(info["accept"])
         eta_prev = info["cg_eta_next"]
+        nu_prev = info["lam_nu_next"]
         hist.append(info)
         if verbose:
             print(
@@ -800,7 +859,36 @@ def fit(
         if not np.isfinite(info["grad_norm"]):
             if verbose:
                 print("gradient norm is NaN or Inf; adding noise to parameters")
-            theta = jax.tree.map(lambda x: 1e-2 * jr.normal(sk, x.shape), theta)
+            # Jitter `theta` rather than overwrite it: the iterate itself is
+            # usually fine and only the local geometry is degenerate, so
+            # discarding the fit so far costs every step taken to here.
+            # One key per leaf -- reusing `sk` gives equal-shaped leaves
+            # identical noise -- and only inexact leaves are perturbed.
+            leaves, treedef = jax.tree.flatten(theta)
+            keys = jr.split(sk, len(leaves))
+            theta = jax.tree.unflatten(
+                treedef,
+                [
+                    leaf + 1e-2 * jr.normal(k, jnp.shape(leaf), jnp.result_type(leaf))
+                    if eqx.is_inexact_array(leaf)
+                    else leaf
+                    for leaf, k in zip(leaves, keys)
+                ],
+            )
+            # Everything carried forward describes the *old* `theta`: `r` would
+            # make the next step compute `J(theta_new)^T r_old` and an `F` from
+            # a point it has left, `p_prev` warm-starts CG from a step of a
+            # system that no longer exists, and the Gram blocks were estimated
+            # elsewhere. Recompute or discard all three.
+            r = res_fn(theta, args)
+            p_prev = jax.tree.map(jnp.zeros_like, theta)
+            accepted_since_build = rebuild_every  # rebuild at the new theta
+            # The model-quality measurement the forcing term is built on refers
+            # to the old point too; restart it, and the `lam` escalation with
+            # it, from their seeds -- at `r`'s dtype, as above, so the restart
+            # does not recompile `step`.
+            eta_prev = jnp.asarray(cg_eta_max, dtype=r.dtype)
+            nu_prev = jnp.asarray(nu0, dtype=r.dtype)
 
         if min_loss and info["F_out"] < min_loss:
             break
