@@ -2080,6 +2080,7 @@ def make_sparse_triangular_map(
     affine_transformer=False,
     contract_transformer=False,
     asymmetric_transformer=False,
+    feature_degree=None,
 ):
     """Build a `SparseTriangularMap` bijection for the given ordering.
 
@@ -2118,6 +2119,9 @@ def make_sparse_triangular_map(
             Layer counts of the elementwise transformer, see
             `make_transformer`. If all are zero, `SparseTriangularMap`'s own
             default transformer is used.
+        feature_degree: Degree of the `HermiteFeatures` the conditioners see
+            instead of the raw parents, see `SparseTriangularMap`. None for
+            the raw parents.
     """
     if nn_width is None:
         nn_width = 16
@@ -2162,6 +2166,7 @@ def make_sparse_triangular_map(
         nn_depth=nn_depth,
         nn_activation=activation,
         location_skip=location_skip,
+        feature_degree=feature_degree,
     )
     if zero_init:
         layer = zero_init_conditioners(layer)
@@ -2379,6 +2384,7 @@ def make_flow(
     order: ArrayLike | None = None,
     sparsity: ArrayLike | None = None,
     location_skip: bool = True,
+    feature_degree: int | None = None,
 ):
     if activation is None:
         activation = jax.nn.leaky_relu
@@ -2531,7 +2537,22 @@ def make_flow(
             affine_transformer=affine_transformer,
             contract_transformer=contract_transformer,
             asymmetric_transformer=asymmetric_transformer,
+            feature_degree=feature_degree,
         )
+        if feature_degree is not None:
+            # The marginal maps of the features, fitted on the draws as the
+            # triangular map sees them: standardized, then in its order.
+            from nutpie.triangular import fit_marginal_maps
+
+            standardized = ((positions - np.asarray(mean)) / np.asarray(diag))[
+                :, np.asarray(order)
+            ]
+            where = lambda chain: chain.bijections[0].inner
+            inner = eqx.tree_at(
+                where,
+                inner,
+                where(inner).with_marginal_maps(fit_marginal_maps(standardized)),
+            )
     else:
         raise ValueError(f"Unknown flow kind: {kind}")
     return bijections.Chain([inner, *flows])
