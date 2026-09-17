@@ -136,6 +136,69 @@ def _fill(graph, order) -> sp.csr_array:
     return _pattern(np.concatenate([rows, cols]), np.concatenate([cols, rows]), n)
 
 
+def _draw_cells(ax, x, y, **kwargs):
+    """Draw unit squares centred at `(x, y)` in data coordinates, so that
+    neighbouring cells meet without gaps at any size or resolution. Returns
+    the `PolyCollection`, `kwargs` are passed on to it."""
+    from matplotlib.collections import PolyCollection
+
+    corners = np.array([[-0.5, -0.5], [0.5, -0.5], [0.5, 0.5], [-0.5, 0.5]])
+    centers = np.stack([x, y], axis=-1).astype(np.float64)
+    cells = PolyCollection(
+        centers[:, None, :] + corners[None, :, :],
+        edgecolors="none",
+        antialiased=False,
+        rasterized=True,
+        **kwargs,
+    )
+    ax.add_collection(cells)
+    return cells
+
+
+def _variable_strips(ax, variables, perm, max_variables):
+    """Coloured strips left of and below `ax` that show the model variable
+    of each unconstrained parameter, in the order `perm`. The largest
+    `max_variables` variables get a colour, the others are grey. Returns the
+    legend handles, in the order in which the variables first appear."""
+    from matplotlib.colors import ListedColormap
+    from matplotlib.patches import Patch
+    from mpl_toolkits.axes_grid1 import make_axes_locatable
+
+    n = len(perm)
+    codes, names = pd.factorize(pd.Series(variables))
+    sizes = np.bincount(codes, minlength=len(names))
+    coloured = np.argsort(-sizes, kind="stable")[:max_variables]
+    colors = ["0.85"] * len(names)
+    for i, code in enumerate(sorted(coloured)):
+        colors[code] = f"C{i % 10}"
+    cmap = ListedColormap(colors)
+    strip = codes[perm]
+
+    # Outside of the tick labels, and not on top where the title goes
+    divider = make_axes_locatable(ax)
+    for side, values in [("left", strip[:, None]), ("bottom", strip[None, :])]:
+        strip_ax = divider.append_axes(side, size="3%", pad=0.4)
+        strip_ax.imshow(
+            values,
+            cmap=cmap,
+            vmin=-0.5,
+            vmax=len(names) - 0.5,
+            aspect="auto",
+            interpolation="nearest",
+        )
+        strip_ax.set_axis_off()
+
+    first = np.full(len(names), n)
+    np.minimum.at(first, strip, np.arange(n))
+    handles = [
+        Patch(color=colors[code], label=names[code])
+        for code in sorted(coloured, key=lambda code: first[code])
+    ]
+    if len(names) > len(coloured):
+        handles.append(Patch(color="0.85", label="other"))
+    return handles
+
+
 @dataclass(frozen=True, repr=False)
 class Factorization:
     """Symbolic factorization of the Hessian sparsity pattern.
@@ -332,11 +395,7 @@ class Factorization:
         The matplotlib axes.
         """
         import matplotlib.pyplot as plt
-        from matplotlib.collections import PolyCollection
-        from matplotlib.colors import ListedColormap
         from matplotlib.lines import Line2D
-        from matplotlib.patches import Patch
-        from mpl_toolkits.axes_grid1 import make_axes_locatable
 
         n = self.n_dim
         if order == "flow":
@@ -365,63 +424,19 @@ class Factorization:
                 )
             return cols[keep], rows[keep]
 
-        def draw_cells(x, y, color):
-            # Squares in data coordinates, so that neighbouring cells meet
-            # without gaps at any size or resolution.
-            corners = np.array([[-0.5, -0.5], [0.5, -0.5], [0.5, 0.5], [-0.5, 0.5]])
-            centers = np.stack([x, y], axis=-1).astype(np.float64)
-            cells = PolyCollection(
-                centers[:, None, :] + corners[None, :, :],
-                facecolors=color,
-                edgecolors="none",
-                antialiased=False,
-                rasterized=True,
-            )
-            ax.add_collection(cells)
-
-        draw_cells(*entries(self.hessian_sparsity), color="0.2")
-        draw_cells(*entries(self.filled, exclude=self.hessian_sparsity), color="0.7")
+        _draw_cells(ax, *entries(self.hessian_sparsity), facecolors="0.2")
+        _draw_cells(
+            ax, *entries(self.filled, exclude=self.hessian_sparsity), facecolors="0.7"
+        )
         ax.set_xlim(-0.5, n - 0.5)
         ax.set_ylim(n - 0.5, -0.5)
         ax.set_aspect("equal")
-
-        # The largest variables get a colour, the rest is grey
-        codes, names = pd.factorize(pd.Series(self.variables))
-        sizes = np.bincount(codes, minlength=len(names))
-        coloured = np.argsort(-sizes, kind="stable")[:max_variables]
-        colors = ["0.85"] * len(names)
-        for i, code in enumerate(sorted(coloured)):
-            colors[code] = f"C{i % 10}"
-        cmap = ListedColormap(colors)
-        strip = codes[perm]
-
-        # Outside of the tick labels, and not on top where the title goes
-        divider = make_axes_locatable(ax)
-        for side, values in [("left", strip[:, None]), ("bottom", strip[None, :])]:
-            strip_ax = divider.append_axes(side, size="3%", pad=0.4)
-            strip_ax.imshow(
-                values,
-                cmap=cmap,
-                vmin=-0.5,
-                vmax=len(names) - 0.5,
-                aspect="auto",
-                interpolation="nearest",
-            )
-            strip_ax.set_axis_off()
 
         handles = [
             Line2D([], [], marker="s", linestyle="", color="0.2", label="Hessian"),
             Line2D([], [], marker="s", linestyle="", color="0.7", label="fill-in"),
         ]
-        # In the order in which the variables first appear in the plot
-        first = np.full(len(names), n)
-        np.minimum.at(first, strip, np.arange(n))
-        handles += [
-            Patch(color=colors[code], label=names[code])
-            for code in sorted(coloured, key=lambda code: first[code])
-        ]
-        if len(names) > len(coloured):
-            handles.append(Patch(color="0.85", label="other"))
+        handles += _variable_strips(ax, self.variables, perm, max_variables)
         ax.legend(handles=handles, loc="upper left", bbox_to_anchor=(1.02, 1))
         return ax
 
