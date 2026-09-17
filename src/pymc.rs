@@ -197,6 +197,10 @@ impl CpuLogpFunc for PyMcModelRef {
         self.model.dim
     }
 
+    fn vector_coord(&self) -> Option<Value> {
+        self.model.unconstrained_names.clone().map(Value::Strings)
+    }
+
     fn logp(&mut self, position: &[f64], gradient: &mut [f64]) -> Result<f64, Self::LogpError> {
         let mut logp = 0f64;
         let logp_ptr = (&mut logp) as *mut f64;
@@ -472,11 +476,14 @@ pub(crate) struct PyMcModel {
     variables: Arc<Vec<PyVariable>>,
     dim_sizes: HashMap<String, u64>,
     coords: HashMap<String, Value>,
+    /// Labels of the `unconstrained_parameter` dim of the sampler stats
+    unconstrained_names: Option<Vec<String>>,
 }
 
 #[pymethods]
 impl PyMcModel {
     #[new]
+    #[pyo3(signature = (density, expand, variables, dim, dim_sizes, coords, init_func, transform_adapter=None, unconstrained_names=None))]
     fn new<'py>(
         py: Python<'py>,
         density: LogpFunc,
@@ -487,6 +494,7 @@ impl PyMcModel {
         coords: Py<PyDict>,
         init_func: Py<PyAny>,
         transform_adapter: Option<Py<PyAny>>,
+        unconstrained_names: Option<Vec<String>>,
     ) -> PyResult<Self> {
         let dim_sizes = dim_sizes
             .bind(py)
@@ -521,6 +529,7 @@ impl PyMcModel {
             dim_sizes,
             transform_adapter: transform_adapter.map(PyTransformAdapt::new),
             variables: Arc::new(variables),
+            unconstrained_names,
         })
     }
 

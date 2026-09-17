@@ -782,9 +782,7 @@ def test_hessian_sparsity_jax():
     factorization = compiled.with_factorization(front=["theta"]).factorization
     # Names as in the `unconstrained_parameter` coordinate of the trace
     assert factorization.summary().index[0] == "theta_0"
-    assert factorization.unconstrained_parameters == list(
-        compiled.coords["unconstrained_parameter"]
-    )
+    assert factorization.unconstrained_parameters == compiled._unconstrained_parameters()
 
     assert "hessian sparsity: 41 of 231 pairs nonzero" in repr(compiled)
     assert compiled.with_data().hessian_sparsity is None
@@ -801,3 +799,47 @@ def test_hessian_sparsity_numba():
     assert compiled.factorization.num_fill == 0
     assert "theta_3" in compiled.factorization.unconstrained_parameters
     assert repr(compiled).startswith("CompiledPyMCModel (numba, n_dim=22)")
+
+
+@pytest.mark.pymc
+@pytest.mark.parametrize("backend", ["numba", "jax"])
+@pytest.mark.parametrize("storage", ["arrow", "zarr"])
+def test_unconstrained_parameter_coords(backend, storage, tmp_path):
+    with pm.Model(coords={"group": ["x", "y"]}) as model:
+        pm.Normal("a")
+        pm.HalfNormal("s")
+        pm.Normal("b", dims="group")
+    kwargs = {"gradient_backend": "jax"} if backend == "jax" else {}
+    compiled = nutpie.compile_pymc_model(model, backend=backend, **kwargs)
+    # Only in the trace, not a coord of the model
+    assert "unconstrained_parameter" not in compiled.coords
+    names = compiled._unconstrained_parameters()
+    # The order of the variables depends on the backend
+    assert sorted(names) == ["a", "b_0", "b_1", "s_log__"]
+
+    sample_kwargs = {}
+    if storage == "zarr":
+        path = tmp_path / "trace.zarr"
+        path.mkdir()
+        sample_kwargs["zarr_store"] = nutpie.zarr_store.LocalStore(str(path))
+    trace = nutpie.sample(
+        compiled,
+        chains=1,
+        tune=50,
+        draws=10,
+        store_unconstrained=True,
+        progress_bar=False,
+        seed=1,
+        **sample_kwargs,
+    )
+    coord = trace.sample_stats.coords["unconstrained_parameter"]
+    assert [str(name) for name in coord.values] == names
+    assert list(trace.posterior.coords["group"].values) == ["x", "y"]
+
+
+@pytest.mark.pymc
+def test_reserved_unconstrained_parameter():
+    with pm.Model(coords={"unconstrained_parameter": [0, 1]}) as model:
+        pm.Normal("a", dims="unconstrained_parameter")
+    with pytest.raises(ValueError, match="unconstrained_parameter"):
+        nutpie.compile_pymc_model(model)

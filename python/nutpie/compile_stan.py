@@ -15,7 +15,7 @@ import scipy.sparse as sp
 from numpy.typing import NDArray
 
 from nutpie import _lib
-from nutpie.sample import CompiledModel, _wrap_init_point_fn
+from nutpie.sample import CompiledModel, _check_reserved_names, _wrap_init_point_fn
 
 logger = logging.getLogger("nutpie")
 
@@ -65,14 +65,13 @@ class CompiledStanModel(CompiledModel):
         )
 
     def with_coords(self, **coords):
-        if self.coords is None:
-            coords_new = {}
-        else:
-            coords_new = self.coords.copy()
+        _check_reserved_names(coords, {})
+        coords_new = {} if self._coords is None else self._coords.copy()
         coords_new.update(coords)
         return replace(self, _coords=coords_new)
 
     def with_dims(self, **dims):
+        _check_reserved_names({}, dims)
         if self.dims is None:
             dims_new = {}
         else:
@@ -230,8 +229,9 @@ class CompiledStanModel(CompiledModel):
                 "The Hessian sparsity depends on the data. Call `with_data(...)` first."
             )
 
-    def _unconstrained_parameters(self):
-        # The same names as in the trace coordinate, see `vector_coord`
+    def _unconstrained_parameter_names(self):
+        # From bridgestan, the same that `vector_coord` gives the zarr store.
+        # They depend on the data.
         return self._make_model().unconstrained_names()
 
     def _unconstrained_variables(self):
@@ -500,6 +500,7 @@ def compile_stan_model(
         dims = {}
     if coords is None:
         coords = {}
+    _check_reserved_names(coords, dims)
 
     if code is not None and filename is not None:
         raise ValueError("Specify exactly one of `code` and `filename`")

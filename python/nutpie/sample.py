@@ -33,6 +33,9 @@ class CompiledModel:
     # the data, and are reset by `with_data`.
     _hessian_sparsity: sp.csr_array | None = field(default=None, kw_only=True)
     _factorization: Factorization | None = field(default=None, kw_only=True)
+    # Labels of the ``unconstrained_parameter`` dim of the sampler stats. Kept
+    # out of `coords`, which only describe the model's own dims.
+    _unconstrained_names: list[str] | None = field(default=None, kw_only=True)
 
     @property
     def n_dim(self) -> int:
@@ -148,12 +151,17 @@ class CompiledModel:
             "Pass it explicitly with `with_hessian_sparsity(array)`."
         )
 
+    def _unconstrained_parameter_names(self) -> list[str] | None:
+        """Labels of the ``unconstrained_parameter`` dim of the trace, None if
+        the model has none (the dim then gets an integer index)."""
+        return self._unconstrained_names
+
     def _unconstrained_parameters(self) -> list[str]:
         """Names of the unconstrained parameters, as in the
         ``unconstrained_parameter`` coordinate of the trace."""
-        coords = self.coords or {}
-        if "unconstrained_parameter" in coords:
-            return [str(name) for name in coords["unconstrained_parameter"]]
+        names = self._unconstrained_parameter_names()
+        if names is not None:
+            return [str(name) for name in names]
         return [str(i) for i in range(self.n_dim)]
 
     def _unconstrained_variables(self) -> list[str]:
@@ -346,6 +354,14 @@ def _wrap_init_point_fn(init_point_fn, model, convert_dict=None):
         return np.ascontiguousarray(point, dtype=np.float64)
 
     return init_point
+
+
+def _check_reserved_names(coords, dims):
+    """The trace uses ``unconstrained_parameter`` for the dim of the sampler
+    stats, so the model must not use it as a coord or dim."""
+    used = set(coords) | {dim for var_dims in dims.values() for dim in var_dims}
+    if "unconstrained_parameter" in used:
+        raise ValueError("Model contains invalid name 'unconstrained_parameter'.")
 
 
 def _arrow_to_arviz(
@@ -963,16 +979,22 @@ class _BackgroundSampler:
                     "inference_library_settings": json.dumps(self._settings.as_dict()),
                 }
 
+                coords = {
+                    name: pd.Index(vals)
+                    for name, vals in (self._compiled_model.coords or {}).items()
+                }
+                # The zarr store gets these from `vector_coord` on the rust side.
+                names = self._compiled_model._unconstrained_parameter_names()
+                if names is not None:
+                    coords["unconstrained_parameter"] = pd.Index(names)
+
                 return _arrow_to_arviz(
                     draw_batches,
                     stat_batches,
                     skip_vars=skip_vars,
                     reparameterized_names=self._compiled_model.reparameterized_names,
                     keep_unconstrained_draw=self._store_unconstrained,
-                    coords={
-                        name: pd.Index(vals)
-                        for name, vals in self._compiled_model.coords.items()
-                    },
+                    coords=coords,
                     save_warmup=self._save_warmup,
                     attrs={"sample_stats": attrs},
                 )
