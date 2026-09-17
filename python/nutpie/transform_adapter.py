@@ -806,6 +806,34 @@ class FisherLoss(eqx.Module):
         )
 
 
+def _describe_flow(bijection):
+    """Size and structure of a flow, for the verbose output."""
+    from nutpie.triangular import SparseTriangularMap
+
+    bijection = unwrap(bijection)
+    arrays = jax.tree.leaves(eqx.filter(bijection, eqx.is_inexact_array))
+    text = f"{bijection.shape[0]} dimensions, {sum(a.size for a in arrays)} parameters"
+    maps = [
+        leaf
+        for leaf in jax.tree.leaves(
+            bijection, is_leaf=lambda x: isinstance(x, SparseTriangularMap)
+        )
+        if isinstance(leaf, SparseTriangularMap)
+    ]
+    for tmap in maps:
+        dim = tmap.shape[0]
+        # Padded parent slots read the dummy index `dim`
+        max_parents = max(
+            (
+                int((np.asarray(parents) < dim).sum(axis=1).max(initial=0))
+                for parents in tmap.bucket_parent_indices
+            ),
+            default=0,
+        )
+        text += f", at most {max_parents} parents, {tmap.n_levels} levels"
+    return text
+
+
 def _format_log_f(value):
     value = float(value)
     return f"{value:+.2f}" if np.isfinite(value) else "  nan"
@@ -1218,6 +1246,7 @@ class TransformAdapter:
                     flowjax.distributions.StandardNormal(base.shape), base
                 )
                 params, static = eqx.partition(flow, eqx.is_inexact_array)
+                self._report(n_draws, f"new flow: {_describe_flow(base)}")
                 if self._verbose >= 2:
                     fresh_loss = self._loss_fn(
                         params,
