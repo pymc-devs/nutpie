@@ -11,6 +11,60 @@ import equinox as eqx
 
 
 
+def _min_waste_segments(counts: np.ndarray, n_segments: int) -> list:
+    """Split `counts` into at most `n_segments` *contiguous* runs, minimizing
+    ``sum(run_max * len(run))`` -- the number of padded slots when each run is
+    stored as one rectangular array of its own width.
+
+    This is `_min_waste_buckets`' objective (the two differ by ``sum(counts)``,
+    a constant) under one extra constraint: the runs must be contiguous in the
+    *given* order, not in sorted order. Elimination levels cannot be reordered,
+    since back substitution needs level ``l + 1`` resolved before level ``l``,
+    so the sortedness that lets `_min_waste_buckets` read a group's maximum off
+    its last element is unavailable and the maximum is carried explicitly.
+
+    Splitting matters whenever the per-level edge counts are skewed, which a
+    single variable that parents many others is enough to cause: one level then
+    sizes the array for all of them.
+
+    Returns:
+        List of ``(start, stop)`` index pairs covering ``range(len(counts))``.
+    """
+    counts = np.asarray(counts, dtype=np.int64)
+    n = len(counts)
+    n_segments = max(1, min(n_segments, n))
+    prefix = np.concatenate([[0], np.cumsum(counts)])
+
+    no_split = -1
+    prev_dp = np.full(n + 1, np.inf)
+    prev_dp[0] = 0.0
+    split = np.full((n_segments + 1, n + 1), no_split, dtype=np.int64)
+    for b in range(1, n_segments + 1):
+        new_dp = np.full(n + 1, np.inf)
+        for r in range(b, n + 1):
+            l_range = np.arange(b - 1, r)
+            # running max of counts[l:r], for every candidate left edge l
+            run_max = np.maximum.accumulate(counts[l_range][::-1])[::-1]
+            costs = prev_dp[l_range] + run_max * (r - l_range)
+            best = int(np.argmin(costs))
+            new_dp[r] = costs[best]
+            split[b, r] = l_range[best]
+        prev_dp = new_dp
+
+    boundaries = []
+    r = n
+    for b in range(n_segments, 0, -1):
+        left = int(split[b, r])
+        if left == no_split:
+            break
+        boundaries.append((left, r))
+        r = left
+        if r == 0:
+            break
+    boundaries.reverse()
+    return boundaries
+
+
 def _min_waste_buckets(counts: np.ndarray, n_buckets: int) -> np.ndarray:
     """Partition `counts` into at most `n_buckets` groups, minimizing the
     total padding waste ``sum(group_max - value)`` that results from padding
@@ -104,25 +158,35 @@ class _SparseTriangularLayout(eqx.Module):
     edge_child_index: jnp.ndarray
     # (n_edges + 1,) parent variable of each edge, same sentinel convention.
     edge_parent_index: jnp.ndarray
-    # (n_levels, max_level_size) variables at each level, padded with `dim`.
-    level_members: jnp.ndarray
-    # (n_levels, max_edges_per_level) edges whose *parent* sits at that level.
-    level_edge_index: jnp.ndarray
-    # (n_levels, max_edges_per_level) slot within level_members that each
-    # edge's parent occupies; padding entries use max_level_size, which is
-    # dropped.
-    level_edge_target_slot: jnp.ndarray
-    # The same two arrays for the transposed direction: edges grouped by the
-    # level of their *child*, and the slot that child occupies.
-    child_level_edge_index: jnp.ndarray
-    child_level_edge_target_slot: jnp.ndarray
+    # The level arrays are split into contiguous segments of levels, each
+    # stored at its own width (see `_min_waste_segments`). A single array over
+    # all levels would be padded to the widest level's edge count, and one
+    # variable that parents many others makes that the whole dimension.
+    #
+    # Segments are in level order, so a sweep runs one scan per segment,
+    # visiting them last-to-first for back substitution and first-to-last for
+    # its transpose. Each entry below is a tuple with one array per segment.
+    #
+    # level_members:           (levels_in_segment, max_level_size), padded with `dim`
+    # *_edge_index:            (levels_in_segment, width) edges landing on that level
+    # *_edge_target_slot:      (levels_in_segment, width) slot within level_members;
+    #                          padding uses max_level_size, out of bounds and dropped
+    level_members: tuple
+    # Grouped by the level of each edge's *parent* (back substitution).
+    level_edge_index: tuple
+    level_edge_target_slot: tuple
+    # Grouped by the level of each edge's *child* (the transposed solve).
+    child_level_edge_index: tuple
+    child_level_edge_target_slot: tuple
 
     n_variables: int = eqx.field(static=True)
     n_edges: int = eqx.field(static=True)
     max_level_size: int = eqx.field(static=True)
 
 
-def _build_layout(bucket_members, bucket_parent_indices, level_of_variable, dim):
+def _build_layout(
+    bucket_members, bucket_parent_indices, level_of_variable, dim, n_level_segments=8
+):
     """Derive the static edge layout from the model's bucket and level data.
 
     Edges are grouped by the level of their *parent*, not their child,
@@ -160,49 +224,59 @@ def _build_layout(bucket_members, bucket_parent_indices, level_of_variable, dim)
         level_members[level, : len(members_at_level)] = members_at_level
         slot_within_level[members_at_level] = np.arange(len(members_at_level))
 
-    level_of_edge_parent = level_of_variable[edge_parent]
-    max_edges_per_level = int(
-        np.bincount(level_of_edge_parent, minlength=n_levels).max()
-    )
-    level_edge_index = np.full((n_levels, max_edges_per_level), n_edges, np.int32)
-    level_edge_target_slot = np.full(
-        (n_levels, max_edges_per_level), max_level_size, np.int32
-    )
-    for level in range(n_levels):
-        edges_at_level = np.flatnonzero(level_of_edge_parent == level)
-        level_edge_index[level, : len(edges_at_level)] = edges_at_level
-        level_edge_target_slot[level, : len(edges_at_level)] = slot_within_level[
-            edge_parent[edges_at_level]
+    def group_edges(level_of_edge, endpoint_of_edge, segments):
+        """Per-segment (edge index, target slot) arrays at each segment's own
+        width, together with the edges' owning level."""
+        by_level = [
+            np.flatnonzero(level_of_edge == level) for level in range(n_levels)
         ]
+        index_segments, slot_segments = [], []
+        for start, stop in segments:
+            width = max((len(by_level[l]) for l in range(start, stop)), default=0)
+            width = max(width, 1)
+            index = np.full((stop - start, width), n_edges, np.int32)
+            slot = np.full((stop - start, width), max_level_size, np.int32)
+            for row, level in enumerate(range(start, stop)):
+                edges = by_level[level]
+                index[row, : len(edges)] = edges
+                slot[row, : len(edges)] = slot_within_level[endpoint_of_edge[edges]]
+            index_segments.append(jnp.asarray(index))
+            slot_segments.append(jnp.asarray(slot))
+        return tuple(index_segments), tuple(slot_segments)
 
-    # Same edges, regrouped by the level of their child, for the transposed
-    # (forward-substitution) solve the VJP needs.
+    # Segment the level range so that one wide level does not size the arrays
+    # for all of them; both groupings get their own segmentation, since their
+    # per-level edge counts are unrelated.
+    level_of_edge_parent = level_of_variable[edge_parent]
     level_of_edge_child = level_of_variable[edge_child]
-    max_edges_per_child_level = int(
-        np.bincount(level_of_edge_child, minlength=n_levels).max(initial=0)
+    parent_counts = np.bincount(level_of_edge_parent, minlength=n_levels)
+    child_counts = np.bincount(level_of_edge_child, minlength=n_levels)
+    parent_segments = _min_waste_segments(parent_counts, n_level_segments)
+    child_segments = _min_waste_segments(child_counts, n_level_segments)
+
+    level_edge_index, level_edge_target_slot = group_edges(
+        level_of_edge_parent, edge_parent, parent_segments
     )
-    child_level_edge_index = np.full(
-        (n_levels, max(max_edges_per_child_level, 1)), n_edges, np.int32
+    child_level_edge_index, child_level_edge_target_slot = group_edges(
+        level_of_edge_child, edge_child, child_segments
     )
-    child_level_edge_target_slot = np.full(
-        (n_levels, max(max_edges_per_child_level, 1)), max_level_size, np.int32
+    # `level_members` is sliced to match each grouping's segmentation.
+    parent_members = tuple(
+        jnp.asarray(level_members[start:stop]) for start, stop in parent_segments
     )
-    for level in range(n_levels):
-        edges_at_level = np.flatnonzero(level_of_edge_child == level)
-        child_level_edge_index[level, : len(edges_at_level)] = edges_at_level
-        child_level_edge_target_slot[level, : len(edges_at_level)] = slot_within_level[
-            edge_child[edges_at_level]
-        ]
+    child_members = tuple(
+        jnp.asarray(level_members[start:stop]) for start, stop in child_segments
+    )
 
     return _SparseTriangularLayout(
         bucket_value_gather=tuple(jnp.asarray(g) for g in bucket_value_gather),
         edge_child_index=jnp.asarray(np.append(edge_child, dim).astype(np.int32)),
         edge_parent_index=jnp.asarray(np.append(edge_parent, dim).astype(np.int32)),
-        level_members=jnp.asarray(level_members),
-        level_edge_index=jnp.asarray(level_edge_index),
-        level_edge_target_slot=jnp.asarray(level_edge_target_slot),
-        child_level_edge_index=jnp.asarray(child_level_edge_index),
-        child_level_edge_target_slot=jnp.asarray(child_level_edge_target_slot),
+        level_members=(parent_members, child_members),
+        level_edge_index=level_edge_index,
+        level_edge_target_slot=level_edge_target_slot,
+        child_level_edge_index=child_level_edge_index,
+        child_level_edge_target_slot=child_level_edge_target_slot,
         n_variables=dim,
         n_edges=n_edges,
         max_level_size=max_level_size,
@@ -231,6 +305,7 @@ def _sweep_levels(
     layout,
     rhs,
     edge_endpoint_index,
+    level_members,
     level_edge_index,
     level_edge_target_slot,
     reverse,
@@ -242,6 +317,11 @@ def _sweep_levels(
     edge supplies the already-solved value (the child for back substitution,
     the parent for forward substitution), and the level arrays say which
     edges land on which level and in whose slot.
+
+    The level arrays arrive as one array per contiguous segment of levels, each
+    at its own width, so this runs one scan per segment rather than one over
+    all levels at the widest level's width. Segments are visited in the sweep's
+    own direction, and `reverse` applies within each.
     """
     max_level_size = layout.max_level_size
 
@@ -274,12 +354,18 @@ def _sweep_levels(
         solution = solution.at[members].set(updated, mode="drop", unique_indices=True)
         return solution, None
 
-    solution, _ = jax.lax.scan(
-        eliminate_level,
-        jnp.zeros_like(rhs),
-        (layout.level_members, level_edge_index, level_edge_target_slot),
-        reverse=reverse,
-    )
+    segments = list(zip(level_members, level_edge_index, level_edge_target_slot))
+    if reverse:
+        segments = segments[::-1]
+
+    solution = jnp.zeros_like(rhs)
+    for members, edge_index, target_slot in segments:
+        solution, _ = jax.lax.scan(
+            eliminate_level,
+            solution,
+            (members, edge_index, target_slot),
+            reverse=reverse,
+        )
     return solution
 
 
@@ -317,6 +403,7 @@ def _solve_triangular_sparse(edge_values, jacobian_diagonal, layout, rhs):
             layout,
             b,
             layout.edge_child_index,
+            layout.level_members[0],
             layout.level_edge_index,
             layout.level_edge_target_slot,
             reverse=True,
@@ -329,6 +416,7 @@ def _solve_triangular_sparse(edge_values, jacobian_diagonal, layout, rhs):
             layout,
             b,
             layout.edge_parent_index,
+            layout.level_members[1],
             layout.child_level_edge_index,
             layout.child_level_edge_target_slot,
             reverse=False,
