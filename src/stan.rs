@@ -10,7 +10,7 @@ use nuts_rs::{
     CpuLogpFunc, CpuMath, HasDims, InitPositionError, LogpError, Model, Storable, Value,
 };
 use pyo3::exceptions::PyRuntimeError;
-use pyo3::types::{PyDict, PyNone, PyTuple};
+use pyo3::types::{PyDict, PyNone};
 use pyo3::{exceptions::PyValueError, pyclass, pymethods, PyResult};
 use pyo3::{prelude::*, BoundObject};
 use rand::prelude::Distribution;
@@ -29,15 +29,6 @@ type InnerModel = bridgestan::Model<Arc<bridgestan::StanLibrary>>;
 #[derive(Clone)]
 pub struct StanLibrary(Arc<bridgestan::StanLibrary>);
 
-#[derive(Clone, Debug)]
-struct Parameter {
-    name: String,
-    shape: Vec<usize>,
-    size: usize,
-    start_idx: usize,
-    end_idx: usize,
-}
-
 #[pymethods]
 impl StanLibrary {
     #[new]
@@ -45,37 +36,6 @@ impl StanLibrary {
         let lib = open_library(path)
             .map_err(|e| PyValueError::new_err(format!("Could not open stan libray: {e}")))?;
         Ok(Self(Arc::new(lib)))
-    }
-}
-
-#[pyclass]
-pub struct StanVariable(Parameter);
-
-#[pymethods]
-impl StanVariable {
-    #[getter]
-    fn name(&self) -> String {
-        self.0.name.clone()
-    }
-
-    #[getter]
-    fn shape<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
-        PyTuple::new(py, self.0.shape.iter())
-    }
-
-    #[getter]
-    fn size(&self) -> usize {
-        self.0.size
-    }
-
-    #[getter]
-    fn start_idx(&self) -> usize {
-        self.0.start_idx
-    }
-
-    #[getter]
-    fn end_idx(&self) -> usize {
-        self.0.end_idx
     }
 }
 
@@ -91,14 +51,88 @@ pub struct StanModel {
     dims: HashMap<String, Vec<String>>,
     unc_names: Value,
     init_point_func: Option<Arc<Py<PyAny>>>,
+    parameters: Vec<Parameter>,
 }
 
-/// Return meta information about the constrained parameters of the model
-fn params(
-    var_string: &str,
+/// A stan variable in the flat output of `param_constrain`.
+///
+/// Stan stores values in fortran order. For complex variables the real
+/// and imaginary parts are interleaved, so `start_idx..end_idx` has
+/// fortran shape `[2, *shape]`. In the trace, complex variables are split
+/// into two variables `name.real` and `name.imag`.
+#[derive(Clone, Debug)]
+struct Parameter {
+    name: String,
+    shape: Vec<usize>,
+    /// Number of elements, not counting real and imaginary parts separately
+    size: usize,
+    is_complex: bool,
+    start_idx: usize,
+    end_idx: usize,
+}
+
+impl Parameter {
+    /// Append the values of the trace variables of this parameter in C
+    /// order to `out`, one vector per variable.
+    fn unpack(&self, flat: &[f64], out: &mut Vec<Vec<f64>>) {
+        let slice = &flat[self.start_idx..self.end_idx];
+        let mut values = Vec::with_capacity(slice.len());
+        let mut stan_shape: SmallVec<[u64; 8]> = self.shape.iter().map(|&d| d as u64).collect();
+        if self.is_complex {
+            stan_shape.insert(0, 2);
+        }
+        // For rank < 2 fortran and C order are the same
+        if slice.is_empty() || stan_shape.len() < 2 {
+            values.extend_from_slice(slice);
+        } else {
+            fortran_to_c_order(slice, &stan_shape, &mut values);
+        }
+        if self.is_complex {
+            // In C order with shape `[2, *shape]`, all real parts come first
+            let imag = values.split_off(self.size);
+            out.push(values);
+            out.push(imag);
+        } else {
+            out.push(values);
+        }
+    }
+}
+
+/// Create the variables of the trace for the stan parameters.
+fn trace_variables(
+    parameters: &[Parameter],
     all_dims: &mut HashMap<String, Vec<String>>,
     dim_sizes: &mut HashMap<String, u64>,
 ) -> anyhow::Result<Vec<PyVariable>> {
+    let mut variables = Vec::new();
+    for param in parameters {
+        let shape: Vec<u64> = param.shape.iter().map(|&d| d as u64).collect();
+        let names = if param.is_complex {
+            vec![
+                format!("{}.real", param.name),
+                format!("{}.imag", param.name),
+            ]
+        } else {
+            vec![param.name.clone()]
+        };
+        // The indices of the variables are only nominal, the values are
+        // extracted with `Parameter::unpack`.
+        for (i, name) in names.into_iter().enumerate() {
+            variables.push(PyVariable::new(
+                name,
+                ItemType(nuts_rs::ItemType::F64),
+                Some(shape.clone()),
+                all_dims,
+                dim_sizes,
+                Some(param.start_idx + i * param.size),
+            )?);
+        }
+    }
+    Ok(variables)
+}
+
+/// Parse the comma separated parameter names returned by stan.
+fn params(var_string: &str) -> anyhow::Result<Vec<Parameter>> {
     if var_string.is_empty() {
         return Ok(vec![]);
     }
@@ -147,7 +181,7 @@ fn params(
         .collect();
 
     // Group variables by name and build Parameter objects
-    let mut variables = Vec::new();
+    let mut parameters = Vec::new();
     let mut start_idx = 0;
 
     for (name, group) in &parsed_variables?.iter().chunk_by(|(name, _, _)| name) {
@@ -155,46 +189,22 @@ fn params(
         let (shape, is_complex) = determine_variable_shape(group)
             .context(format!("Error while parsing stan variable {name}"))?;
 
-        // Calculate total size of this variable
         let size: usize = shape.iter().product();
-        let mut end_idx = start_idx + size;
+        let end_idx = start_idx + if is_complex { 2 * size } else { size };
 
-        // Create Parameter objects (one for real and one for imag if complex)
-        if is_complex {
-            variables.push(PyVariable::new(
-                format!("{name}.real"),
-                ItemType(nuts_rs::ItemType::F64),
-                Some(shape.iter().map(|&d| d as u64).collect()),
-                all_dims,
-                dim_sizes,
-                Some(start_idx),
-            )?);
-            start_idx = end_idx;
-            end_idx = start_idx + size;
-            variables.push(PyVariable::new(
-                format!("{name}.imag"),
-                ItemType(nuts_rs::ItemType::F64),
-                Some(shape.iter().map(|&d| d as u64).collect()),
-                all_dims,
-                dim_sizes,
-                Some(start_idx),
-            )?);
-        } else {
-            variables.push(PyVariable::new(
-                name.to_string(),
-                ItemType(nuts_rs::ItemType::F64),
-                Some(shape.iter().map(|&d| d as u64).collect()),
-                all_dims,
-                dim_sizes,
-                Some(start_idx),
-            )?);
-        }
+        parameters.push(Parameter {
+            name: name.to_string(),
+            shape,
+            size,
+            is_complex,
+            start_idx,
+            end_idx,
+        });
 
-        // Move to the next variable
         start_idx = end_idx;
     }
 
-    Ok(variables)
+    Ok(parameters)
 }
 
 // Helper function to determine the shape and complex flag for a group of variables
@@ -324,7 +334,8 @@ impl StanModel {
         let model = Arc::new(model);
 
         let var_string = model.param_names(true, true);
-        let variables = params(var_string, &mut dims, &mut dim_sizes)?;
+        let parameters = params(var_string)?;
+        let variables = trace_variables(&parameters, &mut dims, &mut dim_sizes)?;
         let transform_adapter = transform_adapter.map(PyTransformAdapt::new);
 
         Ok(StanModel {
@@ -336,6 +347,7 @@ impl StanModel {
             dims,
             unc_names,
             init_point_func: None,
+            parameters,
         })
     }
 
@@ -575,31 +587,15 @@ impl CpuLogpFunc for StanDensity {
             .context("Failed to constrain the parameters of the draw")
             .map_err(|e| nuts_rs::CpuMathError::ExpandError(format!("{}", e)))?;
 
-        let mut vars = Vec::new();
-
-        for var in self.model.variables.iter() {
-            let mut out = Vec::with_capacity(var.num_elements);
-            let start = var.start_idx.expect("Variable start index not set");
-            let end = var.end_idx.expect("Variable end index not set");
-            let slice = &self.expanded_buffer[start..end];
-            assert!(slice.len() == var.num_elements);
-
-            if var.num_elements == 0 {
-                vars.push(Some(Value::F64(out)));
-                continue;
-            }
-
-            // The slice is in fortran order. This doesn't matter if it low dim
-            if var.shape.as_slice().len() < 2 {
-                out.extend_from_slice(slice);
-                vars.push(Some(Value::F64(out)));
-                continue;
-            }
-
-            // We need to transpose
-            fortran_to_c_order(slice, var.shape.as_slice(), &mut out);
-            vars.push(Some(Value::F64(out)));
+        let mut values = Vec::with_capacity(self.model.variables.len());
+        for param in self.model.parameters.iter() {
+            param.unpack(&self.expanded_buffer, &mut values);
         }
+        assert!(values.len() == self.model.variables.len());
+        let vars = values
+            .into_iter()
+            .map(|values| Some(Value::F64(values)))
+            .collect();
 
         Ok(ExpandedVector(vars))
     }
@@ -984,17 +980,63 @@ mod tests {
         assert!(expect.iter().zip_eq(out.iter()).all(|(a, b)| a == b));
     }
 
+    fn parse(
+        vars: &str,
+        dims: &mut HashMap<String, Vec<String>>,
+        dim_sizes: &mut HashMap<String, u64>,
+    ) -> anyhow::Result<Vec<crate::common::PyVariable>> {
+        super::trace_variables(&super::params(vars)?, dims, dim_sizes)
+    }
+
+    #[test]
+    fn unpack_complex() {
+        let mut dims = HashMap::new();
+        let mut dim_sizes = HashMap::new();
+
+        // A real scalar, a complex vector of length 2 and a complex
+        // matrix of shape (2, 2).
+        let vars = "a,\
+            z.1.real,z.1.imag,z.2.real,z.2.imag,\
+            m.1.1.real,m.1.1.imag,m.2.1.real,m.2.1.imag,\
+            m.1.2.real,m.1.2.imag,m.2.2.real,m.2.2.imag";
+        let parameters = super::params(vars).unwrap();
+        let variables = super::trace_variables(&parameters, &mut dims, &mut dim_sizes).unwrap();
+        let names: Vec<_> = variables.iter().map(|var| var.name.as_str()).collect();
+        assert_eq!(names, ["a", "z.real", "z.imag", "m.real", "m.imag"]);
+
+        // Values as stan returns them: interleaved and in fortran order
+        let flat = [
+            0., //
+            1., 10., 2., 20., //
+            11., -11., 21., -21., 12., -12., 22., -22.,
+        ];
+        let mut out = vec![];
+        for param in parameters.iter() {
+            param.unpack(&flat, &mut out);
+        }
+        assert_eq!(
+            out,
+            vec![
+                vec![0.],
+                vec![1., 2.],
+                vec![10., 20.],
+                vec![11., 12., 21., 22.],
+                vec![-11., -12., -21., -22.],
+            ]
+        );
+    }
+
     #[test]
     fn parse_vars() {
         let mut dims = HashMap::new();
         let mut dim_sizes = HashMap::new();
 
         let vars = "";
-        let parsed = super::params(vars, &mut dims, &mut dim_sizes).unwrap();
+        let parsed = parse(vars, &mut dims, &mut dim_sizes).unwrap();
         assert!(parsed.len() == 0);
 
         let vars = "x.1.1,x.2.1,x.3.1,x.1.2,x.2.2,x.3.2";
-        let parsed = super::params(vars, &mut dims, &mut dim_sizes).unwrap();
+        let parsed = parse(vars, &mut dims, &mut dim_sizes).unwrap();
         assert!(parsed.len() == 1);
         let parsed = parsed[0].clone();
         assert!(parsed.name == "x");
@@ -1002,14 +1044,23 @@ mod tests {
 
         // Incorrect order
         let vars = "x.1.2,x.1.1,x.2.1,x.2.2,x.3.1,x.3.2";
-        assert!(super::params(vars, &mut dims, &mut dim_sizes).is_err());
+        assert!(parse(vars, &mut dims, &mut dim_sizes).is_err());
 
         // Incorrect order
         let vars = "x.1.2.real,x.1.2.imag";
-        assert!(super::params(vars, &mut dims, &mut dim_sizes).is_err());
+        assert!(parse(vars, &mut dims, &mut dim_sizes).is_err());
 
         let vars = "x.1.1.real,x.1.1.imag,x.2.1.real,x.2.1.imag,x.3.1.real,x.3.1.imag";
-        let parsed = super::params(vars, &mut dims, &mut dim_sizes).unwrap();
+        let parameters = super::params(vars).unwrap();
+        assert_eq!(parameters.len(), 1);
+        let param = &parameters[0];
+        assert_eq!(param.name, "x");
+        assert!(param.is_complex);
+        assert_eq!(param.shape, vec![3, 1]);
+        assert_eq!(param.size, 3);
+        assert_eq!((param.start_idx, param.end_idx), (0, 6));
+
+        let parsed = parse(vars, &mut dims, &mut dim_sizes).unwrap();
         assert!(parsed.len() == 2);
         let var = parsed[0].clone();
         assert!(var.name == "x.real");
@@ -1021,7 +1072,7 @@ mod tests {
 
         // Test single variable
         let vars = "alpha";
-        let parsed = super::params(vars, &mut dims, &mut dim_sizes).unwrap();
+        let parsed = parse(vars, &mut dims, &mut dim_sizes).unwrap();
         assert_eq!(parsed.len(), 1);
         let var = &parsed[0];
         assert_eq!(var.name, "alpha");
@@ -1030,7 +1081,7 @@ mod tests {
 
         // Test multiple scalar variables
         let vars = "alpha,beta,gamma";
-        let parsed = super::params(vars, &mut dims, &mut dim_sizes).unwrap();
+        let parsed = parse(vars, &mut dims, &mut dim_sizes).unwrap();
         assert_eq!(parsed.len(), 3);
         assert_eq!(parsed[0].name, "alpha");
         assert_eq!(parsed[1].name, "beta");
@@ -1038,7 +1089,7 @@ mod tests {
 
         // Test 1D array
         let vars = "theta.1,theta.2,theta.3,theta.4";
-        let parsed = super::params(vars, &mut dims, &mut dim_sizes).unwrap();
+        let parsed = parse(vars, &mut dims, &mut dim_sizes).unwrap();
         assert_eq!(parsed.len(), 1);
         let var = &parsed[0];
         assert_eq!(var.name, "theta");
@@ -1047,7 +1098,7 @@ mod tests {
 
         // Test variable name with colons and dots
         let vars = "x:1:2.4:1.1,x:1:2.4:1.2,x:1:2.4:1.3";
-        let parsed = super::params(vars, &mut dims, &mut dim_sizes).unwrap();
+        let parsed = parse(vars, &mut dims, &mut dim_sizes).unwrap();
         assert_eq!(parsed.len(), 1);
         let var = &parsed[0];
         assert_eq!(var.name, "x:1:2.4:1");
@@ -1257,7 +1308,7 @@ mod tests {
             ultimate.2.3:2.3.5,
             ultimate.2.3:2.4.5
         ";
-        let parsed = super::params(vars, &mut dims, &mut dim_sizes).unwrap();
+        let parsed = parse(vars, &mut dims, &mut dim_sizes).unwrap();
         assert_eq!(parsed[0].name, "a");
         assert_eq!(parsed[0].shape.as_slice(), vec![0; 0]);
 
