@@ -143,7 +143,11 @@ impl Activation {
             }
             Activation::Softplus => {
                 let u = (-v.abs()).exp();
-                let sigmoid = if v >= 0.0 { 1.0 / (1.0 + u) } else { u / (1.0 + u) };
+                let sigmoid = if v >= 0.0 {
+                    1.0 / (1.0 + u)
+                } else {
+                    u / (1.0 + u)
+                };
                 (u.ln_1p() + v.max(0.0), sigmoid)
             }
             Activation::Silu => {
@@ -264,10 +268,7 @@ mod softplus {
 
         // `a <= 0` so `k <= 0` and the scaled product cannot overflow; undoing
         // the bias last is what lets small results decay into the denormals.
-        simd.mul_f64s(
-            simd.mul_f64s(two_k, exp_r),
-            simd.splat_f64s(UNSCALE),
-        )
+        simd.mul_f64s(simd.mul_f64s(two_k, exp_r), simd.splat_f64s(UNSCALE))
     }
 
     /// `log(1 + u)` for `u` in `[0, 1]`.
@@ -794,12 +795,7 @@ fn axpy_block<S: pulp::Simd, const N: usize>(
 /// Softplus and relu go through SIMD; the rest fall back to a scalar loop,
 /// which for the transcendental ones is no worse than before.
 #[inline(always)]
-fn apply_activation<S: pulp::Simd>(
-    simd: S,
-    activation: Activation,
-    src: &[f64],
-    dst: &mut [f64],
-) {
+fn apply_activation<S: pulp::Simd>(simd: S, activation: Activation, src: &[f64], dst: &mut [f64]) {
     debug_assert_eq!(src.len(), dst.len());
     match activation {
         Activation::Softplus | Activation::Relu => {
@@ -850,15 +846,13 @@ fn apply_activation_with_derivative<S: pulp::Simd>(
             let (src_head, src_tail) = S::as_simd_f64s(src);
             let (dst_head, dst_tail) = S::as_mut_simd_f64s(dst);
             let (deriv_head, deriv_tail) = S::as_mut_simd_f64s(deriv);
-            for ((out, slope), &pre) in
-                dst_head.iter_mut().zip(deriv_head.iter_mut()).zip(src_head)
+            for ((out, slope), &pre) in dst_head.iter_mut().zip(deriv_head.iter_mut()).zip(src_head)
             {
                 let (value, derivative) = softplus::softplus_with_derivative(simd, pre);
                 *out = value;
                 *slope = derivative;
             }
-            for ((out, slope), &pre) in
-                dst_tail.iter_mut().zip(deriv_tail.iter_mut()).zip(src_tail)
+            for ((out, slope), &pre) in dst_tail.iter_mut().zip(deriv_tail.iter_mut()).zip(src_tail)
             {
                 let (value, derivative) = activation.apply_with_derivative(pre);
                 *out = value;
@@ -1166,9 +1160,7 @@ impl<'a> WithSimd for EvalMlp<'a> {
                         &mut inputs[..n_out],
                         &mut derivs[deriv_offset..deriv_offset + n_out],
                     ),
-                    None => {
-                        apply_activation(simd, activation, &acc[..n_out], &mut inputs[..n_out])
-                    }
+                    None => apply_activation(simd, activation, &acc[..n_out], &mut inputs[..n_out]),
                 }
                 deriv_offset += n_out;
             }
@@ -1513,8 +1505,7 @@ impl TriangularTransform {
         let mut log_det = 0.0;
         for &variable in &self.level_vars {
             let variable = variable as usize;
-            let (value, element) =
-                self.eval_variable::<TAPE>(variable, y, x[variable], &mut pad);
+            let (value, element) = self.eval_variable::<TAPE>(variable, y, x[variable], &mut pad);
             y[variable].set(value);
             log_det += element;
         }
@@ -1559,9 +1550,7 @@ impl TriangularTransform {
     fn run_dataflow_top<const TAPE: bool>(&self, x: &[f64], y: &[Cell]) -> f64 {
         let log_det = Cell::zeros(self.n_variables);
         let pending: Vec<AtomicU32> = (0..self.n_variables)
-            .map(|i| {
-                AtomicU32::new((self.parent_indptr[i + 1] - self.parent_indptr[i]) as u32)
-            })
+            .map(|i| AtomicU32::new((self.parent_indptr[i + 1] - self.parent_indptr[i]) as u32))
             .collect();
 
         let roots: ReadyList = (0..self.n_variables as u32)
@@ -1668,8 +1657,8 @@ fn build_transform(
     min_parallel_work: i64,
     schedule: &str,
 ) -> Result<TriangularTransform> {
-    let activation: Activation = from_tag(activation)
-        .map_err(|_| anyhow::anyhow!("unknown activation {activation:?}"))?;
+    let activation: Activation =
+        from_tag(activation).map_err(|_| anyhow::anyhow!("unknown activation {activation:?}"))?;
     let schedule: Schedule =
         from_tag(schedule).map_err(|_| anyhow::anyhow!("unknown schedule {schedule:?}"))?;
 
@@ -1822,20 +1811,20 @@ impl FlowTransform {
         let map = has_map
             .then(|| {
                 build_transform(
-            &ints(layout, "parent_indptr")?,
-            &ints(layout, "parent_index")?,
-            &floats(layout, "blob")?,
-            &ints(layout, "blob_offset")?,
-            &ints(layout, "layer_out")?,
-            &floats(layout, "skip_weight")?,
-            item(layout, "skip_index")?.extract()?,
-            &item(layout, "activation")?.extract::<String>()?,
-            &item(layout, "transformer")?,
-            &ints(layout, "level_ptr")?,
-            &ints(layout, "level_vars")?,
-            &ints(layout, "level_work")?,
-            item(layout, "min_parallel_work")?.extract()?,
-            &item(layout, "schedule")?.extract::<String>()?,
+                    &ints(layout, "parent_indptr")?,
+                    &ints(layout, "parent_index")?,
+                    &floats(layout, "blob")?,
+                    &ints(layout, "blob_offset")?,
+                    &ints(layout, "layer_out")?,
+                    &floats(layout, "skip_weight")?,
+                    item(layout, "skip_index")?.extract()?,
+                    &item(layout, "activation")?.extract::<String>()?,
+                    &item(layout, "transformer")?,
+                    &ints(layout, "level_ptr")?,
+                    &ints(layout, "level_vars")?,
+                    &ints(layout, "level_work")?,
+                    item(layout, "min_parallel_work")?.extract()?,
+                    &item(layout, "schedule")?.extract::<String>()?,
                 )
             })
             .transpose()?;
