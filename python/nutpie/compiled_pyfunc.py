@@ -5,9 +5,11 @@ from functools import partial
 from typing import Any
 
 import numpy as np
+import scipy.sparse as sp
 
 from nutpie import _lib  # type: ignore
 from nutpie.sample import CompiledModel, _flatten_point, _wrap_init_point_fn
+from nutpie.sparsity import variables_from_layout
 
 SeedType = int
 
@@ -21,7 +23,7 @@ def _ignore_chain_id(init_point_fn: Callable[[SeedType], np.ndarray]):
     return init_point
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class PyFuncModel(CompiledModel):
     _make_logp_func: Callable
     _make_expand_func: Callable
@@ -59,7 +61,9 @@ class PyFuncModel(CompiledModel):
 
         updated = self._shared_data.copy()
         updated.update(**updates)
-        return dataclasses.replace(self, _shared_data=updated)
+        return dataclasses.replace(
+            self, _shared_data=updated, _hessian_sparsity=None, _factorization=None
+        )
 
     def with_transform_adapt(self, **kwargs):
         return dataclasses.replace(self, _transform_adapt_args=kwargs)
@@ -94,6 +98,82 @@ class PyFuncModel(CompiledModel):
 
         return _wrap_init_point_fn(self._init_point_fn, self, convert_dict)
 
+    def _detect_hessian_sparsity(self, num_points: int = 4, *, seed=None):
+        """Detect the Hessian sparsity with asdex.
+
+        asdex computes a structural pattern from the jax program. We then
+        drop entries that are exactly zero at all of `num_points` initial
+        points, using a sparse Hessian with that pattern.
+        """
+        if self._raw_logp_fn is None:
+            raise NotImplementedError(
+                "Detecting the Hessian sparsity needs the jax log density. "
+                "Compile the model with `gradient_backend='jax'`, or pass the "
+                "pattern with `with_hessian_sparsity(array)`."
+            )
+        import asdex
+        import jax
+
+        def logp(x):
+            return self._raw_logp_fn(x)[0]
+
+        points = self._hessian_points(num_points, seed)
+        structural = asdex.hessian_sparsity(logp, points[0])
+        coloring = asdex.hessian_coloring_from_sparsity(structural)
+        hessian = jax.jit(asdex.hessian_from_coloring(logp, coloring))
+
+        rows, cols = [], []
+        for point in points:
+            values = hessian(point)
+            indices = np.asarray(values.indices)
+            # NaN counts as nonzero
+            keep = np.asarray(values.data) != 0
+            rows.append(indices[keep, 0])
+            cols.append(indices[keep, 1])
+        rows, cols = np.concatenate(rows), np.concatenate(cols)
+        return sp.coo_array(
+            (np.ones(len(rows), dtype=bool), (rows, cols)),
+            shape=(self.n_dim, self.n_dim),
+        )
+
+    def _hessian_points(self, num_points, seed, max_tries=100):
+        """Initial points with finite log density."""
+        rng = np.random.default_rng(seed)
+        init = self._make_init_point_func()
+        points = []
+        for _ in range(num_points * max_tries):
+            if len(points) == num_points:
+                break
+            if init is None:
+                point = rng.uniform(-2, 2, size=self.n_dim)
+            else:
+                point = np.asarray(init(int(rng.integers(2**63)), len(points)))
+            if np.isfinite(float(self._raw_logp_fn(point)[0])):
+                points.append(point)
+        if len(points) < num_points:
+            raise ValueError(
+                f"Found only {len(points)} of {num_points} points with finite "
+                "log density to evaluate the Hessian."
+            )
+        return points
+
+    def _unconstrained_variables(self):
+        if self._init_point_layout is None:
+            return super()._unconstrained_variables()
+        return variables_from_layout(*self._init_point_layout)
+
+    def _repr_header(self):
+        return f"PyFuncModel (n_dim={self.n_dim})"
+
+    def _repr_items(self):
+        items = []
+        if self._shared_data:
+            items.append(("data", ", ".join(self._shared_data)))
+        if self._coords:
+            coords = ", ".join(f"{k} ({len(v)})" for k, v in self._coords.items())
+            items.append(("coords", coords))
+        return items + super()._repr_items()
+
     def _make_sampler(
         self,
         settings,
@@ -103,7 +183,7 @@ class PyFuncModel(CompiledModel):
         extra_callback_rate,
         store,
     ):
-        model = self._make_model()
+        model = self._make_model(self._flow_structure_kwargs(settings))
         return _lib.PySampler.from_pyfunc(
             settings,
             cores,
@@ -114,7 +194,7 @@ class PyFuncModel(CompiledModel):
             store,
         )
 
-    def _make_model(self):
+    def _make_model(self, flow_structure_kwargs=None):
         def make_logp_func():
             logp_fn = self._make_logp_func()
             return partial(logp_fn, **self._shared_data)
@@ -124,9 +204,10 @@ class PyFuncModel(CompiledModel):
             return partial(expand_fn, **self._shared_data)
 
         if self._raw_logp_fn is not None:
-            outer_kwargs = self._transform_adapt_args
-            if outer_kwargs is None:
-                outer_kwargs = {}
+            outer_kwargs = {
+                **(self._transform_adapt_args or {}),
+                **(flow_structure_kwargs or {}),
+            }
 
             def make_adapter(*args, **kwargs):
                 from nutpie.transform_adapter import make_transform_adapter

@@ -10,6 +10,7 @@ import flowjax.flows
 import jax
 import jax.numpy as jnp
 import numpy as np
+import scipy.sparse
 from equinox.nn import Linear
 from flowjax import bijections
 from flowjax.bijections.bijection import AbstractBijection
@@ -2207,8 +2208,9 @@ def make_sparse_triangular_map(
             precision as ``Lambda = C^T C`` rather than ``L L^T``. See
             `SparseTriangularMap` for the full argument. Reversing costs no
             fill: the fill count is the one the elimination order achieved.
-        sparsity: ``(n_dim, n_dim)`` array convertible to boolean, the
-            Markov-blanket adjacency matrix, see `SparseTriangularMap`.
+        sparsity: ``(n_dim, n_dim)`` dense or scipy sparse matrix
+            convertible to boolean, the Markov-blanket adjacency matrix, see
+            `SparseTriangularMap`.
             ``sparsity[i, j]`` being truthy means ``j`` may be used to
             parameterize the transform of ``i``, provided ``j`` precedes
             ``i`` in ``order``.
@@ -2225,6 +2227,9 @@ def make_sparse_triangular_map(
         nn_depth = 1
 
     order = np.asarray(order)
+    if scipy.sparse.issparse(sparsity):
+        # The triangular map still works with a dense pattern for now
+        sparsity = sparsity.toarray()
     sparsity = np.asarray(sparsity, dtype=bool)
 
     if order.shape != (n_dim,):
