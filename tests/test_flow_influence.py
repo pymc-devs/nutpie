@@ -12,7 +12,12 @@ import jax.numpy as jnp
 from flowjax.utils import get_ravelled_pytree_constructor
 from paramax import NonTrainable
 
-from nutpie.flow_influence import fisher_influence, fisher_information
+from nutpie.flow_influence import (
+    _quadrature,
+    fisher_influence,
+    fisher_information,
+    latent_velocities,
+)
 from nutpie.normalizing_flow import make_transformer
 
 
@@ -45,6 +50,28 @@ def test_fisher_information_affine(x64):
     np.testing.assert_allclose(
         fisher_information(constructor, theta), expected, atol=1e-12
     )
+
+
+def test_velocity_parity_affine(x64):
+    """A location change has an even latent velocity, a scale change an odd
+    one, which is what splits the speed into its two parts."""
+    transformer = make_transformer(
+        affine_transformer=1, contract_transformer=0, asymmetric_transformer=0
+    )
+    constructor, num_params = get_ravelled_pytree_constructor(
+        transformer,
+        filter_spec=eqx.is_inexact_array,
+        is_leaf=lambda leaf: isinstance(leaf, NonTrainable),
+    )
+    nodes, _ = _quadrature(16, jnp.float64)
+    np.testing.assert_allclose(nodes[::-1], -nodes)
+    V, _ = latent_velocities(constructor, jnp.zeros(num_params), nodes)
+    parities = sorted(
+        "even" if np.allclose(v, v[::-1]) else "odd"
+        for v in np.asarray(V).T
+        if not np.allclose(v, 0)
+    )
+    assert parities == ["even", "odd"]
 
 
 @pytest.mark.skipif(find_spec("pymc") is None, reason="needs pymc")
@@ -87,18 +114,25 @@ def test_fisher_influence(x64):
     )
     position = np.empty_like(influence.order)
     position[influence.order] = np.arange(7)
-    for kind in ["total", "location", "scale_shape"]:
+    for kind in ["total", "location_skew", "scale_tails"]:
         matrix = getattr(influence, kind).tocoo()
         assert matrix.nnz > 0
         assert np.all(np.isfinite(matrix.data)) and np.all(matrix.data >= 0)
         # Only parents, which come earlier in the flow order
         assert np.all(position[matrix.col] < position[matrix.row])
 
+    # The squares of the two parts add up to the total
+    np.testing.assert_allclose(
+        (influence.location_skew**2 + influence.scale_tails**2).toarray(),
+        (influence.total**2).toarray(),
+        rtol=1e-10,
+    )
+
     variables = compiled._unconstrained_variables()
     axes = influence.plot(variables=variables)
     assert [ax.get_title() for ax in axes] == [
         "Fisher speed",
-        "location only",
-        "scale and shape",
+        "location and skew",
+        "scale and tails",
     ]
     plt.close(axes[0].figure)
