@@ -1,3 +1,4 @@
+import math
 from collections.abc import Callable
 from functools import partial
 from importlib.util import find_spec
@@ -899,7 +900,7 @@ class TransformAdapter:
         solver_rtol=1e-3,
         solver_atol=1e-6,
         lm_linear_steps=300,
-        lm_min_loss=float(np.exp(-3)),
+        lm_min_loss=math.exp(-3),
         lm_probe_batch=32,
         lm_probes=64,
         lm_residual_batch=256,
@@ -910,6 +911,7 @@ class TransformAdapter:
         lm_line_search=False,
         lm_forcing="residual",
         lm_exact_blocks=False,
+        native_flow=True,
     ):
         self._logp_fn = logp_fn
         self._make_flow_fn = make_flow_fn
@@ -960,6 +962,9 @@ class TransformAdapter:
         self._lm_line_search = lm_line_search
         self._lm_forcing = lm_forcing
         self._lm_exact_blocks = lm_exact_blocks
+        # Whether the sampler may run the flow natively in its leapfrog steps,
+        # see `flow_transform_layout`.
+        self._native_flow = native_flow
         # Damping the previous LM fit ended with, to start the next one from:
         # consecutive windows fit nearly the same problem, and restarting from
         # `lam0` makes each fit rediscover the scale, typically overshooting on
@@ -1351,6 +1356,17 @@ class TransformAdapter:
             print(traceback.format_exc())
             raise
 
+    def flow_transform_layout(self):
+        """The current flow's layout for the sampler's native leapfrog
+        transform, or `None` to keep using JAX (see
+        `triangular_rust.flow_transform_layout`). The Rust side asks again
+        after every `update`."""
+        if not self._native_flow:
+            return None
+        from nutpie.triangular_rust import flow_transform_layout
+
+        return flow_transform_layout(self._bijection)
+
     def init_from_transformed_position_part1(self, transformed_position):
         try:
             transformed_position = jnp.array(transformed_position)
@@ -1439,7 +1455,7 @@ def make_transform_adapter(
     extension_var_trafo_count=2,
     debug_save_bijection=False,
     make_optimizer=None,
-    coupling_type="masked",
+    coupling_type="triangular",
     mvscale_layer=False,
     num_project=None,
     num_embed=None,
@@ -1454,21 +1470,22 @@ def make_transform_adapter(
     order=None,
     sparsity=None,
     location_skip=True,
-    method="adam",
+    method="lm",
     solver_rtol=1e-3,
     solver_atol=1e-6,
-    lm_linear_steps=300,
-    lm_min_loss=float(np.exp(-3)),
+    lm_linear_steps=200,
+    lm_min_loss=math.exp(-3),
     lm_probe_batch=32,
-    lm_probes=64,
-    lm_residual_batch=256,
+    lm_probes=1024,
+    lm_residual_batch=128,
     lm_probe_groups=None,
     lm_probe_rounds=1,
     lm_fit_affine=False,
     lm_patience=5,
-    lm_line_search=False,
+    lm_line_search=True,
     lm_forcing="residual",
-    lm_exact_blocks=False,
+    lm_exact_blocks=True,
+    native_flow=True,
 ):
     if extension_windows is None:
         extension_windows = []
@@ -1533,4 +1550,5 @@ def make_transform_adapter(
         lm_line_search=lm_line_search,
         lm_forcing=lm_forcing,
         lm_exact_blocks=lm_exact_blocks,
+        native_flow=native_flow,
     )

@@ -17,7 +17,6 @@ use thiserror::Error;
 
 use crate::{
     common::{call_init_point_func, PyValue, PyVariable},
-    common::{PyValue, PyVariable},
     wrapper::{NativeFlow, PyTransformAdapt},
 };
 
@@ -126,6 +125,7 @@ pub struct PyDensity {
     variables: Arc<Vec<PyVariable>>,
     dim_sizes: HashMap<String, u64>,
     coords: HashMap<String, Value>,
+    native_flow: NativeFlow,
 }
 
 impl PyDensity {
@@ -149,6 +149,7 @@ impl PyDensity {
             variables,
             dim_sizes,
             coords,
+            native_flow: NativeFlow::default(),
         })
     }
 }
@@ -424,6 +425,28 @@ impl CpuLogpFunc for PyDensity {
         transformed_gradient: &mut [f64],
         clip: Option<f64>,
     ) -> std::result::Result<(f64, f64), Self::LogpError> {
+        // Native path: only the model's logp runs in Python, the flow does
+        // not. `native_flow` is moved out so the logp closure can borrow `self`.
+        let adapter = self
+            .transform_adapter
+            .clone()
+            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?;
+        let mut native = std::mem::take(&mut self.native_flow);
+        let result = native.init_from_transformed_position(
+            &adapter,
+            params,
+            untransformed_position,
+            untransformed_gradient,
+            transformed_position,
+            transformed_gradient,
+            clip,
+            |y, grad| self.logp(y, grad),
+        );
+        self.native_flow = native;
+        if let Some(out) = result? {
+            return Ok(out);
+        }
+
         let (logp, logdet) = self
             .transform_adapter
             .as_mut()
@@ -471,6 +494,7 @@ impl CpuLogpFunc for PyDensity {
         untransformed_logp: impl ExactSizeIterator<Item = &'a f64>,
         params: &'a mut Py<PyAny>,
     ) -> std::result::Result<(), Self::LogpError> {
+        self.native_flow.invalidate();
         self.transform_adapter
             .as_mut()
             .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?
@@ -491,6 +515,7 @@ impl CpuLogpFunc for PyDensity {
         untransformed_gradient: &[f64],
         chain: u64,
     ) -> std::result::Result<Py<PyAny>, Self::LogpError> {
+        self.native_flow.invalidate();
         let trafo = self
             .transform_adapter
             .as_mut()

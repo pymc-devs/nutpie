@@ -11,6 +11,7 @@ use crate::{
     pyfunc::PyModel,
     pymc::{ExpandFunc, LogpFunc, PyMcModel},
     stan::{StanLibrary, StanModel},
+    triangular::FlowTransform,
 };
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -1470,6 +1471,84 @@ impl PyTrace {
     }
 }
 
+/// Soft-clip a model gradient in place, `clip * asinh(g / clip)`, as the
+/// Python side's `_init_from_transformed_position` does before pulling it back.
+pub fn soft_clip(gradient: &mut [f64], clip: Option<f64>) {
+    if let Some(clip) = clip {
+        for g in gradient.iter_mut() {
+            *g = clip * (*g / clip).asinh();
+        }
+    }
+}
+
+/// Per-chain native form of the adapter's flow, so a leapfrog step never
+/// calls into Python: only the model's own logp runs outside Rust, if it is a
+/// Python function at all.
+///
+/// Keyed by the adapter object it came from, and must be `invalidate`d
+/// whenever that object's transformation is (re)initialized or updated.
+#[derive(Default)]
+pub struct NativeFlow {
+    cache: FlowCache,
+}
+
+#[derive(Default)]
+enum FlowCache {
+    #[default]
+    Stale,
+    /// The adapter's current flow has no native form: use the Python path.
+    Missing(usize),
+    Ready(usize, FlowTransform),
+}
+
+impl NativeFlow {
+    pub fn invalidate(&mut self) {
+        self.cache = FlowCache::Stale;
+    }
+
+    /// `PyTransformAdapt::init_from_transformed_position`, natively: the
+    /// transformed position mapped to the untransformed one, `logp` there, and
+    /// its gradient pulled back, returning `(logp, logdet)` -- including the
+    /// optional soft clip of the model gradient. `Ok(None)` if the adapter's
+    /// flow has no native form; the caller then takes the Python path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn init_from_transformed_position<E: From<anyhow::Error>>(
+        &mut self,
+        adapter: &PyTransformAdapt,
+        params: &Py<PyAny>,
+        untransformed_position: &mut [f64],
+        untransformed_gradient: &mut [f64],
+        transformed_position: &[f64],
+        transformed_gradient: &mut [f64],
+        clip: Option<f64>,
+        logp: impl FnOnce(&[f64], &mut [f64]) -> std::result::Result<f64, E>,
+    ) -> std::result::Result<Option<(f64, f64)>, E> {
+        let key = params.as_ptr() as usize;
+        let current = matches!(
+            &self.cache,
+            FlowCache::Missing(k) | FlowCache::Ready(k, _) if *k == key
+        );
+        if !current {
+            self.cache = match adapter
+                .flow_transform(params)
+                .context("Failed to build the native flow transform")?
+            {
+                Some(flow) => FlowCache::Ready(key, flow),
+                None => FlowCache::Missing(key),
+            };
+        }
+        let FlowCache::Ready(_, flow) = &mut self.cache else {
+            return Ok(None);
+        };
+
+        let logdet = flow.transform_and_log_det(transformed_position, untransformed_position)?;
+        let logp = logp(untransformed_position, untransformed_gradient)?;
+        soft_clip(untransformed_gradient, clip);
+        flow.pullback(untransformed_gradient, transformed_gradient)?;
+        Ok(Some((logp, logdet)))
+    }
+}
+
 #[pyclass(from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyTransformAdapt(Arc<Py<PyAny>>);
@@ -1702,6 +1781,25 @@ impl PyTransformAdapt {
         })
     }
 
+    /// The adapter's current flow as a native transform for the leapfrog
+    /// step, or `None` if it has none (see `TransformAdapter.flow_transform_layout`).
+    pub fn flow_transform(&self, params: &Py<PyAny>) -> Result<Option<FlowTransform>> {
+        Python::attach(|py| {
+            let layout = params
+                .getattr(py, intern!(py, "flow_transform_layout"))
+                .context("No attribute flow_transform_layout")?
+                .call0(py)
+                .context("Failed adapter.flow_transform_layout")?;
+            let layout: Option<Bound<'_, PyDict>> = layout
+                .extract(py)
+                .map_err(PyErr::from)
+                .context("flow_transform_layout must return a dict or None")?;
+            layout
+                .map(|layout| FlowTransform::from_layout(&layout))
+                .transpose()
+        })
+    }
+
     pub fn transformation_id(&self, params: &Py<PyAny>) -> Result<i64> {
         Python::attach(|py| {
             let id: i64 = params
@@ -1730,6 +1828,7 @@ pub fn _lib(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyStorage>()?;
     m.add_class::<PyTrace>()?;
     m.add_class::<crate::triangular::PySparseTriangularTransform>()?;
+    m.add_class::<crate::triangular::PyFlowTransform>()?;
     m.add_function(wrap_pyfunction!(
         crate::triangular::activation_for_testing,
         m

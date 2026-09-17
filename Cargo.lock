@@ -2383,6 +2383,7 @@ dependencies = [
  "itertools 0.15.0",
  "numpy",
  "nuts-rs",
+ "pulp",
  "pyo3",
  "pyo3-arrow",
  "pyo3-object_store",
