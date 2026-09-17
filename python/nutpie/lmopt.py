@@ -138,8 +138,19 @@ def _scatter(S, p):
 
 def pcg(Av, Minv, b, x0, tol, maxiter):
     """PCG on pytrees.  tol is ABSOLUTE on ||b - Av(x)||.  Returns (x, n_iters)."""
-    r0 = jax.tree.map(lambda p, q: p - q, b, Av(x0))
+
+    Ax0 = Av(x0)
+    bx, xAx = tdot(b, x0), tdot(x0, Ax0)
+    # Best multiple of the warm start: q(alpha*x0) = -(b.x0)^2 / (2 x0'A x0) <= 0,
+    # so the monotone CG iterates keep q < 0 and the undamped pred > 0.
+    # alpha = 0 (cold start) if x0 is uphill or zero.
+    alpha = jnp.where((bx > 0) & (xAx > 0), bx / jnp.where(xAx > 0, xAx, 1.0), 0.0)
+    x0 = jax.tree.map(lambda x: alpha * x, x0)
+    r0 = jax.tree.map(lambda bb, ax: bb - alpha * ax, b, Ax0)
     z0 = Minv(r0)
+
+    #r0 = jax.tree.map(lambda p, q: p - q, b, Av(x0))
+    #z0 = Minv(r0)
 
     def cond(c):
         _, r, _, _, rz, k = c
@@ -405,13 +416,15 @@ def step(
     r,
     lam,
     key,
+    *,
+    rebuild_blocks: jax.Array,
+    p_prev: jax.Array,
     m=256,
     batch=32,
     precondition=True,
     cg_tol=1e-2,
     cg_eta_max=0.5,
     cg_max=300,
-    p_prev=None,
     accept_rho=0.1,
     good_rho=0.75,
     lam_down=3.0,
@@ -421,7 +434,6 @@ def step(
     damping="marquardt",
     capture_diagnostic=False,
     blocks=None,
-    rebuild_blocks=True,
 ):
     """One LM step.  res_fn and plans are static under eqx.filter_jit; plans
     is built once via get_plans and cached by parameter structure, so its
@@ -494,7 +506,7 @@ def step(
 
     g = vjp(r)
     rhs = jax.tree.map(jnp.negative, g)
-    x0 = jax.tree.map(jnp.zeros_like, theta) if p_prev is None else p_prev
+    x0 = p_prev
 
     # Inexact-Newton forcing term (Dembo/Eisenstat/Steihaug; the
     # `min(eta_max, sqrt(||g||))` rule from the trust-region Newton line).
@@ -716,10 +728,11 @@ def fit(
             print(
                 f"{i:3d}  F={float(info['F_new']):.4e}  "
                 f"log(F)={float(np.log(info['F_new'])):+.2f} "
-                f"rho={float(info['rho']):+.2f}  lam={float(info['lam_out']):.1e}  "
+                f"rho={float(info['rho']):+.2f}  "
+                f"lam={float(info['lam_out']):.1e}  "
                 f"cg={int(info['n_cg']):3d}{'' if info['cg_converged'] else '*'} "
                 f"eta={float(info['cg_eta']):.2f}"
-                f"{'' if info['rebuilt_blocks'] else '~'}  "
+                f"{' ' if info['rebuilt_blocks'] else '~'}  "
                 f"|g|={float(info['grad_norm']):.2e}"
                 + (
                     "  capture sub/cond="
