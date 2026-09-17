@@ -11,7 +11,12 @@ import equinox as eqx
 
 
 
-def _min_waste_segments(counts: np.ndarray, n_segments: int) -> list:
+_N_LEVEL_SEGMENTS = 8
+
+
+def _min_waste_segments(
+    counts: np.ndarray, n_segments: int, weights: np.ndarray | None = None
+) -> list:
     """Split `counts` into at most `n_segments` *contiguous* runs, minimizing
     ``sum(run_max * len(run))`` -- the number of padded slots when each run is
     stored as one rectangular array of its own width.
@@ -27,13 +32,26 @@ def _min_waste_segments(counts: np.ndarray, n_segments: int) -> list:
     single variable that parents many others is enough to cause: one level then
     sizes the array for all of them.
 
+    `counts` may also be ``(n, n_groups)``, for the case where each level is
+    stored as one rectangular array *per group* -- one per conditioner bucket
+    in `SparseTriangularMap.transform_and_log_det`. Each group is then padded
+    to its own per-run maximum and the run's cost is the weighted sum over
+    groups, ``len(run) * sum_g weights[g] * run_max[g]``. `weights` is the
+    relative cost of one padded slot in each group (a bucket whose conditioner
+    reads 200 parents wastes far more per slot than one that reads 1), and
+    defaults to uniform.
+
     Returns:
         List of ``(start, stop)`` index pairs covering ``range(len(counts))``.
     """
     counts = np.asarray(counts, dtype=np.int64)
-    n = len(counts)
+    if counts.ndim == 1:
+        counts = counts[:, None]
+    n, n_groups = counts.shape
     n_segments = max(1, min(n_segments, n))
-    prefix = np.concatenate([[0], np.cumsum(counts)])
+    if weights is None:
+        weights = np.ones(n_groups, dtype=np.float64)
+    weights = np.asarray(weights, dtype=np.float64)
 
     no_split = -1
     prev_dp = np.full(n + 1, np.inf)
@@ -44,8 +62,8 @@ def _min_waste_segments(counts: np.ndarray, n_segments: int) -> list:
         for r in range(b, n + 1):
             l_range = np.arange(b - 1, r)
             # running max of counts[l:r], for every candidate left edge l
-            run_max = np.maximum.accumulate(counts[l_range][::-1])[::-1]
-            costs = prev_dp[l_range] + run_max * (r - l_range)
+            run_max = np.maximum.accumulate(counts[l_range][::-1], axis=0)[::-1]
+            costs = prev_dp[l_range] + (run_max @ weights) * (r - l_range)
             best = int(np.argmin(costs))
             new_dp[r] = costs[best]
             split[b, r] = l_range[best]
@@ -185,7 +203,11 @@ class _SparseTriangularLayout(eqx.Module):
 
 
 def _build_layout(
-    bucket_members, bucket_parent_indices, level_of_variable, dim, n_level_segments=8
+    bucket_members,
+    bucket_parent_indices,
+    level_of_variable,
+    dim,
+    n_level_segments=_N_LEVEL_SEGMENTS,
 ):
     """Derive the static edge layout from the model's bucket and level data.
 
@@ -524,9 +546,12 @@ class SparseTriangularMap(bijections.AbstractBijection):
     fully dense `blanket` every variable ends up in its own level and this
     degenerates to the naive per-variable scan, while a shallow/tree-like
     `blanket` can cut the sequential depth from ``dim`` down to
-    ``O(log dim)`` or less. The tradeoff is that levels are padded to the
-    width of the widest level, so this trades sequential steps for total
-    work and is a net win only when levels are reasonably balanced.
+    ``O(log dim)`` or less. The tradeoff is that levels are padded to a
+    common width, so this trades sequential steps for total work and is a
+    net win only when levels are reasonably balanced. The padding is kept
+    to what the imbalance really costs by splitting the level range into
+    contiguous segments, each bucket sized per segment and skipped over the
+    segments where it has no members (see `_min_waste_segments`).
 
     Separately, conditioner networks are grouped into `n_buckets` buckets by
     parent count (see `_min_waste_buckets`), each with its own (smaller)
@@ -560,9 +585,20 @@ class SparseTriangularMap(bijections.AbstractBijection):
     conditioners: tuple[eqx.nn.MLP, ...]
     bucket_members: tuple[Array, ...]
     bucket_parent_indices: tuple[Array, ...]
-    bucket_level_members: tuple[Array, ...]
-    bucket_level_local_members: tuple[Array, ...]
-    bucket_level_parent_indices: tuple[Array, ...]
+    # Layout of `transform_and_log_det`'s level scan, one entry per contiguous
+    # segment of levels (see `_min_waste_segments`). Within a segment, only the
+    # buckets that actually have members there are listed, each padded to its
+    # own width over that segment's levels -- rather than every bucket being
+    # evaluated at every level, at its global maximum level occupancy.
+    #
+    # level_segment_buckets[s]:            tuple of bucket indices active in s
+    # level_segment_members[s][i]:         (levels_in_segment, width) global
+    #                                      variable indices, padded with `dim`
+    # level_segment_local_members[s][i]:   (levels_in_segment, width) positions
+    #                                      within that bucket's ensemble
+    level_segment_buckets: tuple[tuple[int, ...], ...] = eqx.field(static=True)
+    level_segment_members: tuple[tuple[Array, ...], ...]
+    level_segment_local_members: tuple[tuple[Array, ...], ...]
     transformer_constructor: Callable
     # A normal pytree field, not `static=True`. Its leaves are index arrays, so
     # marking them static made them pytree *metadata*, which JAX compares for
@@ -666,14 +702,27 @@ class SparseTriangularMap(bijections.AbstractBijection):
             )
             return mlp  # SumLinearAndMlp(linear, mlp)
 
+        def net_cost(in_size):
+            """Rough cost of one conditioner evaluation, used to weight the
+            padding waste of a bucket against the other buckets'."""
+            if nn_depth == 0:
+                return max(in_size, 1) * num_params
+            return (
+                max(in_size, 1) * nn_width
+                + max(nn_depth - 1, 0) * nn_width**2
+                + nn_width * num_params
+            )
+
         keys = jax.random.split(key, max(n_buckets_eff, 1))
 
         conditioners = []
         bucket_members = []
         bucket_parent_indices = []
-        bucket_level_members = []
-        bucket_level_local_members = []
-        bucket_level_parent_indices = []
+        bucket_net_costs = []
+        # Per bucket, the bucket's members at each level, as global indices and
+        # as positions within the bucket's own ensemble.
+        bucket_members_by_level = []
+        bucket_local_members_by_level = []
 
         for b in range(n_buckets_eff):
             members_b = np.flatnonzero(bucket_of == b)
@@ -691,6 +740,7 @@ class SparseTriangularMap(bijections.AbstractBijection):
             bucket_parent_indices.append(
                 parent_indices[members_b][:, :max_parents_b].astype(np.int32)
             )
+            bucket_net_costs.append(net_cost(max_parents_b))
 
             # local position of each global variable index within this
             # bucket's own (bucket_size_b,)-shaped ensemble/member list, so
@@ -699,35 +749,61 @@ class SparseTriangularMap(bijections.AbstractBijection):
             local_of_global[members_b] = np.arange(bucket_size_b, dtype=np.int32)
 
             levels_b = level[members_b]
-            group_sizes_b = np.bincount(levels_b, minlength=n_levels)
-            max_group_b = int(group_sizes_b.max())
+            members_at_level = [members_b[levels_b == lvl] for lvl in range(n_levels)]
+            bucket_members_by_level.append(members_at_level)
+            bucket_local_members_by_level.append(
+                [local_of_global[idx] for idx in members_at_level]
+            )
 
-            lvl_members = np.full((n_levels, max(max_group_b, 1)), dim, dtype=np.int32)
-            lvl_local = np.zeros((n_levels, max(max_group_b, 1)), dtype=np.int32)
-            for lvl in range(n_levels):
-                idx = members_b[levels_b == lvl]
-                lvl_members[lvl, : len(idx)] = idx
-                lvl_local[lvl, : len(idx)] = local_of_global[idx]
+        # The level scan is sequential in the levels but not in the buckets, so
+        # a naive layout evaluates every bucket at every level, padded to that
+        # bucket's widest level. Splitting the level range into contiguous
+        # segments lets each bucket be sized per segment instead -- and lets a
+        # bucket be skipped entirely over the levels where it has no members at
+        # all, which is the common case for the few-but-wide buckets.
+        level_bucket_counts = np.array(
+            [
+                [len(bucket_members_by_level[b][lvl]) for b in range(n_buckets_eff)]
+                for lvl in range(n_levels)
+            ],
+            dtype=np.int64,
+        ).reshape(n_levels, n_buckets_eff)
+        segments = _min_waste_segments(
+            level_bucket_counts,
+            _N_LEVEL_SEGMENTS,
+            weights=np.asarray(bucket_net_costs, dtype=np.float64),
+        )
 
-            lvl_gather = np.clip(lvl_members, 0, max(dim - 1, 0))
-            lvl_parent_idx = parent_indices[lvl_gather][:, :, :max_parents_b]
+        level_segment_buckets = []
+        level_segment_members = []
+        level_segment_local_members = []
+        for start, stop in segments:
+            widths = level_bucket_counts[start:stop].max(axis=0)
+            active_buckets = np.flatnonzero(widths > 0)
+            members_of_segment = []
+            local_members_of_segment = []
+            for b in active_buckets:
+                seg_members = np.full((stop - start, widths[b]), dim, dtype=np.int32)
+                seg_local = np.zeros((stop - start, widths[b]), dtype=np.int32)
+                for row, lvl in enumerate(range(start, stop)):
+                    idx = bucket_members_by_level[b][lvl]
+                    seg_members[row, : len(idx)] = idx
+                    seg_local[row, : len(idx)] = bucket_local_members_by_level[b][lvl]
+                members_of_segment.append(jnp.asarray(seg_members))
+                local_members_of_segment.append(jnp.asarray(seg_local))
+            level_segment_buckets.append(tuple(int(b) for b in active_buckets))
+            level_segment_members.append(tuple(members_of_segment))
+            level_segment_local_members.append(tuple(local_members_of_segment))
 
-            bucket_level_members.append(lvl_members)
-            bucket_level_local_members.append(lvl_local)
-            bucket_level_parent_indices.append(lvl_parent_idx)
+        self.level_segment_buckets = tuple(level_segment_buckets)
+        self.level_segment_members = tuple(level_segment_members)
+        self.level_segment_local_members = tuple(level_segment_local_members)
 
         self.conditioners = tuple(conditioners)
         self.transformer_constructor = constructor
         self.bucket_members = tuple(jnp.asarray(m) for m in bucket_members)
         self.bucket_parent_indices = tuple(
             jnp.asarray(m) for m in bucket_parent_indices
-        )
-        self.bucket_level_members = tuple(jnp.asarray(m) for m in bucket_level_members)
-        self.bucket_level_local_members = tuple(
-            jnp.asarray(m) for m in bucket_level_local_members
-        )
-        self.bucket_level_parent_indices = tuple(
-            jnp.asarray(m) for m in bucket_level_parent_indices
         )
         self.n_levels = n_levels
         self.shape = (dim,)
@@ -823,43 +899,66 @@ class SparseTriangularMap(bijections.AbstractBijection):
         return x, log_det, tuple(bucket_jacobian_rows), jacobian_diagonal
 
     def transform_and_log_det(self, x, condition=None):
+        """Ancestral x -> y pass: one scan per level segment, log det included.
+
+        The log det comes out of the same conditioner evaluations that resolve
+        `y`, since the scalar transformer returns it anyway; running the
+        parallel y -> x pass afterwards just to obtain it would evaluate every
+        conditioner a second time.
+        """
         dim = self.shape[0]
-        n_buckets = len(self.conditioners)
 
-        def step(y, level_data):
-            y_padded = jnp.concatenate([y, jnp.zeros((1,), dtype=y.dtype)])
-            y_next = y
-            for b in range(n_buckets):
-                members, local_members, parent_idx = level_data[b]
-                # Clipping/local-index-0 are only for indexing safety;
-                # results for padding slots (where `members == dim`) are
-                # discarded below via the `mode="drop"` scatter. Parents are
-                # read from `y_padded` as of the *start* of this level (safe
-                # -- variables in the same level never depend on each
-                # other), so buckets within a level can be processed in any
-                # order.
-                gather_idx = jnp.clip(members, 0, max(dim - 1, 0))
-                parents = y_padded[parent_idx]
-                conditioner_group = jax.tree.map(
-                    lambda leaf: leaf[local_members] if eqx.is_array(leaf) else leaf,
-                    self.conditioners[b],
-                )
-                params = eqx.filter_vmap(lambda net, inp: net(inp))(
-                    conditioner_group, parents
-                )
-                transformer = self._flat_params_to_transformer(params)
-                y_group, _ = transformer.transform_and_log_det(x[gather_idx])
-                y_next = y_next.at[members].set(y_group, mode="drop")
-            return y_next, None
+        def make_step(buckets):
+            def step(carry, level_data):
+                y, log_det = carry
+                members_of_level, local_members_of_level = level_data
+                y_next = y
+                for bucket, members, local_members in zip(
+                    buckets, members_of_level, local_members_of_level
+                ):
+                    # Parents are read from `y` as of the *start* of this level
+                    # (safe -- variables in the same level never depend on each
+                    # other), so buckets within a level can be processed in any
+                    # order. Padding slots (`members == dim`) read zeros, and
+                    # their results are discarded by the `mode="drop"` scatter
+                    # and the `where` on the log det.
+                    parent_idx = self.bucket_parent_indices[bucket][local_members]
+                    parents = y.at[parent_idx].get(mode="fill", fill_value=0.0)
+                    conditioner_group = jax.tree.map(
+                        lambda leaf: leaf[local_members]
+                        if eqx.is_array(leaf)
+                        else leaf,
+                        self.conditioners[bucket],
+                    )
 
-        level_data = tuple(
-            (
-                self.bucket_level_members[b],
-                self.bucket_level_local_members[b],
-                self.bucket_level_parent_indices[b],
+                    def transform_element(net, parent_values, value):
+                        params = net(parent_values)
+                        transformer = self.transformer_constructor(params)
+                        return transformer.transform_and_log_det(value)
+
+                    y_group, log_det_group = eqx.filter_vmap(transform_element)(
+                        conditioner_group,
+                        parents,
+                        x.at[members].get(mode="fill", fill_value=0.0),
+                    )
+                    y_next = y_next.at[members].set(
+                        y_group, mode="drop", unique_indices=True
+                    )
+                    log_det = log_det + jnp.sum(
+                        jnp.where(members != dim, log_det_group, 0.0)
+                    )
+                return (y_next, log_det), None
+
+            return step
+
+        y = x
+        log_det = jnp.zeros((), x.dtype)
+        for buckets, members, local_members in zip(
+            self.level_segment_buckets,
+            self.level_segment_members,
+            self.level_segment_local_members,
+        ):
+            (y, log_det), _ = jax.lax.scan(
+                make_step(buckets), (y, log_det), (members, local_members)
             )
-            for b in range(n_buckets)
-        )
-        y, _ = jax.lax.scan(step, x, level_data)
-        _, log_det = self.inverse_and_log_det(y, condition)
-        return y, -log_det
+        return y, log_det
