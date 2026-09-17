@@ -168,6 +168,86 @@ class CompiledStanModel(CompiledModel):
             return self.with_data().model
         return self.model
 
+    def hessian_vector_product(
+        self,
+        point: NDArray,
+        vector: NDArray,
+        *,
+        jacobian: bool = True,
+        propto: bool = True,
+    ) -> tuple[float, NDArray]:
+        """Compute the log density and the product of its Hessian with
+        ``vector`` at ``point`` on the unconstrained space.
+
+        The model must be compiled with ``ad_hessian=True``.
+        """
+        return self._make_model().log_density_hessian_vector_product(
+            np.ascontiguousarray(point, dtype=np.float64),
+            np.ascontiguousarray(vector, dtype=np.float64),
+            propto,
+            jacobian,
+        )
+
+    def hessian_sparsity(
+        self,
+        num_points: int = 4,
+        *,
+        seed: int | None = None,
+        bloom_size: int | None = None,
+        num_hashes: int = 3,
+    ) -> NDArray:
+        """Detect the sparsity pattern of the Hessian of the log density on
+        the unconstrained space.
+
+        The pattern is computed from autodiff Hessian-vector products at
+        ``num_points`` initial points, generated like the initial points of
+        the sampler (see :meth:`with_init_point_fn`). An entry is nonzero if
+        it is nonzero at any of the points. Dependencies in branches of the
+        model that are not taken at any of the points are not detected.
+
+        The model must be compiled with ``ad_hessian=True``.
+
+        Parameters
+        ----------
+        num_points:
+            Number of points at which the Hessian is evaluated.
+        seed:
+            Seed for the initial points and the probing vectors.
+        bloom_size:
+            Number of Hessian-vector products per point used to find
+            candidates for the nonzeros. Defaults to ``32 * ceil(log2(n_dim))``.
+            For small models, unit vectors are used instead.
+        num_hashes:
+            Number of probes that each parameter is part of while searching
+            for candidates.
+
+        Returns
+        -------
+        A symmetric boolean array with shape ``(n_dim, n_dim)``, with a true
+        diagonal.
+        """
+        pattern, num_hvps, num_colors = self._sampling_model().hessian_sparsity(
+            num_points, seed, bloom_size, num_hashes
+        )
+        logger.debug(
+            "Hessian sparsity: %s Hessian-vector products, %s colours",
+            num_hvps,
+            num_colors,
+        )
+        return pattern
+
+    def _sampling_model(self):
+        """The rust model with the init point function attached."""
+        compiled = self if self.model is not None else self.with_data()
+        model = compiled.model
+        if compiled._init_point_fn is not None:
+            model = model.with_init_point_func(
+                _wrap_init_point_fn(
+                    compiled._init_point_fn, compiled, compiled._init_values_to_json
+                )
+            )
+        return model
+
     def _make_sampler(
         self,
         settings,
@@ -177,14 +257,7 @@ class CompiledStanModel(CompiledModel):
         extra_callback_rate,
         store,
     ):
-        compiled = self if self.model is not None else self.with_data()
-        model = compiled.model
-        if compiled._init_point_fn is not None:
-            model = model.with_init_point_func(
-                _wrap_init_point_fn(
-                    compiled._init_point_fn, compiled, compiled._init_values_to_json
-                )
-            )
+        model = self._sampling_model()
         return _lib.PySampler.from_stan(
             settings,
             cores,
@@ -231,6 +304,8 @@ def _stan_cache_key(
     code: str,
     extra_compile_args: list[str] | None,
     extra_stanc_args: list[str] | None,
+    *,
+    ad_hessian: bool = False,
 ) -> str:
     """Return a SHA-256 hex digest identifying a unique compilation job."""
     import bridgestan
@@ -240,6 +315,7 @@ def _stan_cache_key(
             "code": code,
             "extra_compile_args": sorted(extra_compile_args or []),
             "extra_stanc_args": sorted(extra_stanc_args or []),
+            "ad_hessian": ad_hessian,
             "bridgestan_version": bridgestan.__version__,
         },
         sort_keys=True,
@@ -336,6 +412,7 @@ def compile_stan_model(
     cleanup: bool = True,
     cache: bool = False,
     prune_cache: bool = True,
+    ad_hessian: bool = False,
 ) -> CompiledStanModel:
     """Compile a Stan model and return a :class:`CompiledStanModel`.
 
@@ -373,6 +450,12 @@ def compile_stan_model(
         When ``True`` (the default), call :func:`prune_stan_cache` after
         each new compilation to evict old cache entries.  Has no effect
         when *cache* is ``False``.
+    ad_hessian:
+        Compile the model with support for Hessians using autodiff
+        (``BRIDGESTAN_AD_HESSIAN=true``). This is required for
+        :meth:`CompiledStanModel.hessian_sparsity` and
+        :meth:`CompiledStanModel.hessian_vector_product`, but makes
+        compilation slower. Defaults to ``False``.
     """
     if find_spec("bridgestan") is None:
         raise ImportError(
@@ -400,6 +483,8 @@ def compile_stan_model(
         model_name = "model"
 
     make_args = ["STAN_THREADS=true"]
+    if ad_hessian:
+        make_args.append("BRIDGESTAN_AD_HESSIAN=true")
     if extra_compile_args:
         make_args.extend(extra_compile_args)
     stanc_args = []
@@ -407,7 +492,9 @@ def compile_stan_model(
         stanc_args.extend(extra_stanc_args)
 
     if cache:
-        digest = _stan_cache_key(code, extra_compile_args, extra_stanc_args)
+        digest = _stan_cache_key(
+            code, extra_compile_args, extra_stanc_args, ad_hessian=ad_hessian
+        )
         entry_dir = _stan_cache_dir() / digest
         marker = entry_dir / "ok"
 
