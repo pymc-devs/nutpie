@@ -158,6 +158,21 @@ def test_nested():
             to_matrix(linspaced_vector(20, 7, 11), 4, 5) * basep5
         )
         }};
+
+    // Complex containers, where the real and imaginary parts are interleaved
+    // in the output of stan
+    complex_vector[3] cv;
+    complex_matrix[2, 3] cm;
+    array[2] complex ca;
+    for (i in 1:3) {
+        cv[i] = to_complex(base * i, base * (10 + i));
+    }
+    for (i in 1:2) {
+        for (j in 1:3) {
+            cm[i, j] = to_complex(base * (10 * i + j), base * (100 + 10 * i + j));
+        }
+        ca[i] = to_complex(base * (200 + i), base * (300 + i));
+    }
     }
     """
 
@@ -183,6 +198,22 @@ def test_nested():
         tr.posterior["ultimate.2.3:1.1:2"].values[:, :, 1], 3 * (base + 5)
     )
     assert np.allclose(tr.posterior["base_i"], tr.posterior.base_i.astype(int))
+
+    def check_complex(values, base):
+        base = np.asarray(base)[..., None]
+        idx = np.arange(1, 4)
+        assert np.allclose(values["cv.real"], base * idx)
+        assert np.allclose(values["cv.imag"], base * (10 + idx))
+        base = base[..., None]
+        idx = 10 * np.arange(1, 3)[:, None] + np.arange(1, 4)[None, :]
+        assert np.allclose(values["cm.real"], base * idx)
+        assert np.allclose(values["cm.imag"], base * (100 + idx))
+        base = base[..., 0]
+        idx = np.arange(1, 3)
+        assert np.allclose(values["ca.real"], base * (200 + idx))
+        assert np.allclose(values["ca.imag"], base * (300 + idx))
+
+    check_complex(tr.posterior, base)
 
 
 @pytest.mark.stan
@@ -457,14 +488,13 @@ def test_stan_constrain_unconstrain():
     assert point.shape == (compiled_model.n_dim,)
     np.testing.assert_allclose(point[0], np.log(2.0))
 
+    # Stan stores matrices in column-major order
     values = compiled_model.constrain(point)
-    assert set(values) == {"sigma", "m"}
-    np.testing.assert_allclose(values["sigma"], 2.0)
-    np.testing.assert_allclose(values["m"], m)
+    np.testing.assert_allclose(values, [2.0, *m.ravel(order="F")])
 
     values = compiled_model.constrain(point, include_tp=True, include_gq=True, seed=1)
-    assert set(values) == {"sigma", "m", "sigma2", "draw"}
-    np.testing.assert_allclose(values["sigma2"], 4.0)
+    assert values.shape == (9,)
+    np.testing.assert_allclose(values[7], 4.0)
 
 
 @pytest.mark.stan
