@@ -43,6 +43,7 @@ _LOG_SKIP_TRAINING_VALUE = -4
 # Remat toggle for the per-draw residual, see `FisherLoss.residuals`.
 CHECKPOINT_RESIDUAL = False
 
+
 def fit_to_data(
     key: PRNGKeyArray,
     dist: PyTree,
@@ -76,6 +77,8 @@ def fit_to_data(
     lm_forcing: str = "residual",
     lm_lam0: float | None = None,
     lm_exact_blocks: bool = False,
+    lm_max_exact_block_size: int = 256,
+    lm_print_blocks: bool = False,
 ):
     r"""Train a distribution (e.g. a flow) to samples from the target distribution.
 
@@ -132,7 +135,8 @@ def fit_to_data(
             once CG is cheap. It also sets where `lmopt.make_plan` splits a
             conditioner into sub-blocks (``q`` is capped relative to it), so
             raising it both sharpens the estimate and keeps large conditioners
-            unsplit. Only used when ``method`` is ``"lm"``.
+            unsplit. Not used with ``lm_exact_blocks``. Only used when
+            ``method`` is ``"lm"``.
         lm_probe_batch: How many of the Rademacher probes used to estimate the
             block preconditioner are taken at once. This is the main memory
             knob of an LM step: each concurrent probe carries a full reverse
@@ -172,9 +176,12 @@ def fit_to_data(
             carry it over. Only used when ``method`` is ``"lm"``.
         lm_exact_blocks: Compute the LM preconditioner's Gauss-Newton blocks
             exactly (see `FisherLoss.gauss_newton_factors`) instead of
-            estimating them from ``lm_probes`` Rademacher probes, which then
-            only sets the sub-block size. Needs ``lm_fit_affine=False``.
-            Only used when ``method`` is ``"lm"``.
+            estimating them from ``lm_probes`` Rademacher probes. Needs
+            ``lm_fit_affine=False``. Only used when ``method`` is ``"lm"``.
+        lm_max_exact_block_size: With ``lm_exact_blocks``, conditioners with
+            more parameters are split into sub-blocks of at most this size.
+            This only bounds the cost of the preconditioner, roughly
+            ``size**2`` memory and ``size**3`` time per sub-block.
         lm_min_loss: Stop the LM fit once the Fisher divergence falls below
             this. Note that the divergence is a *sum* over dimensions, so this
             is an absolute, dimension-independent target: it bounds each
@@ -215,6 +222,9 @@ def fit_to_data(
                 "forcing": lm_forcing,
                 "lam0": lm_lam0,
                 "exact_blocks": lm_exact_blocks,
+                "max_exact_block_size": lm_max_exact_block_size,
+                "verbose": verbose,
+                "print_blocks": lm_print_blocks,
             }
             if method == "lm"
             else {}
@@ -233,8 +243,8 @@ def fit_to_data(
         losses = {"train": [float(loss_val)], "val": [float(loss_val)]}
         if method == "lm":
             losses["lm_lam"] = result[2]
-        if verbose:
-            print(f"{method} loss: {loss_val}")
+            losses["lm_steps"] = result[3]
+            losses["lm_accepted"] = result[4]
         dist = eqx.combine(params, static)
         return dist, losses, None
     elif method != "adam":
@@ -366,6 +376,9 @@ def _fit_lm(
     forcing,
     lam0,
     exact_blocks,
+    max_exact_block_size,
+    verbose,
+    print_blocks,
 ):
     if not hasattr(loss_fn, "residuals"):
         raise ValueError(
@@ -389,8 +402,10 @@ def _fit_lm(
         forcing=forcing,
         **({} if lam0 is None else {"lam0": lam0}),
         factor_fn=gn_factor_fn if exact_blocks else None,
+        max_exact_block_size=max_exact_block_size,
         n_steps=max_steps,
-        verbose=True,
+        verbose=verbose,
+        print_blocks=print_blocks,
         min_loss=min_loss,
         cg_max=linear_steps,
         m=probes,
@@ -398,7 +413,14 @@ def _fit_lm(
         precondition=True,
     )
 
-    return theta, hist[-1]["F_out"], float(hist[-1]["lam_out"])
+    n_accepted = sum(bool(info["accept"]) for info in hist)
+    return (
+        theta,
+        hist[-1]["F_out"],
+        float(hist[-1]["lam_out"]),
+        len(hist),
+        n_accepted,
+    )
 
 
 @eqx.filter_jit
@@ -602,6 +624,8 @@ class FisherLoss(eqx.Module):
     target_norm: jax.Array = eqx.field(converter=jnp.asarray, default=1.0)
     residual_batch_size: int | None = eqx.field(static=True, default=256)
     huber_delta: float | None = eqx.field(static=True, default=None)
+    # See `SparseTriangularMap.gauss_newton_factors`
+    cholesky_jitter: float | None = eqx.field(static=True, default=None)
 
     @eqx.filter_jit
     def __call__(
@@ -662,7 +686,9 @@ class FisherLoss(eqx.Module):
                 flow = unwrap(eqx.combine(params, static, is_leaf=eqx.is_inexact_array))
 
                 def compute_residual(bijection, draw, grad, logp):
-                    draw, grad, logp = inverse_gradient_and_val(bijection, draw, grad, logp)
+                    draw, grad, logp = inverse_gradient_and_val(
+                        bijection, draw, grad, logp
+                    )
                     return draw, grad
 
                 draws, grads = jax.vmap(compute_residual, [None, 0, 0, 0])(
@@ -670,8 +696,7 @@ class FisherLoss(eqx.Module):
                 )
 
                 resid = jax.lax.stop_gradient(draws + grads)
-                return ((resid * draws).sum())
-
+                return (resid * draws).sum()
 
             return jnp.log(raw)
 
@@ -764,7 +789,14 @@ class FisherLoss(eqx.Module):
         draw, grad, _ = inverse_gradient_and_val(
             bijections.Invert(sandwich.outer), draw, grad, logp
         )
-        return sandwich.inner.gauss_newton_factors(draw, grad)
+        return sandwich.inner.gauss_newton_factors(
+            draw, grad, cholesky_jitter=self.cholesky_jitter
+        )
+
+
+def _format_log_f(value):
+    value = float(value)
+    return f"{value:+.2f}" if np.isfinite(value) else "  nan"
 
 
 def fit_flow(key, bijection, loss_fn, draws, grads, logps, **kwargs):
@@ -904,6 +936,7 @@ class TransformAdapter:
         lm_probe_batch=32,
         lm_probes=64,
         lm_residual_batch=256,
+        lm_cholesky_jitter=None,
         lm_probe_groups=None,
         lm_probe_rounds=1,
         lm_fit_affine=True,
@@ -911,12 +944,15 @@ class TransformAdapter:
         lm_line_search=False,
         lm_forcing="residual",
         lm_exact_blocks=False,
+        lm_max_exact_block_size=256,
         native_flow=True,
     ):
         self._logp_fn = logp_fn
         self._make_flow_fn = make_flow_fn
         self._chain = chain
-        self._verbose = verbose
+        # 0: silent, 1: one line per window, 2: also the LM iterations
+        self._verbose = int(verbose)
+        self._printed_lm_blocks = False
         self._window_size = window_size
         self._initial_skip = initial_skip
         self._num_layers = num_layers
@@ -928,7 +964,11 @@ class TransformAdapter:
             self._make_optimizer = make_optimizer
         self._optimizer = self._make_optimizer()
         self._loss_fn = FisherLoss(
-            gamma, log_inside_batch, residual_batch_size=lm_residual_batch, huber_delta=None,
+            gamma,
+            log_inside_batch,
+            residual_batch_size=lm_residual_batch,
+            huber_delta=None,
+            cholesky_jitter=lm_cholesky_jitter,
         )
         self._fisher_ema = None
         self._fisher_ema_alpha = fisher_ema_alpha
@@ -962,6 +1002,7 @@ class TransformAdapter:
         self._lm_line_search = lm_line_search
         self._lm_forcing = lm_forcing
         self._lm_exact_blocks = lm_exact_blocks
+        self._lm_max_exact_block_size = lm_max_exact_block_size
         # Whether the sampler may run the flow natively in its leapfrog steps,
         # see `flow_transform_layout`.
         self._native_flow = native_flow
@@ -1016,12 +1057,16 @@ class TransformAdapter:
                 + (1 - self._fisher_ema_alpha) * self._fisher_ema
             )
 
-    def update(self, seed, positions, gradients, logps):
-        self.index += 1
+    def _report(self, n_draws, message):
+        """One line about the current window, for ``verbose >= 1``."""
         if self._verbose:
             print(
-                f"Chain {self._chain}: Total available points: {len(positions)}, seed {seed}"
+                f"flow chain {self._chain} window {self.index:3d} "
+                f"({n_draws:5d} draws): {message}"
             )
+
+    def update(self, seed, positions, gradients, logps):
+        self.index += 1
         n_draws = len(positions)
         assert n_draws == len(positions)
         assert n_draws == len(gradients)
@@ -1056,8 +1101,7 @@ class TransformAdapter:
                 new_loss = self._loss_fn(params, static, positions, gradients, logps)
                 self._record_fisher_divergence(new_loss)
 
-                if self._verbose:
-                    print("loss from diag:", new_loss)
+                self._report(n_draws, f"log F  diag {_format_log_f(new_loss)}")
 
                 if np.isfinite(new_loss):
                     self._bijection = fit
@@ -1071,6 +1115,10 @@ class TransformAdapter:
 
             total_hist_len = len(hist_positions)
             if total_hist_len < 10:
+                self._report(
+                    n_draws,
+                    f"keep flow, waiting for draws after the first {self._initial_skip}",
+                )
                 return
 
             # Number of draws that arrived since the previous update() call.
@@ -1124,7 +1172,7 @@ class TransformAdapter:
             if len(positions) < 10:
                 return
 
-            if self._verbose and not np.isfinite(gradients).all():
+            if self._verbose >= 2 and not np.isfinite(gradients).all():
                 print(gradients)
                 print(gradients.shape)
                 print((~np.isfinite(gradients)).nonzero())
@@ -1149,23 +1197,22 @@ class TransformAdapter:
                     flowjax.distributions.StandardNormal(base.shape), base
                 )
                 params, static = eqx.partition(flow, eqx.is_inexact_array)
-                if self._verbose:
-                    print(
-                        "loss before optimization: ",
-                        self._loss_fn(
-                            params,
-                            static,
-                            positions[-128:],
-                            gradients[-128:],
-                            logps[-128:],
-                        ),
+                if self._verbose >= 2:
+                    fresh_loss = self._loss_fn(
+                        params,
+                        static,
+                        positions[-128:],
+                        gradients[-128:],
+                        logps[-128:],
+                    )
+                    self._report(
+                        n_draws, f"log F  fresh flow {_format_log_f(fresh_loss)}"
                     )
             else:
                 base = self._bijection
 
             if self.index in self._extension_windows:
-                if self._verbose:
-                    print("Extending flow...")
+                self._report(n_draws, "extending the flow")
                 self._last_extend_dct = not self._last_extend_dct
                 dct = self._last_extend_dct and self._extend_dct
                 base = extend_flow(
@@ -1210,8 +1257,11 @@ class TransformAdapter:
 
             skip_training = old_loss < _LOG_SKIP_TRAINING_VALUE and self.index > 10
             if np.isfinite(old_loss) and skip_training:
-                if self._verbose:
-                    print(f"Loss is low ({old_loss}), skipping training")
+                self._report(
+                    n_draws,
+                    f"log F  current {_format_log_f(old_loss)}  -> keep flow, "
+                    f"already below {_format_log_f(_LOG_SKIP_TRAINING_VALUE)}",
+                )
                 return
 
             fit, fit_losses, opt_state = fit_flow(
@@ -1222,7 +1272,8 @@ class TransformAdapter:
                 gradients,
                 logps,
                 show_progress=self._show_progress,
-                verbose=self._verbose,
+                verbose=self._verbose >= 2,
+                lm_print_blocks=self._verbose >= 2 and not self._printed_lm_blocks,
                 optimizer=self._optimizer,
                 batch_size=self._batch_size,
                 opt_state=self._opt_state if self._reuse_opt_state else None,
@@ -1243,10 +1294,17 @@ class TransformAdapter:
                 lm_forcing=self._lm_forcing,
                 lm_lam0=self._lm_lam,
                 lm_exact_blocks=self._lm_exact_blocks,
+                lm_max_exact_block_size=self._lm_max_exact_block_size,
             )
             # Kept even if the fit is discarded below: the damping scale says
-            # something about the problem, whether or not this fit won.
-            self._lm_lam = fit_losses.get("lm_lam", self._lm_lam)
+            # something about the problem, whether or not this fit won. But
+            # not from a fit that made no progress at all, where every
+            # rejected step only raised it.
+            no_progress = fit_losses.get("lm_accepted") == 0
+            if not no_progress:
+                self._lm_lam = fit_losses.get("lm_lam", self._lm_lam)
+            if self._method == "lm":
+                self._printed_lm_blocks = True
 
             flow = flowjax.flows.Transformed(
                 flowjax.distributions.StandardNormal(fit.shape), fit
@@ -1257,10 +1315,20 @@ class TransformAdapter:
                 params, static, positions[-128:], gradients[-128:], logps[-128:]
             )
 
-            if self._verbose:
-                print(f"Chain {self._chain}: New loss {new_loss}, old loss {old_loss}")
+            def report(decision):
+                steps = fit_losses.get("lm_steps")
+                self._report(
+                    n_draws,
+                    f"log F  current {_format_log_f(old_loss)}  "
+                    f"refit {_format_log_f(new_loss)}  -> {decision}"
+                    + (
+                        ""
+                        if steps is None
+                        else f"  ({steps} LM step{'' if steps == 1 else 's'})"
+                    ),
+                )
 
-            if not np.isfinite(old_loss):
+            if self._verbose >= 2 and not np.isfinite(old_loss):
                 flow = flowjax.flows.Transformed(
                     flowjax.distributions.StandardNormal(self._bijection.shape),
                     self._bijection,
@@ -1277,7 +1345,7 @@ class TransformAdapter:
                     )
                 )
 
-            if not np.isfinite(new_loss):
+            if self._verbose >= 2 and not np.isfinite(new_loss):
                 flow = flowjax.flows.Transformed(
                     flowjax.distributions.StandardNormal(fit.shape), fit
                 )
@@ -1310,7 +1378,12 @@ class TransformAdapter:
                     and np.isfinite(grad[0]).all()
                 )
 
+            if no_progress:
+                report("keep flow, no LM step accepted")
+                return
+
             if (not np.isfinite(old_loss)) and (not np.isfinite(new_loss)):
+                report("reset to a diagonal flow, both are invalid")
                 self._bijection = self._make_flow_fn(
                     seed, positions, gradients, n_layers=0
                 )
@@ -1318,18 +1391,18 @@ class TransformAdapter:
                 return
 
             if not valid_new_logp():
-                if self._verbose:
-                    print("Invalid new logp. Skipping update.")
+                report("keep old flow, refit gives an invalid transform")
                 return
 
             if not np.isfinite(new_loss):
-                if self._verbose:
-                    print("Invalid new loss. Skipping update.")
+                report("keep old flow, refit is invalid")
                 return
 
             if new_loss > old_loss:
+                report("keep old flow, refit is worse")
                 return
 
+            report("replace flow")
             self._bijection = fit
             self._opt_state = opt_state
 
@@ -1404,10 +1477,7 @@ class TransformAdapter:
     def init_from_untransformed_position(self, untransformed_position, clip):
         try:
             logp, logdet, *arrays = _init_from_untransformed_position(
-                self._logp_fn,
-                self._bijection,
-                jnp.array(untransformed_position),
-                clip
+                self._logp_fn, self._bijection, jnp.array(untransformed_position), clip
             )
             arrays = [np.array(val, dtype="float64") for val in arrays]
             return float(logp), float(logdet), *arrays
@@ -1478,6 +1548,7 @@ def make_transform_adapter(
     lm_probe_batch=32,
     lm_probes=1024,
     lm_residual_batch=128,
+    lm_cholesky_jitter=None,
     lm_probe_groups=None,
     lm_probe_rounds=1,
     lm_fit_affine=False,
@@ -1485,6 +1556,7 @@ def make_transform_adapter(
     lm_line_search=True,
     lm_forcing="residual",
     lm_exact_blocks=True,
+    lm_max_exact_block_size=256,
     native_flow=True,
 ):
     if extension_windows is None:
@@ -1543,6 +1615,7 @@ def make_transform_adapter(
         lm_probe_batch=lm_probe_batch,
         lm_probes=lm_probes,
         lm_residual_batch=lm_residual_batch,
+        lm_cholesky_jitter=lm_cholesky_jitter,
         lm_probe_groups=lm_probe_groups,
         lm_probe_rounds=lm_probe_rounds,
         lm_fit_affine=lm_fit_affine,
@@ -1550,5 +1623,6 @@ def make_transform_adapter(
         lm_line_search=lm_line_search,
         lm_forcing=lm_forcing,
         lm_exact_blocks=lm_exact_blocks,
+        lm_max_exact_block_size=lm_max_exact_block_size,
         native_flow=native_flow,
     )
