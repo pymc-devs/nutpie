@@ -257,13 +257,14 @@ class CompiledStanModel(CompiledModel):
         extra_callback,
         extra_callback_rate,
         store,
+        stop_event=None,
     ):
         compiled = self if self.model is not None else self.with_data()
         model = compiled._model_with_init()
 
         outer_kwargs = {
             **(compiled._transform_adapt_args or {}),
-            **compiled._flow_structure_kwargs(settings),
+            **compiled._adapter_kwargs(settings, stop_event),
         }
 
         def make_adapter(*args, **kwargs):
