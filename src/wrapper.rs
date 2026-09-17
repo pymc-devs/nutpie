@@ -20,6 +20,7 @@ use nuts_rs::{
     ArrowConfig, ArrowTrace, ChainProgress, DiagMclmcSettings, DiagNutsSettings, FlowMclmcSettings,
     FlowNutsSettings, KineticEnergyKind, LowRankMclmcSettings, LowRankNutsSettings,
     MclmcTrajectoryKind, Model, ProgressCallback, Sampler, SamplerWaitResult, StepSizeAdaptMethod,
+    WalnutsEnergyCriterion,
 };
 use pyo3::{
     exceptions::{PyAttributeError, PyTimeoutError, PyValueError},
@@ -593,6 +594,50 @@ impl PyNutsSettings {
             "extra_doublings" => {
                 let value: u64 = value.extract()?;
                 set_all_settings_field!(self, NutsSettingsKind, extra_doublings = value);
+            }
+            "walnuts" => {
+                let value: bool = value.extract()?;
+                with_all_settings_mut!(self, NutsSettingsKind, settings => {
+                    settings.walnuts = if value {
+                        Some(settings.walnuts.unwrap_or_default())
+                    } else {
+                        None
+                    };
+                });
+            }
+            "walnuts_max_step_halvings" => {
+                let value: u64 = value.extract()?;
+                with_all_settings_mut!(self, NutsSettingsKind, settings => {
+                    settings.walnuts.get_or_insert_default().max_step_halvings = value;
+                });
+            }
+            "walnuts_max_error" => {
+                let value: f64 = value.extract()?;
+                with_all_settings_mut!(self, NutsSettingsKind, settings => {
+                    settings.walnuts.get_or_insert_default().max_error = value;
+                });
+            }
+            "walnuts_min_micro_steps" => {
+                let value: u64 = value.extract()?;
+                with_all_settings_mut!(self, NutsSettingsKind, settings => {
+                    settings.walnuts.get_or_insert_default().min_micro_steps = value;
+                });
+            }
+            "walnuts_energy_criterion" => {
+                let value: String = value.extract()?;
+                let value = match value.as_str() {
+                    "max_min" => WalnutsEnergyCriterion::MaxMin,
+                    "endpoint" => WalnutsEnergyCriterion::Endpoint,
+                    _ => {
+                        return Err(PyValueError::new_err(format!(
+                            "Unknown walnuts_energy_criterion: {value}. \
+                             Expected 'max_min' or 'endpoint'."
+                        )))
+                    }
+                };
+                with_all_settings_mut!(self, NutsSettingsKind, settings => {
+                    settings.walnuts.get_or_insert_default().energy_criterion = value;
+                });
             }
             _ => {
                 if try_shared_euclidean_adapt_update!(self, NutsSettingsKind, name, value) {

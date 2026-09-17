@@ -1193,6 +1193,26 @@ def sample(
         The maximum depth of the tree for each draw. The maximum
         number of gradient evaluations for each draw will
         be 2 ^ maxdepth.
+    walnuts: bool, default=False
+        Use WALNUTS (within-orbit adaptive step sizes) instead of plain
+        NUTS: each leapfrog step is split into smaller micro steps if
+        needed to keep the energy error below ``walnuts_max_error``.
+        Only for ``sampler="nuts"``, and not supported together with
+        ``microcanonical_trajectory``. *Experimental.*
+    walnuts_max_error: float > 0, default=0.5
+        Maximum error of the Hamiltonian within a macro step.
+    walnuts_max_step_halvings: int, default=5
+        Maximum number of times the micro step size is halved. If the
+        macro step is still not within tolerance, it counts as a
+        divergence.
+    walnuts_min_micro_steps: int > 0, default=1
+        Number of micro steps in the first attempt of each macro step.
+    walnuts_energy_criterion: {"max_min", "endpoint"}, default="max_min"
+        How the energy error of a macro step is measured: ``"max_min"``
+        uses ``max H - min H`` over all micro steps, ``"endpoint"`` uses
+        ``|H(end) - H(start)|``.
+
+        Setting any of the ``walnuts_*`` options enables WALNUTS.
     return_raw_trace: bool, default=False
         Return the raw trace object (an apache arrow structure)
         instead of converting to arviz.
