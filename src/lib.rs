@@ -5,6 +5,7 @@ mod pyfunc;
 mod pymc;
 #[cfg(feature = "stan")]
 mod stan;
+mod symbolic;
 mod triangular;
 mod wrapper;
 
