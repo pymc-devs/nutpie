@@ -16,7 +16,12 @@ from numpy.typing import NDArray
 
 from nutpie import _lib
 from nutpie.compiled_pyfunc import SeedType, from_pyfunc
-from nutpie.sample import CompiledModel, _flatten_point, _wrap_init_point_fn
+from nutpie.sample import (
+    CompiledModel,
+    _check_reserved_names,
+    _flatten_point,
+    _wrap_init_point_fn,
+)
 from nutpie.sparsity import variables_from_layout
 
 try:
@@ -244,6 +249,7 @@ class CompiledPyMCModel(CompiledModel):
             coords,
             self._make_init_point_func(),
             make_adapter,
+            self._unconstrained_names,
         )
 
     def with_transform_adapt(self, **kwargs):
@@ -399,7 +405,9 @@ def _compile_pymc_model_numba(
 
         expand_numba = numba.cfunc(c_sig_expand, **kwargs)(expand_numba_raw)
 
-    dims, coords = _prepare_dims_and_coords(model, shape_info, reparameterized_names)
+    dims, coords, unconstrained_names = _prepare_dims_and_coords(
+        model, shape_info, reparameterized_names
+    )
 
     return CompiledPyMCModel(
         _n_dim=n_dim,
@@ -417,6 +425,7 @@ def _compile_pymc_model_numba(
         logp_func=logp_fn_pt,
         expand_func=expand_fn_pt,
         reparameterized_names=reparameterized_names,
+        _unconstrained_names=unconstrained_names,
     )
 
 
@@ -427,19 +436,15 @@ def _prepare_dims_and_coords(model, shape_info, reparameterized_names):
             vals = pd.RangeIndex(int(model.dim_lengths[name].eval()))
         coords[name] = pd.Index(vals)
 
-    if "unconstrained_parameter" in coords:
-        raise ValueError("Model contains invalid name 'unconstrained_parameter'.")
-
-    names = []
+    unconstrained_names = []
     for base, _, shape in zip(*shape_info):
         if base not in [var.name for var in model.value_vars]:
             continue
         for idx in itertools.product(*[range(length) for length in shape]):
             if len(idx) == 0:
-                names.append(base)
+                unconstrained_names.append(base)
             else:
-                names.append(f"{base}_{'.'.join(str(i) for i in idx)}")
-    coords["unconstrained_parameter"] = pd.Index(names)
+                unconstrained_names.append(f"{base}_{'.'.join(str(i) for i in idx)}")
 
     names, _, shape_list = shape_info
 
@@ -457,7 +462,8 @@ def _prepare_dims_and_coords(model, shape_info, reparameterized_names):
         if shape_by_name.get(rv_name) == shape_by_name.get(value_name):
             dims[value_name] = rv_dims
 
-    return dims, coords
+    _check_reserved_names(coords, dims)
+    return dims, coords, unconstrained_names
 
 
 def _compile_pymc_model_jax(
@@ -555,7 +561,9 @@ def _compile_pymc_model_jax(
 
         return expand
 
-    dims, coords = _prepare_dims_and_coords(model, shape_info, reparameterized_names)
+    dims, coords, unconstrained_names = _prepare_dims_and_coords(
+        model, shape_info, reparameterized_names
+    )
 
     return from_pyfunc(
         ndim=n_dim,
@@ -571,6 +579,7 @@ def _compile_pymc_model_jax(
         coords=coords,
         raw_logp_fn=orig_logp_fn,
         reparameterized_names=reparameterized_names,
+        unconstrained_names=unconstrained_names,
     )
 
 
