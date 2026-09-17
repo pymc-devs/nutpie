@@ -79,6 +79,12 @@ class TriangularLayout:
             dependency chain, which vectorizes directly.
         layer_out: output width of each MLP layer; the last one is the number
             of transformer parameters.
+        skip_weight, skip_index: the conditioners' linear skip to the
+            transformer location (see `LocationSkipMlp`), one weight per
+            parent, aligned with `parent_index`: variable ``i`` adds
+            ``skip_weight[j] * y[parent_index[j]]`` over its parents ``j`` to
+            conditioner output `skip_index`. All zeros (and `skip_index` 0)
+            for conditioners without one, which leaves the output unchanged.
         level_ptr, level_vars: elimination levels, as a second CSR. Variables
             within a level are mutually independent and may be evaluated in any
             order or in parallel; levels must be visited in order.
@@ -91,6 +97,8 @@ class TriangularLayout:
     blob: np.ndarray
     blob_offset: np.ndarray
     layer_out: np.ndarray
+    skip_weight: np.ndarray
+    skip_index: int
     activation: str
     transformer: tuple[Contract2Spec, ...]
     level_ptr: np.ndarray
@@ -150,8 +158,10 @@ def _chain_layers(transformer):
     """The `Contract2` layers of a transformer, as a list of field dicts."""
     from flowjax import bijections
 
-    from nutpie.normalizing_flow import Contract2
+    from nutpie.normalizing_flow import Contract2, ElementwiseTransformer
 
+    if isinstance(transformer, ElementwiseTransformer):
+        transformer = transformer.chain
     if isinstance(transformer, bijections.Chain):
         layers = list(transformer.bijections)
     else:
@@ -241,7 +251,7 @@ def extract_layout(flow_map) -> TriangularLayout:
     Raises `NotImplementedError` if the map uses a transformer or activation
     the compiled backends do not know how to reproduce.
     """
-    from nutpie.triangular import SparseTriangularMap
+    from nutpie.triangular import LocationSkipMlp, SparseTriangularMap
 
     if not isinstance(flow_map, SparseTriangularMap):
         raise TypeError(
@@ -251,7 +261,23 @@ def extract_layout(flow_map) -> TriangularLayout:
     (dim,) = flow_map.shape
     n_buckets = len(flow_map.conditioners)
 
-    reference = flow_map.conditioners[0]
+    skips = [
+        conditioner if isinstance(conditioner, LocationSkipMlp) else None
+        for conditioner in flow_map.conditioners
+    ]
+    mlps = [
+        conditioner if skip is None else skip.mlp
+        for conditioner, skip in zip(flow_map.conditioners, skips)
+    ]
+    skip_indices = {None if skip is None else skip.location_index for skip in skips}
+    if len(skip_indices) != 1:
+        raise NotImplementedError(
+            "All conditioner buckets must agree on the location skip."
+        )
+    (skip_index,) = skip_indices
+    skip_index = 0 if skip_index is None else int(skip_index)
+
+    reference = mlps[0]
     n_layers = len(reference.layers)
     activation = _activation_name(reference.activation)
     if not _is_identity(reference.final_activation):
@@ -264,8 +290,7 @@ def extract_layout(flow_map) -> TriangularLayout:
     )
     num_params = int(layer_out[-1])
 
-    for bucket in range(n_buckets):
-        mlp = flow_map.conditioners[bucket]
+    for mlp in mlps:
         if len(mlp.layers) != n_layers or mlp.activation is not reference.activation:
             raise NotImplementedError(
                 "All conditioner buckets must share the same depth and activation."
@@ -289,6 +314,7 @@ def extract_layout(flow_map) -> TriangularLayout:
     n_parents = np.zeros(dim, dtype=np.int64)
     parents_of: list[np.ndarray | None] = [None] * dim
     weights_of: list[np.ndarray | None] = [None] * dim
+    skip_of: list[np.ndarray | None] = [None] * dim
 
     for bucket in range(n_buckets):
         members = np.asarray(flow_map.bucket_members[bucket])
@@ -298,8 +324,13 @@ def extract_layout(flow_map) -> TriangularLayout:
                 np.asarray(layer.weight, dtype=np.float64),
                 np.asarray(layer.bias, dtype=np.float64),
             )
-            for layer in flow_map.conditioners[bucket].layers
+            for layer in mlps[bucket].layers
         ]
+        skip = (
+            None
+            if skips[bucket] is None
+            else np.asarray(skips[bucket].skip, dtype=np.float64)
+        )
         for local, variable in enumerate(members):
             variable = int(variable)
             row = parent_indices[local]
@@ -310,6 +341,10 @@ def extract_layout(flow_map) -> TriangularLayout:
                 )
             n_parents[variable] = len(real)
             parents_of[variable] = real
+            # Real parents fill the leading slots, as for the first layer.
+            skip_of[variable] = (
+                np.zeros(len(real)) if skip is None else skip[local, : len(real)]
+            )
 
             parts = []
             for layer_index, (weight, bias) in enumerate(layers):
@@ -334,6 +369,7 @@ def extract_layout(flow_map) -> TriangularLayout:
         if dim
         else np.zeros(0, dtype=np.int64)
     )
+    skip_weight = np.concatenate(skip_of) if dim else np.zeros(0)
 
     sizes = np.array([len(part) for part in weights_of], dtype=np.int64)
     blob_offset = np.zeros(dim + 1, dtype=np.int64)
@@ -352,6 +388,8 @@ def extract_layout(flow_map) -> TriangularLayout:
         blob=blob,
         blob_offset=blob_offset,
         layer_out=layer_out,
+        skip_weight=skip_weight,
+        skip_index=skip_index,
         activation=activation,
         transformer=transformer,
         level_ptr=level_ptr,

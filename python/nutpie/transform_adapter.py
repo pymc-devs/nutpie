@@ -67,6 +67,10 @@ def fit_to_data(
     lm_min_loss: float = float(np.exp(-3)),
     lm_probe_batch: int = 32,
     lm_probes: int = 64,
+    lm_probe_groups: int | None = None,
+    lm_probe_rounds: int = 1,
+    lm_fit_affine: bool = False,
+    lm_patience: int = 5,
 ):
     r"""Train a distribution (e.g. a flow) to samples from the target distribution.
 
@@ -131,6 +135,22 @@ def fit_to_data(
             (and multiplies with the residual function's own internal
             batching). Lowering it trades sequential chunks for peak memory at
             no extra FLOPs. Only used when ``method`` is ``"lm"``.
+        lm_probe_groups: If given, estimate the block preconditioner from
+            per-group probes instead (see `lmopt.build_blocks_grouped`): the
+            draws are split into this many groups, each probed separately, so
+            one round yields this many samples for about the cost of a single
+            ``lm_probes`` probe plus one forward pass. ``lm_probes`` then only
+            sets the sub-block size, and ``lm_probe_batch`` counts groups
+            rather than probes. ``None`` keeps the all-draws probes. Only used
+            when ``method`` is ``"lm"``.
+        lm_probe_rounds: Rounds of per-group probes, each an independent set
+            of ``lm_probe_groups`` samples. Only used with ``lm_probe_groups``.
+        lm_fit_affine: Whether LM also fits the flow's diagonal affine layer.
+            By default it stays at its initialization (see
+            `lmopt.split_frozen`). Only used when ``method`` is ``"lm"``.
+        lm_patience: Stop the LM fit once this many consecutive steps have
+            together lowered the loss by less than a fraction
+            ``solver_rtol`` of it. Only used when ``method`` is ``"lm"``.
         lm_min_loss: Stop the LM fit once the Fisher divergence falls below
             this. Note that the divergence is a *sum* over dimensions, so this
             is an absolute, dimension-independent target: it bounds each
@@ -163,6 +183,10 @@ def fit_to_data(
                 "min_loss": lm_min_loss,
                 "probe_batch": lm_probe_batch,
                 "probes": lm_probes,
+                "probe_groups": lm_probe_groups,
+                "probe_rounds": lm_probe_rounds,
+                "fit_affine": lm_fit_affine,
+                "patience": lm_patience,
             }
             if method == "lm"
             else {}
@@ -296,6 +320,10 @@ def _fit_lm(
     min_loss,
     probe_batch,
     probes,
+    probe_groups,
+    probe_rounds,
+    fit_affine,
+    patience,
 ):
     if not hasattr(loss_fn, "residuals"):
         raise ValueError(
@@ -308,7 +336,13 @@ def _fit_lm(
     theta, hist = fit(
         params,
         res_fn,
-        (loss_fn, static, *data),
+        (loss_fn, static),
+        data=data,
+        n_groups=probe_groups,
+        rounds=probe_rounds,
+        fit_affine=fit_affine,
+        rtol=rtol,
+        patience=patience,
         n_steps=max_steps,
         verbose=True,
         min_loss=min_loss,
@@ -803,6 +837,10 @@ class TransformAdapter:
         lm_probe_batch=32,
         lm_probes=64,
         lm_residual_batch=256,
+        lm_probe_groups=None,
+        lm_probe_rounds=1,
+        lm_fit_affine=True,
+        lm_patience=5,
     ):
         self._logp_fn = logp_fn
         self._make_flow_fn = make_flow_fn
@@ -819,7 +857,7 @@ class TransformAdapter:
             self._make_optimizer = make_optimizer
         self._optimizer = self._make_optimizer()
         self._loss_fn = FisherLoss(
-            gamma, log_inside_batch, residual_batch_size=lm_residual_batch
+            gamma, log_inside_batch, residual_batch_size=lm_residual_batch, huber_delta=None,
         )
         self._fisher_ema = None
         self._fisher_ema_alpha = fisher_ema_alpha
@@ -846,6 +884,10 @@ class TransformAdapter:
         self._lm_min_loss = lm_min_loss
         self._lm_probe_batch = lm_probe_batch
         self._lm_probes = lm_probes
+        self._lm_probe_groups = lm_probe_groups
+        self._lm_probe_rounds = lm_probe_rounds
+        self._lm_fit_affine = lm_fit_affine
+        self._lm_patience = lm_patience
 
         if extension_windows is None:
             self._extension_windows = []
@@ -1111,6 +1153,10 @@ class TransformAdapter:
                 lm_min_loss=self._lm_min_loss,
                 lm_probe_batch=self._lm_probe_batch,
                 lm_probes=self._lm_probes,
+                lm_probe_groups=self._lm_probe_groups,
+                lm_probe_rounds=self._lm_probe_rounds,
+                lm_fit_affine=self._lm_fit_affine,
+                lm_patience=self._lm_patience,
             )
 
             flow = flowjax.flows.Transformed(
@@ -1323,6 +1369,7 @@ def make_transform_adapter(
     reuse_embed=True,
     order=None,
     sparsity=None,
+    location_skip=True,
     method="adam",
     solver_rtol=1e-3,
     solver_atol=1e-6,
@@ -1331,6 +1378,10 @@ def make_transform_adapter(
     lm_probe_batch=32,
     lm_probes=64,
     lm_residual_batch=256,
+    lm_probe_groups=None,
+    lm_probe_rounds=1,
+    lm_fit_affine=False,
+    lm_patience=5,
 ):
     if extension_windows is None:
         extension_windows = []
@@ -1358,6 +1409,7 @@ def make_transform_adapter(
             reuse_embed=reuse_embed,
             order=order,
             sparsity=sparsity,
+            location_skip=location_skip,
         ),
         show_progress=show_progress,
         num_diag_windows=num_diag_windows,
@@ -1387,4 +1439,8 @@ def make_transform_adapter(
         lm_probe_batch=lm_probe_batch,
         lm_probes=lm_probes,
         lm_residual_batch=lm_residual_batch,
+        lm_probe_groups=lm_probe_groups,
+        lm_probe_rounds=lm_probe_rounds,
+        lm_fit_affine=lm_fit_affine,
+        lm_patience=lm_patience,
     )

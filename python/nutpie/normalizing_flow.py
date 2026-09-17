@@ -1360,8 +1360,8 @@ def _bounded_log_gamma(unbounded, low, high):
 
     A shifted, scaled logistic, chosen so that ``f(0) = 0`` and ``f'(0) = 1``:
     the map is unchanged to first order around the identity, so zero-init and
-    anything calibrated against the unbounded parameterization (notably
-    `init_conditioners_from_precision`) still see the same local scaling. It
+    anything calibrated against the unbounded parameterization still see the
+    same local scaling. It
     is ``C^inf`` and strictly monotone, and handles asymmetric bounds --
     ``low < 0 < high`` is required, since ``log gamma = 0`` is the identity
     and has to stay reachable in the interior.
@@ -1624,6 +1624,37 @@ class Activation(eqx.Module):
         return self.fn(*args)
 
 
+class ElementwiseTransformer(bijections.AbstractBijection):
+    """A `make_transformer` chain that knows which parameter is its location.
+
+    The location is a parameter entering the forward map purely additively,
+    ``transform(x) = T0(x) + location``, so in the density direction it is the
+    shift ``y - location`` applied directly to the model-space value.
+    Conditioners use it to route a linear function of the parents straight to
+    the conditional mean (see `SparseTriangularMap`).
+
+    `location_field` is ``(layer, field)``: the location is attribute `field`
+    of ``chain.bijections[layer]``. `None` if the chain has no such parameter.
+    """
+
+    chain: bijections.Chain
+    location_field: tuple[int, str] | None = eqx.field(static=True)
+    shape: tuple[int, ...] = ()
+    cond_shape: tuple[int, ...] | None = None
+
+    def location(self):
+        if self.location_field is None:
+            return None
+        layer, field = self.location_field
+        return getattr(self.chain.bijections[layer], field)
+
+    def transform_and_log_det(self, x, condition=None):
+        return self.chain.transform_and_log_det(x, condition)
+
+    def inverse_and_log_det(self, y, condition=None):
+        return self.chain.inverse_and_log_det(y, condition)
+
+
 def make_transformer(
     affine_transformer=False,
     contract_transformer=True,
@@ -1673,6 +1704,12 @@ def make_transformer(
             layer's ``log gamma``, see that class. Note the bound is per
             layer and log gamma adds along a chain, so ``n`` layers bounded at
             ``high`` reach ``n * high`` overall.
+
+    Returns:
+        An `ElementwiseTransformer`, whose location is the last layer's output
+        shift: the last `Contract2`'s ``mu``, or the `Affine`'s ``loc`` when
+        that is the only layer kind. None if the chain ends in an inverted
+        `AsymmetricAffine`.
     """
     n_affine = int(affine_transformer)
     n_contract = int(contract_transformer)
@@ -1735,9 +1772,18 @@ def make_transformer(
             )
         )
 
-    if len(elemwises) == 1:
-        return elemwises[0]
-    return bijections.Chain(elemwises)
+    # The location is the last layer's output shift, which nothing after it
+    # undoes. `Contract2` ends in ``+ mu`` and `Affine` in ``+ loc``; the
+    # inverted `AsymmetricAffine` has only an *input* shift, so a chain ending
+    # in one has no location.
+    last = elemwises[-1]
+    if isinstance(last, Contract2):
+        location_field = (len(elemwises) - 1, "mu")
+    elif isinstance(last, bijections.Affine):
+        location_field = (len(elemwises) - 1, "loc")
+    else:
+        location_field = None
+    return ElementwiseTransformer(bijections.Chain(elemwises), location_field)
 
 
 def make_twin_flow_scan(
@@ -2130,8 +2176,7 @@ def make_sparse_triangular_map(
     nn_width=None,
     nn_depth=None,
     activation,
-    init_draws: ArrayLike | None = None,
-    init_grads: ArrayLike | None = None,
+    location_skip=True,
 ):
     """Build a `SparseTriangularMap` bijection for the given ordering.
 
@@ -2158,20 +2203,13 @@ def make_sparse_triangular_map(
             precision as ``Lambda = C^T C`` rather than ``L L^T``. See
             `SparseTriangularMap` for the full argument. Reversing costs no
             fill: the fill count is the one the elimination order achieved.
-        init_draws: Optional ``(n_draws, n_dim)`` array of draws, in the same
-            coordinates the map itself sees (i.e. already standardized by any
-            preceding affine layer, but *not* permuted by ``order``). If
-            given, the conditioners are initialized to the exactly
-            Fisher-optimal linear map for these draws instead of to the
-            identity, see `fisher_optimal_precision`. Must be passed together
-            with `init_grads`.
-        init_grads: Gradients of the target log density at `init_draws`, in
-            the same coordinates.
         sparsity: ``(n_dim, n_dim)`` array convertible to boolean, the
             Markov-blanket adjacency matrix, see `SparseTriangularMap`.
             ``sparsity[i, j]`` being truthy means ``j`` may be used to
             parameterize the transform of ``i``, provided ``j`` precedes
             ``i`` in ``order``.
+        location_skip: Linear map from each variable's parents straight to
+            its transformer location, see `SparseTriangularMap`.
     """
     if nn_width is None:
         nn_width = 16
@@ -2202,26 +2240,10 @@ def make_sparse_triangular_map(
         nn_width=nn_width,
         nn_depth=nn_depth,
         nn_activation=activation,
+        location_skip=location_skip,
     )
     if zero_init:
         layer = zero_init_conditioners(layer)
-
-    if init_draws is not None:
-        if init_grads is None:
-            raise ValueError("init_draws and init_grads must be given together.")
-        init_draws = np.asarray(init_draws, dtype=np.float64)
-        init_grads = np.asarray(init_grads, dtype=np.float64)
-        if init_draws.shape != init_grads.shape or init_draws.shape[1:] != (n_dim,):
-            raise ValueError(
-                "init_draws and init_grads must both have shape (n_draws, "
-                f"{n_dim}), got {init_draws.shape} and {init_grads.shape}."
-            )
-        precision, center = fisher_optimal_precision(
-            init_draws[:, order],
-            init_grads[:, order],
-            sparsity_sorted,
-        )
-        layer = init_conditioners_from_precision(layer, precision, center)
 
     layer = bijections.Sandwich(layer, bijections.Permute(jnp.asarray(order)))
 
@@ -2409,85 +2431,6 @@ def reverse_cholesky(matrix):
     return sp.csc_matrix(factor).T[rev][:, rev]
 
 
-def init_conditioners_from_precision(
-    layer: SparseTriangularMap, precision, center=None
-):
-    """Set `layer`'s conditioners to the affine map with this precision.
-
-    ``layer.inverse_and_log_det`` applies, per variable ``k``,
-    ``w_k = sigma_k * s_k + mu_k`` with ``(mu_k, sigma_k)`` the first two
-    outputs of ``k``'s conditioner (`make_transformer`'s asymmetric
-    transformer is used inverted, and is affine at ``theta = 1``). Matching
-    that against ``w = C (s - center)`` gives ``sigma_k = C_kk`` and
-    ``mu_k = sum_{l<k} C_kl s_l - (C center)_k``, so the conditioner is
-    exactly affine in its parents: weight row 0 holds ``C_kl``, its bias
-    holds ``-(C center)_k``, and the scale is a bias. All remaining
-    conditioner outputs (asymmetry, and the trailing `Contract2` parameters)
-    stay at zero, where the transformer is affine.
-    """
-    factor = reverse_cholesky(precision).toarray()
-    dim = factor.shape[0]
-    if center is None:
-        center = np.zeros(dim)
-    intercept = -(factor @ np.asarray(center, dtype=np.float64))
-
-    diag = np.diag(factor)
-    if not (diag > 0).all():
-        raise ValueError("reverse Cholesky produced a non-positive diagonal.")
-    # scale = x + sqrt(1 + x**2), inverted.
-    scale_params = (diag - 1.0 / diag) / 2.0
-
-    conditioners = []
-    for bucket, conditioner in enumerate(layer.conditioners):
-        members = np.asarray(layer.bucket_members[bucket])
-        parents = np.asarray(layer.bucket_parent_indices[bucket])
-
-        linear = (
-            conditioner.linear
-            if isinstance(conditioner, SumLinearAndMlp)
-            else conditioner
-        )
-        weight = np.zeros(linear.weight.shape, dtype=np.float64)
-        bias = np.zeros(linear.bias.shape, dtype=np.float64)
-
-        # `dim` is the sentinel parent index reading a constant zero, so
-        # padded slots keep a zero weight.
-        valid = parents < dim
-        rows = np.broadcast_to(members[:, None], parents.shape)
-        weight[:, 0, :] = np.where(
-            valid, factor[rows, np.minimum(parents, dim - 1)], 0.0
-        )
-        bias[:, 0] = intercept[members]
-        bias[:, 1] = scale_params[members]
-
-        linear = eqx.tree_at(
-            lambda net: (net.weight, net.bias),
-            linear,
-            (
-                jnp.asarray(weight, dtype=linear.weight.dtype),
-                jnp.asarray(bias, dtype=linear.bias.dtype),
-            ),
-        )
-
-        if isinstance(conditioner, SumLinearAndMlp):
-            # The linear part now *is* the map we were asked to install, so
-            # the MLP has to start at exactly zero output rather than merely
-            # small (as `zero_init_conditioners` leaves it). Only the output
-            # layer is zeroed, so hidden layers -- and the gradients flowing
-            # back through them -- keep their normal scale.
-            conditioner = eqx.tree_at(
-                lambda net: net.mlp,
-                conditioner,
-                _scale_last_layer(conditioner.mlp, 0.0),
-            )
-            conditioner = eqx.tree_at(lambda net: net.linear, conditioner, linear)
-        else:
-            conditioner = linear
-        conditioners.append(conditioner)
-
-    return eqx.tree_at(lambda layer: layer.conditioners, layer, tuple(conditioners))
-
-
 def make_flow(
     seed,
     positions,
@@ -2514,7 +2457,7 @@ def make_flow(
     reuse_embed=False,
     order: ArrayLike | None = None,
     sparsity: ArrayLike | None = None,
-    fisher_init: bool = False,
+    location_skip: bool = True,
 ):
     if activation is None:
         activation = jax.nn.leaky_relu
@@ -2654,25 +2597,16 @@ def make_flow(
             )
         if order is None:
             order = np.arange(n_dim)
-        # `diag_affine` is applied *after* the triangular map in the forward
-        # direction, so the map itself sees standardized coordinates:
-        # `s = (m - mean) / diag`, and correspondingly `g_s = g * diag`.
-        init_draws = init_grads = None
-        if fisher_init:
-            diag_np = np.asarray(diag)
-            init_draws = (positions - np.asarray(mean)) / diag_np
-            init_grads = gradients * diag_np
         inner = make_sparse_triangular_map(
             key,
             n_dim,
             order=order,
             sparsity=sparsity,
             zero_init=zero_init,
-            init_draws=init_draws,
-            init_grads=init_grads,
             nn_width=nn_width,
             nn_depth=nn_depth,
             activation=activation,
+            location_skip=location_skip,
         )
     else:
         raise ValueError(f"Unknown flow kind: {kind}")

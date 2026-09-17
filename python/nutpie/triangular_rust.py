@@ -23,6 +23,18 @@ Usage::
 
     fn = compile_transform(sparse_triangular_map)
     y, log_det = fn.transform_and_log_det(x)
+
+For the leapfrog step the value alone is not enough -- the model's gradient has
+to come back through the map -- so the forward pass can also record the sparse
+Jacobian and pull a cotangent back through it::
+
+    y, log_det = fn.transform_and_log_det(x, record=True)
+    logp, grad_y = model(y)                 # between the two halves
+    grad_x = fn.pullback(grad_y)            # J^T grad_y + grad of log_det
+
+`J = dy/dx` is dense (it inverts a sparse triangular matrix), but it is never
+formed: `J = (I - A)^-1 D` with `A` as sparse as the blanket, so `pullback` is
+one reverse sweep over the DAG. See `Tape` in `src/triangular.rs`.
 """
 
 from __future__ import annotations
@@ -97,6 +109,8 @@ def compile_transform(
         blob=np.asarray(layout.blob, dtype=np.float64),
         blob_offset=np.asarray(layout.blob_offset, dtype=np.int64),
         layer_out=np.asarray(layout.layer_out, dtype=np.int64),
+        skip_weight=np.asarray(layout.skip_weight, dtype=np.float64),
+        skip_index=int(layout.skip_index),
         activation=layout.activation,
         transformer=transformer,
         level_ptr=np.asarray(layout.level_ptr, dtype=np.int64),
