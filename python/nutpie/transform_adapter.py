@@ -71,6 +71,9 @@ def fit_to_data(
     lm_probe_rounds: int = 1,
     lm_fit_affine: bool = False,
     lm_patience: int = 5,
+    lm_line_search: bool = False,
+    lm_forcing: str = "residual",
+    lm_lam0: float | None = None,
 ):
     r"""Train a distribution (e.g. a flow) to samples from the target distribution.
 
@@ -151,6 +154,20 @@ def fit_to_data(
         lm_patience: Stop the LM fit once this many consecutive steps have
             together lowered the loss by less than a fraction
             ``solver_rtol`` of it. Only used when ``method`` is ``"lm"``.
+        lm_line_search: Shorten each LM step to the minimizer of a parabola
+            fitted along it, against the Gauss-Newton overshoot on
+            large-residual fits (see `lmopt.step`). Costs one extra residual
+            evaluation on the steps it shortens. Only used when ``method`` is
+            ``"lm"``.
+        lm_forcing: How the CG tolerance adapts between LM steps:
+            ``"residual"`` (Eisenstat-Walker choice 1) or ``"rho"``
+            (``|1 - rho|``), which keeps adapting when the loss plateaus well
+            above zero (see `lmopt.step`). Only used when ``method`` is
+            ``"lm"``.
+        lm_lam0: Initial LM damping; ``None`` uses `lmopt.fit`'s default.
+            The damping the fit ends with is returned as
+            ``losses["lm_lam"]``, so a caller refitting on similar data can
+            carry it over. Only used when ``method`` is ``"lm"``.
         lm_min_loss: Stop the LM fit once the Fisher divergence falls below
             this. Note that the divergence is a *sum* over dimensions, so this
             is an absolute, dimension-independent target: it bounds each
@@ -187,11 +204,14 @@ def fit_to_data(
                 "probe_rounds": lm_probe_rounds,
                 "fit_affine": lm_fit_affine,
                 "patience": lm_patience,
+                "line_search": lm_line_search,
+                "forcing": lm_forcing,
+                "lam0": lm_lam0,
             }
             if method == "lm"
             else {}
         )
-        params, loss_val = fit_solver(
+        result = fit_solver(
             params,
             static,
             data,
@@ -201,7 +221,10 @@ def fit_to_data(
             atol=solver_atol,
             **extra_kwargs,
         )
+        params, loss_val = result[:2]
         losses = {"train": [float(loss_val)], "val": [float(loss_val)]}
+        if method == "lm":
+            losses["lm_lam"] = result[2]
         if verbose:
             print(f"{method} loss: {loss_val}")
         dist = eqx.combine(params, static)
@@ -324,6 +347,9 @@ def _fit_lm(
     probe_rounds,
     fit_affine,
     patience,
+    line_search,
+    forcing,
+    lam0,
 ):
     if not hasattr(loss_fn, "residuals"):
         raise ValueError(
@@ -343,6 +369,9 @@ def _fit_lm(
         fit_affine=fit_affine,
         rtol=rtol,
         patience=patience,
+        line_search=line_search,
+        forcing=forcing,
+        **({} if lam0 is None else {"lam0": lam0}),
         n_steps=max_steps,
         verbose=True,
         min_loss=min_loss,
@@ -352,7 +381,7 @@ def _fit_lm(
         precondition=True,
     )
 
-    return theta, hist[-1]["F_out"]
+    return theta, hist[-1]["F_out"], float(hist[-1]["lam_out"])
 
 
 @eqx.filter_jit
@@ -841,6 +870,8 @@ class TransformAdapter:
         lm_probe_rounds=1,
         lm_fit_affine=True,
         lm_patience=5,
+        lm_line_search=False,
+        lm_forcing="residual",
     ):
         self._logp_fn = logp_fn
         self._make_flow_fn = make_flow_fn
@@ -888,6 +919,13 @@ class TransformAdapter:
         self._lm_probe_rounds = lm_probe_rounds
         self._lm_fit_affine = lm_fit_affine
         self._lm_patience = lm_patience
+        self._lm_line_search = lm_line_search
+        self._lm_forcing = lm_forcing
+        # Damping the previous LM fit ended with, to start the next one from:
+        # consecutive windows fit nearly the same problem, and restarting from
+        # `lam0` makes each fit rediscover the scale, typically overshooting on
+        # its way down.
+        self._lm_lam = None
 
         if extension_windows is None:
             self._extension_windows = []
@@ -1132,7 +1170,7 @@ class TransformAdapter:
                     print(f"Loss is low ({old_loss}), skipping training")
                 return
 
-            fit, _, opt_state = fit_flow(
+            fit, fit_losses, opt_state = fit_flow(
                 key,
                 base,
                 self._loss_fn,
@@ -1157,7 +1195,13 @@ class TransformAdapter:
                 lm_probe_rounds=self._lm_probe_rounds,
                 lm_fit_affine=self._lm_fit_affine,
                 lm_patience=self._lm_patience,
+                lm_line_search=self._lm_line_search,
+                lm_forcing=self._lm_forcing,
+                lm_lam0=self._lm_lam,
             )
+            # Kept even if the fit is discarded below: the damping scale says
+            # something about the problem, whether or not this fit won.
+            self._lm_lam = fit_losses.get("lm_lam", self._lm_lam)
 
             flow = flowjax.flows.Transformed(
                 flowjax.distributions.StandardNormal(fit.shape), fit
@@ -1382,6 +1426,8 @@ def make_transform_adapter(
     lm_probe_rounds=1,
     lm_fit_affine=False,
     lm_patience=5,
+    lm_line_search=False,
+    lm_forcing="residual",
 ):
     if extension_windows is None:
         extension_windows = []
@@ -1443,4 +1489,6 @@ def make_transform_adapter(
         lm_probe_rounds=lm_probe_rounds,
         lm_fit_affine=lm_fit_affine,
         lm_patience=lm_patience,
+        lm_line_search=lm_line_search,
+        lm_forcing=lm_forcing,
     )
