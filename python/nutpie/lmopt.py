@@ -136,8 +136,23 @@ def _scatter(S, p):
 # ============================================================ preconditioned CG
 
 
-def pcg(Av, Minv, b, x0, tol, maxiter):
-    """PCG on pytrees.  tol is ABSOLUTE on ||b - Av(x)||.  Returns (x, n_iters)."""
+def pcg(Av, Minv, b, x0, rtol, maxiter):
+    """PCG on pytrees.  Returns (x, n_iters).
+
+    The stopping test is relative and taken in the norm the preconditioner
+    induces, ``||r||_{M^-1}^2 = r . M^-1 r``: iterate until it falls below
+    ``rtol`` times the same norm of ``b``. That is the norm PCG already
+    monitors -- ``r . z`` is formed every iteration anyway, to build the next
+    search direction -- so the test costs nothing, where a Euclidean ``||r||``
+    costs a separate reduction over the whole parameter pytree per iteration.
+
+    It is also the better-scaled test here. Under Marquardt damping the block
+    curvatures span orders of magnitude, so a Euclidean residual weights each
+    block by raw parameter scale; the ``M^-1`` norm weights it by that block's
+    own curvature, which is what decides how much of the model decrease is
+    still on the table.
+    """
+    tol_sq = rtol**2 * tdot(b, Minv(b))
 
     Ax0 = Av(x0)
     bx, xAx = tdot(b, x0), tdot(x0, Ax0)
@@ -153,8 +168,10 @@ def pcg(Av, Minv, b, x0, tol, maxiter):
     #z0 = Minv(r0)
 
     def cond(c):
-        _, r, _, _, rz, k = c
-        return (tnorm(r) > tol) & (k < maxiter) & jnp.isfinite(rz)
+        # `rz` is `r . z` for the carry's own `r`, so this tests the current
+        # residual, not the previous one.
+        _, _, _, _, rz, k = c
+        return (rz > tol_sq) & (k < maxiter) & jnp.isfinite(rz)
 
     def body(c):
         x, r, p, _, rz, k = c
@@ -419,11 +436,14 @@ def step(
     *,
     rebuild_blocks: jax.Array,
     p_prev: jax.Array,
+    eta_in: jax.Array,
     m=256,
     batch=32,
     precondition=True,
     cg_tol=1e-2,
     cg_eta_max=0.5,
+    cg_gamma=0.9,
+    cg_alpha=1.618,
     cg_max=300,
     accept_rho=0.1,
     good_rho=0.75,
@@ -452,6 +472,11 @@ def step(
     flag would mean carrying two compiled variants of this function. The
     branches differ by an `m`-probe `lax.map`, far too large for XLA to
     predicate, so the untaken one really is skipped.
+
+    `eta_in` is the CG forcing term this step should use, proposed by the
+    previous step (see the Eisenstat-Walker comment below); the successor is
+    returned as ``info["cg_eta_next"]`` for `fit` to feed back. It is traced,
+    like `rebuild_blocks`.
     """
     res_fn_args = lambda p: res_fn(p, args)
     _, vjpf = jax.vjp(res_fn_args, theta)
@@ -508,25 +533,12 @@ def step(
     rhs = jax.tree.map(jnp.negative, g)
     x0 = p_prev
 
-    # Inexact-Newton forcing term (Dembo/Eisenstat/Steihaug; the
-    # `min(eta_max, sqrt(||g||))` rule from the trust-region Newton line).
-    # `eta -> 0` as the gradient does, which keeps the superlinear rate, while
-    # staying loose early where an accurate solve buys nothing. It reads only
-    # the current gradient, so it carries no state and is unchanged across a
-    # rejected step -- it cannot interact with the `lam` update.
-    #
-    # `cg_tol` is the floor: setting `cg_eta_max = cg_tol` recovers the old
-    # fixed-tolerance behaviour exactly.
-    residual_norm = tnorm(rhs)
-    if False:
-        # Fixed relative tolerance. Near convergence this shrinks in lockstep
-        # with the gradient while the system gets no easier, so CG burns
-        # `cg_max` on steps whose truncated solution already gives rho ~ 1.
-        eta = cg_tol
-    else:
-        eta = jnp.clip(jnp.sqrt(residual_norm), cg_tol, cg_eta_max)
+    # `cg_tol` is the floor on the forcing term and `cg_eta_max` the cap;
+    # setting them equal recovers fixed-tolerance behaviour exactly. The value
+    # itself was proposed by the previous step, see `eta_next` below.
+    eta = jnp.clip(eta_in, cg_tol, cg_eta_max)
 
-    p, ncg = pcg(Av, Minv, rhs, x0, eta * residual_norm, cg_max)
+    p, ncg = pcg(Av, Minv, rhs, x0, eta, cg_max)
 
     theta_new = jax.tree.map(jnp.add, theta, p)
     r_new = res_fn_args(theta_new)
@@ -553,6 +565,36 @@ def step(
     # a rejected step's p solves a system with a different lambda: discard it
     p_out = jax.tree.map(lambda a: jnp.where(accept, a, jnp.zeros_like(a)), p)
 
+    # Inexact-Newton forcing term for the *next* step, Eisenstat-Walker choice
+    # 1: how badly the linear model mispredicted the residual the step actually
+    # produced,
+    #
+    #     eta_next = | ||r_new|| - ||r + J p|| | / ||r||.
+    #
+    # Solving the linear system more accurately than the linear model deserves
+    # buys nothing, and this measures that directly, from quantities the step
+    # already formed. It needs no assumption that anything decreases
+    # monotonically -- which rules out the residual-ratio rules (EW choice 2,
+    # and the textbook `min(eta_max, sqrt(||g||))`): `||g|| = ||J^T r||` rises
+    # on a good fraction of accepted steps here, and a ratio rule reacts to a
+    # rising gradient by demanding its *loosest* solve, exactly when the
+    # iteration is doing worst. It is also scale invariant, and unlike a rule
+    # built on `||r||` it still adapts on a large-residual problem, where `F`
+    # plateaus well above zero and every `||r||` ratio sits at 1.
+    linear_r_norm = tnorm(jax.tree.map(jnp.add, r, Jp))
+    eta_next = jnp.abs(jnp.sqrt(F_new) - linear_r_norm) / jnp.sqrt(
+        jnp.where(F > 0, F, 1.0)
+    )
+    # EW's safeguard against an over-rapid decrease: without it a single
+    # unusually accurate model demands a near-exact solve on the very next
+    # step, which is the `cg_max`-burning failure mode the forcing term exists
+    # to avoid. Skipped where it would ask for a loose solve anyway.
+    safeguard = cg_gamma * eta**cg_alpha
+    eta_next = jnp.where(safeguard > 0.1, jnp.maximum(eta_next, safeguard), eta_next)
+    # A rejected step's `p` is thrown away, so the model quality measured along
+    # it says nothing about the step that will be taken instead: hold `eta`.
+    eta_next = jnp.where(accept & ok, eta_next, eta)
+
     info = {
         "F": F,
         "F_new": F_new,
@@ -567,6 +609,7 @@ def step(
         "lam_out": lam_out,
         "n_cg": ncg,
         "cg_eta": eta,
+        "cg_eta_next": eta_next,
         "cg_converged": ncg < cg_max,
         "grad_norm": tnorm(g),
         "step_norm": tnorm(p),
@@ -647,6 +690,8 @@ def fit(
     min_loss=None,
     cg_max=300,
     cg_eta_max=0.5,
+    cg_gamma=0.9,
+    cg_alpha=1.618,
     batch=32,
     damping="marquardt",
     lam_min=None,
@@ -688,6 +733,10 @@ def fit(
     # (p_prev=<pytree>) are different input structures and each triggers its
     # own trace of lm_step (and the pcg while_loop inside it).
     p_prev = jax.tree.map(jnp.zeros_like, params)
+    # Forcing term (see `step`): each step proposes the next one's, so all this
+    # carries is the seed. `cg_eta_max` is the usual Eisenstat-Walker `eta_0` --
+    # there is no model-quality measurement yet to derive one from.
+    eta_prev = jnp.asarray(cg_eta_max)
     key, hist = jr.key(seed), []
     # The Gram estimate is a function of `theta` alone, so it stays exactly
     # valid across a rejected step -- `theta` did not move. Between accepted
@@ -711,8 +760,11 @@ def fit(
             m=m,
             precondition=precondition,
             p_prev=p_prev,
+            eta_in=eta_prev,
             cg_max=cg_max,
             cg_eta_max=cg_eta_max,
+            cg_gamma=cg_gamma,
+            cg_alpha=cg_alpha,
             batch=batch,
             damping=damping,
             lam_min=lam_min,
@@ -723,6 +775,7 @@ def fit(
         if rebuild_blocks:
             accepted_since_build = 0
         accepted_since_build += int(info["accept"])
+        eta_prev = info["cg_eta_next"]
         hist.append(info)
         if verbose:
             print(
