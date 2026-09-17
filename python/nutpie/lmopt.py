@@ -520,6 +520,107 @@ def blocks_zeros(theta, plans):
     return [jnp.zeros(s.shape + s.shape[-1:], s.dtype) for s in spec]
 
 
+# ============================================================ diagnostics
+
+
+def conditioner_norms(v, plans):
+    """Norm of `v` per conditioner, ``(n,)`` per bucket (per dimension for
+    the affine tail)."""
+    return [
+        jnp.sqrt(jnp.sum(p["flatten"](b) ** 2, axis=-1))
+        for b, p in zip(blocks_of(v), plans)
+    ]
+
+
+def _geodesic_diagnostics(
+    res_fn_args, vjp, Av, Minv, theta, r, v, Jv, F, F_full, rtol, cg_max
+):
+    """Would geodesic acceleration have helped the full GN step `v`?
+
+    With ``r''(v)``, the second directional derivative of the residuals
+    along `v`:
+
+    - ``geo_rho_quad``: actual over predicted decrease of the full step,
+      predicted by the second-order residual model ``r + J v + r''(v) / 2``.
+      Near 1 where the GN ``rho`` is poor means the model error is the
+      curvature that acceleration corrects.
+    - ``geo_F``: the loss after the accelerated step ``v + a / 2``, with
+      ``(J^T J + lam D) a = -J^T r''(v)`` solved like the step itself.
+    - ``geo_ratio``: ``2 |a| / |v|``; Transtrum & Sethna accept the
+      acceleration only up to about 0.75.
+    - ``geo_F_full``: the loss after the full step, for comparison.
+    """
+    along = lambda t: jax.jvp(res_fn_args, (t,), (v,))[1]
+    r2 = jax.jvp(along, (theta,), (v,))[1]
+    r_quad = jax.tree.map(lambda a, b, c: a + b + 0.5 * c, r, Jv, r2)
+    decrease_quad = F - tdot(r_quad, r_quad)
+    rho_quad = (F - F_full) / jnp.where(
+        jnp.abs(decrease_quad) < 1e-30, 1e-30, decrease_quad
+    )
+
+    rhs = jax.tree.map(jnp.negative, vjp(r2))
+    zeros = jax.tree.map(jnp.zeros_like, v)
+    a, n_cg = pcg(Av, Minv, rhs, zeros, rtol, cg_max)
+    v_acc = jax.tree.map(lambda x, y: x + 0.5 * y, v, a)
+    r_acc = res_fn_args(jax.tree.map(jnp.add, theta, v_acc))
+    return {
+        "geo_F_full": F_full,
+        "geo_rho_quad": rho_quad,
+        "geo_F": tdot(r_acc, r_acc),
+        "geo_ratio": 2.0 * tnorm(a) / tnorm(v),
+        "geo_cg": n_cg,
+    }
+
+
+def describe_diagnostics(info, plans, labels=None, top=4):
+    """Indented lines for `step`'s ``diagnose`` output.
+
+    `labels` names the conditioners, one integer array per conditioner
+    bucket (e.g. the model coordinate each conditioner transforms); without
+    it they are named ``<parents>p#<position in bucket>``.
+    """
+    log = lambda x: f"{float(np.log(x)):+.2f}" if np.isfinite(x) and x > 0 else "  nan"
+    lines = [
+        f"       geodesic: log F full={log(float(info['geo_F_full']))}"
+        f" accelerated={log(float(info['geo_F']))}"
+        f"  rho_quad={float(info['geo_rho_quad']):+.2f}"
+        f"  2|a|/|p|={float(info['geo_ratio']):.2f}"
+        f"  cg={int(info['geo_cg'])}"
+    ]
+    if "conditioner_step_norms" not in info:
+        return "\n".join(lines)
+
+    names, sq = [], []
+    for i, (norms, p) in enumerate(zip(info["conditioner_step_norms"], plans)):
+        norms = np.asarray(norms)
+        sq.append(norms**2)
+        if p["parents"] is None:
+            names += [f"affine[{j}]" for j in range(len(norms))]
+        elif labels is not None and i < len(labels):
+            names += [f"x{int(k)}" for k in np.asarray(labels[i])]
+        else:
+            names += [f"{p['parents']}p#{j}" for j in range(len(norms))]
+    parents = [p["parents"] for p, s in zip(plans, sq) for _ in s]
+    sq = np.concatenate(sq)
+    total = sq.sum()
+    if not np.isfinite(total) or total <= 0:
+        return "\n".join(lines)
+    order = np.argsort(sq)[::-1]
+    share = np.cumsum(sq[order]) / total
+    n_90 = int(np.searchsorted(share, 0.9)) + 1
+    largest = ", ".join(
+        f"{names[k]} ({'affine' if parents[k] is None else parents[k]} parents)"
+        f" {np.sqrt(sq[k]):.2f}"
+        for k in order[:top]
+    )
+    lines.append(
+        f"       |p| per conditioner: top 1 {share[0]:.0%}, "
+        f"top 5 {share[min(4, len(share) - 1)]:.0%} of |p|^2, "
+        f"90% in {n_90}/{len(sq)}; largest {largest}"
+    )
+    return "\n".join(lines)
+
+
 @eqx.filter_jit
 def step(
     res_fn,
@@ -559,9 +660,14 @@ def step(
     ls_min_fraction=0.1,
     forcing="residual",
     factor_fn=None,
+    diagnose=False,
 ):
     """One LM step. `res_fn` and `plans` are static; get `plans` from
     `get_plans` so its identity is stable across calls.
+
+    `diagnose` adds `_geodesic_diagnostics` and the full step's norm per
+    conditioner (``conditioner_step_norms``) to the info, for about one more
+    CG solve and two more residual evaluations.
 
     `blocks` is the previous step's Gram estimate, reused unless the traced
     `rebuild_blocks` is set. `eta_in`, `nu_in` and `lam_lo_in` are carried
@@ -673,6 +779,14 @@ def step(
     )
     full_step_norm = tnorm(p)
 
+    diagnostics = {}
+    if diagnose:
+        diagnostics = _geodesic_diagnostics(
+            res_fn_args, vjp, Av, Minv, theta, r, p, Jp, F, F_new, eta, cg_max
+        )
+        if plans is not None:
+            diagnostics["conditioner_step_norms"] = conditioner_norms(p, plans)
+
     if line_search:
         # On large-residual problems GN underestimates curvature and
         # overshoots. Fit a parabola through f(0), f'(0) and f(1) along `p`.
@@ -779,6 +893,7 @@ def step(
         "rebuilt_blocks": rebuild_blocks,
         "step_length": step_length,
     }
+    info.update(diagnostics)
     if capture is not None:
         info["capture"] = capture
     if nonfinite_blocks is not None:
@@ -871,6 +986,8 @@ def fit(
     max_exact_block_size=256,
     print_blocks=False,
     should_stop=None,
+    diagnose=False,
+    conditioner_labels=None,
 ):
     """Levenberg-Marquardt fit of ``res_fn(params, (*args, *data))``.
 
@@ -898,6 +1015,11 @@ def fit(
         print_blocks: Print the preconditioner blocks.
         should_stop: Called after each step; the fit stops early if it
             returns true, e.g. when sampling is aborted.
+        diagnose: Also check each step for the benefit of geodesic
+            acceleration and split its norm by conditioner (see `step`),
+            printed below each step's line if `verbose`.
+        conditioner_labels: Names for `describe_diagnostics`, one integer
+            array per conditioner bucket.
     """
     params, frozen = split_frozen(params, fit_affine)
     data = tuple(data)
@@ -973,6 +1095,7 @@ def fit(
             line_search=line_search,
             forcing=forcing,
             factor_fn=factor_fn,
+            diagnose=diagnose,
         )
         if rebuild_blocks:
             accepted_since_build = 0
@@ -1005,6 +1128,8 @@ def fit(
                 + describe_fallbacks(info, plans)
                 + f"{'' if info['accept'] else '   REJECT'}"
             )
+            if diagnose:
+                print(describe_diagnostics(info, plans, conditioner_labels))
 
         if not np.isfinite(info["grad_norm"]):
             if verbose:
