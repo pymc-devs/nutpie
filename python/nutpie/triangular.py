@@ -837,7 +837,7 @@ class SparseTriangularMap(bijections.AbstractBijection):
         )
         return x, grad_x, logp - log_det
 
-    def gauss_newton_factors(self, y, grad):
+    def gauss_newton_factors(self, y, grad, cholesky_jitter=None):
         """Per-draw factors of the exact Gauss-Newton blocks of the Fisher
         residual ``r = x + w``, with ``J^T w = grad - grad_y log_det``.
 
@@ -849,6 +849,11 @@ class SparseTriangularMap(bijections.AbstractBijection):
         ``c = e_0 / delta_i`` (see `notes/lm_derivatives.md`):
 
             V = [ sqrt(1 - |L^{-1} c|^2) a ;  L^T B + (L^{-1} c) a ].
+
+        ``K`` is read off the selected inverse of ``J^T J``, and for badly
+        conditioned ``J`` rounding can make it numerically indefinite. With
+        a `cholesky_jitter`, a failed Cholesky is retried on
+        ``K + cholesky_jitter * max(diag K) I``.
         """
         dim = self.shape[0]
 
@@ -894,6 +899,10 @@ class SparseTriangularMap(bijections.AbstractBijection):
             pad = ~real
             K = jnp.where(pad[:, None] | pad[None, :], jnp.eye(real.shape[0]), sigma)
             L = jnp.linalg.cholesky(K)
+            if cholesky_jitter is not None:
+                jitter = cholesky_jitter * jnp.max(jnp.diagonal(K))
+                L_jittered = jnp.linalg.cholesky(K + jitter * jnp.eye(real.shape[0]))
+                L = jnp.where(jnp.all(jnp.isfinite(L)), L, L_jittered)
             c = jnp.zeros(real.shape[0], a.dtype).at[0].set(1.0 / delta_i)
             Linv_c = jax.scipy.linalg.solve_triangular(L, c, lower=True)
             s = jnp.sqrt(jnp.maximum(1.0 - Linv_c @ Linv_c, 0.0))
