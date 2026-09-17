@@ -192,3 +192,42 @@ After compilation, we can change the dataset:
 compiled2 = compiled.with_data(x=[4, 5, 6])
 trace2 = nutpie.sample(compiled2)
 ```
+
+### Initial points
+
+By default, nutpie uses the initial point of the PyMC model (with some jitter
+added) to start each chain. For fixed starting values, you can pass them
+directly when compiling, just as in PyMC:
+
+```{python}
+with pm.Model() as model:
+    intercept = pm.Normal("intercept", mu=0, sigma=1)
+    sigma = pm.HalfNormal("sigma")
+    y = pm.Normal("y", mu=intercept, sigma=sigma, observed=[1, 2, 3])
+
+compiled = nutpie.compile_pymc_model(model, initial_points={"intercept": 2.0})
+```
+
+For more control, you can provide a function with `with_init_point_fn`. It is
+called as `init_point_fn(model, rng, chain_id)`, where `model` is the compiled
+model that is sampled, `rng` is a `numpy.random.Generator` and `chain_id` is the
+index of the chain. It can return a dictionary with values for some or all
+variables. The values are on the *transformed* space, so they use the names of
+the value variables, like `sigma_log__` instead of `sigma`. Variables missing
+from the dictionary are initialized as usual:
+
+```{python}
+import numpy as np
+
+def init_point(model, rng, chain_id):
+    # Start the chains at different noise scales
+    return {"sigma_log__": np.log(0.5 + chain_id)}
+
+compiled = nutpie.compile_pymc_model(model).with_init_point_fn(init_point)
+trace = nutpie.sample(compiled)
+```
+
+Alternatively, the function can return a flat array on the unconstrained space,
+with shape `(model.n_dim,)`. If the log density at a returned point is not
+finite, the function is called again with a new `rng`, up to 500 times per
+chain.

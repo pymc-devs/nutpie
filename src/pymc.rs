@@ -1,8 +1,10 @@
 use std::{collections::HashMap, ffi::c_void, sync::Arc};
 
-use anyhow::{anyhow, bail, Context, Result};
-use numpy::{AsSliceError, PyReadonlyArray1};
-use nuts_rs::{CpuLogpFunc, CpuMath, HasDims, LogpError, Model, Storable, Value};
+use anyhow::{Context, Result};
+use numpy::AsSliceError;
+use nuts_rs::{
+    CpuLogpFunc, CpuMath, HasDims, InitPositionError, LogpError, Model, Storable, Value,
+};
 use pyo3::{
     exceptions::PyRuntimeError,
     pyclass, pymethods,
@@ -14,8 +16,9 @@ use rand::Rng;
 use thiserror::Error;
 
 use crate::{
+    common::{call_init_point_func, PyValue, PyVariable},
     common::{PyValue, PyVariable},
-    wrapper::PyTransformAdapt,
+    wrapper::{soft_clip, NativeFlow, PyTransformAdapt},
 };
 
 type UserData = *const std::ffi::c_void;
@@ -509,32 +512,14 @@ impl Model for PyMcModel {
     fn init_position<R: rand::Rng + ?Sized>(
         &self,
         rng: &mut R,
-        _chain_id: u64,
+        chain_id: u64,
         position: &mut [f64],
-    ) -> Result<()> {
-        let seed = rng.next_u64();
-
-        Python::attach(|py| {
-            let init_point = self
-                .init_func
-                .call1(py, (seed,))
-                .context("Failed to initialize point")?;
-
-            let init_point: PyReadonlyArray1<f64> = init_point
-                .extract(py)
-                .map_err(|_| anyhow!("Initialization array returned incorrect argument"))?;
-
-            let init_point = init_point
-                .as_slice()
-                .context("Initial point must be contiguous")?;
-
-            if init_point.len() != position.len() {
-                bail!("Initial point has incorrect length");
-            }
-
-            position.copy_from_slice(init_point);
-            Ok(())
-        })?;
-        Ok(())
+    ) -> Result<(), InitPositionError> {
+        Ok(call_init_point_func(
+            &self.init_func,
+            rng.next_u64(),
+            chain_id,
+            position,
+        )?)
     }
 }

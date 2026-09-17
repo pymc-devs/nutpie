@@ -650,3 +650,94 @@ def test_unnamed_shared(backend, gradient_backend):
 
     compiled = nutpie.compile_pymc_model(model)
     nutpie.sample(compiled)
+
+
+@pytest.mark.pymc
+@parameterize_backends
+def test_init_point_fn(backend, gradient_backend):
+    with pm.Model() as model:
+        pm.HalfNormal("sigma")
+        pm.Normal("mu", shape=(2, 3))
+
+    compiled = nutpie.compile_pymc_model(
+        model, backend=backend, gradient_backend=gradient_backend
+    )
+
+    calls = []
+
+    def init_point(model, rng, chain_id):
+        assert isinstance(rng, np.random.Generator)
+        calls.append(chain_id)
+        return rng.normal(size=model.n_dim)
+
+    trace = nutpie.sample(
+        compiled.with_init_point_fn(init_point), chains=3, tune=50, draws=50
+    )
+    assert sorted(calls) == [0, 1, 2]
+    trace.posterior.mu  # noqa: B018
+
+
+@pytest.mark.pymc
+@parameterize_backends
+def test_init_point_fn_dict(backend, gradient_backend):
+    with pm.Model() as model:
+        pm.HalfNormal("sigma")
+        pm.Normal("mu", shape=(2, 3))
+
+    compiled = nutpie.compile_pymc_model(
+        model, backend=backend, gradient_backend=gradient_backend
+    )
+
+    calls = []
+
+    def init_point(model, rng, chain_id):
+        calls.append(chain_id)
+        return {"sigma_log__": 0.5, "mu": rng.normal(size=(2, 3))}
+
+    nutpie.sample(compiled.with_init_point_fn(init_point), chains=2, tune=50, draws=50)
+    assert sorted(calls) == [0, 1]
+
+
+@pytest.mark.pymc
+@parameterize_backends
+def test_init_point_fn_partial_dict(backend, gradient_backend):
+    with pm.Model() as model:
+        pm.HalfNormal("sigma")
+        pm.Normal("mu", shape=(2, 3))
+
+    compiled = nutpie.compile_pymc_model(
+        model, backend=backend, gradient_backend=gradient_backend
+    )
+
+    compiled = compiled.with_init_point_fn(
+        lambda model, rng, chain_id: {"sigma_log__": 0.5}
+    )
+    init = compiled._make_init_point_func()
+
+    # The position of sigma_log__ in the flat point depends on the backend.
+    point = init(1, 0)
+    assert np.sum(point == 0.5) == 1
+    # mu is filled from the default initialization, which is jittered
+    assert np.all(point[point != 0.5] != 0)
+    other = init(2, 0)
+    assert np.sum(other == 0.5) == 1
+    assert not np.array_equal(point, other)
+
+    nutpie.sample(compiled, chains=2, tune=50, draws=50)
+
+
+@pytest.mark.pymc
+@parameterize_backends
+def test_init_point_fn_unknown_key(backend, gradient_backend):
+    with pm.Model() as model:
+        pm.HalfNormal("sigma")
+
+    compiled = nutpie.compile_pymc_model(
+        model, backend=backend, gradient_backend=gradient_backend
+    )
+
+    compiled = compiled.with_init_point_fn(lambda model, rng, chain_id: {"sigma": 0.5})
+    init = compiled._make_init_point_func()
+
+    with pytest.raises(KeyError, match="sigma_log__"):
+        init(1, 0)

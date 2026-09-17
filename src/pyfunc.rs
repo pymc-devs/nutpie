@@ -1,8 +1,10 @@
 use std::{collections::HashMap, sync::Arc};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result};
 use numpy::{AsSliceError, PyArray1, PyReadonlyArray1, PyReadonlyArrayDyn, PyUntypedArrayMethods};
-use nuts_rs::{CpuLogpFunc, CpuMath, HasDims, LogpError, Model, Storable, Value};
+use nuts_rs::{
+    CpuLogpFunc, CpuMath, HasDims, InitPositionError, LogpError, Model, Storable, Value,
+};
 use pyo3::{
     exceptions::PyRuntimeError,
     pyclass, pymethods,
@@ -14,8 +16,9 @@ use rand_distr::{Distribution, Uniform};
 use thiserror::Error;
 
 use crate::{
+    common::{call_init_point_func, PyValue, PyVariable},
     common::{PyValue, PyVariable},
-    wrapper::PyTransformAdapt,
+    wrapper::{NativeFlow, PyTransformAdapt},
 };
 
 #[pyclass(from_py_object)]
@@ -536,37 +539,20 @@ impl Model for PyModel {
     fn init_position<R: rand::prelude::Rng + ?Sized>(
         &self,
         rng: &mut R,
-        _chain_id: u64,
+        chain_id: u64,
         position: &mut [f64],
-    ) -> Result<()> {
+    ) -> Result<(), InitPositionError> {
         let Some(init_func) = self.init_point_func.as_ref() else {
             let dist = Uniform::new(-2f64, 2f64).expect("Could not create uniform distribution");
             position.iter_mut().for_each(|x| *x = dist.sample(rng));
             return Ok(());
         };
 
-        let seed = rng.next_u64();
-
-        Python::attach(|py| {
-            let init_point = init_func
-                .call1(py, (seed,))
-                .context("Failed to initialize point")?;
-
-            let init_point: PyReadonlyArray1<f64> = init_point
-                .extract(py)
-                .map_err(|_| anyhow!("Initialization array returned incorrect argument"))?;
-
-            let init_point = init_point
-                .as_slice()
-                .context("Initial point must be contiguous")?;
-
-            if init_point.len() != position.len() {
-                bail!("Initial point has incorrect length");
-            }
-
-            position.copy_from_slice(init_point);
-            Ok(())
-        })?;
-        Ok(())
+        Ok(call_init_point_func(
+            init_func,
+            rng.next_u64(),
+            chain_id,
+            position,
+        )?)
     }
 }

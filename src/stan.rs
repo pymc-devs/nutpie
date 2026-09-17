@@ -5,7 +5,10 @@ use std::{ffi::CString, path::PathBuf};
 use anyhow::{bail, Context, Result};
 use bridgestan::open_library;
 use itertools::Itertools;
-use nuts_rs::{CpuLogpFunc, CpuMath, HasDims, LogpError, Model, Storable, Value};
+use numpy::{PyArray1, PyReadonlyArray1};
+use nuts_rs::{
+    CpuLogpFunc, CpuMath, HasDims, InitPositionError, LogpError, Model, Storable, Value,
+};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::types::{PyDict, PyNone, PyTuple};
 use pyo3::{exceptions::PyValueError, pyclass, pymethods, PyResult};
@@ -17,7 +20,7 @@ use smallvec::{SmallVec, ToSmallVec};
 
 use thiserror::Error;
 
-use crate::common::{ItemType, PyValue, PyVariable};
+use crate::common::{copy_init_point, ItemType, PyValue, PyVariable};
 use crate::wrapper::PyTransformAdapt;
 
 type InnerModel = bridgestan::Model<Arc<bridgestan::StanLibrary>>;
@@ -87,6 +90,7 @@ pub struct StanModel {
     #[pyo3(get)]
     dims: HashMap<String, Vec<String>>,
     unc_names: Value,
+    init_point_func: Option<Arc<Py<PyAny>>>,
 }
 
 /// Return meta information about the constrained parameters of the model
@@ -331,6 +335,7 @@ impl StanModel {
             coords,
             dims,
             unc_names,
+            init_point_func: None,
         })
     }
 
@@ -347,6 +352,86 @@ impl StanModel {
 
     pub fn ndim(&self) -> usize {
         self.inner.param_unc_num()
+    }
+
+    #[pyo3(signature = (include_tp=false, include_gq=false))]
+    pub fn param_num(&self, include_tp: bool, include_gq: bool) -> usize {
+        self.inner.param_num(include_tp, include_gq)
+    }
+
+    /// Return a copy of the model that generates initial points with
+    /// `init_point_func(seed, chain_id)`. It must return either a flat
+    /// unconstrained point, or a Stan JSON string with values for some or
+    /// all parameters.
+    pub fn with_init_point_func(&self, init_point_func: Py<PyAny>) -> Self {
+        Self {
+            init_point_func: Some(Arc::new(init_point_func)),
+            ..self.clone()
+        }
+    }
+
+    /// Map a point on the unconstrained space to the flat (column-major)
+    /// constrained parameter vector.
+    #[pyo3(signature = (theta_unc, include_tp=false, include_gq=false, seed=None))]
+    pub fn param_constrain<'py>(
+        &self,
+        py: Python<'py>,
+        theta_unc: PyReadonlyArray1<'py, f64>,
+        include_tp: bool,
+        include_gq: bool,
+        seed: Option<u32>,
+    ) -> anyhow::Result<Bound<'py, PyArray1<f64>>> {
+        let theta_unc = theta_unc.as_slice()?;
+        if theta_unc.len() != self.inner.param_unc_num() {
+            bail!(
+                "Unconstrained point has length {} (expected {})",
+                theta_unc.len(),
+                self.inner.param_unc_num()
+            );
+        }
+        let mut out = vec![0f64; self.inner.param_num(include_tp, include_gq)];
+        let mut rng = if include_gq {
+            let seed = seed.unwrap_or_else(|| rng().next_u32());
+            Some(bridgestan::Rng::new(self.inner.clone_library_ref(), seed)?)
+        } else {
+            None
+        };
+        self.inner
+            .param_constrain(theta_unc, include_tp, include_gq, &mut out, rng.as_mut())?;
+        Ok(PyArray1::from_vec(py, out))
+    }
+
+    /// Map a flat (column-major) constrained parameter vector to the
+    /// unconstrained space.
+    pub fn param_unconstrain<'py>(
+        &self,
+        py: Python<'py>,
+        theta: PyReadonlyArray1<'py, f64>,
+    ) -> anyhow::Result<Bound<'py, PyArray1<f64>>> {
+        let theta = theta.as_slice()?;
+        if theta.len() != self.inner.param_num(false, false) {
+            bail!(
+                "Constrained point has length {} (expected {})",
+                theta.len(),
+                self.inner.param_num(false, false)
+            );
+        }
+        let mut out = vec![0f64; self.inner.param_unc_num()];
+        self.inner.param_unconstrain(theta, &mut out)?;
+        Ok(PyArray1::from_vec(py, out))
+    }
+
+    /// Map constrained parameter values in Stan JSON format to the
+    /// unconstrained space.
+    pub fn param_unconstrain_json<'py>(
+        &self,
+        py: Python<'py>,
+        json: String,
+    ) -> anyhow::Result<Bound<'py, PyArray1<f64>>> {
+        let json = CString::new(json)?;
+        let mut out = vec![0f64; self.inner.param_unc_num()];
+        self.inner.param_unconstrain_json(&json, &mut out)?;
+        Ok(PyArray1::from_vec(py, out))
     }
 
     /*
@@ -802,9 +887,33 @@ impl Model for StanModel {
     fn init_position<R: rand::Rng + ?Sized>(
         &self,
         rng: &mut R,
-        _chain_id: u64,
+        chain_id: u64,
         position: &mut [f64],
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), InitPositionError> {
+        if let Some(init_func) = self.init_point_func.as_ref() {
+            let seed = rng.next_u64();
+            let stan_seed = rng.next_u32();
+            // The init function returns either an unconstrained array or
+            // constrained values as a Stan JSON string.
+            return Python::attach(|py| {
+                let init_point = init_func
+                    .call1(py, (seed, chain_id))
+                    .context("Failed to initialize point")?;
+                let init_point = init_point.bind(py);
+                let Ok(json) = init_point.extract::<String>() else {
+                    return Ok(copy_init_point(init_point, position)?);
+                };
+                let json = CString::new(json).context("Invalid initial point json")?;
+                // Parameters missing from the json are drawn uniformly from
+                // [-2, 2] on the unconstrained space. Stan checks that the
+                // log density is finite, and the sampler retries if it isn't.
+                let mut stan_rng = bridgestan::Rng::new(self.inner.clone_library_ref(), stan_seed)
+                    .context("Could not create stan rng")?;
+                self.inner
+                    .param_initialize(&mut stan_rng, &json, 2.0, 1, true, position)
+                    .map_err(|err| InitPositionError::Retry(err.into()))
+            });
+        }
         let dist = StandardNormal;
         dist.sample_iter(rng)
             .zip(position.iter_mut())

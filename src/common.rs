@@ -464,3 +464,41 @@ impl PyVariable {
         Ok(variables)
     }
 }
+
+/// Call a python init point function `func(seed, chain_id)` and copy the
+/// returned unconstrained point into `position`.
+pub fn call_init_point_func(
+    func: &Py<PyAny>,
+    seed: u64,
+    chain_id: u64,
+    position: &mut [f64],
+) -> Result<()> {
+    Python::attach(|py| {
+        let init_point = func
+            .call1(py, (seed, chain_id))
+            .context("Failed to initialize point")?;
+        copy_init_point(init_point.bind(py), position)
+    })
+}
+
+/// Copy an initial point returned from python into `position`.
+pub fn copy_init_point(init_point: &Bound<PyAny>, position: &mut [f64]) -> Result<()> {
+    let init_point: PyReadonlyArray1<f64> = init_point
+        .extract()
+        .map_err(|_| anyhow::anyhow!("Initialization array returned incorrect argument"))?;
+
+    let init_point = init_point
+        .as_slice()
+        .context("Initial point must be contiguous")?;
+
+    if init_point.len() != position.len() {
+        bail!(
+            "Initial point has incorrect length {} (expected {})",
+            init_point.len(),
+            position.len()
+        );
+    }
+
+    position.copy_from_slice(init_point);
+    Ok(())
+}

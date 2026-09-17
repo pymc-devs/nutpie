@@ -16,7 +16,7 @@ from numpy.typing import NDArray
 
 from nutpie import _lib
 from nutpie.compiled_pyfunc import SeedType, from_pyfunc
-from nutpie.sample import CompiledModel
+from nutpie.sample import CompiledModel, _flatten_point, _wrap_init_point_fn
 
 try:
     from numba.extending import intrinsic
@@ -39,7 +39,7 @@ def _rv_dict_to_flat_array_wrapper(
     fn: Callable[[SeedType | None], dict[str, np.ndarray]],
     names: list[str],
     shapes: list[tuple[int]],
-) -> Callable[[SeedType], np.ndarray]:
+) -> Callable[[SeedType, int], np.ndarray]:
     """
     Wraps a function that returns a dictionary of string:array key:value pairs
     and returns a single flat float64 array. Also checks that the shapes of
@@ -59,31 +59,14 @@ def _rv_dict_to_flat_array_wrapper(
     Returns
     -------
     seeded_array_fn: Callable
-        Function that takes a seed and returns a flat, contiguous float64
-        array of initial values. The ordering of the random variables inside
+        Function that takes a seed and a chain id (ignored) and returns a
+        flat, contiguous float64 array of initial values. The ordering of the random variables inside
         the array is controlled by the ``names`` parameter.
     """
 
     @wraps(fn)
-    def seeded_array_fn(seed: SeedType | None = None):
-        initial_value_dict = fn(seed)
-        total_size = sum(np.prod(shape).astype(int) for shape in shapes)
-        flat_array = np.empty(total_size, dtype="float64", order="C")
-        cursor = 0
-
-        for name, shape in zip(names, shapes, strict=True):
-            initial_value = initial_value_dict[name]
-            n = int(np.prod(initial_value.shape))
-            if tuple(initial_value.shape) != tuple(shape):
-                raise ValueError(
-                    f"Size of initial value for {name} is {initial_value.shape}, "
-                    f"expected {shape}"
-                )
-
-            flat_array[cursor : cursor + n] = initial_value.ravel().astype("float64")
-            cursor += n
-
-        return flat_array
+    def seeded_array_fn(seed: SeedType | None = None, chain_id: int | None = None):
+        return _flatten_point(fn(seed), names, shapes)
 
     return seeded_array_fn
 
@@ -105,7 +88,8 @@ def address_as_void_pointer(typingctx, src):
 class CompiledPyMCModel(CompiledModel):
     compiled_logp_func: "numba.core.ccallback.CFunc"
     compiled_expand_func: "numba.core.ccallback.CFunc"
-    initial_point_func: Callable[[SeedType], np.ndarray]
+    # Called as `fn(seed, chain_id)`
+    initial_point_func: Callable[[SeedType, int], np.ndarray]
 
     # The value of the shared variables with a specific key
     shared_data: dict[str, NDArray]
@@ -124,6 +108,8 @@ class CompiledPyMCModel(CompiledModel):
     _shapes: dict[str, tuple[int, ...]]
     _coords: dict[str, Any] | None
     _transform_adapt_args: dict | None = None
+    # User init function `fn(model, rng, chain_id)`, see `with_init_point_fn`
+    _init_point_fn: Callable | None = None
 
     @property
     def n_dim(self):
@@ -165,17 +151,43 @@ class CompiledPyMCModel(CompiledModel):
             user_data=user_data,
         )
 
+    def with_init_point_fn(self, init_point_fn):
+        """Use a custom function to generate the initial point of each chain.
+
+        Parameters
+        ----------
+        init_point_fn : Callable[[CompiledPyMCModel, np.random.Generator, int], np.ndarray | dict]
+            Called as ``init_point_fn(model, rng, chain_id)``. Must return
+            either a flat point on the unconstrained space with shape
+            ``(n_dim,)``, or a dict mapping the names of the (transformed)
+            value variables, e.g. ``"sigma_log__"``, to their values.
+            Variables missing from the dict are initialized with the default
+            initialization of the model.
+        """
+        return dataclasses.replace(self, _init_point_fn=init_point_fn)
+
+    def _make_init_point_func(self):
+        if self._init_point_fn is None:
+            return self.initial_point_func
+
+        names, shapes = _unconstrained_layout(self.shape_info, self.n_dim)
+
+        def convert_dict(values, seed, chain_id):
+            base = self.initial_point_func(seed, chain_id)
+            return _flatten_point(values, names, shapes, base)
+
+        return _wrap_init_point_fn(self._init_point_fn, self, convert_dict)
+
     def _make_sampler(
         self,
         settings,
-        init_mean,
         cores,
         progress_type,
         extra_callback,
         extra_callback_rate,
         store,
     ):
-        model = self._make_model(init_mean)
+        model = self._make_model()
         return _lib.PySampler.from_pymc(
             settings,
             cores,
@@ -186,7 +198,7 @@ class CompiledPyMCModel(CompiledModel):
             store,
         )
 
-    def _make_model(self, init_mean):
+    def _make_model(self):
         expand_fn = _lib.ExpandFunc(
             self.n_dim,
             self.n_expanded,
@@ -228,12 +240,26 @@ class CompiledPyMCModel(CompiledModel):
             self.n_dim,
             dim_sizes,
             coords,
-            self.initial_point_func,
+            self._make_init_point_func(),
             make_adapter,
         )
 
     def with_transform_adapt(self, **kwargs):
         return dataclasses.replace(self, _transform_adapt_args=kwargs)
+
+
+def _unconstrained_layout(shape_info, n_dim):
+    """Names and shapes of the value variables that make up the
+    unconstrained point. They are the leading entries of ``shape_info``.
+    Empty variables are skipped, as they can't be told apart from empty
+    expanded variables at the boundary."""
+    names, slices, shapes = shape_info
+    layout = [
+        (name, tuple(shape))
+        for name, slice_, shape in zip(names, slices, shapes, strict=True)
+        if slice_.start < slice_.stop <= n_dim
+    ]
+    return [name for name, _ in layout], [shape for _, shape in layout]
 
 
 def update_user_data(user_data, user_data_storage):
@@ -509,6 +535,7 @@ def _compile_pymc_model_jax(
         make_logp_fn=make_logp_func,
         make_expand_fn=make_expand_func,
         make_initial_point_fn=initial_point_fn,
+        init_point_layout=_unconstrained_layout(shape_info, n_dim),
         expanded_dtypes=dtypes,
         expanded_shapes=shapes,
         expanded_names=names,

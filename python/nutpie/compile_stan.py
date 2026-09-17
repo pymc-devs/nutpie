@@ -4,15 +4,17 @@ import json
 import logging
 import shutil
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from importlib.util import find_spec
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 from numpy.typing import NDArray
 
 from nutpie import _lib
-from nutpie.sample import CompiledModel
+from nutpie.sample import CompiledModel, _wrap_init_point_fn
 
 logger = logging.getLogger("nutpie")
 
@@ -26,6 +28,8 @@ class CompiledStanModel(CompiledModel):
     model: Any
     model_name: str | None = None
     _transform_adapt_args: dict | None = None
+    # User init function `fn(model, rng, chain_id)`, see `with_init_point_fn`
+    _init_point_fn: Callable | None = None
 
     def with_data(self, *, seed=None, **updates):
         if self.data is None:
@@ -35,19 +39,7 @@ class CompiledStanModel(CompiledModel):
 
         data.update(updates)
 
-        if data is not None:
-            if find_spec("stanio") is None:
-                raise ImportError(
-                    "stanio is not installed in the current environment. "
-                    "Please install it with something like "
-                    "'pip install stanio' or 'pip install nutpie[stan]'."
-                )
-
-            import stanio
-
-            data_json = stanio.dump_stan_json(data)
-        else:
-            data_json = None
+        data_json = _dump_stan_json(data)
 
         outer_kwargs = self._transform_adapt_args
         if outer_kwargs is None:
@@ -72,20 +64,8 @@ class CompiledStanModel(CompiledModel):
         model = _lib.StanModel(
             self.library, dim_sizes, dims, coords, seed, data_json, make_adapter
         )
-        coords = self._coords
-        if coords is None:
-            coords = {}
-        else:
-            coords = coords.copy()
 
-        return CompiledStanModel(
-            _coords=coords,
-            data=data,
-            code=self.code,
-            library=self.library,
-            dims=self.dims,
-            model=model,
-        )
+        return replace(self, _coords=coords, data=data, model=model)
 
     def with_coords(self, **coords):
         if self.coords is None:
@@ -106,7 +86,84 @@ class CompiledStanModel(CompiledModel):
     def with_transform_adapt(self, **kwargs):
         return replace(self, _transform_adapt_args=kwargs).with_data()
 
-    def _make_model(self, init_mean):
+    def with_init_point_fn(self, init_point_fn):
+        """Use a custom function to generate the initial point of each chain.
+
+        Parameters
+        ----------
+        init_point_fn : Callable[[CompiledStanModel, np.random.Generator, int], np.ndarray | dict]
+            Called as ``init_point_fn(model, rng, chain_id)``. Must return
+            either a flat point on the unconstrained space with shape
+            ``(n_dim,)``, or a dict with constrained values for some or all
+            parameters. Parameters missing from the dict are drawn uniformly
+            from ``[-2, 2]`` on the unconstrained space.
+        """
+        return replace(self, _init_point_fn=init_point_fn)
+
+    def _init_values_to_json(self, values, seed, chain_id):
+        model = self._make_model()
+        n_params = model.param_num()
+        shapes = {
+            name: tuple(var.shape)
+            for name, var in model.variables().items()
+            if var.end_idx <= n_params
+        }
+        unknown = [name for name in values if name not in shapes]
+        if unknown:
+            raise KeyError(
+                f"Unknown parameters in initial point: {unknown}. "
+                f"Expected a subset of {list(shapes)}."
+            )
+        for name, value in values.items():
+            if np.shape(value) != shapes[name]:
+                raise ValueError(
+                    f"Initial value for {name} has shape {np.shape(value)}, "
+                    f"expected {shapes[name]}"
+                )
+        return _dump_stan_json(values)
+
+    def unconstrain(self, **values) -> NDArray:
+        """Map constrained parameter values to the unconstrained space.
+
+        Values for all parameters of the model must be given as keyword
+        arguments, with the shapes as declared in the Stan program.
+        """
+        model = self._make_model()
+        return model.param_unconstrain_json(_dump_stan_json(values))
+
+    def constrain(
+        self,
+        point: NDArray,
+        *,
+        include_tp: bool = False,
+        include_gq: bool = False,
+        seed: int | None = None,
+    ) -> NDArray:
+        """Map a point on the unconstrained space to the constrained
+        parameter values.
+
+        Returns the flat vector of constrained values in the order used by
+        Stan: variables in declaration order, each in column-major order.
+
+        Parameters
+        ----------
+        point:
+            Flat point on the unconstrained space with shape ``(n_dim,)``.
+        include_tp:
+            Also return the transformed parameters.
+        include_gq:
+            Also return the generated quantities. ``seed`` controls
+            the random number generator used for those.
+        """
+        model = self._make_model()
+        return model.param_constrain(
+            np.ascontiguousarray(point, dtype=np.float64),
+            include_tp,
+            include_gq,
+            seed,
+        )
+
+    def _make_model(self):
         if self.model is None:
             return self.with_data().model
         return self.model
@@ -114,14 +171,20 @@ class CompiledStanModel(CompiledModel):
     def _make_sampler(
         self,
         settings,
-        init_mean,
         cores,
         progress_type,
         extra_callback,
         extra_callback_rate,
         store,
     ):
-        model = self._make_model(init_mean)
+        compiled = self if self.model is not None else self.with_data()
+        model = compiled.model
+        if compiled._init_point_fn is not None:
+            model = model.with_init_point_func(
+                _wrap_init_point_fn(
+                    compiled._init_point_fn, compiled, compiled._init_values_to_json
+                )
+            )
         return _lib.PySampler.from_stan(
             settings,
             cores,
@@ -149,6 +212,19 @@ class CompiledStanModel(CompiledModel):
         if self.model is None:
             return self.with_data().coords
         return self._coords
+
+
+def _dump_stan_json(values: dict[str, Any]) -> str:
+    if find_spec("stanio") is None:
+        raise ImportError(
+            "stanio is not installed in the current environment. "
+            "Please install it with something like "
+            "'pip install stanio' or 'pip install nutpie[stan]'."
+        )
+
+    import stanio
+
+    return stanio.dump_stan_json(values)
 
 
 def _stan_cache_key(
@@ -254,7 +330,7 @@ def compile_stan_model(
     filename: str | None = None,
     extra_compile_args: list[str] | None = None,
     extra_stanc_args: list[str] | None = None,
-    dims: dict[str, int] | None = None,
+    dims: dict[str, tuple[str, ...]] | None = None,
     coords: dict[str, Any] | None = None,
     model_name: str | None = None,
     cleanup: bool = True,
