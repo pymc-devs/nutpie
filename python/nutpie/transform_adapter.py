@@ -318,7 +318,7 @@ def _fit_lm(
         precondition=True,
     )
 
-    return theta, hist[-1]["F_new"]
+    return theta, hist[-1]["F_out"]
 
 
 @eqx.filter_jit
