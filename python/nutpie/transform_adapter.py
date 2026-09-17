@@ -79,6 +79,7 @@ def fit_to_data(
     lm_exact_blocks: bool = False,
     lm_max_exact_block_size: int = 256,
     lm_print_blocks: bool = False,
+    should_stop: Callable[[], bool] | None = None,
 ):
     r"""Train a distribution (e.g. a flow) to samples from the target distribution.
 
@@ -225,6 +226,7 @@ def fit_to_data(
                 "max_exact_block_size": lm_max_exact_block_size,
                 "verbose": verbose,
                 "print_blocks": lm_print_blocks,
+                "should_stop": should_stop,
             }
             if method == "lm"
             else {}
@@ -279,6 +281,8 @@ def fit_to_data(
 
         if True:
             for batch in zip(*batches, strict=True):
+                if should_stop is not None and should_stop():
+                    break
                 key, subkey = jr.split(key)
                 params, opt_state, batch_loss = step(
                     params,
@@ -301,6 +305,9 @@ def fit_to_data(
                 *batches,
             )
 
+        if not batch_losses:
+            # Stopped before the first batch of this epoch
+            break
         losses["train"].append((sum(batch_losses) / len(batch_losses)).item())
 
         # Val epoch
@@ -323,6 +330,9 @@ def fit_to_data(
 
         elif stop_value is not None and loss < stop_value:
             loop.set_postfix_str(f"{loop.postfix} (Stop value reached)")
+            break
+
+        if should_stop is not None and should_stop():
             break
 
     params = best_params if return_best else params
@@ -379,6 +389,7 @@ def _fit_lm(
     max_exact_block_size,
     verbose,
     print_blocks,
+    should_stop,
 ):
     if not hasattr(loss_fn, "residuals"):
         raise ValueError(
@@ -406,6 +417,7 @@ def _fit_lm(
         n_steps=max_steps,
         verbose=verbose,
         print_blocks=print_blocks,
+        should_stop=should_stop,
         min_loss=min_loss,
         cg_max=linear_steps,
         m=probes,
@@ -946,6 +958,7 @@ class TransformAdapter:
         lm_exact_blocks=False,
         lm_max_exact_block_size=256,
         native_flow=True,
+        stop_event=None,
     ):
         self._logp_fn = logp_fn
         self._make_flow_fn = make_flow_fn
@@ -1006,6 +1019,9 @@ class TransformAdapter:
         # Whether the sampler may run the flow natively in its leapfrog steps,
         # see `flow_transform_layout`.
         self._native_flow = native_flow
+        # Set by the main thread when sampling is aborted. The training runs
+        # in a chain's thread, where Python never raises KeyboardInterrupt.
+        self._stop_event = stop_event
         # Damping the previous LM fit ended with, to start the next one from:
         # consecutive windows fit nearly the same problem, and restarting from
         # `lam0` makes each fit rediscover the scale, typically overshooting on
@@ -1065,9 +1081,14 @@ class TransformAdapter:
                 f"({n_draws:5d} draws): {message}"
             )
 
+    def _should_stop(self):
+        return self._stop_event is not None and self._stop_event.is_set()
+
     def update(self, seed, positions, gradients, logps):
         self.index += 1
         n_draws = len(positions)
+        if self._should_stop():
+            return
         assert n_draws == len(positions)
         assert n_draws == len(gradients)
         assert n_draws == len(logps)
@@ -1295,7 +1316,12 @@ class TransformAdapter:
                 lm_lam0=self._lm_lam,
                 lm_exact_blocks=self._lm_exact_blocks,
                 lm_max_exact_block_size=self._lm_max_exact_block_size,
+                should_stop=self._should_stop,
             )
+            if self._should_stop():
+                # Sampling was aborted, keep the flow as it is.
+                return
+
             # Kept even if the fit is discarded below: the damping scale says
             # something about the problem, whether or not this fit won. But
             # not from a fit that made no progress at all, where every
@@ -1558,6 +1584,7 @@ def make_transform_adapter(
     lm_exact_blocks=True,
     lm_max_exact_block_size=256,
     native_flow=True,
+    stop_event=None,
 ):
     if extension_windows is None:
         extension_windows = []
@@ -1625,4 +1652,5 @@ def make_transform_adapter(
         lm_exact_blocks=lm_exact_blocks,
         lm_max_exact_block_size=lm_max_exact_block_size,
         native_flow=native_flow,
+        stop_event=stop_event,
     )

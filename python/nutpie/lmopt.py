@@ -865,6 +865,7 @@ def fit(
     factor_fn=None,
     max_exact_block_size=256,
     print_blocks=False,
+    should_stop=None,
 ):
     """Levenberg-Marquardt fit of ``res_fn(params, (*args, *data))``.
 
@@ -890,6 +891,8 @@ def fit(
         rebuild_every: Accepted steps between block estimates.
         verbose: Print one line per step.
         print_blocks: Print the preconditioner blocks.
+        should_stop: Called after each step; the fit stops early if it
+            returns true, e.g. when sampling is aborted.
     """
     params, frozen = split_frozen(params, fit_affine)
     data = tuple(data)
@@ -973,6 +976,8 @@ def fit(
         nu_prev = info["lam_nu_next"]
         lam_lo_prev = info["lam_lo_next"]
         hist.append(info)
+        if should_stop is not None and should_stop():
+            break
         if verbose:
             print(
                 f"{i:3d}  log F={float(np.log(info['F_new'])):+.2f}  "
