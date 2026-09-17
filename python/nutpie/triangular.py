@@ -487,20 +487,93 @@ def _selected_inverse(edge_values, jacobian_diagonal, layout):
     return store
 
 
+def marginal_to_normal(params: Array, y: Array) -> tuple[Array, Array]:
+    """``u = g(y)`` and ``log g'(y)`` for the monotone marginal map of one
+    coordinate, a sinh-arcsinh (`Contract2`) inverse.
+
+    ``params[..., :]`` are ``(log gamma, eps, log sigma, mu, nu)``; zeros give
+    the identity. `fit_marginal_maps` fits them so that ``u`` is standard
+    normal under the draws.
+    """
+    log_gamma, eps, log_sigma, mu, nu = jnp.moveaxis(params, -1, 0)
+    half = jnp.exp(log_gamma - log_sigma) * (y - mu) / 2
+    w = (jnp.arcsinh(half) - eps) * jnp.exp(-log_gamma)
+    u = 2 * jnp.sinh(w) + nu
+    log_du = -log_sigma + _log_cosh(w) - 0.5 * jnp.log1p(half * half)
+    return u, log_du
+
+
+def _log_cosh(v):
+    a = jnp.abs(v)
+    return a + jnp.log1p(jnp.exp(-2.0 * a)) - jnp.log(2.0)
+
+
+def hermite_features(u: Array, degree: int) -> Array:
+    """``He_k(u) / sqrt(k!)`` for ``k = 1..degree``, stacked on a new last
+    axis: orthonormal under a standard normal ``u``."""
+    previous, current = jnp.ones_like(u), u
+    out = [current]
+    for k in range(1, degree):
+        previous, current = current, u * current - k * previous
+        out.append(current / np.sqrt(float(np.prod(np.arange(1, k + 2)))))
+    return jnp.stack(out, axis=-1)
+
+
+def fit_marginal_maps(y, *, steps: int = 100, ridge: float = 1e-3) -> np.ndarray:
+    """Fit `marginal_to_normal` per coordinate of the draws ``y`` (``(n, dim)``)
+    by maximum likelihood, so that ``u`` is standard normal. Returns
+    ``(dim, 5)`` parameters.
+
+    Damped Newton, vectorized over the coordinates. The small `ridge`
+    towards the identity pins down ``mu`` and ``nu``, which are redundant
+    for a near normal marginal.
+    """
+    y = jnp.asarray(y)
+
+    def loss(theta, values):
+        u, log_du = marginal_to_normal(theta, values)
+        return jnp.mean(0.5 * u * u - log_du) + ridge * jnp.sum(theta * theta)
+
+    loss_all = jax.vmap(loss, in_axes=(0, 1))
+    grad_all = jax.vmap(jax.grad(loss), in_axes=(0, 1))
+    hess_all = jax.vmap(jax.hessian(loss), in_axes=(0, 1))
+
+    def step(_, state):
+        theta, value, lam = state
+        g, H = grad_all(theta, y), hess_all(theta, y)
+        damped = H + lam[:, None, None] * jnp.eye(5)
+        proposal = theta + jnp.linalg.solve(damped, -g[..., None])[..., 0]
+        new_value = loss_all(proposal, y)
+        better = jnp.isfinite(new_value) & (new_value < value)
+        theta = jnp.where(better[:, None], proposal, theta)
+        value = jnp.where(better, new_value, value)
+        lam = jnp.where(better, lam / 3, lam * 4)
+        return theta, value, lam
+
+    dim = y.shape[1]
+    theta = jnp.zeros((dim, 5), y.dtype)
+    state = (theta, loss_all(theta, y), jnp.full(dim, 1e-2, y.dtype))
+    theta, _, _ = jax.jit(lambda s: jax.lax.fori_loop(0, steps, step, s))(state)
+    return np.asarray(theta)
+
+
 class LocationSkipMlp(eqx.Module):
     """Conditioner MLP plus a linear skip from the parents to the transformer's
     location.
 
     The skip weights enter linearly, so the dominant linear dependence on the
-    parents is well conditioned from the start.
+    parents is well conditioned from the start. The MLP may see other inputs
+    than the parents (`SparseTriangularMap`'s parent features); the skip is
+    always linear in the parents themselves.
     """
 
     mlp: eqx.nn.MLP
     skip: Array
     location_index: int = eqx.field(static=True)
 
-    def __call__(self, x: Array) -> Array:
-        return self.mlp(x).at[self.location_index].add(self.skip @ x)
+    def __call__(self, x: Array, inputs: Array | None = None) -> Array:
+        inputs = x if inputs is None else inputs
+        return self.mlp(inputs).at[self.location_index].add(self.skip @ x)
 
 
 def _location_index(transformer, constructor, num_params):
@@ -560,6 +633,14 @@ class SparseTriangularMap(bijections.AbstractBijection):
         nn_activation: Conditioner activation function.
         location_skip: Wrap conditioners in `LocationSkipMlp`. Ignored if the
             transformer has no location.
+        feature_degree: If given, the conditioner MLPs see features of the
+            parents instead of their raw values: each coordinate through its
+            fixed marginal map to a standard normal (`marginal_to_normal`),
+            then the orthonormal Hermite polynomials of degree
+            ``1..feature_degree`` (`hermite_features`). The location skip
+            stays linear in the raw parents, so this needs `location_skip`.
+            The marginal maps start at the identity; set them with
+            `with_marginal_maps`.
     """
 
     shape: tuple[int, ...]
@@ -585,6 +666,10 @@ class SparseTriangularMap(bijections.AbstractBijection):
     # See `gauss_newton_factors`.
     selected_inverse: _SelectedInverseLayout
     bucket_sigma_index: tuple[Array, ...]
+    # `(dim, 5)` `marginal_to_normal` parameters, `NonTrainable`, or None
+    # when the conditioners see the raw parents.
+    feature_params: Array | None
+    feature_degree: int | None = eqx.field(static=True)
     cond_shape = None
 
     def __init__(
@@ -599,6 +684,7 @@ class SparseTriangularMap(bijections.AbstractBijection):
         nn_depth: int = 1,
         nn_activation: Callable = jax.nn.gelu,
         location_skip: bool = True,
+        feature_degree: int | None = None,
     ):
         blanket = np.asarray(blanket, dtype=bool)
         if blanket.ndim != 2 or blanket.shape[0] != blanket.shape[1]:
@@ -659,10 +745,16 @@ class SparseTriangularMap(bijections.AbstractBijection):
             if location_skip
             else None
         )
+        if feature_degree is not None and location_index is None:
+            raise ValueError(
+                "feature_degree needs the location skip (location_skip=True and "
+                "a transformer with a location)."
+            )
+        features_per_parent = 1 if feature_degree is None else feature_degree
 
         def make_net(key, in_size):
             mlp = eqx.nn.MLP(
-                in_size=in_size,
+                in_size=in_size * features_per_parent,
                 out_size=num_params,
                 width_size=nn_width,
                 depth=nn_depth,
@@ -676,6 +768,7 @@ class SparseTriangularMap(bijections.AbstractBijection):
 
         def net_cost(in_size):
             """Rough cost of one conditioner evaluation, to weight padding."""
+            in_size = in_size * features_per_parent
             if nn_depth == 0:
                 return max(in_size, 1) * num_params
             return (
@@ -769,6 +862,12 @@ class SparseTriangularMap(bijections.AbstractBijection):
         )
         self.n_levels = n_levels
         self.shape = (dim,)
+        self.feature_degree = feature_degree
+        self.feature_params = (
+            None
+            if feature_degree is None
+            else NonTrainable(jnp.zeros((dim, 5)))
+        )
 
         self.jacobian_layout = _build_layout(
             self.bucket_members,
@@ -798,6 +897,40 @@ class SparseTriangularMap(bijections.AbstractBijection):
             bucket_sigma_index.append(jnp.asarray(index))
         self.bucket_sigma_index = tuple(bucket_sigma_index)
 
+    def with_marginal_maps(self, params) -> "SparseTriangularMap":
+        """Set the marginal map of every coordinate, ``(dim, 5)`` parameters
+        of `marginal_to_normal` (e.g. from `fit_marginal_maps`)."""
+        if self.feature_degree is None:
+            raise ValueError("The map has no parent features (feature_degree).")
+        dim = self.shape[0]
+        params = jnp.asarray(params)
+        if params.shape != (dim, 5):
+            raise ValueError(
+                f"Expected params of shape ({dim}, 5), got {params.shape}."
+            )
+        return eqx.tree_at(lambda m: m.feature_params, self, NonTrainable(params))
+
+    def mlp_inputs(self, parents, parent_indices):
+        """What a conditioner's MLP sees: the parent features, or None if it
+        sees the raw `parents`. `parent_indices` are the parents' variables
+        (``dim`` for padded slots, which read zero)."""
+        if self.feature_degree is None:
+            return None
+        dim = self.shape[0]
+        # Padded slots use the identity map, and their features are zeroed.
+        params = jnp.concatenate(
+            [self.feature_params, jnp.zeros((1, 5), self.feature_params.dtype)]
+        )[parent_indices]
+        u, _ = marginal_to_normal(params, parents)
+        real = (parent_indices < dim)[:, None]
+        features = jnp.where(real, hermite_features(u, self.feature_degree), 0.0)
+        return features.reshape(-1)
+
+    def _condition(self, net, parents, parent_indices):
+        """Transformer parameters from one conditioner at its parents."""
+        inputs = self.mlp_inputs(parents, parent_indices)
+        return net(parents) if inputs is None else net(parents, inputs)
+
     def _flat_params_to_transformer(self, params: Array):
         """``(n, num_params)`` params -> vmapped transformer."""
         transformer = eqx.filter_vmap(self.transformer_constructor)(params)
@@ -810,9 +943,9 @@ class SparseTriangularMap(bijections.AbstractBijection):
         log_det = jnp.zeros(())
         for bucket in range(len(self.conditioners)):
             members = self.bucket_members[bucket]
-            parents = y_padded[self.bucket_parent_indices[bucket]]
-            params = eqx.filter_vmap(lambda net, inp: net(inp))(
-                self.conditioners[bucket], parents
+            parent_indices = self.bucket_parent_indices[bucket]
+            params = eqx.filter_vmap(self._condition)(
+                self.conditioners[bucket], y_padded[parent_indices], parent_indices
             )
             transformer = self._flat_params_to_transformer(params)
             x_bucket, logdet_bucket = transformer.inverse_and_log_det(y[members])
@@ -873,7 +1006,7 @@ class SparseTriangularMap(bijections.AbstractBijection):
 
         y_padded = jnp.concatenate([y, jnp.zeros((1,), y.dtype)])
 
-        def factor(net, parents, real, value, w_i, delta_i, sigma):
+        def factor(net, parents, parent_indices, real, value, w_i, delta_i, sigma):
             arrays, static = eqx.partition(net, eqx.is_inexact_array)
             flat, unravel = jax.flatten_util.ravel_pytree(arrays)
 
@@ -881,7 +1014,9 @@ class SparseTriangularMap(bijections.AbstractBijection):
                 net = eqx.combine(unravel(flat), static)
 
                 def element(parents, value):
-                    transformer = self.transformer_constructor(net(parents))
+                    transformer = self.transformer_constructor(
+                        self._condition(net, parents, parent_indices)
+                    )
                     return transformer.inverse_and_log_det(value)
 
                 x_i, _ = element(parents, value)
@@ -924,6 +1059,7 @@ class SparseTriangularMap(bijections.AbstractBijection):
                 eqx.filter_vmap(factor)(
                     conditioner,
                     y_padded[parent_indices],
+                    parent_indices,
                     real,
                     y[members],
                     w[members],
@@ -939,10 +1075,12 @@ class SparseTriangularMap(bijections.AbstractBijection):
         (dim,) = self.shape
         y_padded = jnp.concatenate([y, jnp.zeros((1,), y.dtype)])
 
-        def differentiate_one_variable(conditioner, parent_values, own_value):
+        def differentiate_one_variable(
+            conditioner, parent_values, parent_indices, own_value
+        ):
             @jax.profiler.annotate_function
             def transform_element(parents, value):
-                params = conditioner(parents)
+                params = self._condition(conditioner, parents, parent_indices)
                 transformer = self.transformer_constructor(params)
                 return transformer.inverse_and_log_det(value)
 
@@ -962,7 +1100,12 @@ class SparseTriangularMap(bijections.AbstractBijection):
 
             bucket_x, bucket_log_det, bucket_rows, bucket_diagonal = eqx.filter_vmap(
                 differentiate_one_variable
-            )(self.conditioners[bucket], y_padded[parent_indices], y[members])
+            )(
+                self.conditioners[bucket],
+                y_padded[parent_indices],
+                parent_indices,
+                y[members],
+            )
 
             x = x.at[members].set(bucket_x)
             jacobian_diagonal = jacobian_diagonal.at[members].set(bucket_diagonal)
@@ -994,14 +1137,15 @@ class SparseTriangularMap(bijections.AbstractBijection):
                         self.conditioners[bucket],
                     )
 
-                    def transform_element(net, parent_values, value):
-                        params = net(parent_values)
+                    def transform_element(net, parent_values, indices, value):
+                        params = self._condition(net, parent_values, indices)
                         transformer = self.transformer_constructor(params)
                         return transformer.transform_and_log_det(value)
 
                     y_group, log_det_group = eqx.filter_vmap(transform_element)(
                         conditioner_group,
                         parents,
+                        parent_idx,
                         x.at[members].get(mode="fill", fill_value=0.0),
                     )
                     y_next = y_next.at[members].set(

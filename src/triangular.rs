@@ -508,6 +508,19 @@ fn log_cosh_from_sinh(sinh_v: f64, v: f64) -> f64 {
     }
 }
 
+/// The fixed marginal map of a parent feature, `u = g(y)` and `g'(y)`, with
+/// `params = (log gamma, eps, log sigma, mu, nu)`; the inverse of one
+/// sinh-arcsinh layer, as `nutpie.triangular.marginal_to_normal`.
+#[inline]
+fn marginal_to_normal(params: &[f64; 5], y: f64) -> (f64, f64) {
+    let [log_gamma, eps, log_sigma, mu, nu] = *params;
+    let half = (log_gamma - log_sigma).exp() * (y - mu) / 2.0;
+    let w = (half.asinh() - eps) * (-log_gamma).exp();
+    let u = 2.0 * w.sinh() + nu;
+    let du = (-log_sigma).exp() * w.cosh() / (1.0 + half * half).sqrt();
+    (u, du)
+}
+
 /// The elementwise transformer chain, mirroring
 /// `Contract2::transform_and_log_det`.
 ///
@@ -1237,6 +1250,10 @@ struct Scratchpad {
     next_l: Scratch,
     edge_y: Scratch,
     edge_l: Scratch,
+    /// With parent features: the MLP's input cotangents, `K` per parent,
+    /// before they are chained to one per parent.
+    feature_y: Scratch,
+    feature_l: Scratch,
 }
 
 impl Scratchpad {
@@ -1256,6 +1273,8 @@ impl Scratchpad {
             next_l: SmallVec::from_elem(0.0, width),
             edge_y: SmallVec::from_elem(0.0, parents),
             edge_l: SmallVec::from_elem(0.0, parents),
+            feature_y: SmallVec::from_elem(0.0, parents * transform.feature_degree.max(1)),
+            feature_l: SmallVec::from_elem(0.0, parents * transform.feature_degree.max(1)),
         }
     }
 }
@@ -1282,6 +1301,16 @@ pub struct TriangularTransform {
     /// conditioners have none.
     skip_weight: Vec<f64>,
     skip_index: usize,
+    /// Parent features: with `feature_degree = K > 0` the MLPs see, for each
+    /// parent, the orthonormal Hermite polynomials of degree `1..=K` of the
+    /// parent through its marginal map (`marginal_to_normal` with
+    /// `feature_params[parent]`). Zero: the raw parents.
+    feature_degree: usize,
+    feature_params: Vec<[f64; 5]>,
+    /// Each variable's `K` features and their derivatives in its value,
+    /// written when the variable is evaluated and read by its children.
+    features: Vec<Cell>,
+    feature_derivs: Vec<Cell>,
     activation: Activation,
     layers: Vec<Contract2>,
     level_ptr: Vec<usize>,
@@ -1328,18 +1357,28 @@ impl TriangularTransform {
         let start = self.parent_indptr[variable];
         let stop = self.parent_indptr[variable + 1];
         let n_in = stop - start;
-        for (slot, &parent) in pad.inputs[..n_in]
-            .iter_mut()
-            .zip(&self.parent_index[start..stop])
-        {
-            *slot = y[parent as usize].get();
-        }
+        let parents = &self.parent_index[start..stop];
         // Taken before the MLP runs, which reuses `inputs` as a layer buffer.
         let skip: f64 = self.skip_weight[start..stop]
             .iter()
-            .zip(&pad.inputs[..n_in])
-            .map(|(weight, value)| weight * value)
+            .zip(parents)
+            .map(|(weight, &parent)| weight * y[parent as usize].get())
             .sum();
+        let degree = self.feature_degree;
+        let n_mlp_in = if degree == 0 {
+            for (slot, &parent) in pad.inputs[..n_in].iter_mut().zip(parents) {
+                *slot = y[parent as usize].get();
+            }
+            n_in
+        } else {
+            for (j, &parent) in parents.iter().enumerate() {
+                let source = &self.features[parent as usize * degree..][..degree];
+                for (slot, cell) in pad.inputs[j * degree..][..degree].iter_mut().zip(source) {
+                    *slot = cell.get();
+                }
+            }
+            n_in * degree
+        };
 
         let weights = &self.blob[self.blob_offset[variable]..self.blob_offset[variable + 1]];
 
@@ -1350,7 +1389,7 @@ impl TriangularTransform {
             weights,
             layer_out: &self.layer_out,
             activation: self.activation,
-            n_in,
+            n_in: n_mlp_in,
             inputs: &mut pad.inputs,
             acc: &mut pad.acc,
             act_derivs: if TAPE {
@@ -1362,7 +1401,9 @@ impl TriangularTransform {
         pad.acc[self.skip_index] += skip;
 
         if !TAPE {
-            return transform_element(&self.layers, &pad.acc[..self.num_params], x);
+            let result = transform_element(&self.layers, &pad.acc[..self.num_params], x);
+            self.store_features(variable, result.0);
+            return result;
         }
 
         let (value, log_det, dy_dx, dld_dx) = transform_element_with_grads(
@@ -1378,18 +1419,37 @@ impl TriangularTransform {
         if n_in > 0 {
             pad.seed_y[..self.num_params].copy_from_slice(&pad.dy_dtheta);
             pad.seed_l[..self.num_params].copy_from_slice(&pad.dld_dtheta);
+            let (out_y, out_l) = if degree == 0 {
+                (&mut pad.edge_y[..n_in], &mut pad.edge_l[..n_in])
+            } else {
+                (&mut pad.feature_y[..n_mlp_in], &mut pad.feature_l[..n_mlp_in])
+            };
             self.arch.dispatch(BackpropMlp {
                 weights,
                 layer_out: &self.layer_out,
-                n_in,
+                n_in: n_mlp_in,
                 act_derivs: &pad.act_derivs,
                 seed_y: &mut pad.seed_y,
                 seed_l: &mut pad.seed_l,
                 next_y: &mut pad.next_y,
                 next_l: &mut pad.next_l,
-                out_y: &mut pad.edge_y[..n_in],
-                out_l: &mut pad.edge_l[..n_in],
+                out_y,
+                out_l,
             });
+            if degree > 0 {
+                // Chain the feature cotangents to one per parent.
+                for (j, &parent) in parents.iter().enumerate() {
+                    let derivs = &self.feature_derivs[parent as usize * degree..][..degree];
+                    let (mut sum_y, mut sum_l) = (0.0, 0.0);
+                    for (k, derivative) in derivs.iter().enumerate() {
+                        let derivative = derivative.get();
+                        sum_y += pad.feature_y[j * degree + k] * derivative;
+                        sum_l += pad.feature_l[j * degree + k] * derivative;
+                    }
+                    pad.edge_y[j] = sum_y;
+                    pad.edge_l[j] = sum_l;
+                }
+            }
             let skip_dy = pad.dy_dtheta[self.skip_index];
             let skip_dld = pad.dld_dtheta[self.skip_index];
             for (k, &weight) in self.skip_weight[start..stop].iter().enumerate() {
@@ -1402,7 +1462,32 @@ impl TriangularTransform {
             }
         }
 
+        self.store_features(variable, value);
         (value, log_det)
+    }
+
+    /// Write `variable`'s parent features, and their derivatives, for its
+    /// children to read.
+    #[inline]
+    fn store_features(&self, variable: usize, value: f64) {
+        let degree = self.feature_degree;
+        if degree == 0 {
+            return;
+        }
+        let (u, du) = marginal_to_normal(&self.feature_params[variable], value);
+        let features = &self.features[variable * degree..][..degree];
+        let derivs = &self.feature_derivs[variable * degree..][..degree];
+        // He_k(u) / sqrt(k!) and its derivative k He_{k-1}(u) / sqrt(k!) * du.
+        let (mut previous, mut current) = (1.0, u);
+        let mut norm = 1.0_f64;
+        for k in 1..=degree {
+            if k > 1 {
+                (previous, current) = (current, u * current - (k - 1) as f64 * previous);
+            }
+            norm *= (k as f64).sqrt();
+            features[k - 1].set(current / norm);
+            derivs[k - 1].set(k as f64 * previous / norm * du);
+        }
     }
 
     /// `x -> y`, returning `log|det dy/dx|`.
@@ -1649,6 +1734,8 @@ fn build_transform(
     layer_out: &[i64],
     skip_weight: &[f64],
     skip_index: i64,
+    feature_degree: i64,
+    feature_params: &[f64],
     activation: &str,
     transformer: &Bound<'_, PyAny>,
     level_ptr: &[i64],
@@ -1714,10 +1801,25 @@ fn build_transform(
         .max()
         .unwrap_or(0);
     let act_deriv_len: usize = layer_out[..layer_out.len() - 1].iter().sum();
+
+    let feature_degree = usize::try_from(feature_degree)
+        .map_err(|_| anyhow::anyhow!("feature_degree must not be negative"))?;
+    let feature_params: Vec<[f64; 5]> = if feature_degree == 0 {
+        vec![[0.0; 5]; n_variables]
+    } else {
+        if feature_params.len() != 5 * n_variables {
+            bail!("feature_params must have five entries per variable");
+        }
+        feature_params
+            .chunks_exact(5)
+            .map(|chunk| chunk.try_into().expect("chunks of five"))
+            .collect()
+    };
+
     let buffer_size = layer_out
         .iter()
         .copied()
-        .chain(std::iter::once(max_parents))
+        .chain(std::iter::once(max_parents * feature_degree.max(1)))
         .max()
         .unwrap_or(1)
         .max(1);
@@ -1744,6 +1846,10 @@ fn build_transform(
         layer_out,
         skip_weight,
         skip_index,
+        feature_degree,
+        feature_params,
+        features: Cell::zeros(n_variables * feature_degree),
+        feature_derivs: Cell::zeros(n_variables * feature_degree),
         activation,
         layers,
         level_ptr,
@@ -1818,6 +1924,8 @@ impl FlowTransform {
                     &ints(layout, "layer_out")?,
                     &floats(layout, "skip_weight")?,
                     item(layout, "skip_index")?.extract()?,
+                    item(layout, "feature_degree")?.extract()?,
+                    &floats(layout, "feature_params")?,
                     &item(layout, "activation")?.extract::<String>()?,
                     &item(layout, "transformer")?,
                     &ints(layout, "level_ptr")?,
@@ -1930,6 +2038,8 @@ impl PySparseTriangularTransform {
         layer_out,
         skip_weight,
         skip_index,
+        feature_degree,
+        feature_params,
         activation,
         transformer,
         level_ptr,
@@ -1947,6 +2057,8 @@ impl PySparseTriangularTransform {
         layer_out: PyReadonlyArray1<'_, i64>,
         skip_weight: PyReadonlyArray1<'_, f64>,
         skip_index: i64,
+        feature_degree: i64,
+        feature_params: PyReadonlyArray1<'_, f64>,
         activation: &str,
         transformer: &Bound<'_, PyAny>,
         level_ptr: PyReadonlyArray1<'_, i64>,
@@ -1964,6 +2076,8 @@ impl PySparseTriangularTransform {
                 layer_out.as_slice()?,
                 skip_weight.as_slice()?,
                 skip_index,
+                feature_degree,
+                feature_params.as_slice()?,
                 activation,
                 transformer,
                 level_ptr.as_slice()?,

@@ -262,7 +262,10 @@ def test_conditioner_capacity_matches_residuals(x64, fitted_flow):
         for m, member in enumerate(np.asarray(tmap.bucket_members[bucket])):
             one = eqx.combine(jax.tree.map(lambda a: a[m], arrays), static)
             parents = y_padded[:, parent_indices[m]]
-            mean = jax.vmap(_unit_features(one))(parents).mean(0)
+            indices = tmap.bucket_parent_indices[bucket][m]
+            mean = jax.vmap(lambda p: _unit_features(tmap, one)(p, indices))(
+                parents
+            ).mean(0)
             directions = _gate_directions(one, mean)
             _, unravel = ravel_pytree(eqx.partition(one, eqx.is_inexact_array)[0])
 
