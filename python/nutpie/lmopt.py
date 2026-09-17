@@ -106,30 +106,92 @@ def _perm_from_labels(block, label_fn):
     one = jax.tree.map(lambda l: l[0], arr)
     leaves = jax.tree.leaves(one)
     labels = label_fn(one)
-    assert [tuple(l.shape) for l in leaves] == [
-        tuple(np.shape(g)) for g in labels
-    ], "label shapes must match jax.tree.leaves order of the block"
+    assert [tuple(l.shape) for l in leaves] == [tuple(np.shape(g)) for g in labels], (
+        "label shapes must match jax.tree.leaves order of the block"
+    )
     lab = np.concatenate([np.asarray(g).ravel() for g in labels])
     return np.argsort(lab, kind="stable")
 
 
-def make_plan(block, m, label_fn=None, q_min=16):
+def block_limit(m, q_min=16, max_block_size=None):
+    """Largest sub-block size: `max_block_size` if given (exact blocks,
+    where only the cost matters), else ``max(q_min, 2 m)`` (probe-based
+    blocks, which `m` probes can only estimate up to a certain size)."""
+    return max_block_size if max_block_size is not None else max(q_min, 2 * m)
+
+
+def describe_plans(plans, limit):
+    """Table of the blocks of each bucket, for the verbose output.
+
+    `parents` is the input width of the bucket's conditioners, the largest
+    number of parents in the bucket.
+    """
+    lines = [
+        f"LM preconditioner blocks (sub-blocks of at most {limit} parameters):",
+        "  parents  conditioners  weights/conditioner  blocks/conditioner",
+    ]
+    for p in plans:
+        parents = "affine" if p["parents"] is None else p["parents"]
+        blocks = f"{p['G']} x {p['q']}"
+        lines.append(f"  {parents:>7}  {p['n']:>12}  {p['Pb']:>19}  {blocks:>18}")
+    return "\n".join(lines)
+
+
+def describe_fallbacks(info, plans):
+    """Sub-blocks replaced by their diagonal in this step, for the verbose
+    output, e.g. ``"  non-finite blocks: 3 (8 parents: 3)"``."""
+    text = ""
+    for key, label in [
+        ("nonfinite_blocks", "non-finite blocks"),
+        ("failed_inverses", "diagonal inverses"),
+    ]:
+        counts = np.asarray(info.get(key, []))
+        if not counts.sum():
+            continue
+        buckets = ", ".join(
+            f"{'affine' if p['parents'] is None else p['parents']} parents: {c}"
+            for c, p in zip(counts, plans)
+            if c
+        )
+        text += f"  {label}: {counts.sum()} ({buckets})"
+    return text
+
+
+def mlp_input_width(one):
+    """Input width of one conditioner, as given to `make_net`."""
+    from nutpie.triangular import LocationSkipMlp
+
+    mlp = one.mlp if isinstance(one, LocationSkipMlp) else one
+    return int(mlp.layers[0].weight.shape[-1])
+
+
+def make_plan(block, m, label_fn=None, q_min=16, max_block_size=None):
     """Sub-block plan for one bucket: ``G`` sub-blocks of size
-    ``q = min(Pb, max(q_min, 2 m))``."""
+    ``q = min(Pb, block_limit(m, q_min, max_block_size))``."""
     flatten, unflatten, Pb = codec(block)
+    arrays, _ = eqx.partition(block, eqx.is_inexact_array)
+    n = jax.tree.leaves(arrays)[0].shape[0]
+    # Conditioners have labels, the affine tail doesn't.
+    parents = (
+        mlp_input_width(jax.tree.map(lambda leaf: leaf[0], block))
+        if label_fn is not None
+        else None
+    )
     perm = (
         _perm_from_labels(block, label_fn)
         if (label_fn is not None and Pb > 0)
         else np.arange(Pb)
     )
-    #q = int(min(Pb, max(q_min, m // 2))) if Pb else 1
-    q = int(min(Pb, max(q_min, 2 * m))) if Pb else 1
+    # q = int(min(Pb, max(q_min, m // 2))) if Pb else 1
+    q = int(min(Pb, block_limit(m, q_min, max_block_size))) if Pb else 1
     G = -(-Pb // q) if Pb else 1
     idx = np.full(G * q, Pb, dtype=int)
     idx[:Pb] = perm  # column Pb = dummy sink
     return {
         "flatten": flatten,
         "unflatten": unflatten,
+        "n": n,
+        "parents": parents,
         "Pb": Pb,
         "q": q,
         "G": G,
@@ -171,8 +233,8 @@ def pcg(Av, Minv, b, x0, rtol, maxiter):
     r0 = jax.tree.map(lambda bb, ax: bb - alpha * ax, b, Ax0)
     z0 = Minv(r0)
 
-    #r0 = jax.tree.map(lambda p, q: p - q, b, Av(x0))
-    #z0 = Minv(r0)
+    # r0 = jax.tree.map(lambda p, q: p - q, b, Av(x0))
+    # z0 = Minv(r0)
 
     def cond(c):
         _, _, _, _, rz, k = c
@@ -341,9 +403,7 @@ def block_diagonal(blocks, plans, template, floors):
     out = [
         p["unflatten"](
             _scatter(
-                jnp.maximum(
-                    jnp.diagonal(H, axis1=-2, axis2=-1), floor[:, None, None]
-                ),
+                jnp.maximum(jnp.diagonal(H, axis1=-2, axis2=-1), floor[:, None, None]),
                 p,
             )
         )
@@ -365,9 +425,7 @@ MARQUARDT_GLOBAL_FLOOR = 1e-10
 def marquardt_floors(blocks):
     """Per-conditioner floor for ``diag(J^T J)`` in Marquardt damping,
     ``(n,)`` per bucket."""
-    local = [
-        jnp.max(jnp.diagonal(H, axis1=-2, axis2=-1), axis=(1, 2)) for H in blocks
-    ]
+    local = [jnp.max(jnp.diagonal(H, axis1=-2, axis2=-1), axis=(1, 2)) for H in blocks]
     global_max = jnp.maximum(jnp.max(jnp.concatenate(local)), 1e-300)
     return [
         jnp.maximum(MARQUARDT_FLOOR * dmax, MARQUARDT_GLOBAL_FLOOR * global_max)
@@ -375,13 +433,33 @@ def marquardt_floors(blocks):
     ]
 
 
+def _sanitize_blocks(blocks):
+    """Replace non-finite ``(q, q)`` sub-blocks by their finite diagonal.
+
+    A single non-finite block would otherwise spread through the global
+    Marquardt floor into every conditioner's damping, and through `D` into
+    the damped system itself, so CG could not make any step. Returns the
+    blocks and the number of replaced sub-blocks per bucket.
+    """
+    out, counts = [], []
+    for H in blocks:
+        bad = ~jnp.all(jnp.isfinite(H), axis=(-2, -1))
+        diag = jnp.diagonal(H, axis1=-2, axis2=-1)
+        diag = jnp.where(jnp.isfinite(diag), diag, 0.0)
+        fallback = diag[..., :, None] * jnp.eye(H.shape[-1], dtype=H.dtype)
+        out.append(jnp.where(bad[..., None, None], fallback, H))
+        counts.append(jnp.sum(bad))
+    return out, jnp.stack(counts)
+
+
 def _block_inv(H, lam, floor, shrinkage):
-    """Inverse of the damped block ``H + lam D``.
+    """Inverse of the damped block ``H + lam D``, and whether it failed.
 
     ``D = I`` if `floor` is ``None`` (Levenberg), else ``diag(H)`` floored at
     `floor` (Marquardt); it must match `step`'s `Av`. `H` is first shrunk
     towards its diagonal by `shrinkage`, so directions the probes missed fall
-    back to Jacobi. A small ridge keeps the Cholesky stable.
+    back to Jacobi. A small ridge keeps the Cholesky stable. If the inverse
+    is still not finite, the inverse of the damped diagonal is used instead.
     """
     if False:
         w, V = jnp.linalg.eigh(H)
@@ -397,25 +475,30 @@ def _block_inv(H, lam, floor, shrinkage):
         damped = H + jnp.diag(diag)
     factor = jnp.linalg.cholesky(damped)
     inv_factor = solve_triangular(factor, eye, lower=True)
-    return inv_factor.T @ inv_factor
+    inv = inv_factor.T @ inv_factor
+    failed = ~jnp.all(jnp.isfinite(inv))
+    return jnp.where(failed, jnp.diag(1.0 / jnp.diagonal(damped)), inv), failed
 
 
 def precompute_Minvs(blocks, plans, n_samples, lam, floors):
-    """Inverse damped blocks ``(n, G, q, q)`` per bucket, once per step.
+    """Inverse damped blocks ``(n, G, q, q)`` per bucket, once per step, and
+    the number of sub-blocks per bucket that fell back to the diagonal.
 
     `floors` is ``None`` for absolute damping. Shrinkage is
     ``q / (q + n_samples)``.
     """
-    out = []
+    out, failed = [], []
     for i, (H, p) in enumerate(zip(blocks, plans)):
         shrinkage = p["q"] / (p["q"] + n_samples)
         if floors is None:
             inv = lambda H: _block_inv(H, lam, None, shrinkage)
-            out.append(jax.vmap(jax.vmap(inv))(H))
+            Minv, bad = jax.vmap(jax.vmap(inv))(H)
         else:
             inv = lambda H, floor: _block_inv(H, lam, floor, shrinkage)
-            out.append(jax.vmap(jax.vmap(inv, in_axes=(0, None)))(H, floors[i]))
-    return out
+            Minv, bad = jax.vmap(jax.vmap(inv, in_axes=(0, None)))(H, floors[i])
+        out.append(Minv)
+        failed.append(jnp.sum(bad))
+    return out, jnp.stack(failed)
 
 
 def apply_Minvs(Minvs, plans, v):
@@ -525,7 +608,14 @@ def step(
         else:
             n_samples = n_groups * rounds
             estimate = lambda capture: build_blocks_grouped(
-                group_res_fn, data, theta, key, plans, n_groups, rounds, batch,
+                group_res_fn,
+                data,
+                theta,
+                key,
+                plans,
+                n_groups,
+                rounds,
+                batch,
                 capture=capture,
             )
         if blocks is None or capture_diagnostic:
@@ -535,25 +625,25 @@ def step(
             Hb = jax.lax.cond(
                 rebuild_blocks, lambda: estimate(False)[0], lambda: blocks
             )
+        Hb, nonfinite_blocks = _sanitize_blocks(Hb)
         if damping == "marquardt":
             floors = marquardt_floors(Hb)
             D = block_diagonal(Hb, plans, theta, floors)
         else:
             D = floors = None
-        Minvs = precompute_Minvs(Hb, plans, n_samples, lam, floors)
+        Minvs, failed_inverses = precompute_Minvs(Hb, plans, n_samples, lam, floors)
         Minv = lambda v: apply_Minvs(Minvs, plans, v)
     else:
         # No blocks, so no diagonal for Marquardt damping.
         Hb = D = capture = None
+        nonfinite_blocks = failed_inverses = None
         Minv = lambda v: v
 
     jvp = lambda v: jax.jvp(res_fn_args, (theta,), (v,))[1]
     if D is None:
         Av = lambda v: jax.tree.map(lambda a, b: a + lam * b, vjp(jvp(v)), v)
     else:
-        Av = lambda v: jax.tree.map(
-            lambda a, d, b: a + lam * d * b, vjp(jvp(v)), D, v
-        )
+        Av = lambda v: jax.tree.map(lambda a, d, b: a + lam * d * b, vjp(jvp(v)), D, v)
 
     g = vjp(r)
     rhs = jax.tree.map(jnp.negative, g)
@@ -572,8 +662,8 @@ def step(
     step_length = jnp.ones((), F.dtype)
     # `lam` is driven by the full GN step, not the line-searched one.
     pred_full = -tdot(p, g) - 0.5 * tdot(Jp, Jp)
-    rho_full = 0.5 * (F - F_new) / jnp.where(
-        jnp.abs(pred_full) < 1e-30, 1e-30, pred_full
+    rho_full = (
+        0.5 * (F - F_new) / jnp.where(jnp.abs(pred_full) < 1e-30, 1e-30, pred_full)
     )
     full_step_good = (
         (rho_full > accept_rho)
@@ -686,6 +776,9 @@ def step(
     }
     if capture is not None:
         info["capture"] = capture
+    if nonfinite_blocks is not None:
+        info["nonfinite_blocks"] = nonfinite_blocks
+        info["failed_inverses"] = failed_inverses
     # Block eigenvalue diagnostics, disabled.
     if False and plans is not None:
         info["block_min_eig"] = jnp.stack([jnp.min(jnp.linalg.eigvalsh(H)) for H in Hb])
@@ -698,30 +791,36 @@ def step(
 _plans_cache = {}
 
 
-def _plans_signature(params, m, q_min):
+def _plans_signature(params, m, q_min, max_block_size):
     """`_plans_cache` key: treedef, leaf shapes and dtypes, plan settings."""
     leaves, treedef = jax.tree_util.tree_flatten(params)
     shapes = tuple((tuple(np.shape(l)), np.result_type(l).str) for l in leaves)
-    return (treedef, shapes, m, q_min)
+    return (treedef, shapes, m, q_min, max_block_size)
 
 
-def get_plans(params, m=128, q_min=16):
+def get_plans(params, m=128, q_min=16, max_block_size=None):
     """Block plans for this parameter structure, cached so that `step`, which
     takes them as static arguments, does not recompile."""
-    key = _plans_signature(params, m, q_min)
+    key = _plans_signature(params, m, q_min, max_block_size)
     if key not in _plans_cache:
         n_conditioners = len(_conditioners(params))
         _plans_cache[key] = [
             # The affine tail has no hidden units to group by.
-            make_plan(b, m, mlp_unit_labels if i < n_conditioners else None, q_min)
+            make_plan(
+                b,
+                m,
+                mlp_unit_labels if i < n_conditioners else None,
+                q_min,
+                max_block_size,
+            )
             for i, b in enumerate(blocks_of(params))
         ]
     return _plans_cache[key]
 
 
-def setup(params, m=128, q_min=16):
+def setup(params, m=128, q_min=16, max_block_size=None):
     """Block plans for `step`, checking that `blocks_of` round-trips."""
-    plans = get_plans(params, m, q_min)
+    plans = get_plans(params, m, q_min, max_block_size)
 
     assert jax.tree.all(
         jax.tree.map(
@@ -764,6 +863,8 @@ def fit(
     line_search=False,
     forcing="residual",
     factor_fn=None,
+    max_exact_block_size=256,
+    print_blocks=False,
 ):
     """Levenberg-Marquardt fit of ``res_fn(params, (*args, *data))``.
 
@@ -779,11 +880,16 @@ def fit(
         n_groups, rounds: Use `build_blocks_grouped` instead of `build_blocks`.
         factor_fn: ``factor_fn(params, args, draw_data)`` gives exact block
             factors (see `build_blocks_exact`). Needs ``fit_affine=False``.
+        max_exact_block_size: Largest sub-block with exact blocks. Larger
+            conditioners are split, only to bound the cost; with probe-based
+            blocks the size follows from `m` instead.
         fit_affine: Also fit the affine tail, see `split_frozen`.
         line_search: Shorten steps to a fitted parabola's minimum (``a=`` in
             the log).
         forcing: CG tolerance rule, ``"residual"`` or ``"rho"``; see `step`.
         rebuild_every: Accepted steps between block estimates.
+        verbose: Print one line per step.
+        print_blocks: Print the preconditioner blocks.
     """
     params, frozen = split_frozen(params, fit_affine)
     data = tuple(data)
@@ -799,13 +905,11 @@ def fit(
             )
 
     if precondition:
-        plans = setup(params, m)
+        max_block_size = max_exact_block_size if factor_fn is not None else None
+        plans = setup(params, m, max_block_size=max_block_size)
 
-        if verbose:
-            print(
-                "bucket (Pb, q, n_subblocks):",
-                [(p["Pb"], p["q"], p["G"]) for p in plans],
-            )
+        if print_blocks:
+            print(describe_plans(plans, block_limit(m, max_block_size=max_block_size)))
     else:
         plans = None
 
@@ -871,8 +975,7 @@ def fit(
         hist.append(info)
         if verbose:
             print(
-                f"{i:3d}  F={float(info['F_new']):.4e}  "
-                f"log(F)={float(np.log(info['F_new'])):+.2f} "
+                f"{i:3d}  log F={float(np.log(info['F_new'])):+.2f}  "
                 f"rho={float(info['rho']):+.2f}  "
                 f"lam={float(info['lam_out']):.1e}  "
                 f"cg={int(info['n_cg']):3d}{' ' if info['cg_converged'] else '*'} "
@@ -887,6 +990,7 @@ def fit(
                     if "capture" in info
                     else ""
                 )
+                + describe_fallbacks(info, plans)
                 + f"{'' if info['accept'] else '   REJECT'}"
             )
 
