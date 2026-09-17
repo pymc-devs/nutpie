@@ -1,11 +1,8 @@
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
+#[cfg(feature = "parallel")]
 use std::{
-    collections::BTreeMap,
-    sync::{
-        mpsc::{sync_channel, SyncSender},
-        Arc,
-    },
+    sync::mpsc::{sync_channel, SyncSender},
     thread::spawn,
-    time::Duration,
 };
 
 use anyhow::{Context, Result};
@@ -17,15 +14,54 @@ use upon::{Engine, Value};
 
 use crate::wrapper::PyChainProgress;
 
+/// Where rendered progress updates go: a channel to our own callback thread,
+/// or without `parallel` the python callback itself.
+#[cfg(feature = "parallel")]
+type Updates = SyncSender<String>;
+#[cfg(not(feature = "parallel"))]
+type Updates = Arc<Py<PyAny>>;
+
+#[cfg(feature = "parallel")]
+fn send_update(updates: &Updates, update: String) {
+    if let Err(e) = updates.send(update) {
+        eprintln!("Could not send progress update: {e}");
+    }
+}
+
+#[cfg(not(feature = "parallel"))]
+fn send_update(callback: &Updates, update: String) {
+    let res = Python::attach(|py| callback.call1(py, (update,)));
+    if let Err(err) = res {
+        eprintln!("Error in progress callback: {err}");
+    }
+}
+
 pub struct ProgressHandler {
     engine: Engine<'static>,
     template: String,
     rate: Duration,
     n_cores: usize,
-    updates: SyncSender<String>,
+    updates: Updates,
 }
 
 impl ProgressHandler {
+    /// Without threads the sampler reports progress from inside `wait`, on the
+    /// thread that called it, so we can call into python directly.
+    #[cfg(not(feature = "parallel"))]
+    pub fn new(callback: Arc<Py<PyAny>>, rate: Duration, template: String, n_cores: usize) -> Self {
+        Self {
+            engine: Engine::new(),
+            rate,
+            template,
+            n_cores,
+            updates: callback,
+        }
+    }
+
+    /// The sampler reports progress from its controller thread. Hand the
+    /// updates to a thread of our own, so that a slow python callback does not
+    /// hold up the controller.
+    #[cfg(feature = "parallel")]
     pub fn new(callback: Arc<Py<PyAny>>, rate: Duration, template: String, n_cores: usize) -> Self {
         let engine = Engine::new();
 
@@ -79,10 +115,7 @@ impl ProgressHandler {
                 progress_to_value(progress_update_count, self.n_cores, time_sampling, progress);
             let rendered = template.render_from(&self.engine, &progress).to_string();
             let rendered = rendered.unwrap_or_else(|err| format!("{err}"));
-            if let Err(e) = self.updates.send(rendered) {
-                eprintln!("Could not send progress update: {e}");
-                return;
-            }
+            send_update(&self.updates, rendered);
             progress_update_count += 1;
         };
 
