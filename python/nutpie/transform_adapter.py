@@ -853,10 +853,7 @@ class TransformAdapter:
     def init_from_untransformed_position(self, untransformed_position, clip):
         try:
             logp, logdet, *arrays = _init_from_untransformed_position(
-                self._logp_fn,
-                self._bijection,
-                jnp.array(untransformed_position),
-                clip
+                self._logp_fn, self._bijection, jnp.array(untransformed_position), clip
             )
             arrays = [np.array(val, dtype="float64") for val in arrays]
             return float(logp), float(logdet), *arrays
