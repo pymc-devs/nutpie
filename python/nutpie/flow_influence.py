@@ -2,20 +2,33 @@
 
 For fixed parents, the flow gives parameter ``i`` a one-dimensional
 conditional distribution ``p_theta(y_i)``, where ``theta = net(y_parents)``
-are the parameters of its transformer. A change of parent ``j`` moves
-``theta`` along ``g_j = d theta / d y_j``. With the Fisher information
-``I(theta)`` of the one-dimensional family,
+are the parameters of its transformer ``y = T_theta(x)`` with standard normal
+``x``. A change of parent ``j`` moves ``theta`` along
+``g_j = d theta / d y_j``. With the Fisher information ``I(theta)`` of the
+one-dimensional family,
 
     speed(i <- j) = sqrt(g_j^T I(theta) g_j)
 
 is how fast the conditional distribution of ``i`` changes in the Fisher-Rao
 metric when parent ``j`` moves by one unit. It does not depend on how the
-transformer is parameterized, so location, scale and shape parameters are
-combined consistently. ``I(theta)`` is computed exactly enough with
-Gauss-Hermite quadrature in the latent space.
+transformer is parameterized.
 
-The speed is averaged (as a root mean square) over posterior draws, taken in
-the input space of the triangular map, after the flow's diagonal affine
+It is computed in the latent space: the latent velocity of the change is
+``V(x) = sum_a g_ja d_a T(x) / T'(x)``, the corresponding score is
+``x V(x) - V'(x)`` (a Stein operator, which maps Hermite polynomials
+``He_n`` to ``He_{n+1}``), and the speed is its root mean square, with
+Gauss-Hermite quadrature over ``x``. This only needs the forward map.
+
+Splitting ``V`` into its even and odd part in ``x`` splits the squared speed
+exactly, since the scores of the two parts are odd and even, and so
+uncorrelated under the normal distribution:
+
+- even velocities move all latent points the same way or asymmetrically:
+  a change of *location and skew*,
+- odd velocities stretch symmetrically: a change of *scale and tails*.
+
+The speeds are averaged (as a root mean square) over posterior draws, taken
+in the input space of the triangular map, after the flow's diagonal affine
 layer. That layer standardizes the parameters roughly, so a speed of 1 means
 that moving the parent by about one posterior standard deviation changes the
 conditional distribution of the child by about as much as shifting a normal
@@ -29,8 +42,8 @@ import scipy.sparse as sp
 
 KINDS = {
     "total": "Fisher speed",
-    "location": "location only",
-    "scale_shape": "scale and shape",
+    "location_skew": "location and skew",
+    "scale_tails": "scale and tails",
 }
 
 
@@ -45,11 +58,9 @@ class FlowInfluence:
         Sparse ``(n_dim, n_dim)`` matrix, ``total[i, j]`` is the RMS Fisher
         speed of the conditional distribution of ``i`` per unit of parent
         ``j``. Only parents of the flow have entries.
-    location:
-        The same, with only the change of the location, or None if the
-        transformer has no location parameter.
-    scale_shape:
-        The same, with the change of everything but the location.
+    location_skew, scale_tails:
+        The parts of the speed from changes of location and skew, and of
+        scale and tails. Their squares add up to the square of `total`.
     order:
         The flow order: ``order[k]`` is the parameter at position ``k``.
     unconstrained_parameters:
@@ -59,8 +70,8 @@ class FlowInfluence:
     """
 
     total: sp.csr_array
-    location: sp.csr_array | None
-    scale_shape: sp.csr_array
+    location_skew: sp.csr_array
+    scale_tails: sp.csr_array
     order: np.ndarray
     unconstrained_parameters: list[str]
     num_draws: int
@@ -71,7 +82,7 @@ class FlowInfluence:
 
     def plot(
         self,
-        kinds=("total", "location", "scale_shape"),
+        kinds=("total", "location_skew", "scale_tails"),
         *,
         variables=None,
         max_variables=10,
@@ -86,7 +97,7 @@ class FlowInfluence:
         ----------
         kinds:
             Which influences to show, one panel each: ``"total"``,
-            ``"location"`` and ``"scale_shape"``.
+            ``"location_skew"`` and ``"scale_tails"``.
         variables:
             The model variable of each unconstrained parameter, e.g.
             ``compiled.factorization.variables``. If given, coloured strips
@@ -104,7 +115,6 @@ class FlowInfluence:
 
         from nutpie.sparsity import _draw_cells, _variable_strips
 
-        kinds = [kind for kind in kinds if getattr(self, kind) is not None]
         if axes is None:
             _, axes = plt.subplots(
                 1, len(kinds), figsize=(5.5 * len(kinds), 5), squeeze=False
@@ -159,44 +169,41 @@ def _draws(trace):
     return values.reshape(-1, values.shape[-1]), names
 
 
-def _find_location_index(conditioner, constructor, num_params):
-    """Index of the transformer parameter that is its location, or None."""
-    from nutpie.triangular import LocationSkipMlp, _location_index
-
-    if isinstance(conditioner, LocationSkipMlp):
-        return conditioner.location_index
-    import jax.numpy as jnp
-
-    try:
-        transformer = constructor(jnp.zeros((num_params,)))
-        return _location_index(transformer, constructor, num_params)
-    except (AttributeError, ValueError):
-        return None
-
-
-def fisher_information(constructor, theta, num_nodes=16):
-    """Fisher information of the one-dimensional family ``p_theta(y)``,
-    where ``x = constructor(theta).inverse(y)`` is standard normal.
-
-    ``log p_theta(y) = log phi(x) + log |dx/dy|``. The expectation over
-    ``y ~ p_theta`` is taken with Gauss-Hermite quadrature on ``x``.
-    """
-    import jax
+def _quadrature(num_nodes, dtype):
+    """Gauss-Hermite nodes and normalized weights for a standard normal. The
+    nodes are symmetric: reversing them negates them."""
     import jax.numpy as jnp
 
     nodes, weights = np.polynomial.hermite_e.hermegauss(num_nodes)
-    nodes = jnp.asarray(nodes, dtype=theta.dtype)
-    weights = jnp.asarray(weights / weights.sum(), dtype=theta.dtype)
-
-    def log_p(theta, y):
-        x, log_det = constructor(theta).inverse_and_log_det(y)
-        return -0.5 * x**2 + log_det
-
-    ys = jax.vmap(lambda x: constructor(theta).transform_and_log_det(x)[0])(nodes)
-    scores = jax.vmap(jax.grad(log_p), in_axes=(None, 0))(
-        theta, jax.lax.stop_gradient(ys)
+    return jnp.asarray(nodes, dtype=dtype), jnp.asarray(
+        weights / weights.sum(), dtype=dtype
     )
-    return jnp.einsum("k,ki,kj->ij", weights, scores, scores)
+
+
+def latent_velocities(constructor, theta, nodes):
+    """Latent velocities ``V_a(x) = d_a T(x) / T'(x)`` of the transformer
+    parameters and their ``x``-derivatives at `nodes`, each ``(nodes, q)``."""
+    import jax
+
+    def T(theta, x):
+        return constructor(theta).transform_and_log_det(x)[0]
+
+    def velocity(x):
+        return jax.grad(T, argnums=0)(theta, x) / jax.grad(T, argnums=1)(theta, x)
+
+    return jax.vmap(velocity)(nodes), jax.vmap(jax.jacfwd(velocity))(nodes)
+
+
+def fisher_information(constructor, theta, num_nodes=16):
+    """Fisher information of the one-dimensional family ``y = T_theta(x)``,
+    ``x`` standard normal: ``E[s_a s_b]`` with the scores
+    ``s_a = x V_a(x) - V_a'(x)``, see `latent_velocities`."""
+    import jax.numpy as jnp
+
+    nodes, weights = _quadrature(num_nodes, theta.dtype)
+    V, dV = latent_velocities(constructor, theta, nodes)
+    scores = nodes[:, None] * V - dV
+    return jnp.einsum("k,ka,kb->ab", weights, scores, scores)
 
 
 def fisher_influence(bijection, trace, *, num_nodes=16, batch_size=256):
@@ -212,8 +219,8 @@ def fisher_influence(bijection, trace, *, num_nodes=16, batch_size=256):
         A trace sampled with ``store_unconstrained=True``. Only the
         unconstrained draws in ``sample_stats`` are used.
     num_nodes:
-        Number of Gauss-Hermite nodes for the Fisher information of each
-        one-dimensional conditional distribution.
+        Number of Gauss-Hermite nodes for each one-dimensional conditional
+        distribution.
     batch_size:
         Draws evaluated at once, the memory knob.
 
@@ -242,53 +249,46 @@ def fisher_influence(bijection, trace, *, num_nodes=16, batch_size=256):
     to_map = jax.jit(
         jax.vmap(lambda d: bijections.Invert(sandwich.outer).inverse(affine.inverse(d)))
     )
-
     constructor = tmap.transformer_constructor
 
-    def speeds(net, parents, location_index):
-        """Squared speeds per parent slot, for one conditioner and draw."""
+    def speeds(net, parents):
+        """Squared speeds per parent slot, for one conditioner and draw:
+        total, even (location and skew) and odd (scale and tails) part."""
+        nodes, weights = _quadrature(num_nodes, parents.dtype)
         theta = net(parents)
         G = jax.jacfwd(net)(parents)  # (num_params, num_parents)
-        info = fisher_information(constructor, theta, num_nodes)
-        total = jnp.einsum("pk,pq,qk->k", G, info, G)
-        if location_index is None:
-            return total, jnp.zeros_like(total), total
-        location = info[location_index, location_index] * G[location_index] ** 2
-        G_rest = G.at[location_index].set(0.0)
-        rest = jnp.einsum("pk,pq,qk->k", G_rest, info, G_rest)
-        return total, location, rest
+        V, dV = latent_velocities(constructor, theta, nodes)
+        V, dV = V @ G, dV @ G  # per parent slot, (nodes, num_parents)
+        # The nodes are symmetric, so reversing them gives V(-x).
+        even = (V + V[::-1]) / 2
+        odd = (V - V[::-1]) / 2
+        d_even = (dV - dV[::-1]) / 2
+        d_odd = (dV + dV[::-1]) / 2
+        x = nodes[:, None]
+        even_part = weights @ (x * even - d_even) ** 2
+        odd_part = weights @ (x * odd - d_odd) ** 2
+        return even_part + odd_part, even_part, odd_part
 
     @eqx.filter_jit
-    def bucket_sums(conditioner, parent_values, location_index):
+    def bucket_sums(conditioner, parent_values):
         # vmap over the draws, then over the conditioners of the bucket
         per_draw = jax.vmap(
-            lambda values: eqx.filter_vmap(
-                lambda net, parents: speeds(net, parents, location_index)
-            )(conditioner, values)
+            lambda values: eqx.filter_vmap(speeds)(conditioner, values)
         )(parent_values)
         return [part.sum(0) for part in per_draw]
 
     rows, cols, values = [], [], {kind: [] for kind in KINDS}
-    has_location = True
     for bucket, conditioner in enumerate(tmap.conditioners):
         members = np.asarray(tmap.bucket_members[bucket])
         parent_indices = np.asarray(tmap.bucket_parent_indices[bucket])
         if parent_indices.shape[1] == 0:
             continue
-        one = jax.tree.map(
-            lambda leaf: leaf[0] if eqx.is_array(leaf) else leaf, conditioner
-        )
-        num_params = int(one(jnp.zeros(parent_indices.shape[1])).shape[0])
-        location_index = _find_location_index(conditioner, constructor, num_params)
-        has_location &= location_index is not None
 
         sums = None
         for start in range(0, len(draws), batch_size):
             y = to_map(jnp.asarray(draws[start : start + batch_size]))
             y_padded = jnp.concatenate([y, jnp.zeros((len(y), 1), y.dtype)], axis=1)
-            batch = bucket_sums(
-                conditioner, y_padded[:, parent_indices], location_index
-            )
+            batch = bucket_sums(conditioner, y_padded[:, parent_indices])
             sums = batch if sums is None else [s + b for s, b in zip(sums, batch)]
 
         # Padded parent slots read a constant and have no influence.
@@ -307,8 +307,8 @@ def fisher_influence(bijection, trace, *, num_nodes=16, batch_size=256):
 
     return FlowInfluence(
         total=matrix("total"),
-        location=matrix("location") if has_location else None,
-        scale_shape=matrix("scale_shape"),
+        location_skew=matrix("location_skew"),
+        scale_tails=matrix("scale_tails"),
         order=order,
         unconstrained_parameters=names,
         num_draws=len(draws),
