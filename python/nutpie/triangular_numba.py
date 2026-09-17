@@ -193,7 +193,7 @@ def _log_cosh_from_sinh(sinh_v, v):
 
 @numba.njit(fastmath=True, error_model='numpy', boundscheck=False)
 def _kernel(x, y, parent_indptr, parent_index, blob, blob_offset,
-            layer_out, buf_a, buf_b):
+            layer_out, skip_weight, skip_index, buf_a, buf_b):
     n_variables = x.shape[0]
     n_layers = layer_out.shape[0]
     log_det = 0.0
@@ -201,8 +201,10 @@ def _kernel(x, y, parent_indptr, parent_index, blob, blob_offset,
     for i in range(n_variables):
         start = parent_indptr[i]
         n_in = parent_indptr[i + 1] - start
+        skip = 0.0
         for k in range(n_in):
             buf_a[k] = y[parent_index[start + k]]
+            skip += skip_weight[start + k] * buf_a[k]
 
         offset = blob_offset[i]
         for layer in range(n_layers):
@@ -225,6 +227,7 @@ def _kernel(x, y, parent_indptr, parent_index, blob, blob_offset,
                     buf_a[o] = _act(buf_b[o])
             n_in = n_out
 
+        buf_b[skip_index] += skip
         value, element_log_det = _transformer(buf_b, x[i])
         y[i] = value
         log_det += element_log_det
@@ -274,6 +277,8 @@ class NumbaTriangularTransform:
             layout.blob,
             layout.blob_offset,
             layout.layer_out,
+            layout.skip_weight,
+            layout.skip_index,
             self._buf_a,
             self._buf_b,
         )

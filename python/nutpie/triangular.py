@@ -10,10 +10,6 @@ from flowjax import bijections
 import equinox as eqx
 
 
-
-_N_LEVEL_SEGMENTS = 8
-
-
 def _min_waste_segments(
     counts: np.ndarray, n_segments: int, weights: np.ndarray | None = None
 ) -> list:
@@ -207,7 +203,7 @@ def _build_layout(
     bucket_parent_indices,
     level_of_variable,
     dim,
-    n_level_segments=_N_LEVEL_SEGMENTS,
+    n_level_segments,
 ):
     """Derive the static edge layout from the model's bucket and level data.
 
@@ -449,23 +445,50 @@ def _solve_triangular_sparse(edge_values, jacobian_diagonal, layout, rhs):
     )
 
 
-class SumLinearAndMlp(eqx.Module):
-    linear: eqx.nn.Linear
-    mlp: eqx.nn.MLP
+class LocationSkipMlp(eqx.Module):
+    """Conditioner MLP plus a direct linear map from the parents to the
+    transformer's location parameter.
 
-    def __init__(
-        self,
-        linear: eqx.nn.Linear,
-        mlp: eqx.nn.MLP,
-    ):
-        super().__init__()
-        self.linear = linear
-        self.mlp = mlp
+    Linear dependence of the conditional mean on the parents is the bulk of
+    the structure in most posteriors, and an MLP only represents it through
+    the product of its layers -- which, zero-initialized, starts with almost no
+    curvature in the first layer. The skip weights enter linearly and do not
+    depend on any other parameter, so they are well conditioned from the start.
+    """
+
+    mlp: eqx.nn.MLP
+    skip: Array
+    location_index: int = eqx.field(static=True)
 
     def __call__(self, x: Array) -> Array:
-        linear_out = self.linear(x)
-        mlp_out = self.mlp(x)
-        return linear_out + mlp_out
+        return self.mlp(x).at[self.location_index].add(self.skip @ x)
+
+
+def _location_index(transformer, constructor, num_params):
+    """Which flat conditioner output drives `transformer`'s location, or
+    `None` if it has none.
+
+    Measured by probing `constructor`, the same unravelling the conditioners
+    feed, rather than derived from the pytree flattening order.
+    """
+    from nutpie.normalizing_flow import ElementwiseTransformer
+
+    if not isinstance(transformer, ElementwiseTransformer):
+        return None
+    zeros = jnp.zeros((num_params,))
+    base = constructor(zeros).location()
+    if base is None:
+        return None
+    hits = [
+        k
+        for k in range(num_params)
+        if constructor(zeros.at[k].set(1.0)).location() != base
+    ]
+    if len(hits) != 1:
+        raise ValueError(
+            f"Expected one conditioner output to drive the location, found {hits}."
+        )
+    return hits[0]
 
 
 class SparseTriangularMap(bijections.AbstractBijection):
@@ -578,11 +601,15 @@ class SparseTriangularMap(bijections.AbstractBijection):
         nn_width: Conditioner hidden layer width.
         nn_depth: Conditioner hidden layer depth.
         nn_activation: Conditioner activation function.
+        location_skip: Give every conditioner a linear map from its parents
+            straight to the transformer's location, see `LocationSkipMlp`.
+            Only takes effect if `transformer` is an `ElementwiseTransformer`
+            with a location; otherwise the conditioners are plain MLPs.
     """
 
     shape: tuple[int, ...]
     n_levels: int
-    conditioners: tuple[eqx.nn.MLP, ...]
+    conditioners: tuple[eqx.nn.MLP | LocationSkipMlp, ...]
     bucket_members: tuple[Array, ...]
     bucket_parent_indices: tuple[Array, ...]
     # Layout of `transform_and_log_det`'s level scan, one entry per contiguous
@@ -620,6 +647,7 @@ class SparseTriangularMap(bijections.AbstractBijection):
         nn_width: int = 16,
         nn_depth: int = 1,
         nn_activation: Callable = jax.nn.gelu,
+        location_skip: bool = True,
     ):
         blanket = np.asarray(blanket, dtype=bool)
         if blanket.ndim != 2 or blanket.shape[0] != blanket.shape[1]:
@@ -685,13 +713,13 @@ class SparseTriangularMap(bijections.AbstractBijection):
             is_leaf=lambda leaf: isinstance(leaf, NonTrainable),
         )
 
+        location_index = (
+            _location_index(transformer, constructor, num_params)
+            if location_skip
+            else None
+        )
+
         def make_net(key, in_size):
-            key, key_linear = jax.random.split(key)
-            linear = eqx.nn.Linear(in_size, num_params, key=key_linear)
-
-            linear = eqx.tree_at(lambda l: l.weight, linear, 1e-3 * linear.weight)
-            linear = eqx.tree_at(lambda l: l.bias, linear, 1e-3 * linear.bias)
-
             mlp = eqx.nn.MLP(
                 in_size=in_size,
                 out_size=num_params,
@@ -700,7 +728,11 @@ class SparseTriangularMap(bijections.AbstractBijection):
                 activation=nn_activation,
                 key=key,
             )
-            return mlp  # SumLinearAndMlp(linear, mlp)
+            if location_index is None:
+                return mlp
+            # Starts at exactly zero: its curvature does not depend on its
+            # value, so there is nothing to gain from a random start.
+            return LocationSkipMlp(mlp, jnp.zeros((in_size,)), location_index)
 
         def net_cost(in_size):
             """Rough cost of one conditioner evaluation, used to weight the
@@ -770,7 +802,7 @@ class SparseTriangularMap(bijections.AbstractBijection):
         ).reshape(n_levels, n_buckets_eff)
         segments = _min_waste_segments(
             level_bucket_counts,
-            _N_LEVEL_SEGMENTS,
+            n_buckets,
             weights=np.asarray(bucket_net_costs, dtype=np.float64),
         )
 
@@ -809,7 +841,7 @@ class SparseTriangularMap(bijections.AbstractBijection):
         self.shape = (dim,)
 
         self.jacobian_layout = _build_layout(
-            self.bucket_members, self.bucket_parent_indices, level, dim
+            self.bucket_members, self.bucket_parent_indices, level, dim, n_buckets
         )
 
     def _flat_params_to_transformer(self, params: Array):

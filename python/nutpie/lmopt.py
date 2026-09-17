@@ -35,35 +35,53 @@ def codec(block):
 # ============================================================ flow structure
 
 
+def _conditioners(tree):
+    return tree.bijection.bijections[0].bijections[0].inner.conditioners
+
+
+def _diag_affine(tree):
+    return tree.bijection.bijections[1]
+
+
 def blocks_of(tree):
-    """Parameter blocks: one per conditioner bucket, plus the affine tail."""
-    # return list(tree.bijection.bijections[0].inner.conditioners) + [tree.bijection.bijections[1]]
-    return [
-        *tree.bijection.bijections[0].bijections[0].inner.conditioners,
-        (
-            tree.bijection.bijections[1],
-            #tree.bijection.bijections[0].bijections[1],
-        ),
-    ]
+    """Parameter blocks: one per conditioner bucket, plus the diagonal affine
+    tail unless `split_frozen` has taken it out (see `fit`'s `fit_affine`)."""
+    tail = _diag_affine(tree)
+    return [*_conditioners(tree), *([] if tail is None else [tail])]
 
 
 def rebuild(tree, blocks):
     """Inverse of blocks_of."""
-    tree = eqx.tree_at(
-        lambda t: t.bijection.bijections[0].bijections[0].inner.conditioners,
-        tree,
-        tuple(blocks[:-1]),
-    )
-    tree = eqx.tree_at(lambda t: t.bijection.bijections[1], tree, blocks[-1][0])
-    #tree = eqx.tree_at(
-    #    lambda t: t.bijection.bijections[0].bijections[1], tree, blocks[-1][1]
-    #)
+    n_conditioners = len(_conditioners(tree))
+    tree = eqx.tree_at(_conditioners, tree, tuple(blocks[:n_conditioners]))
+    if len(blocks) > n_conditioners:
+        tree = eqx.tree_at(_diag_affine, tree, blocks[n_conditioners])
     return tree
 
-    tree = eqx.tree_at(
-        lambda t: t.bijection.bijections[0].inner.conditioners, tree, tuple(blocks[:-1])
-    )
-    return eqx.tree_at(lambda t: t.bijection.bijections[1], tree, blocks[-1])
+
+def split_frozen(params, fit_affine=False):
+    """Split off the diagonal affine tail, unless `fit_affine`.
+
+    It is (near-)redundant with each conditioner's own output shift and scale,
+    so fitting it mostly adds coupling *between* blocks that the
+    block-diagonal preconditioner cannot see. `make_flow` initializes it at the
+    per-variable Gaussian optimum, and the transformers can absorb any later
+    drift.
+
+    Returns ``(trainable, frozen)``. When frozen, `trainable` has the tail
+    replaced by ``None``, so every pytree-wide operation in `step` skips it;
+    when fitted, `frozen` is ``None`` and `trainable` is `params` unchanged.
+    """
+    if fit_affine:
+        return params, None
+    return eqx.tree_at(_diag_affine, params, None), _diag_affine(params)
+
+
+def merge_frozen(trainable, frozen):
+    """Inverse of split_frozen."""
+    if frozen is None:
+        return trainable
+    return eqx.tree_at(_diag_affine, trainable, frozen, is_leaf=lambda x: x is None)
 
 
 # ============================================================ sub-blocking
@@ -72,7 +90,14 @@ def rebuild(tree, blocks):
 def mlp_unit_labels(one):
     """Depth-1 equinox MLP: label each coordinate by hidden unit, so a sub-block
     is never a single layer (which conditions badly when layer scales differ).
-    Returns label arrays in jax.tree.leaves order."""
+    A `LocationSkipMlp`'s skip weights get a label of their own, after every
+    unit's, so they stay together. Returns label arrays in jax.tree.leaves
+    order."""
+    from nutpie.triangular import LocationSkipMlp
+
+    if isinstance(one, LocationSkipMlp):
+        n_units = one.mlp.layers[0].weight.shape[0]
+        return mlp_unit_labels(one.mlp) + [np.full(one.skip.shape, n_units)]
     l1, l2 = one.layers
     W = l1.weight.shape[0]
     return [
@@ -270,41 +295,114 @@ def build_blocks(vjpf, shape, key, plans, m, batch=32, capture=False):
         return [_gather(p["flatten"](b), p) for b, p in zip(blocks_of(g), plans)]
 
     keys = jr.split(key, m)
+    totals, capture_info = _accumulate_grams(one, keys, batch, capture)
+    return [total / m for total in totals], capture_info
+
+
+def _accumulate_grams(one, items, batch, capture):
+    """``sum_t G_t^T G_t`` per bucket, `G_t = one(items[t])` in gathered
+    ``(n, G, q)`` form, taking `batch` items at a time. Returns ``(totals,
+    capture_fractions or None)``; see `build_blocks` for why the two paths
+    differ."""
+    n_items = jax.tree.leaves(items)[0].shape[0]
 
     if capture:
-        Gs = jax.lax.map(one, keys, batch_size=batch)
-        blocks = [jnp.einsum("tngi,tngj->ngij", G, G) / m for G in Gs]
-        return blocks, capture_fractions(Gs, m)
+        Gs = jax.lax.map(one, items, batch_size=batch)
+        totals = [jnp.einsum("tngi,tngj->ngij", G, G) for G in Gs]
+        return totals, capture_fractions(Gs, n_items)
 
-    def chunk_gram(chunk_keys):
-        return [
-            jnp.einsum("tngi,tngj->ngij", G, G) for G in jax.vmap(one)(chunk_keys)
-        ]
+    def chunk_gram(chunk):
+        return [jnp.einsum("tngi,tngj->ngij", G, G) for G in jax.vmap(one)(chunk)]
 
     # (n, G, q) per bucket -> (n, G, q, q) accumulators, from shapes alone.
     totals = [
         jnp.zeros(spec.shape + spec.shape[-1:], spec.dtype)
-        for spec in jax.eval_shape(one, keys[0])
+        for spec in jax.eval_shape(one, jax.tree.map(lambda a: a[0], items))
     ]
 
-    n_chunks, remainder = divmod(m, batch)
+    n_chunks, remainder = divmod(n_items, batch)
     if n_chunks:
 
-        def accumulate(carry, chunk_keys):
-            return [c + g for c, g in zip(carry, chunk_gram(chunk_keys))], None
+        def accumulate(carry, chunk):
+            return [c + g for c, g in zip(carry, chunk_gram(chunk))], None
 
-        totals, _ = jax.lax.scan(
-            accumulate, totals, keys[: n_chunks * batch].reshape(n_chunks, batch)
+        chunks = jax.tree.map(
+            lambda a: a[: n_chunks * batch].reshape((n_chunks, batch) + a.shape[1:]),
+            items,
         )
+        totals, _ = jax.lax.scan(accumulate, totals, chunks)
     if remainder:
-        tail = chunk_gram(keys[n_chunks * batch :])
+        tail = chunk_gram(jax.tree.map(lambda a: a[n_chunks * batch :], items))
         totals = [c + g for c, g in zip(totals, tail)]
 
-    return [total / m for total in totals], None
+    return totals, None
 
 
-def block_diagonal(blocks, plans, template):
-    """`diag(J^T J)` as a pytree shaped like `template`.
+def build_blocks_grouped(
+    group_res_fn, data, theta, key, plans, n_groups, rounds, batch=32, capture=False
+):
+    """[ (n_j, G_j, q_j, q_j) ] per bucket, from per-group probes.
+
+    `build_blocks` probes the residual of *every* draw at once, ``g = J^T w =
+    sum_s J_s^T w_s``, so each sample's outer product carries all ``n^2`` draw
+    pairs, and the ``s != t`` ones are zero-mean noise: entry variance grows
+    like ``n^2 / m``, from ``m`` reverse passes over all draws. Here the draws
+    are split into `n_groups` groups, each with its own probe, and the outer
+    product is taken per group, so only pairs *within* a group contribute
+    noise. Every group's gradient together costs one forward and reverse pass
+    over the draws, so a round yields `n_groups` samples for the price of one
+    of `build_blocks`' probes: variance ``~ n^2 / (n_groups * rounds)`` and rank
+    up to ``n_groups * rounds``, from `rounds` passes. The estimate stays
+    unbiased and PSD.
+
+    The group gradients cannot come from `step`'s global `vjpf` -- a probe
+    masked to one group still pays a full reverse pass -- so each group
+    linearizes `group_res_fn` on its own draws, which adds up to one extra
+    forward pass per round.
+
+    `group_res_fn(theta, group_data)` must evaluate the residuals of the draws
+    in `group_data` (leading axis: draws), normalized like `res_fn` by
+    ``1 / sqrt(number of draws)``; the ``sqrt(group size / n)`` that turns
+    group-normalized into globally normalized residuals is applied here.
+
+    Groups are contiguous and equal-sized. When `n_groups` does not divide the
+    draw count, the last group is padded by repeating draw 0, so its residual
+    stays finite, and the padded draws get a zero probe, so they contribute
+    nothing.
+
+    `batch` is the number of groups taken at once, each carrying a forward and
+    reverse pass over its own draws. `capture` needs two independent halves
+    that each cover every draw, so it requires an even `rounds`.
+    """
+    n = jax.tree.leaves(data)[0].shape[0]
+    n_groups = min(n_groups, n)
+    size = -(-n // n_groups)
+    flat = np.arange(n_groups * size)
+    index = np.where(flat < n, flat, 0).reshape(n_groups, size)
+    mask = jnp.asarray((flat < n).reshape(n_groups, size), dtype=float)
+    grouped = jax.tree.map(lambda a: a[index], data)
+    if capture and rounds % 2:
+        raise ValueError("capture_diagnostic with grouped probes needs even rounds.")
+
+    def one(item):
+        group, k = item
+        group_data = jax.tree.map(lambda a: a[group], grouped)
+        out, vjpg = jax.vjp(lambda p: group_res_fn(p, group_data), theta)
+        group_mask = mask[group].reshape((size,) + (1,) * (out.ndim - 1))
+        w = jr.rademacher(k, out.shape, dtype=out.dtype) * group_mask
+        g = vjpg(w)[0]
+        return [_gather(p["flatten"](b), p) for b, p in zip(blocks_of(g), plans)]
+
+    # Round-major, so each half of the items (for `capture`) is whole rounds.
+    groups = jnp.asarray(np.tile(np.arange(n_groups), rounds))
+    keys = jr.split(key, n_groups * rounds)
+    totals, capture_info = _accumulate_grams(one, (groups, keys), batch, capture)
+    return [total * (size / n) / rounds for total in totals], capture_info
+
+
+def block_diagonal(blocks, plans, template, floors):
+    """`diag(J^T J)`, floored per conditioner at `floors`, as a pytree shaped
+    like `template`.
 
     Free: `build_blocks` already estimates each block's Gram matrix, and its
     diagonal is exactly the corresponding run of `diag(J^T J)` -- a plan's
@@ -312,8 +410,15 @@ def block_diagonal(blocks, plans, template):
     sub-block, in exactly one position.
     """
     out = [
-        p["unflatten"](_scatter(jnp.diagonal(H, axis1=-2, axis2=-1), p))
-        for p, H in zip(plans, blocks)
+        p["unflatten"](
+            _scatter(
+                jnp.maximum(
+                    jnp.diagonal(H, axis1=-2, axis2=-1), floor[:, None, None]
+                ),
+                p,
+            )
+        )
+        for p, H, floor in zip(plans, blocks, floors)
     ]
     # `unflatten` recombines each block's static leaves, which `template` (a
     # filtered params pytree) does not carry; drop them again so the result can
@@ -321,42 +426,44 @@ def block_diagonal(blocks, plans, template):
     return eqx.filter(rebuild(template, out), eqx.is_inexact_array)
 
 
-# Fraction of the largest curvature below which Marquardt damping is floored.
-# Must not be tiny: `zero_init` sets each conditioner's last layer to zero, so
-# the first-layer parameters start with *exactly* zero gradient and curvature,
-# and an unfloored `lam * diag(J^T J)` leaves them undamped -- both in CG and,
-# far worse, in the block preconditioner, whose inverse then carries entries of
-# order `1 / (lam * floor)`.
+# Fraction of a conditioner's largest curvature below which Marquardt damping
+# is floored. Must not be tiny: `zero_init` shrinks each conditioner's last
+# layer to near zero, so the first-layer parameters start with (near-)zero
+# gradient and curvature, and an unfloored `lam * diag(J^T J)` leaves them
+# undamped -- both in CG and, far worse, in the block preconditioner, whose
+# inverse then carries entries of order `1 / (lam * floor)`.
 #
-# Measured on the 10-dim funnel (arrow pattern, 10 LM steps, final F / steps
-# accepted): 1e-8 -> 1.6e+02, 1/10 (diverges); 1e-4 -> 1.4e-02, 8/10;
-# 1e-2 -> 4.8e-02, 9/10; 1e-1 -> 8.9e-02, 10/10. Too low and the flat
-# directions blow up; too high and this degrades towards absolute damping,
-# which is what it exists to avoid.
+# Measured with a *global* floor on the 10-dim funnel (arrow pattern, 10 LM
+# steps, final F / steps accepted): 1e-8 -> 1.6e+02, 1/10 (diverges); 1e-4 ->
+# 1.4e-02, 8/10; 1e-2 -> 4.8e-02, 9/10; 1e-1 -> 8.9e-02, 10/10. Too low and the
+# flat directions blow up; too high and this degrades towards absolute
+# damping, which is what it exists to avoid.
 MARQUARDT_FLOOR = 1e-4
+# Fraction of the largest curvature *anywhere*, as a fallback for conditioners
+# that are flat as a whole, which a purely local floor would leave undamped.
+MARQUARDT_GLOBAL_FLOOR = 1e-10
 
 
-def marquardt_floor(D):
-    """Smallest damping scale allowed, from the largest curvature seen.
+def marquardt_floors(blocks):
+    """Smallest damping scale allowed, one per conditioner: ``(n,)`` per bucket.
 
     Marquardt damping is `lam * diag(J^T J)`, which vanishes wherever the
-    curvature does -- a conditioner with `in_features=0` has a draw-independent
-    Jacobian, so its Gram block is exactly zero and an unfloored `lam * diag`
-    would leave that block undamped and singular. Flooring at `1e-8` of the
-    global maximum only bites on blocks that far below scale, so it rescues the
-    degenerate ones without flattening the per-block scaling everywhere else.
+    curvature does. The floor is relative to each conditioner's own largest
+    curvature rather than the global one, so that a conditioner whose
+    curvature sits orders of magnitude below the stiffest one is still damped
+    by its own scale instead of being flattened towards absolute damping.
     """
-    # Empty leaves are skipped: the zero-parent conditioner's first layer has
-    # `in_features=0`, so its weight is a genuine zero-size array, and `max`
-    # over it has no identity.
-    leaves = [l for l in jax.tree.leaves(D) if eqx.is_inexact_array(l) and l.size]
-    if not leaves:
-        return jnp.asarray(1e-300)
-    dmax = jnp.maximum(jnp.max(jnp.stack([jnp.max(leaf) for leaf in leaves])), 1e-300)
-    return MARQUARDT_FLOOR * dmax
+    local = [
+        jnp.max(jnp.diagonal(H, axis1=-2, axis2=-1), axis=(1, 2)) for H in blocks
+    ]
+    global_max = jnp.maximum(jnp.max(jnp.concatenate(local)), 1e-300)
+    return [
+        jnp.maximum(MARQUARDT_FLOOR * dmax, MARQUARDT_GLOBAL_FLOOR * global_max)
+        for dmax in local
+    ]
 
 
-def _block_inv(H, lam, floor):
+def _block_inv(H, lam, floor, shrinkage):
     """Inverse of the damped block, via Cholesky.
 
     `floor is None` selects absolute (Levenberg) damping, `lam * I`; otherwise
@@ -370,6 +477,14 @@ def _block_inv(H, lam, floor):
     `step`'s `damping` argument; whichever is chosen, `floor` must match the
     one `step` applies in `Av`, or the preconditioner would approximate a
     different operator than CG is solving.
+
+    `H` is first shrunk towards its diagonal, ``(1 - s) H + s diag(H)``. It is
+    a Hutchinson estimate from `m` probes, so it has rank at most `m`, and its
+    small eigen-directions are unreliable well before that unless ``m >> q``.
+    Unshrunk, directions the probes missed fall back to `lam * D` alone, and as
+    `lam` decays the preconditioned operator there grows like ``1 / lam``;
+    shrunk, they fall back to Jacobi. The diagonal is unchanged, so `D` stays
+    consistent with the `Av` operator.
 
     `H` is a Gram matrix (see `build_blocks`), hence PSD, so `H + lam D` with
     `D` a positive diagonal is positive definite; the extra ridge keeps that
@@ -393,6 +508,7 @@ def _block_inv(H, lam, floor):
 
     q = H.shape[-1]
     eye = jnp.eye(q, dtype=H.dtype)
+    H = (1.0 - shrinkage) * H + shrinkage * jnp.diag(jnp.diagonal(H))
     if floor is None:
         damped = H + (lam + 1e-12 * jnp.maximum(jnp.mean(jnp.diagonal(H)), 1.0)) * eye
     else:
@@ -403,16 +519,29 @@ def _block_inv(H, lam, floor):
     return inv_factor.T @ inv_factor
 
 
-def precompute_Minvs(blocks, lam, floor):
+def precompute_Minvs(blocks, plans, n_samples, lam, floors):
     """(n, G, q, q) per bucket.  Computed once per lm_step call and reused
     across every Minv(v) call inside that step's PCG loop.
 
-    `lam` and `floor` are closed over rather than passed through `in_axes`, so
-    that `floor=None` (absolute damping) stays a plain trace-time branch inside
-    `_block_inv` instead of something vmap has to map over.
+    `floors` is `marquardt_floors`' output, or `None` for absolute damping,
+    which then stays a plain trace-time branch inside `_block_inv` instead of
+    something vmap has to map over.
+
+    The shrinkage weight ``q / (q + n_samples)`` is the usual covariance-
+    shrinkage scale: negligible once the samples behind the estimate (probes,
+    or groups times rounds) outnumber the block's size, about half when they
+    match it.
     """
-    vinv = jax.vmap(jax.vmap(lambda H: _block_inv(H, lam, floor)))
-    return [vinv(H) for H in blocks]
+    out = []
+    for i, (H, p) in enumerate(zip(blocks, plans)):
+        shrinkage = p["q"] / (p["q"] + n_samples)
+        if floors is None:
+            inv = lambda H: _block_inv(H, lam, None, shrinkage)
+            out.append(jax.vmap(jax.vmap(inv))(H))
+        else:
+            inv = lambda H, floor: _block_inv(H, lam, floor, shrinkage)
+            out.append(jax.vmap(jax.vmap(inv, in_axes=(0, None)))(H, floors[i]))
+    return out
 
 
 def apply_Minvs(Minvs, plans, v):
@@ -451,12 +580,14 @@ def blocks_zeros(theta, plans):
 def step(
     res_fn,
     args,
+    data,
     plans,
     theta,
     r,
     lam,
     key,
     *,
+    frozen,
     rebuild_blocks: jax.Array,
     p_prev: jax.Array,
     eta_in: jax.Array,
@@ -476,6 +607,8 @@ def step(
     damping="marquardt",
     capture_diagnostic=False,
     blocks=None,
+    n_groups=None,
+    rounds=1,
 ):
     """One LM step.  res_fn and plans are static under eqx.filter_jit; plans
     is built once via get_plans and cached by parameter structure, so its
@@ -500,8 +633,17 @@ def step(
     returned as ``info["cg_eta_next"]`` for `fit` to feed back. It is traced,
     like `rebuild_blocks`. `nu_in` is the companion state for the `lam` update,
     returned as ``info["lam_nu_next"]``.
+
+    `theta` is the trainable part only; `frozen` is merged back in for every
+    residual evaluation, see `split_frozen`.
+
+    `n_groups` selects the block estimator: `None` probes all draws at once
+    with `m` probes (`build_blocks`), an integer uses `rounds` rounds of
+    per-group probes over `data` (`build_blocks_grouped`). Either way `m` sets
+    the sub-block size through `plans`.
     """
-    res_fn_args = lambda p: res_fn(p, args)
+    group_res_fn = lambda p, d: res_fn(merge_frozen(p, frozen), (*args, *d))
+    res_fn_args = lambda p: group_res_fn(p, data)
     _, vjpf = jax.vjp(res_fn_args, theta)
     vjp = lambda w: vjpf(w)[0]
 
@@ -517,26 +659,32 @@ def step(
         lam_min = 1e-6 if damping == "marquardt" else 1e-10
 
     if precondition:
+        if n_groups is None:
+            n_samples = m
+            estimate = lambda capture: build_blocks(
+                vjpf, r.shape, key, plans, m, batch, capture=capture
+            )
+        else:
+            n_samples = n_groups * rounds
+            estimate = lambda capture: build_blocks_grouped(
+                group_res_fn, data, theta, key, plans, n_groups, rounds, batch,
+                capture=capture,
+            )
         if blocks is None or capture_diagnostic:
             # Nothing to reuse on the first step, and the diagnostic needs the
             # individual probes, so both always build.
-            Hb, capture = build_blocks(
-                vjpf, r.shape, key, plans, m, batch, capture=capture_diagnostic
-            )
+            Hb, capture = estimate(capture_diagnostic)
         else:
             capture = None
             Hb = jax.lax.cond(
-                rebuild_blocks,
-                lambda: build_blocks(vjpf, r.shape, key, plans, m, batch)[0],
-                lambda: blocks,
+                rebuild_blocks, lambda: estimate(False)[0], lambda: blocks
             )
         if damping == "marquardt":
-            D = block_diagonal(Hb, plans, theta)
-            floor = marquardt_floor(D)
-            D = jax.tree.map(lambda d: jnp.maximum(d, floor), D)
+            floors = marquardt_floors(Hb)
+            D = block_diagonal(Hb, plans, theta, floors)
         else:
-            D = floor = None
-        Minvs = precompute_Minvs(Hb, lam, floor)
+            D = floors = None
+        Minvs = precompute_Minvs(Hb, plans, n_samples, lam, floors)
         Minv = lambda v: apply_Minvs(Minvs, plans, v)
     else:
         # Without the block estimates there is no per-parameter curvature to
@@ -694,13 +842,12 @@ def get_plans(params, m=128, q_min=16):
     """
     key = _plans_signature(params, m, q_min)
     if key not in _plans_cache:
-        bs = blocks_of(params)
-        label_fns = [mlp_unit_labels] * (len(bs) - 1) + [
-            None,
-            #None,
-        ]  # affine tail: no units
-
-        _plans_cache[key] = [make_plan(b, m, lf, q_min) for b, lf in zip(bs, label_fns, strict=True)]
+        n_conditioners = len(_conditioners(params))
+        _plans_cache[key] = [
+            # The affine tail has no hidden units to group by.
+            make_plan(b, m, mlp_unit_labels if i < n_conditioners else None, q_min)
+            for i, b in enumerate(blocks_of(params))
+        ]
     return _plans_cache[key]
 
 
@@ -740,8 +887,27 @@ def fit(
     nu0=2.0,
     capture_diagnostic=False,
     rebuild_every=1,
+    data=(),
+    n_groups=None,
+    rounds=1,
+    fit_affine=True,
+    rtol=None,
+    patience=5,
 ):
     """Levenberg-Marquardt fit.
+
+    Stops after `n_steps`, once the loss falls below `min_loss`, or -- if
+    `rtol` is given -- once `patience` consecutive steps have together lowered
+    the loss by less than a fraction `rtol` of it. Rejected steps count
+    towards `patience`: a run of rejections at rising `lam` is stagnation too.
+
+    Residuals are ``res_fn(params, (*args, *data))``. `data` holds the
+    per-draw arrays (leading axis: draws), kept apart from `args` so that the
+    grouped block estimator can evaluate subsets of draws, see
+    `build_blocks_grouped` for what `res_fn` must then satisfy. `n_groups`
+    selects that estimator, with `rounds` rounds of probes; `None` keeps
+    `build_blocks`' `m` probes over all draws. `m` sets the sub-block size
+    either way.
 
     `damping` selects the trust region: ``"marquardt"`` damps with
     ``lam * diag(J^T J)``, ``"absolute"`` with the classical ``lam * I`` (see
@@ -756,7 +922,16 @@ def fit(
     and that cost multiplies with whatever batching the residual function does
     internally. Lowering it trades sequential chunks (`m / batch`) for peak
     memory at no extra FLOPs.
+
+    The diagonal affine tail is held fixed at its value in `params` unless
+    `fit_affine`, in which case it gets preconditioner blocks of its own, one
+    per variable; see `split_frozen`.
     """
+    params, frozen = split_frozen(params, fit_affine)
+    data = tuple(data)
+    if n_groups is not None and not data:
+        raise ValueError("n_groups needs the per-draw arrays passed as `data`.")
+
     if precondition:
         plans = setup(params, m)
 
@@ -770,7 +945,7 @@ def fit(
 
     key = jax.random.key(0)
 
-    theta, r = params, res_fn(params, args)
+    theta, r = params, res_fn(merge_frozen(params, frozen), (*args, *data))
     # Seed with real zeros (not None) so p_prev's pytree structure is the
     # same on every iteration -- else step 0 (p_prev=None) and step 1
     # (p_prev=<pytree>) are different input structures and each triggers its
@@ -786,6 +961,7 @@ def fit(
     # carries is the seed. `cg_eta_max` is the usual Eisenstat-Walker `eta_0` --
     # there is no model-quality measurement yet to derive one from. `nu` is the
     # companion seed for Nielsen's `lam` update.
+    best_loss, stalled = float(tdot(r, r)), 0
     lam = jnp.asarray(lam0, dtype=r.dtype)
     eta_prev = jnp.asarray(cg_eta_max, dtype=r.dtype)
     nu_prev = jnp.asarray(nu0, dtype=r.dtype)
@@ -808,11 +984,13 @@ def fit(
         theta, r, lam, p_prev, blocks, info = step(
             res_fn,
             args,
+            data,
             plans,
             theta,
             r,
             lam,
             sk,
+            frozen=frozen,
             m=m,
             precondition=precondition,
             p_prev=p_prev,
@@ -829,6 +1007,8 @@ def fit(
             capture_diagnostic=capture_diagnostic,
             blocks=blocks,
             rebuild_blocks=jnp.asarray(rebuild_blocks),
+            n_groups=n_groups,
+            rounds=rounds,
         )
         if rebuild_blocks:
             accepted_since_build = 0
@@ -842,7 +1022,7 @@ def fit(
                 f"log(F)={float(np.log(info['F_new'])):+.2f} "
                 f"rho={float(info['rho']):+.2f}  "
                 f"lam={float(info['lam_out']):.1e}  "
-                f"cg={int(info['n_cg']):3d}{'' if info['cg_converged'] else '*'} "
+                f"cg={int(info['n_cg']):3d}{' ' if info['cg_converged'] else '*'} "
                 f"eta={float(info['cg_eta']):.2f}"
                 f"{' ' if info['rebuilt_blocks'] else '~'}  "
                 f"|g|={float(info['grad_norm']):.2e}"
@@ -880,7 +1060,7 @@ def fit(
             # a point it has left, `p_prev` warm-starts CG from a step of a
             # system that no longer exists, and the Gram blocks were estimated
             # elsewhere. Recompute or discard all three.
-            r = res_fn(theta, args)
+            r = res_fn(merge_frozen(theta, frozen), (*args, *data))
             p_prev = jax.tree.map(jnp.zeros_like, theta)
             accepted_since_build = rebuild_every  # rebuild at the new theta
             # The model-quality measurement the forcing term is built on refers
@@ -889,7 +1069,23 @@ def fit(
             # does not recompile `step`.
             eta_prev = jnp.asarray(cg_eta_max, dtype=r.dtype)
             nu_prev = jnp.asarray(nu0, dtype=r.dtype)
+            # A new point, so progress is measured afresh from its loss.
+            best_loss, stalled = float(tdot(r, r)), 0
+        else:
+            # `F_out` only moves on acceptance, so `best_loss` only resets once
+            # the improvement since it accumulates past `rtol`.
+            if float(info["F_out"]) < best_loss * (1.0 - (rtol or 0.0)):
+                best_loss, stalled = float(info["F_out"]), 0
+            else:
+                stalled += 1
 
         if min_loss and info["F_out"] < min_loss:
             break
-    return theta, hist
+        if rtol is not None and stalled >= patience:
+            if verbose:
+                print(
+                    f"loss improved by less than {rtol:g} (relative) in the last "
+                    f"{patience} steps; stopping"
+                )
+            break
+    return merge_frozen(theta, frozen), hist
