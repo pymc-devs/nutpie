@@ -72,7 +72,20 @@ pub struct SparsityPattern {
 }
 
 impl SparsityPattern {
+    /// The pattern in CSR format: `(indptr, indices)`.
+    pub fn to_csr(&self) -> (Vec<i64>, Vec<i64>) {
+        let mut indptr = Vec::with_capacity(self.rows.len() + 1);
+        let mut indices = Vec::new();
+        indptr.push(0);
+        for row in self.rows.iter() {
+            indices.extend(row.iter().map(|&j| j as i64));
+            indptr.push(indices.len() as i64);
+        }
+        (indptr, indices)
+    }
+
     /// The pattern as a dense row-major boolean matrix.
+    #[cfg(test)]
     pub fn to_dense(&self) -> Vec<bool> {
         let n = self.rows.len();
         let mut dense = vec![false; n * n];
