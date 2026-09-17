@@ -420,12 +420,27 @@ def step(
     lam_max=1e10,
     damping="marquardt",
     capture_diagnostic=False,
+    blocks=None,
+    rebuild_blocks=True,
 ):
     """One LM step.  res_fn and plans are static under eqx.filter_jit; plans
     is built once via get_plans and cached by parameter structure, so its
     identity (and that of the flatten/unflatten closures it holds) stays
     stable across steps and across repeated `fit` calls with the same
-    architecture."""
+    architecture.
+
+    `blocks` carries the Gram estimate in from the previous step, reused when
+    `rebuild_blocks` is false. Estimating it costs `m` reverse passes, several
+    times a whole solve once CG is cheap, so reuse is the dominant cost lever;
+    `fit` decides the policy. Only `Hb` is carried -- `Minvs` depends on `lam`
+    and is rebuilt every step, but that is small Choleskys with no VJPs.
+
+    `rebuild_blocks` is a *traced* predicate selecting between the two through
+    `lax.cond`, not a static flag: `fit` flips it on a schedule, and a static
+    flag would mean carrying two compiled variants of this function. The
+    branches differ by an `m`-probe `lax.map`, far too large for XLA to
+    predicate, so the untaken one really is skipped.
+    """
     res_fn_args = lambda p: res_fn(p, args)
     _, vjpf = jax.vjp(res_fn_args, theta)
     vjp = lambda w: vjpf(w)[0]
@@ -442,9 +457,19 @@ def step(
         lam_min = 1e-6 if damping == "marquardt" else 1e-10
 
     if precondition:
-        Hb, capture = build_blocks(
-            vjpf, r.shape, key, plans, m, batch, capture=capture_diagnostic
-        )
+        if blocks is None or capture_diagnostic:
+            # Nothing to reuse on the first step, and the diagnostic needs the
+            # individual probes, so both always build.
+            Hb, capture = build_blocks(
+                vjpf, r.shape, key, plans, m, batch, capture=capture_diagnostic
+            )
+        else:
+            capture = None
+            Hb = jax.lax.cond(
+                rebuild_blocks,
+                lambda: build_blocks(vjpf, r.shape, key, plans, m, batch)[0],
+                lambda: blocks,
+            )
         if damping == "marquardt":
             D = block_diagonal(Hb, plans, theta)
             floor = marquardt_floor(D)
@@ -519,6 +544,9 @@ def step(
     info = {
         "F": F,
         "F_new": F_new,
+        # Loss of the state actually carried forward: `F_new` is the proposal,
+        # which a rejected step throws away.
+        "F_out": jnp.where(accept, F_new, F),
         "accept": accept,
         "rho": rho,
         "actual": actual,
@@ -531,6 +559,7 @@ def step(
         "grad_norm": tnorm(g),
         "step_norm": tnorm(p),
         "finite": ok,
+        "rebuilt_blocks": rebuild_blocks,
     }
     if capture is not None:
         info["capture"] = capture
@@ -540,7 +569,7 @@ def step(
     if False and plans is not None:
         info["block_min_eig"] = jnp.stack([jnp.min(jnp.linalg.eigvalsh(H)) for H in Hb])
         info["block_max_eig"] = jnp.stack([jnp.max(jnp.linalg.eigvalsh(H)) for H in Hb])
-    return theta_out, r_out, lam_out, p_out, info
+    return theta_out, r_out, lam_out, p_out, Hb, info
 
 
 # ============================================================ setup and driver
@@ -610,6 +639,7 @@ def fit(
     damping="marquardt",
     lam_min=None,
     capture_diagnostic=False,
+    rebuild_every=3,
 ):
     """Levenberg-Marquardt fit.
 
@@ -647,9 +677,18 @@ def fit(
     # own trace of lm_step (and the pcg while_loop inside it).
     p_prev = jax.tree.map(jnp.zeros_like, params)
     key, hist = jr.key(seed), []
+    # The Gram estimate is a function of `theta` alone, so it stays exactly
+    # valid across a rejected step -- `theta` did not move. Between accepted
+    # steps it only drifts, so `rebuild_every` trades a slightly stale
+    # preconditioner (which costs CG iterations, never correctness) against `m`
+    # reverse passes. Counting only accepted steps makes the reuse on rejection
+    # exact rather than an approximation.
+    blocks = None
+    accepted_since_build = rebuild_every  # build on the first step
     for i in range(n_steps):
         key, sk = jr.split(key)
-        theta, r, lam, p_prev, info = step(
+        rebuild_blocks = accepted_since_build >= rebuild_every
+        theta, r, lam, p_prev, blocks, info = step(
             res_fn,
             args,
             plans,
@@ -666,7 +705,12 @@ def fit(
             damping=damping,
             lam_min=lam_min,
             capture_diagnostic=capture_diagnostic,
+            blocks=blocks,
+            rebuild_blocks=jnp.asarray(rebuild_blocks),
         )
+        if rebuild_blocks:
+            accepted_since_build = 0
+        accepted_since_build += int(info["accept"])
         hist.append(info)
         if verbose:
             print(
@@ -674,7 +718,8 @@ def fit(
                 f"log(F)={float(np.log(info['F_new'])):+.2f} "
                 f"rho={float(info['rho']):+.2f}  lam={float(info['lam_out']):.1e}  "
                 f"cg={int(info['n_cg']):3d}{'' if info['cg_converged'] else '*'} "
-                f"eta={float(info['cg_eta']):.2f}  "
+                f"eta={float(info['cg_eta']):.2f}"
+                f"{'' if info['rebuilt_blocks'] else '~'}  "
                 f"|g|={float(info['grad_norm']):.2e}"
                 + (
                     "  capture sub/cond="
@@ -691,6 +736,6 @@ def fit(
                 print("gradient norm is NaN or Inf; adding noise to parameters")
             theta = jax.tree.map(lambda x: 1e-2 * jr.normal(sk, x.shape), theta)
 
-        if min_loss and info["F_new"] < min_loss:
+        if min_loss and info["F_out"] < min_loss:
             break
     return theta, hist
