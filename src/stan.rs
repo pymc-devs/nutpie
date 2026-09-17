@@ -5,7 +5,7 @@ use std::{ffi::CString, path::PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use bridgestan::open_library;
 use itertools::Itertools;
-use numpy::{PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1};
+use numpy::{PyArray1, PyReadonlyArray1};
 use nuts_rs::{
     CpuLogpFunc, CpuMath, HasDims, InitPositionError, LogpError, Model, Storable, Value,
 };
@@ -368,6 +368,23 @@ impl StanModel {
         self.inner.param_unc_num()
     }
 
+    /// Return a copy of the model that uses `transform_adapter` for the
+    /// normalizing flow adaptation.
+    pub fn with_transform_adapter(&self, transform_adapter: Py<PyAny>) -> Self {
+        Self {
+            transform_adapter: Some(PyTransformAdapt::new(transform_adapter)),
+            ..self.clone()
+        }
+    }
+
+    /// Names of the unconstrained parameters.
+    pub fn unconstrained_names(&self) -> Vec<String> {
+        match &self.unc_names {
+            Value::Strings(names) => names.clone(),
+            _ => unreachable!("Unconstrained names are strings"),
+        }
+    }
+
     #[pyo3(signature = (include_tp=false, include_gq=false))]
     pub fn param_num(&self, include_tp: bool, include_gq: bool) -> usize {
         self.inner.param_num(include_tp, include_gq)
@@ -409,9 +426,10 @@ impl StanModel {
     ///
     /// The pattern is the union of the patterns at `num_points` initial
     /// points of the model, computed from autodiff Hessian-vector products.
-    /// See `crate::hessian_sparsity` for the algorithm. Returns a symmetric
-    /// boolean matrix with a true diagonal, the number of Hessian-vector
-    /// products and the number of colours of the verification stage.
+    /// See `crate::hessian_sparsity` for the algorithm. Returns the symmetric
+    /// pattern with a true diagonal in CSR format (`indptr`, `indices`), the
+    /// number of Hessian-vector products and the number of colours of the
+    /// verification stage.
     #[pyo3(signature = (num_points=4, seed=None, bloom_size=None, num_hashes=3, max_tries=100))]
     pub fn hessian_sparsity<'py>(
         &self,
@@ -421,9 +439,13 @@ impl StanModel {
         bloom_size: Option<usize>,
         num_hashes: usize,
         max_tries: usize,
-    ) -> anyhow::Result<(Bound<'py, PyArray2<bool>>, usize, usize)> {
+    ) -> anyhow::Result<(
+        Bound<'py, PyArray1<i64>>,
+        Bound<'py, PyArray1<i64>>,
+        usize,
+        usize,
+    )> {
         self.check_ad_hessian()?;
-        let n = self.inner.param_unc_num();
         let seed = seed.unwrap_or_else(|| rng().next_u64());
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
 
@@ -437,8 +459,13 @@ impl StanModel {
         let pattern =
             py.detach(|| hessian_sparsity(&mut StanHessian { inner }, &points, &options))?;
 
-        let dense = PyArray1::from_vec(py, pattern.to_dense()).reshape([n, n])?;
-        Ok((dense, pattern.num_hvps, pattern.num_colors))
+        let (indptr, indices) = pattern.to_csr();
+        Ok((
+            PyArray1::from_vec(py, indptr),
+            PyArray1::from_vec(py, indices),
+            pattern.num_hvps,
+            pattern.num_colors,
+        ))
     }
 
     /// Return a copy of the model that generates initial points with
@@ -938,9 +965,8 @@ impl StanModel {
     fn check_ad_hessian(&self) -> Result<()> {
         if !self.ad_hessian() {
             bail!(
-                "The Stan model was not compiled with autodiff Hessians, and \
-                 bridgestan would fall back to finite differences. Compile it \
-                 with `nutpie.compile_stan_model(..., ad_hessian=True)`."
+                "Automatic hessian sparsity detection requires hessian information.
+                 Compile with `nutpie.compile_stan_model(..., ad_hessian=True)`."
             );
         }
         Ok(())

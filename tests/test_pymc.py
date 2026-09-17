@@ -741,3 +741,63 @@ def test_init_point_fn_unknown_key(backend, gradient_backend):
 
     with pytest.raises(KeyError, match="sigma_log__"):
         init(1, 0)
+
+
+def _hierarchical_model(n_groups=20):
+    with pm.Model() as model:
+        mu = pm.Normal("mu")
+        tau = pm.HalfNormal("tau")
+        theta = pm.Normal("theta", mu, tau, shape=n_groups)
+        pm.Normal("y", theta, 1, observed=np.zeros(n_groups))
+    return model
+
+
+def _hierarchical_expected(compiled, n_groups=20):
+    # Everything interacts with mu and tau, theta only with themselves
+    variables = compiled._unconstrained_variables()
+    hyper = [i for i, var in enumerate(variables) if var in ("mu", "tau_log__")]
+    expected = np.eye(n_groups + 2, dtype=bool)
+    expected[hyper, :] = True
+    expected[:, hyper] = True
+    return expected
+
+
+@pytest.mark.pymc
+def test_hessian_sparsity_jax():
+    compiled = nutpie.compile_pymc_model(
+        _hierarchical_model(), backend="jax", gradient_backend="jax"
+    )
+    assert compiled.hessian_sparsity is None
+    compiled = compiled.with_hessian_sparsity(seed=1)
+    np.testing.assert_array_equal(
+        compiled.hessian_sparsity.toarray(), _hierarchical_expected(compiled)
+    )
+
+    factorization = compiled.with_factorization().factorization
+    assert factorization.num_fill == 0
+    assert factorization.max_parents == 2
+    first = {factorization.variables[i] for i in factorization.order[:2]}
+    assert first == {"mu", "tau_log__"}
+
+    factorization = compiled.with_factorization(front=["theta"]).factorization
+    # Names as in the `unconstrained_parameter` coordinate of the trace
+    assert factorization.summary().index[0] == "theta_0"
+    assert factorization.unconstrained_parameters == list(
+        compiled.coords["unconstrained_parameter"]
+    )
+
+    assert "hessian sparsity: 41 of 231 pairs nonzero" in repr(compiled)
+    assert compiled.with_data().hessian_sparsity is None
+
+
+@pytest.mark.pymc
+def test_hessian_sparsity_numba():
+    compiled = nutpie.compile_pymc_model(_hierarchical_model(), backend="numba")
+    with pytest.raises(NotImplementedError, match="numba"):
+        compiled.with_hessian_sparsity()
+
+    expected = _hierarchical_expected(compiled)
+    compiled = compiled.with_hessian_sparsity(expected).with_factorization()
+    assert compiled.factorization.num_fill == 0
+    assert "theta_3" in compiled.factorization.unconstrained_parameters
+    assert repr(compiled).startswith("CompiledPyMCModel (numba, n_dim=22)")

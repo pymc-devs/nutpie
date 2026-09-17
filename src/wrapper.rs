@@ -1833,6 +1833,8 @@ pub fn _lib(m: &Bound<'_, PyModule>) -> PyResult<()> {
         crate::triangular::activation_for_testing,
         m
     )?)?;
+    m.add_function(wrap_pyfunction!(crate::symbolic::py_amd_order, m)?)?;
+    m.add_function(wrap_pyfunction!(crate::symbolic::py_symbolic_fill, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     #[cfg(feature = "zarr")]
     {

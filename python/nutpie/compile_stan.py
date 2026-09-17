@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import scipy.sparse as sp
 from numpy.typing import NDArray
 
 from nutpie import _lib
@@ -19,7 +20,7 @@ from nutpie.sample import CompiledModel, _wrap_init_point_fn
 logger = logging.getLogger("nutpie")
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class CompiledStanModel(CompiledModel):
     _coords: dict[str, Any] | None
     code: str
@@ -41,15 +42,6 @@ class CompiledStanModel(CompiledModel):
 
         data_json = _dump_stan_json(data)
 
-        outer_kwargs = self._transform_adapt_args
-        if outer_kwargs is None:
-            outer_kwargs = {}
-
-        def make_adapter(*args, **kwargs):
-            from nutpie.transform_adapter import make_transform_adapter
-
-            return make_transform_adapter(**outer_kwargs)(*args, **kwargs, logp_fn=None)
-
         coords = self._coords
         if coords is None:
             coords = {}
@@ -61,11 +53,16 @@ class CompiledStanModel(CompiledModel):
         dims = dims.copy()
         dim_sizes = {name: len(dim) for name, dim in coords.items()}
 
-        model = _lib.StanModel(
-            self.library, dim_sizes, dims, coords, seed, data_json, make_adapter
-        )
+        model = _lib.StanModel(self.library, dim_sizes, dims, coords, seed, data_json)
 
-        return replace(self, _coords=coords, data=data, model=model)
+        return replace(
+            self,
+            _coords=coords,
+            data=data,
+            model=model,
+            _hessian_sparsity=None,
+            _factorization=None,
+        )
 
     def with_coords(self, **coords):
         if self.coords is None:
@@ -84,7 +81,7 @@ class CompiledStanModel(CompiledModel):
         return replace(self, dims=dims_new)
 
     def with_transform_adapt(self, **kwargs):
-        return replace(self, _transform_adapt_args=kwargs).with_data()
+        return replace(self, _transform_adapt_args=kwargs)
 
     def with_init_point_fn(self, init_point_fn):
         """Use a custom function to generate the initial point of each chain.
@@ -188,7 +185,7 @@ class CompiledStanModel(CompiledModel):
             jacobian,
         )
 
-    def hessian_sparsity(
+    def _detect_hessian_sparsity(
         self,
         num_points: int = 4,
         *,
@@ -196,14 +193,7 @@ class CompiledStanModel(CompiledModel):
         bloom_size: int | None = None,
         num_hashes: int = 3,
     ) -> NDArray:
-        """Detect the sparsity pattern of the Hessian of the log density on
-        the unconstrained space.
-
-        The pattern is computed from autodiff Hessian-vector products at
-        ``num_points`` initial points, generated like the initial points of
-        the sampler (see :meth:`with_init_point_fn`). An entry is nonzero if
-        it is nonzero at any of the points. Dependencies in branches of the
-        model that are not taken at any of the points are not detected.
+        """Detect the Hessian sparsity from autodiff Hessian-vector products.
 
         The model must be compiled with ``ad_hessian=True``.
 
@@ -220,13 +210,9 @@ class CompiledStanModel(CompiledModel):
         num_hashes:
             Number of probes that each parameter is part of while searching
             for candidates.
-
-        Returns
-        -------
-        A symmetric boolean array with shape ``(n_dim, n_dim)``, with a true
-        diagonal.
         """
-        pattern, num_hvps, num_colors = self._sampling_model().hessian_sparsity(
+        model = self._model_with_init()
+        indptr, indices, num_hvps, num_colors = model.hessian_sparsity(
             num_points, seed, bloom_size, num_hashes
         )
         logger.debug(
@@ -234,9 +220,24 @@ class CompiledStanModel(CompiledModel):
             num_hvps,
             num_colors,
         )
-        return pattern
+        n = model.ndim()
+        data = np.ones(len(indices), dtype=bool)
+        return sp.csr_array((data, indices, indptr), shape=(n, n))
 
-    def _sampling_model(self):
+    def _check_has_data(self):
+        if self.model is None:
+            raise ValueError(
+                "The Hessian sparsity depends on the data. Call `with_data(...)` first."
+            )
+
+    def _unconstrained_parameters(self):
+        # The same names as in the trace coordinate, see `vector_coord`
+        return self._make_model().unconstrained_names()
+
+    def _unconstrained_variables(self):
+        return [name.split(".")[0] for name in self._unconstrained_parameters()]
+
+    def _model_with_init(self):
         """The rust model with the init point function attached."""
         compiled = self if self.model is not None else self.with_data()
         model = compiled.model
@@ -257,7 +258,20 @@ class CompiledStanModel(CompiledModel):
         extra_callback_rate,
         store,
     ):
-        model = self._sampling_model()
+        compiled = self if self.model is not None else self.with_data()
+        model = compiled._model_with_init()
+
+        outer_kwargs = {
+            **(compiled._transform_adapt_args or {}),
+            **compiled._flow_structure_kwargs(settings),
+        }
+
+        def make_adapter(*args, **kwargs):
+            from nutpie.transform_adapter import make_transform_adapter
+
+            return make_transform_adapter(**outer_kwargs)(*args, **kwargs, logp_fn=None)
+
+        model = model.with_transform_adapter(make_adapter)
         return _lib.PySampler.from_stan(
             settings,
             cores,
@@ -267,6 +281,20 @@ class CompiledStanModel(CompiledModel):
             extra_callback_rate,
             store,
         )
+
+    def _repr_header(self):
+        if self.model is None:
+            return f"CompiledStanModel {self.model_name!r} (no data, call with_data)"
+        return f"CompiledStanModel {self.model_name!r} (n_dim={self.model.ndim()})"
+
+    def _repr_items(self):
+        items = []
+        if self.data:
+            items.append(("data", ", ".join(self.data)))
+        if self._coords:
+            coords = ", ".join(f"{k} ({len(v)})" for k, v in self._coords.items())
+            items.append(("coords", coords))
+        return items + super()._repr_items()
 
     @property
     def n_dim(self):
@@ -453,7 +481,8 @@ def compile_stan_model(
     ad_hessian:
         Compile the model with support for Hessians using autodiff
         (``BRIDGESTAN_AD_HESSIAN=true``). This is required for
-        :meth:`CompiledStanModel.hessian_sparsity` and
+        detecting the Hessian sparsity with
+        :meth:`CompiledStanModel.with_hessian_sparsity` and
         :meth:`CompiledStanModel.hessian_vector_product`, but makes
         compilation slower. Defaults to ``False``.
     """
