@@ -1,4 +1,3 @@
-from nutpie.triangular import SparseTriangularMap
 import itertools
 import math
 from collections.abc import Callable
@@ -19,6 +18,8 @@ from flowjax.utils import arraylike_to_array
 from jaxtyping import Array, ArrayLike, PyTree
 from paramax import NonTrainable, Parameterize, unwrap
 from paramax.wrappers import AbstractUnwrappable
+
+from nutpie.triangular import SparseTriangularMap
 
 
 def _generate_sequences(k, r_vals):
@@ -320,7 +321,7 @@ def zero_init_conditioners(bijection, scale=1e-3):
     layers, and thus the gradients flowing back through them, stay at their
     normal scale.
     """
-    is_mlp = lambda x: isinstance(x, (FactoredMLP, eqx.nn.MLP))  # noqa: E731
+    is_mlp = lambda x: isinstance(x, (FactoredMLP, eqx.nn.MLP))
     return jax.tree_util.tree_map(
         lambda leaf: _scale_last_layer(leaf, scale) if is_mlp(leaf) else leaf,
         bijection,
@@ -1247,109 +1248,6 @@ class Planar(bijections.AbstractBijection):
         return x, -logdet_inner
 
 
-class Contract2(bijections.AbstractBijection):
-    alpha: Array | None
-    beta: Array
-    sigma: Array
-    mu: Array
-    nu: Array
-    shape: tuple[int, ...]
-    cond_shape: tuple[int, ...] | None = None
-
-    def __init__(self, alpha, beta, sigma, mu, nu):
-        if alpha is not None:
-            self.alpha = jnp.array(alpha)
-        else:
-            self.alpha = None
-        self.beta = jnp.array(beta)
-        self.sigma = jnp.array(sigma)
-        self.mu = jnp.array(mu)
-        self.nu = jnp.array(nu)
-        self.shape = ()
-
-    def transform_and_log_det(
-        self, x: ArrayLike, condition: ArrayLike | None = None
-    ) -> tuple[Array, Array]:
-        """
-        Forward transformation:
-
-          T(x) = sigma_mod * (delta^2 * z^gamma - delta^(-2) * z^(-gamma)) / gamma + mu,
-
-        where
-          gamma = exp(alpha),
-          delta = exp(beta),
-          sigma_mod = sigma + sqrt(1 + sigma^2),
-          z = x/2 + sqrt(1 + x^2/4)
-          (note: z = exp(asinh(x/2))).
-
-        """
-        eps = 1e-4
-        if self.alpha is not None:
-            # gamma = jnp.exp(self.alpha)
-            gamma = self.alpha + jnp.sqrt(1 + self.alpha * self.alpha) + eps
-        else:
-            gamma = 1
-        # delta = jnp.exp(self.beta)
-        delta = self.beta + jnp.sqrt(1 + self.beta * self.beta) + eps
-        sigma_mod = self.sigma + jnp.sqrt(1 + self.sigma * self.sigma) + eps
-        mu = self.mu
-        nu = self.nu
-
-        def trafo(x):
-            x = x - nu
-            z = x / 2 + jnp.sqrt(1 + x * x / 4)
-            return (
-                sigma_mod
-                * (delta**2 * z**gamma - delta ** (-2) * z ** (-gamma))
-                / gamma
-                + mu
-            )
-
-        y, det = jax.jvp(trafo, [x], [jnp.ones(())])
-        return y, jnp.log(det)
-
-    def inverse_and_log_det(
-        self, y: ArrayLike, condition: ArrayLike | None = None
-    ) -> tuple[Array, Array]:
-        """
-        Inverse transformation:
-
-          Given y, we compute x such that
-              y = T(x) = sigma_mod * (delta^2 * z^gamma - delta^(-2) * z^(-gamma)) / gamma + mu,
-          with z = x/2 + sqrt(1 + x^2/4) = exp(asinh(x/2)).
-
-          The inverse is computed via:
-
-              1. Set sigma_mod = sigma + sqrt(1 + sigma^2), gamma = exp(alpha), delta = exp(beta).
-              2. Define A = (gamma/sigma_mod) * (y - mu).
-              3. Solve for w from: delta^2 * w - delta^(-2) / w = A,
-                 i.e., w = (A + sqrt(A^2 + 4)) / (2 * delta^2), where w = z^gamma.
-              4. Recover z = w^(1/gamma).
-              5. Then, x = z - 1/z.
-        """
-        eps = 1e-4
-        if self.alpha is not None:
-            # gamma = jnp.exp(self.alpha)
-            gamma = self.alpha + jnp.sqrt(1 + self.alpha * self.alpha) + eps
-        else:
-            gamma = 1
-        # delta = jnp.exp(self.beta)
-        delta = self.beta + jnp.sqrt(1 + self.beta * self.beta) + eps
-        sigma_mod = self.sigma + jnp.sqrt(1 + self.sigma * self.sigma) + eps
-        mu = self.mu
-        nu = self.nu
-
-        def inv_trafo(y):
-            A = (gamma / sigma_mod) * (y - mu)
-            w = (A + jnp.sqrt(A * A + 4)) / (2 * delta**2)
-            z = w ** (1 / gamma)
-            z = z - 1 / z
-            return z + nu
-
-        x, det = jax.jvp(inv_trafo, [y], [jnp.ones(())])
-        return x, jnp.log(det)
-
-
 def _log_cosh(v):
     """log(cosh(v)), stable for large |v|."""
     a = jnp.abs(v)
@@ -1382,9 +1280,7 @@ class Contract2(bijections.AbstractBijection):
     mu: Array
     nu: Array
     cond_shape: tuple[int, ...] | None = None
-    log_gamma_bounds: tuple[float, float] | None = eqx.field(
-        static=True, default=None
-    )
+    log_gamma_bounds: tuple[float, float] | None = eqx.field(static=True, default=None)
 
     def __init__(self, alpha, beta, sigma, mu, nu, log_gamma_bounds=None):
         """
@@ -1734,7 +1630,9 @@ def make_transformer(
         elemwises.append(affine)
 
     if n_asymmetric:
-        locs = [0.0] if n_asymmetric == 1 else list(np.linspace(-2.0, 2.0, n_asymmetric))
+        locs = (
+            [0.0] if n_asymmetric == 1 else list(np.linspace(-2.0, 2.0, n_asymmetric))
+        )
         for loc in locs:
             scale = Parameterize(lambda x: x + jnp.sqrt(1 + x**2), jnp.zeros(()))
             theta = Parameterize(lambda x: x + jnp.sqrt(1 + x**2), jnp.zeros(()))
