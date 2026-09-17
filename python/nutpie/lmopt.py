@@ -104,7 +104,8 @@ def mlp_unit_labels(one):
         np.broadcast_to(np.arange(W)[:, None], l1.weight.shape),  # w1 row
         np.arange(W),  # b1
         np.broadcast_to(np.arange(W)[None, :], l2.weight.shape),  # w2 col
-        np.arange(l2.bias.shape[0]) % W,
+        # With no hidden units (`nn_width=0`) there is nothing to spread over.
+        np.arange(l2.bias.shape[0]) % max(W, 1),
     ]  # b2 spread
 
 
@@ -609,6 +610,9 @@ def step(
     blocks=None,
     n_groups=None,
     rounds=1,
+    line_search=False,
+    ls_min_fraction=0.1,
+    forcing="residual",
 ):
     """One LM step.  res_fn and plans are static under eqx.filter_jit; plans
     is built once via get_plans and cached by parameter structure, so its
@@ -651,6 +655,8 @@ def step(
         raise ValueError(
             f"Unknown damping {damping!r}, expected 'marquardt' or 'absolute'."
         )
+    if forcing not in ("residual", "rho"):
+        raise ValueError(f"Unknown forcing {forcing!r}, expected 'residual' or 'rho'.")
     if lam_min is None:
         # Under Marquardt damping `lam` is dimensionless -- a fraction of each
         # block's own curvature -- so the 1e-10 that made sense for absolute
@@ -716,6 +722,55 @@ def step(
     Jp = jvp(p)
 
     F, F_new = tdot(r, r), tdot(r_new, r_new)
+    step_length = jnp.ones((), F.dtype)
+    # Quality of the full GN step, which is what `lam` controls. The line
+    # search below only picks how much of that step to take; were `lam` fed
+    # the shortened step's `rho` instead, a well-predicted short step would
+    # keep lowering `lam`, lengthening the GN step it is cut from, until the
+    # search sits at its minimum fraction along an ever longer direction.
+    pred_full = -tdot(p, g) - 0.5 * tdot(Jp, Jp)
+    rho_full = 0.5 * (F - F_new) / jnp.where(
+        jnp.abs(pred_full) < 1e-30, 1e-30, pred_full
+    )
+    full_step_good = (
+        (rho_full > accept_rho)
+        & (pred_full > 0)
+        & jnp.isfinite(F_new)
+        & jnp.isfinite(rho_full)
+    )
+
+    if line_search:
+        # On a large-residual problem the dropped second-order term makes the
+        # GN model underestimate curvature -- by about 2x along scale
+        # directions -- so every step overshoots and the error flips sign
+        # rather than shrinking; damping only slows that into a creep, and
+        # Nielsen's update is stuck there, since its fixed point is exactly
+        # `rho = 0.5`. A parabola through f(0), f'(0) = g.p and f(1), with
+        # f = F / 2 along `p`, measures the curvature actually met and picks
+        # the step fraction that minimizes it: about 1/2 in that regime. It
+        # costs one residual evaluation, and only when it shortens the step.
+        slope = tdot(p, g)
+        curvature = 0.5 * (F_new - F) - slope
+        fraction = -slope / (2.0 * jnp.where(curvature > 0, curvature, 1.0))
+        fraction = jnp.clip(fraction, ls_min_fraction, 1.0)
+        shorten = jnp.isfinite(F_new) & (curvature > 0) & (fraction < 0.95)
+        p_short = jax.tree.map(lambda a: fraction * a, p)
+        r_short = jax.lax.cond(
+            shorten,
+            lambda: res_fn_args(jax.tree.map(jnp.add, theta, p_short)),
+            lambda: r_new,
+        )
+        F_short = tdot(r_short, r_short)
+        # Kept only if it actually beats the full step; a NaN compares False.
+        take = shorten & (F_short < F_new)
+        pick_short = lambda a, b: jax.tree.map(lambda x, y: jnp.where(take, x, y), a, b)
+        p, r_new = pick_short(p_short, p), pick_short(r_short, r_new)
+        # `J` is linear, so the shortened step's `Jp` is just rescaled.
+        Jp = jax.tree.map(lambda a: jnp.where(take, fraction, 1.0) * a, Jp)
+        theta_new = jax.tree.map(jnp.add, theta, p)
+        F_new = jnp.where(take, F_short, F_new)
+        step_length = jnp.where(take, fraction, 1.0)
+
     actual = 0.5 * (F - F_new)
     pred = -tdot(p, g) - 0.5 * tdot(Jp, Jp)  # undamped GN model
     rho = actual / jnp.where(jnp.abs(pred) < 1e-30, 1e-30, pred)
@@ -745,11 +800,20 @@ def step(
     # each of those probes costs a full CG solve plus a residual and Jacobian
     # evaluation. Escalating means a second consecutive failure leaves the
     # interval instead of retracing it.
-    lam_decrease = jnp.maximum(1.0 / 3.0, 1.0 - (2.0 * rho - 1.0) ** 3)
-    lam_out = jnp.clip(
-        jnp.where(accept, lam * lam_decrease, lam * nu_in), lam_min, lam_max
-    )
-    nu_out = jnp.where(accept, nu0, 2.0 * nu_in)
+    lam_decrease = jnp.maximum(1.0 / 3.0, 1.0 - (2.0 * rho_full - 1.0) ** 3)
+    lam_next = jnp.where(full_step_good, lam * lam_decrease, lam * nu_in)
+    nu_out = jnp.where(full_step_good, nu0, 2.0 * nu_in)
+    # When the line search took (and kept) only a fraction `a` of the GN step,
+    # the step `lam` produced was ~1/a too long. Where damping dominates the
+    # curvature, step length goes like 1 / lam, so `lam / a` sizes the next GN
+    # step about right in one go -- rather than letting Nielsen's rules halve
+    # or triple their way there while CG keeps solving tightly for steps that
+    # are mostly thrown away. Where the curvature dominates it undercorrects,
+    # and the usual rules take over on the following steps.
+    shortened = accept & (step_length < 1.0)
+    lam_next = jnp.where(shortened, lam / step_length, lam_next)
+    nu_out = jnp.where(shortened, nu0, nu_out)
+    lam_out = jnp.clip(lam_next, lam_min, lam_max)
     # a rejected step's p solves a system with a different lambda: discard it
     p_out = jax.tree.map(lambda a: jnp.where(accept, a, jnp.zeros_like(a)), p)
 
@@ -766,13 +830,31 @@ def step(
     # and the textbook `min(eta_max, sqrt(||g||))`): `||g|| = ||J^T r||` rises
     # on a good fraction of accepted steps here, and a ratio rule reacts to a
     # rising gradient by demanding its *loosest* solve, exactly when the
-    # iteration is doing worst. It is also scale invariant, and unlike a rule
-    # built on `||r||` it still adapts on a large-residual problem, where `F`
-    # plateaus well above zero and every `||r||` ratio sits at 1.
-    linear_r_norm = tnorm(jax.tree.map(jnp.add, r, Jp))
-    eta_next = jnp.abs(jnp.sqrt(F_new) - linear_r_norm) / jnp.sqrt(
-        jnp.where(F > 0, F, 1.0)
-    )
+    # iteration is doing worst. It is also scale invariant.
+    #
+    # It does not adapt on a large-residual problem, though: where `F`
+    # plateaus well above zero, both norms in the numerator are ~||r|| and
+    # differ only at second order in the step, so the ratio collapses to
+    # `cg_tol` exactly when the solves stop mattering. `forcing="rho"` instead
+    # measures the model error against the *predicted decrease*,
+    #
+    #     eta_next = |1 - rho|,
+    #
+    # with `rho` that of the full GN step (the one CG solved for, whatever the
+    # line search then takes). A model that is only roughly right on the
+    # plateau, `rho ~ 0.5-0.9`, then gets a correspondingly rough solve.
+    if forcing == "rho":
+        eta_next = jnp.abs(1.0 - rho_full)
+        # A full step that blew up has no finite `rho`, but the line search
+        # may still have accepted a shortened one; the model is then as poor
+        # as it gets, so ask for the loosest solve rather than pass on a NaN,
+        # which `jnp.clip` would keep.
+        eta_next = jnp.where(jnp.isfinite(eta_next), eta_next, cg_eta_max)
+    else:
+        linear_r_norm = tnorm(jax.tree.map(jnp.add, r, Jp))
+        eta_next = jnp.abs(jnp.sqrt(F_new) - linear_r_norm) / jnp.sqrt(
+            jnp.where(F > 0, F, 1.0)
+        )
     # EW's safeguard against an over-rapid decrease: without it a single
     # unusually accurate model demands a near-exact solve on the very next
     # step, which is the `cg_max`-burning failure mode the forcing term exists
@@ -805,6 +887,7 @@ def step(
         "step_norm": tnorm(p),
         "finite": ok,
         "rebuilt_blocks": rebuild_blocks,
+        "step_length": step_length,
     }
     if capture is not None:
         info["capture"] = capture
@@ -893,8 +976,20 @@ def fit(
     fit_affine=True,
     rtol=None,
     patience=5,
+    line_search=False,
+    forcing="residual",
 ):
     """Levenberg-Marquardt fit.
+
+    `line_search` shortens each step to the minimizer of a parabola fitted
+    along it, which counters the Gauss-Newton overshoot on large-residual
+    problems (see `step`); the fraction taken shows as ``a=`` in the log.
+    A shortened step also raises `lam` by ``1 / a``, so the next GN step comes
+    out about the length the line search found.
+
+    `forcing` picks how the CG tolerance adapts, ``"residual"``
+    (Eisenstat-Walker choice 1) or ``"rho"`` (``|1 - rho|``, which keeps
+    adapting when the loss plateaus well above zero); see `step`.
 
     Stops after `n_steps`, once the loss falls below `min_loss`, or -- if
     `rtol` is given -- once `patience` consecutive steps have together lowered
@@ -1009,6 +1104,8 @@ def fit(
             rebuild_blocks=jnp.asarray(rebuild_blocks),
             n_groups=n_groups,
             rounds=rounds,
+            line_search=line_search,
+            forcing=forcing,
         )
         if rebuild_blocks:
             accepted_since_build = 0
@@ -1026,6 +1123,7 @@ def fit(
                 f"eta={float(info['cg_eta']):.2f}"
                 f"{' ' if info['rebuilt_blocks'] else '~'}  "
                 f"|g|={float(info['grad_norm']):.2e}"
+                + (f"  a={float(info['step_length']):.2f}" if line_search else "")
                 + (
                     "  capture sub/cond="
                     f"{float(info['capture']['sub_block']):.2f}/"
