@@ -17,7 +17,6 @@ import flowjax.train
 import jax
 import jax.numpy as jnp
 import jax.random as jr
-import lineax as lx
 import numpy as np
 import optax
 import optimistix as optx
