@@ -116,6 +116,45 @@ impl Activation {
             Activation::Tanh => v.tanh(),
         }
     }
+
+    /// The activation and its derivative. NaN propagates through both.
+    #[inline(always)]
+    fn apply_with_derivative(self, v: f64) -> (f64, f64) {
+        match self {
+            Activation::GeluTanh => {
+                const C: f64 = 0.797_884_560_802_865_4;
+                let inner = C * (v + 0.044_715 * v * v * v);
+                let t = inner.tanh();
+                let d_inner = C * (1.0 + 3.0 * 0.044_715 * v * v);
+                (
+                    0.5 * v * (1.0 + t),
+                    0.5 * (1.0 + t) + 0.5 * v * (1.0 - t * t) * d_inner,
+                )
+            }
+            Activation::Relu => {
+                if v.is_nan() {
+                    (v, v)
+                } else if v > 0.0 {
+                    (v, 1.0)
+                } else {
+                    (0.0, 0.0)
+                }
+            }
+            Activation::Softplus => {
+                let u = (-v.abs()).exp();
+                let sigmoid = if v >= 0.0 { 1.0 / (1.0 + u) } else { u / (1.0 + u) };
+                (u.ln_1p() + v.max(0.0), sigmoid)
+            }
+            Activation::Silu => {
+                let s = 1.0 / (1.0 + (-v).exp());
+                (v * s, s + v * s * (1.0 - s))
+            }
+            Activation::Tanh => {
+                let t = v.tanh();
+                (t, 1.0 - t * t)
+            }
+        }
+    }
 }
 
 /// Vectorized `exp` and `log1p`, specialized to the ranges softplus needs.
@@ -286,6 +325,28 @@ mod softplus {
         // `jnp.maximum` propagates instead, and so must this.
         simd.select_f64s(simd.equal_f64s(v, v), out, v)
     }
+
+    /// Softplus and its derivative, which is `sigmoid`.
+    ///
+    /// The derivative comes out of the forward pass for a select and a divide:
+    /// `u = exp(-|v|)` is already computed, and `sigmoid(v)` is `1/(1 + u)` for
+    /// `v >= 0` and `u/(1 + u)` below. No second `exp`.
+    #[inline(always)]
+    pub fn softplus_with_derivative<S: Simd>(simd: S, v: S::f64s) -> (S::f64s, S::f64s) {
+        let zero = simd.splat_f64s(0.0);
+        let one = simd.splat_f64s(1.0);
+        let u = exp_nonpositive(simd, simd.neg_f64s(simd.abs_f64s(v)));
+        let out = simd.add_f64s(simd.max_f64s(v, zero), log1p_unit(simd, u));
+
+        let numerator = simd.select_f64s(simd.greater_than_or_equal_f64s(v, zero), one, u);
+        let derivative = simd.div_f64s(numerator, simd.add_f64s(one, u));
+
+        let finite = simd.equal_f64s(v, v);
+        (
+            simd.select_f64s(finite, out, v),
+            simd.select_f64s(finite, derivative, v),
+        )
+    }
 }
 
 /// `field = conditioner_output[index] + offset`.
@@ -341,6 +402,16 @@ impl LogGammaBound {
     fn apply(&self, unbounded: f64) -> f64 {
         self.low + self.width / (1.0 + (-(self.slope * unbounded + self.offset)).exp())
     }
+
+    /// The same value together with `d/d unbounded`.
+    #[inline(always)]
+    fn apply_with_derivative(&self, unbounded: f64) -> (f64, f64) {
+        let sigmoid = 1.0 / (1.0 + (-(self.slope * unbounded + self.offset)).exp());
+        (
+            self.low + self.width * sigmoid,
+            self.width * self.slope * sigmoid * (1.0 - sigmoid),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -392,6 +463,18 @@ fn exp_asinh(a: f64) -> f64 {
     } else {
         1.0 / (root - a)
     }
+}
+
+/// `exp(asinh(a))` and its derivative, which is `exp(asinh(a)) / sqrt(1 + a*a)`.
+#[inline(always)]
+fn exp_asinh_with_derivative(a: f64) -> (f64, f64) {
+    let root = if a.abs() > 1e150 {
+        a.abs()
+    } else {
+        (1.0 + a * a).sqrt()
+    };
+    let value = if a >= 0.0 { a + root } else { 1.0 / (root - a) };
+    (value, value / root)
 }
 
 /// `log(cosh(asinh(s)))`, which is `0.5 * log1p(s*s)` since
@@ -472,6 +555,163 @@ fn transform_element(layers: &[Contract2], params: &[f64], x: f64) -> (f64, f64)
     (y, log_det)
 }
 
+/// Per-layer partials of one `Contract2`, kept for the reverse pass over the
+/// chain. `p_*_in` are with respect to the layer's input; `params` holds, for
+/// each parameter the layer actually has, its flat index and the layer's two
+/// partials with respect to it.
+#[derive(Clone, Copy)]
+struct LayerTape {
+    /// `d y_out / d y_in`, which is also `exp(log_det)` for this layer.
+    p_y_in: f64,
+    /// `d log_det / d y_in`.
+    p_l_in: f64,
+    n_params: usize,
+    params: [(usize, f64, f64); 5],
+}
+
+impl LayerTape {
+    #[inline(always)]
+    fn push(&mut self, param: Option<Param>, dy: f64, dld: f64) {
+        if let Some(param) = param {
+            self.params[self.n_params] = (param.index, dy, dld);
+            self.n_params += 1;
+        }
+    }
+}
+
+/// `transform_element`, plus every derivative the pullback needs.
+///
+/// Returns `(y, log_det, dy/dx, dlog_det/dx)` and fills `dy_dtheta` and
+/// `dld_dtheta` with the derivatives against the conditioner's outputs.
+///
+/// Two things keep this cheap. `d y_out / d y_in` is `sigma_mod * cosh(arg) /
+/// cosh(u)`, which is exactly `exp(log_det)` for the layer -- so accumulating
+/// it along the chain gives the Jacobian diagonal for free, and more accurately
+/// than exponentiating a sum of logs. And every partial below is rational in
+/// quantities the forward pass already formed: `cosh(u)` is `sqrt(1 + half^2)`
+/// and `cosh(arg)` is `sqrt(1 + sinh(arg)^2)`, so the whole derivative costs
+/// two square roots per layer and **no new transcendental calls**.
+fn transform_element_with_grads(
+    layers: &[Contract2],
+    params: &[f64],
+    x: f64,
+    dy_dtheta: &mut [f64],
+    dld_dtheta: &mut [f64],
+) -> (f64, f64, f64, f64) {
+    let mut tapes: SmallVec<[LayerTape; 4]> = SmallVec::new();
+    let mut y = x;
+    let mut log_det = 0.0;
+
+    for layer in layers {
+        let mut tape = LayerTape {
+            p_y_in: 1.0,
+            p_l_in: 0.0,
+            n_params: 0,
+            params: [(0, 0.0, 0.0); 5],
+        };
+
+        // gamma, and d gamma / d alpha.
+        let (gamma, dgamma) = match (layer.alpha, &layer.bound) {
+            (None, _) => (1.0, 0.0),
+            (Some(alpha), None) => exp_asinh_with_derivative(alpha.get(params)),
+            (Some(alpha), Some(bound)) => {
+                let a = alpha.get(params);
+                let (log_gamma, dlog_gamma) = bound.apply_with_derivative(a.asinh());
+                let gamma = log_gamma.exp();
+                (gamma, gamma * dlog_gamma / (1.0 + a * a).sqrt())
+            }
+        };
+        let (log_delta, dlog_delta) = match layer.beta {
+            None => (0.0, 0.0),
+            Some(beta) => {
+                let b = beta.get(params);
+                (b.asinh(), 1.0 / (1.0 + b * b).sqrt())
+            }
+        };
+        let (sigma_mod, dsigma_mod, log_sigma) = match layer.sigma {
+            None => (1.0, 0.0, 0.0),
+            Some(sigma) => {
+                let (m, dm) = exp_asinh_with_derivative(sigma.get(params));
+                (m, dm, m.ln())
+            }
+        };
+
+        let centred = match layer.nu {
+            None => y,
+            Some(nu) => y - nu.get(params),
+        };
+        let half = 0.5 * centred;
+        let cosh_u = (1.0 + half * half).sqrt();
+        let u = half.asinh();
+        let tanh_u = half / cosh_u;
+
+        let arg = gamma * u + 2.0 * log_delta;
+        let sinh_arg = arg.sinh();
+        let cosh_arg = (1.0 + sinh_arg * sinh_arg).sqrt();
+        // `cosh_arg` overflows past |arg| ~ 355, the same place `sinh_arg`
+        // does; the ratio is 1 long before that.
+        let tanh_arg = if arg.abs() < 300.0 {
+            sinh_arg / cosh_arg
+        } else {
+            arg.signum()
+        };
+
+        let scale = 2.0 * sigma_mod / gamma;
+        let y_out = scale * sinh_arg + layer.mu.map_or(0.0, |mu| mu.get(params));
+        let ld = log_sigma + log_cosh_from_sinh(sinh_arg, arg) - log_cosh_asinh(half);
+
+        let du_dy = 0.5 / cosh_u;
+        tape.p_y_in = sigma_mod * cosh_arg / cosh_u;
+        tape.p_l_in = (gamma * tanh_arg - tanh_u) * du_dy;
+
+        // alpha enters only through gamma, which scales `u` inside `arg` and
+        // divides the outer amplitude.
+        tape.push(
+            layer.alpha,
+            scale * (cosh_arg * u - sinh_arg / gamma) * dgamma,
+            tanh_arg * u * dgamma,
+        );
+        // beta shifts `arg` by `2 log delta`.
+        tape.push(
+            layer.beta,
+            scale * cosh_arg * 2.0 * dlog_delta,
+            tanh_arg * 2.0 * dlog_delta,
+        );
+        // sigma is a pure amplitude, so its log det partial is just
+        // `d log sigma_mod / d sigma`.
+        tape.push(
+            layer.sigma,
+            (2.0 * sinh_arg / gamma) * dsigma_mod,
+            dsigma_mod / sigma_mod,
+        );
+        tape.push(layer.mu, 1.0, 0.0);
+        // nu shifts the input, so its partials are the input ones negated.
+        tape.push(layer.nu, -tape.p_y_in, -tape.p_l_in);
+
+        tapes.push(tape);
+        y = y_out;
+        log_det += ld;
+    }
+
+    // Reverse over the chain. `ay` is `d y_final / d y_k` and `al` is
+    // `d (sum of later log dets) / d y_k`, both at the input of the layer about
+    // to be processed.
+    dy_dtheta.fill(0.0);
+    dld_dtheta.fill(0.0);
+    let mut ay = 1.0;
+    let mut al = 0.0;
+    for tape in tapes.iter().rev() {
+        for &(index, p_y, p_l) in &tape.params[..tape.n_params] {
+            dy_dtheta[index] = ay * p_y;
+            dld_dtheta[index] = p_l + al * p_y;
+        }
+        al = tape.p_l_in + al * tape.p_y_in;
+        ay *= tape.p_y_in;
+    }
+
+    (y, log_det, ay, al)
+}
+
 /// One conditioner MLP, vectorized across the output width.
 ///
 /// The weights arrive input-major -- one contiguous row of `n_out` values per
@@ -496,6 +736,9 @@ struct EvalMlp<'a> {
     /// Receives each layer's pre-activations, and finally the transformer
     /// parameters.
     acc: &'a mut [f64],
+    /// When recording a tape: receives `activation'(z_l)` for every hidden
+    /// layer, concatenated, which is what `BackpropMlp` needs.
+    act_derivs: Option<&'a mut [f64]>,
 }
 
 /// Number of SIMD accumulators kept live at once.
@@ -586,6 +829,246 @@ fn apply_activation<S: pulp::Simd>(
     }
 }
 
+/// `dst = activation(src)` and `deriv = activation'(src)`.
+///
+/// Only softplus takes the SIMD path here, because it is the only one whose
+/// derivative falls out of the forward computation; for the rest the scalar
+/// loop is what the forward-only version would have done anyway.
+#[inline(always)]
+fn apply_activation_with_derivative<S: pulp::Simd>(
+    simd: S,
+    activation: Activation,
+    src: &[f64],
+    dst: &mut [f64],
+    deriv: &mut [f64],
+) {
+    debug_assert_eq!(src.len(), dst.len());
+    debug_assert_eq!(src.len(), deriv.len());
+    match activation {
+        Activation::Softplus => {
+            let (src_head, src_tail) = S::as_simd_f64s(src);
+            let (dst_head, dst_tail) = S::as_mut_simd_f64s(dst);
+            let (deriv_head, deriv_tail) = S::as_mut_simd_f64s(deriv);
+            for ((out, slope), &pre) in
+                dst_head.iter_mut().zip(deriv_head.iter_mut()).zip(src_head)
+            {
+                let (value, derivative) = softplus::softplus_with_derivative(simd, pre);
+                *out = value;
+                *slope = derivative;
+            }
+            for ((out, slope), &pre) in
+                dst_tail.iter_mut().zip(deriv_tail.iter_mut()).zip(src_tail)
+            {
+                let (value, derivative) = activation.apply_with_derivative(pre);
+                *out = value;
+                *slope = derivative;
+            }
+        }
+        other => {
+            for ((out, slope), &pre) in dst.iter_mut().zip(deriv.iter_mut()).zip(src) {
+                let (value, derivative) = other.apply_with_derivative(pre);
+                *out = value;
+                *slope = derivative;
+            }
+        }
+    }
+}
+
+/// Weight rows processed together in the backward pass.
+///
+/// Each row carries two accumulators (one per cotangent row), so four rows give
+/// eight independent FMA chains -- enough to cover the FMA latency -- and eight
+/// horizontal reductions that can overlap instead of one stalling the next.
+const BACK_BLOCK: usize = 4;
+
+/// `N` dot products against two shared vectors: `out_a[i] = rows[i]·a` and
+/// `out_b[i] = rows[i]·b`, for `N` consecutive rows of length `n_out`.
+///
+/// The transposed weight layout that makes the forward pass an AXPY makes the
+/// backward pass a reduction, which is the shape that cannot be reassociated.
+/// Doing one row at a time leaves a single accumulator chain per cotangent and
+/// pays a horizontal `reduce_sum` per row, so it runs at reduction *latency*:
+/// measured at 0.79 cycles per multiply-add against the forward's 0.48.
+///
+/// Blocking fixes it the same way `axpy_block` does. `N` is a const parameter
+/// so the inner loop unrolls and all `2N` accumulators stay in registers, and
+/// the vector index runs *outermost* so every one of them is advanced per
+/// iteration rather than each chain being drained in turn.
+///
+/// Each accumulator still sums its own row in the same order, so this is a
+/// scheduling change and the result is unchanged bit for bit.
+#[inline(always)]
+fn dot2_block<S: pulp::Simd, const N: usize>(
+    simd: S,
+    rows: &[f64],
+    n_out: usize,
+    a: &[f64],
+    b: &[f64],
+    out_a: &mut [f64],
+    out_b: &mut [f64],
+) {
+    let lanes = core::mem::size_of::<S::f64s>() / core::mem::size_of::<f64>();
+    let n_vec = n_out / lanes;
+    let head = n_vec * lanes;
+
+    let (a_head, a_tail) = S::as_simd_f64s(a);
+    let (b_head, b_tail) = S::as_simd_f64s(b);
+    let row_vecs: [&[S::f64s]; N] =
+        core::array::from_fn(|i| S::as_simd_f64s(&rows[i * n_out..i * n_out + head]).0);
+
+    let zero = simd.splat_f64s(0.0);
+    let mut acc_a = [zero; N];
+    let mut acc_b = [zero; N];
+
+    for j in 0..n_vec {
+        let av = a_head[j];
+        let bv = b_head[j];
+        for i in 0..N {
+            let w = row_vecs[i][j];
+            acc_a[i] = simd.mul_add_e_f64s(w, av, acc_a[i]);
+            acc_b[i] = simd.mul_add_e_f64s(w, bv, acc_b[i]);
+        }
+    }
+
+    for i in 0..N {
+        let mut sum_a = simd.reduce_sum_f64s(acc_a[i]);
+        let mut sum_b = simd.reduce_sum_f64s(acc_b[i]);
+        for ((&r, &x), &y) in rows[i * n_out + head..(i + 1) * n_out]
+            .iter()
+            .zip(a_tail)
+            .zip(b_tail)
+        {
+            sum_a += r * x;
+            sum_b += r * y;
+        }
+        out_a[i] = sum_a;
+        out_b[i] = sum_b;
+    }
+}
+
+/// Backpropagate two cotangent rows through one conditioner MLP.
+///
+/// The two rows are `d y_i / d theta` and `d log_det_i / d theta` from the
+/// transformer; the results are `d y_i / d y_p` and `d log_det_i / d y_p` for
+/// each parent `p`, i.e. one row each of the sparse Jacobian `A` and the log
+/// det coupling `C`.
+struct BackpropMlp<'a> {
+    weights: &'a [f64],
+    layer_out: &'a [usize],
+    n_in: usize,
+    /// `activation'(z_l)` for every hidden layer, concatenated in forward order.
+    act_derivs: &'a [f64],
+    seed_y: &'a mut [f64],
+    seed_l: &'a mut [f64],
+    next_y: &'a mut [f64],
+    next_l: &'a mut [f64],
+    out_y: &'a mut [f64],
+    out_l: &'a mut [f64],
+}
+
+impl<'a> WithSimd for BackpropMlp<'a> {
+    type Output = ();
+
+    #[inline(always)]
+    fn with_simd<S: pulp::Simd>(self, simd: S) -> Self::Output {
+        let Self {
+            weights,
+            layer_out,
+            n_in,
+            act_derivs,
+            mut seed_y,
+            mut seed_l,
+            mut next_y,
+            mut next_l,
+            out_y,
+            out_l,
+        } = self;
+
+        // Re-walk the layer geometry rather than carrying it from the forward
+        // pass: it is a handful of integer ops against a second buffer.
+        let n_layers = layer_out.len();
+        let mut layers: SmallVec<[(usize, usize, usize, usize); 8]> = SmallVec::new();
+        let mut offset = 0usize;
+        let mut deriv_offset = 0usize;
+        let mut inputs = n_in;
+        for (layer, &n_out) in layer_out.iter().enumerate() {
+            layers.push((offset, inputs, n_out, deriv_offset));
+            offset += inputs * n_out + n_out;
+            if layer + 1 < n_layers {
+                deriv_offset += n_out;
+            }
+            inputs = n_out;
+        }
+
+        for layer in (0..n_layers).rev() {
+            let (offset, n_in_l, n_out, _) = layers[layer];
+            let columns = &weights[offset..offset + n_in_l * n_out];
+            let (cotangent_y, cotangent_l) = (&seed_y[..n_out], &seed_l[..n_out]);
+
+            // Full blocks, then the remainder; `BACK_BLOCK` is 4 so the arms
+            // below cover every leftover width.
+            let mut done = 0;
+            while done + BACK_BLOCK <= n_in_l {
+                dot2_block::<S, BACK_BLOCK>(
+                    simd,
+                    &columns[done * n_out..],
+                    n_out,
+                    cotangent_y,
+                    cotangent_l,
+                    &mut next_y[done..],
+                    &mut next_l[done..],
+                );
+                done += BACK_BLOCK;
+            }
+            match n_in_l - done {
+                0 => {}
+                1 => dot2_block::<S, 1>(
+                    simd,
+                    &columns[done * n_out..],
+                    n_out,
+                    cotangent_y,
+                    cotangent_l,
+                    &mut next_y[done..],
+                    &mut next_l[done..],
+                ),
+                2 => dot2_block::<S, 2>(
+                    simd,
+                    &columns[done * n_out..],
+                    n_out,
+                    cotangent_y,
+                    cotangent_l,
+                    &mut next_y[done..],
+                    &mut next_l[done..],
+                ),
+                _ => dot2_block::<S, 3>(
+                    simd,
+                    &columns[done * n_out..],
+                    n_out,
+                    cotangent_y,
+                    cotangent_l,
+                    &mut next_y[done..],
+                    &mut next_l[done..],
+                ),
+            }
+            if layer > 0 {
+                // The activation feeding this layer sits at the previous
+                // layer's output width, which is this layer's input width.
+                let deriv_at = layers[layer - 1].3;
+                let slopes = &act_derivs[deriv_at..deriv_at + n_in_l];
+                for (k, &slope) in slopes.iter().enumerate() {
+                    next_y[k] *= slope;
+                    next_l[k] *= slope;
+                }
+            }
+            core::mem::swap(&mut seed_y, &mut next_y);
+            core::mem::swap(&mut seed_l, &mut next_l);
+        }
+
+        out_y.copy_from_slice(&seed_y[..n_in]);
+        out_l.copy_from_slice(&seed_l[..n_in]);
+    }
+}
+
 impl<'a> WithSimd for EvalMlp<'a> {
     type Output = ();
 
@@ -598,11 +1081,13 @@ impl<'a> WithSimd for EvalMlp<'a> {
             mut n_in,
             inputs,
             acc,
+            mut act_derivs,
         } = self;
 
         let lanes = core::mem::size_of::<S::f64s>() / core::mem::size_of::<f64>();
         let n_layers = layer_out.len();
         let mut offset = 0usize;
+        let mut deriv_offset = 0usize;
 
         for (layer, &n_out) in layer_out.iter().enumerate() {
             let bias_at = offset + n_in * n_out;
@@ -668,7 +1153,19 @@ impl<'a> WithSimd for EvalMlp<'a> {
 
             offset = bias_at + n_out;
             if layer + 1 < n_layers {
-                apply_activation(simd, activation, &acc[..n_out], &mut inputs[..n_out]);
+                match &mut act_derivs {
+                    Some(derivs) => apply_activation_with_derivative(
+                        simd,
+                        activation,
+                        &acc[..n_out],
+                        &mut inputs[..n_out],
+                        &mut derivs[deriv_offset..deriv_offset + n_out],
+                    ),
+                    None => {
+                        apply_activation(simd, activation, &acc[..n_out], &mut inputs[..n_out])
+                    }
+                }
+                deriv_offset += n_out;
             }
             n_in = n_out;
         }
@@ -686,6 +1183,86 @@ struct Dataflow<'a> {
     pending: &'a [AtomicU32],
 }
 
+/// The sparse Jacobian of the forward map, recorded as the sweep runs.
+///
+/// `J = dy/dx` itself is dense -- it is the inverse of a sparse triangular
+/// matrix -- but it is never needed. Writing the map as
+/// `y_i = f_i(x_i, y_pa(i))` gives `J = D + A J`, so `J = (I - A)^-1 D` with
+/// `D` diagonal and `A` strictly lower triangular in topological order. A
+/// vector-Jacobian product is then one reverse sweep over the DAG followed by a
+/// scale, and both factors are exactly as sparse as the blanket.
+///
+/// The log det rides along in the same structure: with
+/// `ld_i = log(d f_i / d x_i)`, `grad = J^T(g + C^T 1) + b`, which folds into
+/// one fused sweep. See `TriangularTransform::pullback`.
+///
+/// Everything here is sized once from the layout and overwritten in place, so a
+/// steady-state leapfrog step allocates nothing.
+struct Tape {
+    /// Per edge, in `parent_index` order and interleaved:
+    /// `d y_child / d y_parent` then `d ld_child / d y_parent`.
+    edges: Vec<Cell>,
+    /// `d y_i / d x_i`, the diagonal of `J`'s numerator.
+    diag: Vec<Cell>,
+    /// `d ld_i / d x_i`.
+    ld_dx: Vec<Cell>,
+    /// Whether a forward pass has recorded into this tape since the last
+    /// pullback. A mismatched pair would yield a *wrong gradient* rather than
+    /// an error, which is exactly the kind of bug that shows up weeks later as
+    /// a bad acceptance rate.
+    filled: bool,
+}
+
+impl Tape {
+    fn new(n_variables: usize, n_edges: usize) -> Self {
+        Self {
+            edges: Cell::zeros(2 * n_edges),
+            diag: Cell::zeros(n_variables),
+            ld_dx: Cell::zeros(n_variables),
+            filled: false,
+        }
+    }
+}
+
+/// Per-task working buffers for one variable's evaluation.
+///
+/// Held on the stack (spilling to the heap only for unusually wide maps) so the
+/// parallel schedules can make one per task without touching the allocator.
+struct Scratchpad {
+    inputs: Scratch,
+    acc: Scratch,
+    act_derivs: Scratch,
+    dy_dtheta: Scratch,
+    dld_dtheta: Scratch,
+    seed_y: Scratch,
+    seed_l: Scratch,
+    next_y: Scratch,
+    next_l: Scratch,
+    edge_y: Scratch,
+    edge_l: Scratch,
+}
+
+impl Scratchpad {
+    fn new(transform: &TriangularTransform) -> Self {
+        let width = transform.buffer_size;
+        let params = transform.num_params;
+        let parents = transform.max_parents.max(1);
+        Self {
+            inputs: SmallVec::from_elem(0.0, width),
+            acc: SmallVec::from_elem(0.0, width),
+            act_derivs: SmallVec::from_elem(0.0, transform.act_deriv_len.max(1)),
+            dy_dtheta: SmallVec::from_elem(0.0, params),
+            dld_dtheta: SmallVec::from_elem(0.0, params),
+            seed_y: SmallVec::from_elem(0.0, width),
+            seed_l: SmallVec::from_elem(0.0, width),
+            next_y: SmallVec::from_elem(0.0, width),
+            next_l: SmallVec::from_elem(0.0, width),
+            edge_y: SmallVec::from_elem(0.0, parents),
+            edge_l: SmallVec::from_elem(0.0, parents),
+        }
+    }
+}
+
 /// A `SparseTriangularMap` flattened for evaluation. See
 /// `nutpie.triangular_layout.TriangularLayout` for the field-by-field meaning;
 /// the arrays are the same ones, taken by value.
@@ -697,9 +1274,17 @@ pub struct TriangularTransform {
     /// work forwards along edges, so it needs each variable's children.
     child_indptr: Vec<usize>,
     child_index: Vec<u32>,
+    /// For each reversed edge, its index in the forward `parent_index` order,
+    /// which is where the tape keeps that edge's Jacobian entries.
+    child_edge: Vec<u32>,
     blob: Vec<f64>,
     blob_offset: Vec<usize>,
     layer_out: Vec<usize>,
+    /// Linear skip from the parents to conditioner output `skip_index`, one
+    /// weight per edge in `parent_index` order. All zeros when the
+    /// conditioners have none.
+    skip_weight: Vec<f64>,
+    skip_index: usize,
     activation: Activation,
     layers: Vec<Contract2>,
     level_ptr: Vec<usize>,
@@ -712,9 +1297,14 @@ pub struct TriangularTransform {
     schedule: Schedule,
     buffer_size: usize,
     num_params: usize,
+    max_parents: usize,
+    /// Total width of the hidden-layer activation derivatives, which is what
+    /// `BackpropMlp` reads.
+    act_deriv_len: usize,
     /// Detected once; `dispatch` is then a match on a feature enum, so the
     /// per-variable cost of picking a SIMD path is a predictable branch.
     arch: Arch,
+    tape: Tape,
 }
 
 impl TriangularTransform {
@@ -722,42 +1312,106 @@ impl TriangularTransform {
     ///
     /// Reads only cells belonging to variables at strictly earlier levels,
     /// which every schedule guarantees are already written.
+    ///
+    /// With `TAPE`, the same pass also records this variable's row of the
+    /// sparse Jacobian. The backward pass through the conditioner runs here
+    /// rather than in the reverse sweep deliberately: the weights are still in
+    /// L1 from the forward pass, whereas by the time a reverse sweep reached
+    /// this variable they would have to come back from memory -- a second pass
+    /// over the whole weight blob, which at high parent counts is the dominant
+    /// cost.
     #[inline]
-    fn eval_variable(
+    fn eval_variable<const TAPE: bool>(
         &self,
         variable: usize,
         y: &[Cell],
         x: f64,
-        buf_a: &mut [f64],
-        buf_b: &mut [f64],
+        pad: &mut Scratchpad,
     ) -> (f64, f64) {
         let start = self.parent_indptr[variable];
         let stop = self.parent_indptr[variable + 1];
         let n_in = stop - start;
-        for (slot, &parent) in buf_a[..n_in]
+        for (slot, &parent) in pad.inputs[..n_in]
             .iter_mut()
             .zip(&self.parent_index[start..stop])
         {
             *slot = y[parent as usize].get();
         }
+        // Taken before the MLP runs, which reuses `inputs` as a layer buffer.
+        let skip: f64 = self.skip_weight[start..stop]
+            .iter()
+            .zip(&pad.inputs[..n_in])
+            .map(|(weight, value)| weight * value)
+            .sum();
+
+        let weights = &self.blob[self.blob_offset[variable]..self.blob_offset[variable + 1]];
 
         // One dispatch per variable, covering every layer: the whole MLP runs
         // inside a single `#[target_feature]` body rather than paying for the
         // feature dispatch per layer.
         self.arch.dispatch(EvalMlp {
-            weights: &self.blob[self.blob_offset[variable]..self.blob_offset[variable + 1]],
+            weights,
             layer_out: &self.layer_out,
             activation: self.activation,
             n_in,
-            inputs: buf_a,
-            acc: buf_b,
+            inputs: &mut pad.inputs,
+            acc: &mut pad.acc,
+            act_derivs: if TAPE {
+                Some(&mut pad.act_derivs)
+            } else {
+                None
+            },
         });
+        pad.acc[self.skip_index] += skip;
 
-        transform_element(&self.layers, &buf_b[..self.num_params], x)
+        if !TAPE {
+            return transform_element(&self.layers, &pad.acc[..self.num_params], x);
+        }
+
+        let (value, log_det, dy_dx, dld_dx) = transform_element_with_grads(
+            &self.layers,
+            &pad.acc[..self.num_params],
+            x,
+            &mut pad.dy_dtheta,
+            &mut pad.dld_dtheta,
+        );
+        self.tape.diag[variable].set(dy_dx);
+        self.tape.ld_dx[variable].set(dld_dx);
+
+        if n_in > 0 {
+            pad.seed_y[..self.num_params].copy_from_slice(&pad.dy_dtheta);
+            pad.seed_l[..self.num_params].copy_from_slice(&pad.dld_dtheta);
+            self.arch.dispatch(BackpropMlp {
+                weights,
+                layer_out: &self.layer_out,
+                n_in,
+                act_derivs: &pad.act_derivs,
+                seed_y: &mut pad.seed_y,
+                seed_l: &mut pad.seed_l,
+                next_y: &mut pad.next_y,
+                next_l: &mut pad.next_l,
+                out_y: &mut pad.edge_y[..n_in],
+                out_l: &mut pad.edge_l[..n_in],
+            });
+            let skip_dy = pad.dy_dtheta[self.skip_index];
+            let skip_dld = pad.dld_dtheta[self.skip_index];
+            for (k, &weight) in self.skip_weight[start..stop].iter().enumerate() {
+                pad.edge_y[k] += skip_dy * weight;
+                pad.edge_l[k] += skip_dld * weight;
+            }
+            for k in 0..n_in {
+                self.tape.edges[2 * (start + k)].set(pad.edge_y[k]);
+                self.tape.edges[2 * (start + k) + 1].set(pad.edge_l[k]);
+            }
+        }
+
+        (value, log_det)
     }
 
     /// `x -> y`, returning `log|det dy/dx|`.
-    pub fn transform_and_log_det(&self, x: &[f64]) -> Result<(Vec<f64>, f64)> {
+    ///
+    /// With `record`, also fills the tape so that `pullback` can run.
+    pub fn transform_and_log_det(&mut self, x: &[f64], record: bool) -> Result<(Vec<f64>, f64)> {
         if x.len() != self.n_variables {
             bail!(
                 "expected an array of length {}, got {}",
@@ -767,12 +1421,67 @@ impl TriangularTransform {
         }
 
         let y = Cell::zeros(self.n_variables);
-        let log_det = match self.effective_schedule() {
-            Schedule::Serial => self.run_serial(x, &y),
-            Schedule::Levels => self.run_levels(x, &y),
-            Schedule::Dataflow | Schedule::Auto => self.run_dataflow_top(x, &y),
+        let log_det = if record {
+            self.sweep::<true>(x, &y)
+        } else {
+            self.sweep::<false>(x, &y)
         };
+        self.tape.filled = record;
         Ok((y.iter().map(Cell::get).collect(), log_det))
+    }
+
+    fn sweep<const TAPE: bool>(&self, x: &[f64], y: &[Cell]) -> f64 {
+        match self.effective_schedule() {
+            Schedule::Serial => self.run_serial::<TAPE>(x, y),
+            Schedule::Levels => self.run_levels::<TAPE>(x, y),
+            Schedule::Dataflow | Schedule::Auto => self.run_dataflow_top::<TAPE>(x, y),
+        }
+    }
+
+    /// Pull a cotangent on `(y, log_det)` back to one on `x`.
+    ///
+    /// `grad_x = J^T(grad_y + ld_bar * C^T 1) + ld_bar * b`, which is the
+    /// fused reverse sweep below: each variable collects from its children,
+    /// then scales by the Jacobian diagonal.
+    ///
+    /// Kept serial. It is two fused multiply-adds per edge against a tape a
+    /// fraction the size of the weight blob, so it is memory bound and short;
+    /// the expensive half of the VJP is the Jacobian construction, which the
+    /// forward sweep already schedules.
+    pub fn pullback(&self, grad_y: &[f64], ld_bar: f64) -> Result<Vec<f64>> {
+        if !self.tape.filled {
+            bail!("pullback called without a matching recorded forward pass");
+        }
+        if grad_y.len() != self.n_variables {
+            bail!(
+                "expected a cotangent of length {}, got {}",
+                self.n_variables,
+                grad_y.len()
+            );
+        }
+
+        let mut w = vec![0.0; self.n_variables];
+        let mut grad_x = vec![0.0; self.n_variables];
+
+        for &variable in self.level_vars.iter().rev() {
+            let variable = variable as usize;
+            let mut total = grad_y[variable];
+            let start = self.child_indptr[variable];
+            let stop = self.child_indptr[variable + 1];
+            for (&child, &edge) in self.child_index[start..stop]
+                .iter()
+                .zip(&self.child_edge[start..stop])
+            {
+                let edge = edge as usize;
+                total += self.tape.edges[2 * edge].get() * w[child as usize]
+                    + ld_bar * self.tape.edges[2 * edge + 1].get();
+            }
+            w[variable] = total;
+            grad_x[variable] =
+                self.tape.diag[variable].get() * total + ld_bar * self.tape.ld_dx[variable].get();
+        }
+
+        Ok(grad_x)
     }
 
     fn effective_schedule(&self) -> Schedule {
@@ -788,37 +1497,33 @@ impl TriangularTransform {
         }
     }
 
-    fn run_serial(&self, x: &[f64], y: &[Cell]) -> f64 {
-        let mut buf_a = vec![0.0; self.buffer_size];
-        let mut buf_b = vec![0.0; self.buffer_size];
+    fn run_serial<const TAPE: bool>(&self, x: &[f64], y: &[Cell]) -> f64 {
+        let mut pad = Scratchpad::new(self);
         let mut log_det = 0.0;
         for &variable in &self.level_vars {
             let variable = variable as usize;
             let (value, element) =
-                self.eval_variable(variable, y, x[variable], &mut buf_a, &mut buf_b);
+                self.eval_variable::<TAPE>(variable, y, x[variable], &mut pad);
             y[variable].set(value);
             log_det += element;
         }
         log_det
     }
 
-    fn run_levels(&self, x: &[f64], y: &[Cell]) -> f64 {
-        let mut buf_a = vec![0.0; self.buffer_size];
-        let mut buf_b = vec![0.0; self.buffer_size];
+    fn run_levels<const TAPE: bool>(&self, x: &[f64], y: &[Cell]) -> f64 {
+        let mut pad = Scratchpad::new(self);
         let mut collected: Vec<(f64, f64)> = Vec::new();
         let mut log_det = 0.0;
 
         for level in 0..self.level_ptr.len() - 1 {
             let members = &self.level_vars[self.level_ptr[level]..self.level_ptr[level + 1]];
             if self.level_parallel[level] {
-                let buffer_size = self.buffer_size;
                 members
                     .par_iter()
                     .map(|&variable| {
-                        let mut a: Scratch = SmallVec::from_elem(0.0, buffer_size);
-                        let mut b: Scratch = SmallVec::from_elem(0.0, buffer_size);
+                        let mut pad = Scratchpad::new(self);
                         let variable = variable as usize;
-                        self.eval_variable(variable, y, x[variable], &mut a, &mut b)
+                        self.eval_variable::<TAPE>(variable, y, x[variable], &mut pad)
                     })
                     .collect_into_vec(&mut collected);
                 // Scatter and sum in member order, so the total does not depend
@@ -831,7 +1536,7 @@ impl TriangularTransform {
                 for &variable in members {
                     let variable = variable as usize;
                     let (value, element) =
-                        self.eval_variable(variable, y, x[variable], &mut buf_a, &mut buf_b);
+                        self.eval_variable::<TAPE>(variable, y, x[variable], &mut pad);
                     y[variable].set(value);
                     log_det += element;
                 }
@@ -840,7 +1545,7 @@ impl TriangularTransform {
         log_det
     }
 
-    fn run_dataflow_top(&self, x: &[f64], y: &[Cell]) -> f64 {
+    fn run_dataflow_top<const TAPE: bool>(&self, x: &[f64], y: &[Cell]) -> f64 {
         let log_det = Cell::zeros(self.n_variables);
         let pending: Vec<AtomicU32> = (0..self.n_variables)
             .map(|i| {
@@ -852,7 +1557,7 @@ impl TriangularTransform {
             .filter(|&i| self.parent_indptr[i as usize + 1] == self.parent_indptr[i as usize])
             .collect();
 
-        self.run_dataflow(
+        self.run_dataflow::<TAPE>(
             roots,
             &Dataflow {
                 x,
@@ -896,16 +1601,15 @@ impl TriangularTransform {
     /// tree, and would need memoized nodes with tasks blocking on each other's
     /// subgoals. Pushing forward along edges keeps it a fork-join tree, which
     /// is exactly what `join` wants.
-    fn run_dataflow(&self, mut ready: ReadyList, ctx: &Dataflow<'_>) {
-        let mut buf_a: Scratch = SmallVec::from_elem(0.0, self.buffer_size);
-        let mut buf_b: Scratch = SmallVec::from_elem(0.0, self.buffer_size);
+    fn run_dataflow<const TAPE: bool>(&self, mut ready: ReadyList, ctx: &Dataflow<'_>) {
+        let mut pad = Scratchpad::new(self);
 
         // LIFO, so a task follows its own chain depth-first and keeps the
         // values it just wrote in cache.
         while let Some(variable) = ready.pop() {
             let variable = variable as usize;
             let (value, element) =
-                self.eval_variable(variable, ctx.y, ctx.x[variable], &mut buf_a, &mut buf_b);
+                self.eval_variable::<TAPE>(variable, ctx.y, ctx.x[variable], &mut pad);
             ctx.y[variable].set(value);
             ctx.log_det[variable].set(element);
 
@@ -925,8 +1629,8 @@ impl TriangularTransform {
                 let split = ready.len() / 2;
                 let rest: ReadyList = ready.drain(split..).collect();
                 rayon::join(
-                    || self.run_dataflow(rest, ctx),
-                    move || self.run_dataflow(ready, ctx),
+                    || self.run_dataflow::<TAPE>(rest, ctx),
+                    move || self.run_dataflow::<TAPE>(ready, ctx),
                 );
                 return;
             }
@@ -956,6 +1660,8 @@ impl PySparseTriangularTransform {
         blob,
         blob_offset,
         layer_out,
+        skip_weight,
+        skip_index,
         activation,
         transformer,
         level_ptr,
@@ -971,6 +1677,8 @@ impl PySparseTriangularTransform {
         blob: PyReadonlyArray1<'_, f64>,
         blob_offset: PyReadonlyArray1<'_, i64>,
         layer_out: PyReadonlyArray1<'_, i64>,
+        skip_weight: PyReadonlyArray1<'_, f64>,
+        skip_index: i64,
         activation: &str,
         transformer: &Bound<'_, PyAny>,
         level_ptr: PyReadonlyArray1<'_, i64>,
@@ -998,6 +1706,7 @@ impl PySparseTriangularTransform {
         let level_vars: Vec<u32> = as_u32(level_vars.as_slice()?)?;
         let level_work = level_work.as_slice()?;
         let blob = blob.as_slice()?.to_vec();
+        let skip_weight = skip_weight.as_slice()?.to_vec();
 
         let n_variables = parent_indptr.len().saturating_sub(1);
         if blob_offset.len() != n_variables + 1 {
@@ -1019,15 +1728,23 @@ impl PySparseTriangularTransform {
             bail!("level_vars contains an out of range variable");
         }
 
-        let (child_indptr, child_index) =
+        let (child_indptr, child_index, child_edge) =
             invert_edges(n_variables, &parent_indptr, &parent_index);
 
         let num_params = *layer_out.last().expect("checked non-empty");
+        if skip_weight.len() != parent_index.len() {
+            bail!("skip_weight must have one entry per parent_index entry");
+        }
+        let skip_index = usize::try_from(skip_index)
+            .ok()
+            .filter(|&index| index < num_params)
+            .ok_or_else(|| anyhow::anyhow!("skip_index {skip_index} is out of range"))?;
         let max_parents = parent_indptr
             .windows(2)
             .map(|w| w[1] - w[0])
             .max()
             .unwrap_or(0);
+        let act_deriv_len: usize = layer_out[..layer_out.len() - 1].iter().sum();
         let buffer_size = layer_out
             .iter()
             .copied()
@@ -1045,6 +1762,7 @@ impl PySparseTriangularTransform {
             })
             .collect();
 
+        let n_edges = parent_index.len();
         Ok(Self {
             inner: TriangularTransform {
                 n_variables,
@@ -1052,9 +1770,12 @@ impl PySparseTriangularTransform {
                 parent_index,
                 child_indptr,
                 child_index,
+                child_edge,
                 blob,
                 blob_offset,
                 layer_out,
+                skip_weight,
+                skip_index,
                 activation,
                 layers,
                 level_ptr,
@@ -1063,7 +1784,10 @@ impl PySparseTriangularTransform {
                 schedule,
                 buffer_size,
                 num_params,
+                max_parents,
+                act_deriv_len,
                 arch: Arch::new(),
+                tape: Tape::new(n_variables, n_edges),
             },
         })
     }
@@ -1091,14 +1815,37 @@ impl PySparseTriangularTransform {
     }
 
     /// `x -> (y, log|det dy/dx|)`.
+    ///
+    /// With `record=True` the sparse Jacobian is kept so that `pullback` can
+    /// run; the tape lives in this object, so a given instance supports one
+    /// forward/pullback pair at a time.
+    #[pyo3(signature = (x, record = false))]
     fn transform_and_log_det<'py>(
-        &self,
+        &mut self,
         py: Python<'py>,
         x: PyReadonlyArray1<'py, f64>,
+        record: bool,
     ) -> Result<(Bound<'py, PyArray1<f64>>, f64)> {
         let x = x.as_slice()?.to_vec();
-        let (y, log_det) = py.detach(|| self.inner.transform_and_log_det(&x))?;
+        let (y, log_det) = py.detach(|| self.inner.transform_and_log_det(&x, record))?;
         Ok((PyArray1::from_vec(py, y), log_det))
+    }
+
+    /// Pull a cotangent on `(y, log_det)` back to one on `x`.
+    ///
+    /// Must follow a `transform_and_log_det(..., record=True)` on the same
+    /// object. `log_det_bar` is the cotangent on the scalar output, which the
+    /// sampler always sets to 1.
+    #[pyo3(signature = (grad_y, log_det_bar = 1.0))]
+    fn pullback<'py>(
+        &self,
+        py: Python<'py>,
+        grad_y: PyReadonlyArray1<'py, f64>,
+        log_det_bar: f64,
+    ) -> Result<Bound<'py, PyArray1<f64>>> {
+        let grad_y = grad_y.as_slice()?.to_vec();
+        let grad_x = py.detach(|| self.inner.pullback(&grad_y, log_det_bar))?;
+        Ok(PyArray1::from_vec(py, grad_x))
     }
 }
 
@@ -1141,11 +1888,15 @@ impl<'a> WithSimd for ApplyActivation<'a> {
 }
 
 /// Reverse a CSR edge list: parents-of -> children-of.
+///
+/// Also returns, for each reversed edge, the position of the same edge in the
+/// forward list -- which is where the tape stores that edge's Jacobian entries,
+/// so the reverse sweep can find them.
 fn invert_edges(
     n_variables: usize,
     parent_indptr: &[usize],
     parent_index: &[u32],
-) -> (Vec<usize>, Vec<u32>) {
+) -> (Vec<usize>, Vec<u32>, Vec<u32>) {
     let mut counts = vec![0usize; n_variables + 1];
     for &parent in parent_index {
         counts[parent as usize + 1] += 1;
@@ -1156,15 +1907,17 @@ fn invert_edges(
     let child_indptr = counts.clone();
 
     let mut child_index = vec![0u32; parent_index.len()];
+    let mut child_edge = vec![0u32; parent_index.len()];
     let mut cursor = counts;
     for child in 0..n_variables {
-        for &parent in &parent_index[parent_indptr[child]..parent_indptr[child + 1]] {
-            let slot = &mut cursor[parent as usize];
+        for edge in parent_indptr[child]..parent_indptr[child + 1] {
+            let slot = &mut cursor[parent_index[edge] as usize];
             child_index[*slot] = child as u32;
+            child_edge[*slot] = edge as u32;
             *slot += 1;
         }
     }
-    (child_indptr, child_index)
+    (child_indptr, child_index, child_edge)
 }
 
 fn from_tag<T: for<'de> Deserialize<'de>>(tag: &str) -> Result<T, serde_json::Error> {
