@@ -78,6 +78,7 @@ def fit_to_data(
     lm_exact_blocks: bool = False,
     lm_max_exact_block_size: int = 256,
     lm_print_blocks: bool = False,
+    lm_diagnose: bool = False,
     should_stop: Callable[[], bool] | None = None,
 ):
     r"""Train a distribution (e.g. a flow) to samples from the target distribution.
@@ -170,6 +171,10 @@ def fit_to_data(
             (``|1 - rho|``), which keeps adapting when the loss plateaus well
             above zero (see `lmopt.step`). Only used when ``method`` is
             ``"lm"``.
+        lm_diagnose: Print, below each LM step, whether geodesic acceleration
+            would have helped and how the step splits over the conditioners
+            (see `lmopt.describe_diagnostics`). Costs about one more CG solve
+            per step. Needs ``verbose``; only used when ``method`` is ``"lm"``.
         lm_lam0: Initial LM damping; ``None`` uses `lmopt.fit`'s default.
             The damping the fit ends with is returned as
             ``losses["lm_lam"]``, so a caller refitting on similar data can
@@ -225,6 +230,7 @@ def fit_to_data(
                 "max_exact_block_size": lm_max_exact_block_size,
                 "verbose": verbose,
                 "print_blocks": lm_print_blocks,
+                "diagnose": lm_diagnose,
                 "should_stop": should_stop,
             }
             if method == "lm"
@@ -364,6 +370,19 @@ def gn_factor_fn(params, args, draw_data):
     return loss_fn.gauss_newton_factors(params, static, *draw_data)
 
 
+def _conditioner_coordinates(flow):
+    """The coordinate (index into the flattened unconstrained draw) that each
+    conditioner of a triangular flow transforms, one array per bucket; `None`
+    for other flows."""
+    try:
+        sandwich = unwrap(flow).bijection.bijections[0].bijections[0]
+        order = np.ravel(np.asarray(sandwich.outer.permutation))
+        members = sandwich.inner.bucket_members
+    except (AttributeError, IndexError, TypeError):
+        return None
+    return [order[np.asarray(m)] for m in members]
+
+
 def _fit_lm(
     params,
     static,
@@ -388,6 +407,7 @@ def _fit_lm(
     max_exact_block_size,
     verbose,
     print_blocks,
+    diagnose,
     should_stop,
 ):
     if not hasattr(loss_fn, "residuals"):
@@ -416,6 +436,10 @@ def _fit_lm(
         n_steps=max_steps,
         verbose=verbose,
         print_blocks=print_blocks,
+        diagnose=diagnose,
+        conditioner_labels=(
+            _conditioner_coordinates(eqx.combine(params, static)) if diagnose else None
+        ),
         should_stop=should_stop,
         min_loss=min_loss,
         cg_max=linear_steps,
@@ -1344,6 +1368,7 @@ class TransformAdapter:
                 lm_lam0=self._lm_lam,
                 lm_exact_blocks=self._lm_exact_blocks,
                 lm_max_exact_block_size=self._lm_max_exact_block_size,
+                lm_diagnose=self._verbose >= 3,
                 should_stop=self._should_stop,
             )
             if self._should_stop():
