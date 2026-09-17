@@ -304,7 +304,7 @@ impl StanModel {
             None => rng().next_u32(),
         };
         let data: Option<CString> = data.map(CString::new).transpose()?;
-        let mut model =
+        let model =
             bridgestan::Model::new(lib.0, data.as_ref(), seed).map_err(anyhow::Error::new)?;
 
         // TODO: bridgestan should not require mut self here
@@ -370,9 +370,9 @@ impl StanModel {
     */
 }
 
-pub struct StanDensity<'model> {
-    model: &'model StanModel,
-    rng: bridgestan::Rng<&'model bridgestan::StanLibrary>,
+pub struct StanDensity {
+    model: Arc<StanModel>,
+    rng: bridgestan::Rng<Arc<bridgestan::StanLibrary>>,
     transform_adapter: Option<PyTransformAdapt>,
     expanded_buffer: Vec<f64>,
 }
@@ -397,8 +397,8 @@ impl LogpError for StanLogpError {
 
 pub struct ExpandedVector(Vec<Option<nuts_rs::Value>>);
 
-impl<'model> Storable<StanDensity<'model>> for ExpandedVector {
-    fn names<'a>(parent: &'a StanDensity<'model>) -> Vec<&'a str> {
+impl Storable<StanDensity> for ExpandedVector {
+    fn names<'a>(parent: &'a StanDensity) -> Vec<&'a str> {
         parent
             .model
             .variables
@@ -407,7 +407,7 @@ impl<'model> Storable<StanDensity<'model>> for ExpandedVector {
             .collect()
     }
 
-    fn item_type(parent: &StanDensity<'model>, item: &str) -> nuts_rs::ItemType {
+    fn item_type(parent: &StanDensity, item: &str) -> nuts_rs::ItemType {
         parent
             .model
             .variables
@@ -417,7 +417,7 @@ impl<'model> Storable<StanDensity<'model>> for ExpandedVector {
             .expect("Item not found")
     }
 
-    fn dims<'a>(parent: &'a StanDensity<'model>, item: &str) -> Vec<&'a str> {
+    fn dims<'a>(parent: &'a StanDensity, item: &str) -> Vec<&'a str> {
         parent
             .model
             .variables
@@ -427,7 +427,7 @@ impl<'model> Storable<StanDensity<'model>> for ExpandedVector {
             .expect("Item not found")
     }
 
-    fn get_all<'a>(&'a mut self, parent: &'a StanDensity<'model>) -> Vec<(&'a str, Option<Value>)> {
+    fn get_all<'a>(&'a mut self, parent: &'a StanDensity) -> Vec<(&'a str, Option<Value>)> {
         self.0
             .iter_mut()
             .zip(parent.model.variables.iter())
@@ -436,7 +436,7 @@ impl<'model> Storable<StanDensity<'model>> for ExpandedVector {
     }
 }
 
-impl<'model> HasDims for StanDensity<'model> {
+impl HasDims for StanDensity {
     fn dim_sizes(&self) -> HashMap<String, u64> {
         self.model.dim_sizes.clone()
     }
@@ -446,7 +446,7 @@ impl<'model> HasDims for StanDensity<'model> {
     }
 }
 
-impl<'model> CpuLogpFunc for StanDensity<'model> {
+impl CpuLogpFunc for StanDensity {
     type LogpError = StanLogpError;
     type FlowParameters = Py<PyAny>;
     type ExpandedVector = ExpandedVector;
@@ -549,6 +549,7 @@ impl<'model> CpuLogpFunc for StanDensity<'model> {
         untransformed_gradient: &mut [f64],
         transformed_position: &[f64],
         transformed_gradient: &mut [f64],
+        clip: Option<f64>,
     ) -> std::result::Result<(f64, f64), Self::LogpError> {
         let adapter = self
             .transform_adapter
@@ -564,6 +565,7 @@ impl<'model> CpuLogpFunc for StanDensity<'model> {
             .context("Failed init_from_transformed_position_part1")?;
 
         let logp = self.logp(untransformed_position, untransformed_gradient)?;
+        // TODO: softclip
 
         let adapter = self
             .transform_adapter
@@ -588,10 +590,12 @@ impl<'model> CpuLogpFunc for StanDensity<'model> {
         untransformed_gradient: &mut [f64],
         transformed_position: &mut [f64],
         transformed_gradient: &mut [f64],
+        clip: Option<f64>,
     ) -> std::result::Result<(f64, f64), Self::LogpError> {
         let logp = self
             .logp(untransformed_position, untransformed_gradient)
             .context("Failed to call stan logp function")?;
+        // TODO: softclip
 
         let logdet = self
             .transform_adapter
@@ -755,7 +759,7 @@ impl<'model> DrawStorage for StanTrace<'model> {
 */
 
 impl Model for StanModel {
-    type Math<'model> = CpuMath<StanDensity<'model>>;
+    type Math = CpuMath<StanDensity>;
 
     /*
     fn new_trace<'a, S: Settings, R: rand::Rng + ?Sized>(
@@ -784,11 +788,11 @@ impl Model for StanModel {
     }
     */
 
-    fn math<R: Rng + ?Sized>(&self, rng: &mut R) -> anyhow::Result<Self::Math<'_>> {
-        let rng = self.inner.new_rng(rng.next_u32())?;
+    fn math<R: Rng + ?Sized>(self: Arc<StanModel>, rng: &mut R) -> anyhow::Result<Self::Math> {
+        let rng = bridgestan::Rng::new(self.inner.clone_library_ref(), rng.next_u32())?;
         let num_expanded = self.inner.param_num(true, true);
         Ok(CpuMath::new(StanDensity {
-            model: &self,
+            model: self.clone(),
             rng,
             transform_adapter: self.transform_adapter.clone(),
             expanded_buffer: vec![0f64; num_expanded],
@@ -798,6 +802,7 @@ impl Model for StanModel {
     fn init_position<R: rand::Rng + ?Sized>(
         &self,
         rng: &mut R,
+        _chain_id: u64,
         position: &mut [f64],
     ) -> anyhow::Result<()> {
         let dist = StandardNormal;

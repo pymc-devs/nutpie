@@ -419,6 +419,7 @@ impl CpuLogpFunc for PyDensity {
         untransformed_gradient: &mut [f64],
         transformed_position: &[f64],
         transformed_gradient: &mut [f64],
+        clip: Option<f64>,
     ) -> std::result::Result<(f64, f64), Self::LogpError> {
         let (logp, logdet) = self
             .transform_adapter
@@ -430,6 +431,7 @@ impl CpuLogpFunc for PyDensity {
                 untransformed_gradient,
                 transformed_position,
                 transformed_gradient,
+                clip,
             )?;
         Ok((logp, logdet))
     }
@@ -441,6 +443,7 @@ impl CpuLogpFunc for PyDensity {
         untransformed_gradient: &mut [f64],
         transformed_position: &mut [f64],
         transformed_gradient: &mut [f64],
+        clip: Option<f64>,
     ) -> std::result::Result<(f64, f64), Self::LogpError> {
         let (logp, logdet) = self
             .transform_adapter
@@ -452,6 +455,7 @@ impl CpuLogpFunc for PyDensity {
                 untransformed_gradient,
                 transformed_position,
                 transformed_gradient,
+                clip,
             )?;
         Ok((logp, logdet))
     }
@@ -515,12 +519,9 @@ impl CpuLogpFunc for PyDensity {
 }
 
 impl Model for PyModel {
-    type Math<'model>
-        = CpuMath<PyDensity>
-    where
-        Self: 'model;
+    type Math = CpuMath<PyDensity>;
 
-    fn math<R: Rng + ?Sized>(&self, _rng: &mut R) -> Result<Self::Math<'_>> {
+    fn math<R: Rng + ?Sized>(self: Arc<PyModel>, _rng: &mut R) -> Result<Self::Math> {
         Ok(CpuMath::new(PyDensity::new(
             &self.make_logp_func,
             &self.make_expand_func,
@@ -535,6 +536,7 @@ impl Model for PyModel {
     fn init_position<R: rand::prelude::Rng + ?Sized>(
         &self,
         rng: &mut R,
+        _chain_id: u64,
         position: &mut [f64],
     ) -> Result<()> {
         let Some(init_func) = self.init_point_func.as_ref() else {

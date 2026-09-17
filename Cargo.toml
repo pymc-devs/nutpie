@@ -21,7 +21,7 @@ name = "_lib"
 crate-type = ["cdylib"]
 
 [dependencies]
-nuts-rs = { version = "0.18.3", features = ["zarr", "arrow"] }
+nuts-rs = { version = "0.19.0", features = ["zarr", "arrow"] }
 numpy = "0.29.0"
 rand = "0.10.0"
 thiserror = "2.0.3"

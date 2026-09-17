@@ -393,7 +393,7 @@ def fit_flow(key, bijection, loss_fn, draws, grads, logps, **kwargs):
 
 
 @eqx.filter_jit
-def _init_from_transformed_position(logp_fn, bijection, transformed_position):
+def _init_from_transformed_position(logp_fn, bijection, transformed_position, clip):
     bijection = unwrap(bijection)
     (untransformed_position, logdet), pull_grad = jax.vjp(
         bijection.transform_and_log_det, transformed_position
@@ -401,6 +401,10 @@ def _init_from_transformed_position(logp_fn, bijection, transformed_position):
     logp, untransformed_gradient = jax.value_and_grad(lambda x: logp_fn(x)[0])(
         untransformed_position
     )
+
+    if clip is not None:
+        untransformed_gradient = clip * jnp.arcsinh(untransformed_gradient / clip)
+
     (transformed_gradient,) = pull_grad((untransformed_gradient, 1.0))
     return (
         logp,
@@ -438,10 +442,13 @@ def _init_from_transformed_position_part2(
 
 
 @eqx.filter_jit
-def _init_from_untransformed_position(logp_fn, bijection, untransformed_position):
+def _init_from_untransformed_position(logp_fn, bijection, untransformed_position, clip):
     logp, untransformed_gradient = jax.value_and_grad(lambda x: logp_fn(x)[0])(
         untransformed_position
     )
+    if clip is not None:
+        untransformed_gradient = clip * jnp.arcsinh(untransformed_gradient / clip)
+
     logdet, transformed_position, transformed_gradient = _inv_transform(
         bijection, untransformed_position, untransformed_gradient
     )
@@ -791,12 +798,13 @@ class TransformAdapter:
             print(traceback.format_exc())
             raise
 
-    def init_from_transformed_position(self, transformed_position):
+    def init_from_transformed_position(self, transformed_position, clip):
         try:
             logp, logdet, *arrays = _init_from_transformed_position(
                 self._logp_fn,
                 self._bijection,
                 jnp.array(transformed_position),
+                clip,
             )
             return (
                 float(logp),
@@ -842,12 +850,13 @@ class TransformAdapter:
             print(traceback.format_exc())
             raise
 
-    def init_from_untransformed_position(self, untransformed_position):
+    def init_from_untransformed_position(self, untransformed_position, clip):
         try:
             logp, logdet, *arrays = _init_from_untransformed_position(
                 self._logp_fn,
                 self._bijection,
                 jnp.array(untransformed_position),
+                clip
             )
             arrays = [np.array(val, dtype="float64") for val in arrays]
             return float(logp), float(logdet), *arrays
