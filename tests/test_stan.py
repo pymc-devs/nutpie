@@ -709,3 +709,60 @@ def test_stan_repr():
         "  transform adapt: num_layers=2\n"
         "  init point fn: <lambda>"
     )
+
+
+
+_UNCONSTRAINED_MODEL = """
+parameters {
+    real a;
+    real<lower=0> s;
+    vector[2] b;
+}
+model {
+    a ~ normal(0, 1);
+    s ~ normal(0, 1);
+    b ~ normal(0, 1);
+}
+"""
+
+
+@pytest.mark.stan
+@pytest.mark.parametrize("storage", ["arrow", "zarr"])
+def test_stan_unconstrained_parameter_coords(storage, tmp_path):
+    compiled = nutpie.compile_stan_model(code=_UNCONSTRAINED_MODEL)
+    names = compiled.with_data().model.unconstrained_names()
+    assert len(names) == 4
+    # Only in the trace, not a coord of the model
+    assert "unconstrained_parameter" not in (compiled.coords or {})
+
+    kwargs = {}
+    if storage == "zarr":
+        path = tmp_path / "trace.zarr"
+        path.mkdir()
+        kwargs["zarr_store"] = nutpie.zarr_store.LocalStore(str(path))
+    trace = nutpie.sample(
+        compiled,
+        chains=1,
+        tune=50,
+        draws=10,
+        store_unconstrained=True,
+        progress_bar=False,
+        seed=1,
+        **kwargs,
+    )
+    coord = trace.sample_stats.coords["unconstrained_parameter"]
+    assert [str(name) for name in coord.values] == names
+    assert compiled._unconstrained_parameters() == names
+
+
+@pytest.mark.stan
+def test_stan_reserved_unconstrained_parameter():
+    with pytest.raises(ValueError, match="unconstrained_parameter"):
+        nutpie.compile_stan_model(
+            code=_UNCONSTRAINED_MODEL, coords={"unconstrained_parameter": [0, 1]}
+        )
+    compiled = nutpie.compile_stan_model(code=_UNCONSTRAINED_MODEL)
+    with pytest.raises(ValueError, match="unconstrained_parameter"):
+        compiled.with_coords(unconstrained_parameter=[0, 1])
+    with pytest.raises(ValueError, match="unconstrained_parameter"):
+        compiled.with_dims(b=["unconstrained_parameter"])

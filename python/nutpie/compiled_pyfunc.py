@@ -8,7 +8,12 @@ import numpy as np
 import scipy.sparse as sp
 
 from nutpie import _lib  # type: ignore
-from nutpie.sample import CompiledModel, _flatten_point, _wrap_init_point_fn
+from nutpie.sample import (
+    CompiledModel,
+    _check_reserved_names,
+    _flatten_point,
+    _wrap_init_point_fn,
+)
 from nutpie.sparsity import variables_from_layout
 
 SeedType = int
@@ -229,6 +234,7 @@ class PyFuncModel(CompiledModel):
             coords=self._coords,
             init_point_func=self._make_init_point_func(),
             transform_adapter=make_adapter,
+            unconstrained_names=self._unconstrained_names,
         )
 
 
@@ -248,6 +254,7 @@ def from_pyfunc(
     make_transform_adapter=None,
     raw_logp_fn=None,
     reparameterized_names=None,
+    unconstrained_names: list[str] | None = None,
 ):
     if coords is None:
         coords = {}
@@ -257,6 +264,11 @@ def from_pyfunc(
         shared_data = {}
 
     coords = coords.copy()
+    _check_reserved_names(coords, dims)
+    if unconstrained_names is not None and len(unconstrained_names) != ndim:
+        raise ValueError(
+            f"Got {len(unconstrained_names)} unconstrained names for {ndim} dimensions."
+        )
 
     dim_sizes = {k: len(v) for k, v in coords.items()}
     shapes = [tuple(shape) for shape in expanded_shapes]
@@ -285,4 +297,7 @@ def from_pyfunc(
         _raw_logp_fn=raw_logp_fn,
         _init_point_layout=init_point_layout,
         reparameterized_names=reparameterized_names,
+        _unconstrained_names=(
+            None if unconstrained_names is None else list(unconstrained_names)
+        ),
     )
