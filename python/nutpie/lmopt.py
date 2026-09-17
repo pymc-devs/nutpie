@@ -161,8 +161,10 @@ def mlp_input_width(one):
     """Input width of one conditioner, as given to `make_net`."""
     from nutpie.triangular import LocationSkipMlp
 
-    mlp = one.mlp if isinstance(one, LocationSkipMlp) else one
-    return int(mlp.layers[0].weight.shape[-1])
+    if isinstance(one, LocationSkipMlp):
+        # The MLP may see several features per parent; the skip one each.
+        return int(one.skip.shape[-1])
+    return int(one.layers[0].weight.shape[-1])
 
 
 def make_plan(block, m, label_fn=None, q_min=16, max_block_size=None):
