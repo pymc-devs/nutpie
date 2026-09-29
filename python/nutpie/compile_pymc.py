@@ -596,6 +596,7 @@ def _compile_pymc_model_mlx(
         expand_fn_pt,
         initial_point_fn,
         shape_info,
+        reparameterized_names,
     ) = _make_functions(
         model,
         mode="MLX",
@@ -665,7 +666,7 @@ def _compile_pymc_model_mlx(
 
         return expand
 
-    dims, coords = _prepare_dims_and_coords(model, shape_info)
+    dims, coords = _prepare_dims_and_coords(model, shape_info, reparameterized_names)
 
     return from_pyfunc(
         ndim=n_dim,
@@ -679,6 +680,7 @@ def _compile_pymc_model_mlx(
         dims=dims,
         coords=coords,
         raw_logp_fn=None,
+        reparameterized_names=reparameterized_names,
         # MLX is not thread-safe; see https://github.com/ml-explore/mlx/issues/2133.
         force_single_core=True,
         shared_data_converter=mx.array,
