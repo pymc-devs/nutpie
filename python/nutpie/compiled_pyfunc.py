@@ -24,7 +24,6 @@ class PyFuncModel(CompiledModel):
     _coords: dict[str, Any]
     _raw_logp_fn: Callable | None
     _transform_adapt_args: dict | None = None
-    _force_single_core: bool = False
     _shared_data_converter: Callable[[Any], Any] | None = None
 
     @property
@@ -66,8 +65,6 @@ class PyFuncModel(CompiledModel):
         extra_callback_rate,
         store,
     ):
-        if self._force_single_core:
-            cores = 1
         model = self._make_model(init_mean)
         return _lib.PySampler.from_pyfunc(
             settings,
@@ -130,7 +127,6 @@ def from_pyfunc(
     make_transform_adapter=None,
     raw_logp_fn=None,
     reparameterized_names=None,
-    force_single_core: bool = False,
     shared_data_converter: Callable[[Any], Any] | None = None,
 ):
     if coords is None:
@@ -164,6 +160,5 @@ def from_pyfunc(
         _shared_data=shared_data,
         _raw_logp_fn=raw_logp_fn,
         reparameterized_names=reparameterized_names,
-        _force_single_core=force_single_core,
         _shared_data_converter=shared_data_converter,
     )

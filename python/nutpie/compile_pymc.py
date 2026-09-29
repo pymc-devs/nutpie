@@ -701,8 +701,6 @@ def _compile_pymc_model_mlx(
         coords=coords,
         raw_logp_fn=None,
         reparameterized_names=reparameterized_names,
-        # MLX is not thread-safe; see https://github.com/ml-explore/mlx/issues/2133.
-        force_single_core=True,
         shared_data_converter=mx.array,
     )
 
