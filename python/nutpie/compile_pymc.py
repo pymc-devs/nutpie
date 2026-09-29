@@ -636,27 +636,17 @@ def _compile_pymc_model_mlx(
     expand_shared_names = [var.name for var in expand_fn_pt.get_shared()]
 
     shared_data = {}
-    shared_vars = {}
     seen = set()
     for val in [*logp_fn_pt.get_shared(), *expand_fn_pt.get_shared()]:
         if val.name in shared_data and val not in seen:
             raise ValueError(f"Shared variables must have unique names: {val.name}")
         shared_data[val.name] = mx.array(val.get_value())
-        shared_vars[val.name] = val
         seen.add(val)
 
     def make_logp_func():
         def logp(_x, **shared):
-            # nutpie operates in float64, but MLX evaluates on the Metal GPU
-            # where float64 is unsupported, so the logp and its gradient are
-            # necessarily computed in float32. We cast explicitly rather than
-            # relying on ``mx.array``'s implicit float64->float32 downcast, so
-            # the precision contract cannot silently change with the MLX
-            # version or a global default-dtype override. This single-precision
-            # evaluation is the root cause of MLX sampling not being
-            # bit-reproducible across machines; see test_deterministic_sampling_mlx.
-            _x_mlx = mx.array(_x, dtype=mx.float32)
-            logp, grad = logp_fn(_x_mlx, *[shared[name] for name in logp_shared_names])
+            x = mx.array(_x, dtype=mx.float32)
+            logp, grad = logp_fn(x, *[shared[name] for name in logp_shared_names])
             # Launching the gradient first overlaps the GPU work with the CPU
             # reduction. A single mx.eval(grad, logp) would fail: it joins its
             # outputs in a node on the first output's stream, and a GPU node
@@ -666,17 +656,13 @@ def _compile_pymc_model_mlx(
 
         return logp
 
-    names, slices, shapes = shape_info
-    # TODO do not cast to float64
+    names, _slices, shapes = shape_info
     dtypes = [np.dtype("float64")] * len(names)
 
     def make_expand_func(seed1, seed2, chain):
-        # TODO handle seeds
         def expand(_x, **shared):
-            # Match the logp closure: cast explicitly to float32 (MLX has no
-            # float64 on the GPU) instead of relying on the implicit downcast.
-            _x_mlx = mx.array(_x, dtype=mx.float32)
-            values = expand_fn(_x_mlx, *[shared[name] for name in expand_shared_names])
+            x = mx.array(_x, dtype=mx.float32)
+            values = expand_fn(x, *[shared[name] for name in expand_shared_names])
             return {
                 name: np.asarray(val, order="C", dtype=dtype).reshape(shape)
                 for name, val, dtype, shape in zip(
@@ -817,7 +803,7 @@ def compile_pymc_model(
             **kwargs,
         )
     else:
-        raise ValueError(f"Backend must be one of numba, jax, and mlx. Got {backend}")
+        raise ValueError(f"Backend must be one of numba, jax, or mlx. Got {backend}")
 
 
 def _wrap_with_lock(func: Callable) -> Callable:
