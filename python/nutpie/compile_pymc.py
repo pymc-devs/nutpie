@@ -523,7 +523,6 @@ def _compile_pymc_model_jax(
 def _compile_pymc_model_mlx(
     model,
     *,
-    gradient_backend=None,
     pymc_initial_point_fn: Callable[[SeedType], dict[str, np.ndarray]],
     var_names: Iterable[str] | None = None,
     **kwargs,
@@ -537,11 +536,6 @@ def _compile_pymc_model_mlx(
         )
     import mlx.core as mx
 
-    if gradient_backend is None:
-        gradient_backend = "pytensor"
-    elif gradient_backend not in ["mlx", "pytensor"]:
-        raise ValueError(f"Unknown gradient backend: {gradient_backend}")
-
     (
         n_dim,
         _,
@@ -553,7 +547,7 @@ def _compile_pymc_model_mlx(
     ) = _make_functions(
         model,
         mode="MLX",
-        compute_grad=gradient_backend == "pytensor",
+        compute_grad=True,
         join_expanded=False,
         pymc_initial_point_fn=pymc_initial_point_fn,
         var_names=var_names,
@@ -564,14 +558,6 @@ def _compile_pymc_model_mlx(
 
     logp_shared_names = [var.name for var in logp_fn_pt.get_shared()]
     expand_shared_names = [var.name for var in expand_fn_pt.get_shared()]
-
-    if gradient_backend == "mlx":
-        inner_logp_fn = logp_fn
-
-        def logp_fn_mlx_grad(x, *shared):
-            return mx.value_and_grad(lambda x: inner_logp_fn(x, *shared)[0])(x)
-
-        logp_fn = mx.compile(logp_fn_mlx_grad)
 
     shared_data = {}
     shared_vars = {}
@@ -644,7 +630,7 @@ def compile_pymc_model(
     model: "pm.Model",
     *,
     backend: Literal["numba", "jax", "mlx"] = "numba",
-    gradient_backend: Literal["pytensor", "jax", "mlx"] = "pytensor",
+    gradient_backend: Literal["pytensor", "jax"] = "pytensor",
     initial_points: dict[Union["Variable", str], np.ndarray | float | int]
     | None = None,
     jitter_rvs: set["TensorVariable"] | None = None,
@@ -663,9 +649,9 @@ def compile_pymc_model(
         The model to compile.
     backend : ["jax", "numba", "mlx"]
         The pytensor backend that is used to compile the logp function.
-    gradient_backend: ["pytensor", "jax", "mlx"]
+    gradient_backend: ["pytensor", "jax"]
         Which library is used to compute the gradients. This can only be changed
-        to "jax" if the jax backend is used, or "mlx" if the mlx backend is used.
+        to "jax" if the jax backend is used.
     jitter_rvs : set
         The set (or list or tuple) of random variables for which a U(-1, +1)
         jitter should be added to the initial value. Only available for
@@ -724,10 +710,8 @@ def compile_pymc_model(
     initial_point_fn = _wrap_with_lock(initial_point_fn)
 
     if backend.lower() == "numba":
-        if gradient_backend in ["jax", "mlx"]:
-            raise ValueError(
-                f"Gradient backend cannot be {gradient_backend} when using numba backend"
-            )
+        if gradient_backend == "jax":
+            raise ValueError("Gradient backend cannot be jax when using numba backend")
         return _compile_pymc_model_numba(
             model=model,
             pymc_initial_point_fn=initial_point_fn,
@@ -743,9 +727,10 @@ def compile_pymc_model(
             **kwargs,
         )
     elif backend.lower() == "mlx":
+        if gradient_backend == "jax":
+            raise ValueError("Gradient backend cannot be jax when using mlx backend")
         return _compile_pymc_model_mlx(
             model=model,
-            gradient_backend=gradient_backend,
             pymc_initial_point_fn=initial_point_fn,
             var_names=var_names,
             **kwargs,
