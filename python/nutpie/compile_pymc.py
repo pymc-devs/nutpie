@@ -537,26 +537,6 @@ def _compile_pymc_model_mlx(
         )
     import mlx.core as mx
 
-    # mlx>=0.31 segfaults inside Compiled::eval_gpu on the sampler worker
-    # thread; see https://github.com/ml-explore/mlx/issues/3329.
-    from importlib.metadata import PackageNotFoundError, version as _pkg_version
-
-    try:
-        _mlx_version_str = _pkg_version("mlx")
-    except PackageNotFoundError:
-        _mlx_version_str = None
-    if _mlx_version_str is not None:
-        _mlx_version = tuple(
-            int(p) for p in _mlx_version_str.split(".")[:2] if p.isdigit()
-        )
-        if _mlx_version >= (0, 31):
-            raise RuntimeError(
-                f"MLX {_mlx_version_str} is not supported by nutpie's MLX "
-                "backend due to a known SIGSEGV in compiled Metal kernels "
-                "(see https://github.com/ml-explore/mlx/issues/3329). "
-                "Please install mlx>=0.29,<0.31."
-            )
-
     if gradient_backend is None:
         gradient_backend = "pytensor"
     elif gradient_backend not in ["mlx", "pytensor"]:
