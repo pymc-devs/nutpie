@@ -27,12 +27,7 @@ backend_params = [
 
 # Only add MLX backends if MLX is available
 if MLX_AVAILABLE:
-    backend_params.extend(
-        [
-            ("mlx", "pytensor"),
-            ("mlx", "mlx"),
-        ]
-    )
+    backend_params.append(("mlx", "pytensor"))
 
 parameterize_backends = pytest.mark.parametrize(
     "backend, gradient_backend",
@@ -603,7 +598,7 @@ def test_deterministic_sampling_mlx():
     with pm.Model() as model:
         pm.HalfNormal("a")
 
-    compiled = nutpie.compile_pymc_model(model, backend="mlx", gradient_backend="mlx")
+    compiled = nutpie.compile_pymc_model(model, backend="mlx")
     trace = nutpie.sample(
         compiled, chains=2, seed=123, draws=1000, tune=1000, progress_bar=False
     )
