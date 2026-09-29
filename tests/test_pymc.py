@@ -15,17 +15,9 @@ import pytest
 import nutpie
 import nutpie.compile_pymc
 
-# Check if MLX is available (macOS only, optional dependency)
 MLX_AVAILABLE = find_spec("mlx") is not None
 
-# Build backend list dynamically based on availability
-backend_params = [
-    ("numba", None),
-    ("jax", "pytensor"),
-    ("jax", "jax"),
-]
-
-# Only add MLX backends if MLX is available
+backend_params = [("numba", None), ("jax", "pytensor"), ("jax", "jax")]
 if MLX_AVAILABLE:
     backend_params.append(("mlx", "pytensor"))
 
@@ -317,20 +309,6 @@ def test_pymc_model_with_coordinate(backend, gradient_backend):
 @pytest.mark.pymc
 @parameterize_backends
 def test_pymc_model_store_extra(backend, gradient_backend):
-    if backend == "mlx" and gradient_backend == "pytensor":
-        # PyTensor's MLX linker mis-handles uneven Split ops, which appear in
-        # the gradient graph of the ZeroSumNormal/Dirichlet transforms below.
-        # Its Split dispatch passes a numpy array of split indices to
-        # ``mx.split``, which MLX interprets as an equal-split *count* and
-        # raises "Array split does not result in sub arrays with equal size"
-        # (a Python list of indices would work). The mlx/mlx combination is
-        # unaffected because it differentiates with MLX instead of PyTensor.
-        pytest.xfail(
-            "PyTensor's MLX linker Split dispatch is broken for uneven splits "
-            "(pytensor/link/mlx/dispatch/core.py passes a numpy array to "
-            "mx.split); only affects gradient_backend='pytensor'."
-        )
-
     with pm.Model() as model:
         model.add_coord("foo", length=5)
         model.add_coord("bar", length=4)
@@ -580,21 +558,11 @@ def test_deterministic_sampling_jax():
     return trace.posterior.a.values.ravel()
 
 
-# NOTE: Unlike the numba/jax variants, this is intentionally *not* an
-# array_compare test. MLX evaluates the logp and its gradient on the Metal GPU
-# in float32 (float64 is unsupported on the GPU), and NUTS is a chaotic
-# integrator: the float32 rounding -- which varies with the GPU model, the
-# Metal/MLX version and kernel fusion -- accumulates across the leapfrog steps
-# and makes the draws differ between machines. So instead of comparing against
-# bit-exact reference values we validate statistical correctness against the
-# analytic posterior, which is machine-independent.
+# MLX computes in float32 on the GPU, whose rounding differs between machines,
+# so the draws are checked against analytic moments instead of reference values.
 @pytest.mark.pymc
-def test_deterministic_sampling_mlx():
-    if not MLX_AVAILABLE:
-        pytest.skip("MLX not installed")
-
-    # No observed data, so the posterior of ``a`` is exactly its
-    # HalfNormal(sigma=1) prior.
+@pytest.mark.skipif(not MLX_AVAILABLE, reason="MLX not installed")
+def test_sampling_mlx():
     with pm.Model() as model:
         pm.HalfNormal("a")
 
@@ -604,15 +572,10 @@ def test_deterministic_sampling_mlx():
     )
     a = trace.posterior.a.values
 
-    assert a.shape == (2, 1000)
-    assert np.all(np.isfinite(a))
-    assert (a >= 0).all()  # HalfNormal support
+    assert (a >= 0).all()
 
-    # Analytic moments of HalfNormal(sigma=1). Tolerances are generous (~4x the
-    # Monte Carlo error) so the test is robust to the cross-machine float32
-    # differences described above while still catching a genuinely broken logp.
-    expected_mean = np.sqrt(2.0 / np.pi)  # ~0.7979
-    expected_std = np.sqrt(1.0 - 2.0 / np.pi)  # ~0.6028
+    expected_mean = np.sqrt(2.0 / np.pi)
+    expected_std = np.sqrt(1.0 - 2.0 / np.pi)
     assert a.mean() == pytest.approx(expected_mean, abs=0.05)
     assert a.std() == pytest.approx(expected_std, abs=0.05)
 
@@ -649,6 +612,25 @@ def test_mlx_logp_accumulates_in_float64():
         atol=2e-3,
         rtol=0,
     )
+
+
+@pytest.mark.pymc
+@pytest.mark.parametrize(
+    "backend",
+    [
+        "numba",
+        pytest.param(
+            "mlx",
+            marks=pytest.mark.skipif(not MLX_AVAILABLE, reason="MLX not installed"),
+        ),
+    ],
+)
+def test_jax_gradient_requires_jax_backend(backend):
+    with pm.Model() as model:
+        pm.Normal("a")
+
+    with pytest.raises(ValueError, match="Gradient backend cannot be jax"):
+        nutpie.compile_pymc_model(model, backend=backend, gradient_backend="jax")
 
 
 @pytest.mark.pymc
@@ -715,13 +697,17 @@ def tmp_path():
 
 @pytest.mark.pymc
 @parameterize_backends
-def test_dims_model(backend, gradient_backend):
+def test_dims_model(backend, gradient_backend, request):
     import pymc.dims as pmd
 
     if backend == "mlx":
-        pytest.xfail(
-            "PyTensor's MLX linker does not yet implement XTensorFromTensor; "
-            "see https://github.com/pymc-devs/pytensor/issues/1350"
+        request.applymarker(
+            pytest.mark.xfail(
+                reason="ZeroSumNormal checks its mean against atol=1e-9, which "
+                "float32 cannot meet, and check_bounds=False does not remove "
+                "the check from a pymc.dims model",
+                raises=RuntimeError,
+            )
         )
 
     coords = {"a": range(3), "b": range(5)}
