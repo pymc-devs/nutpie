@@ -43,7 +43,7 @@ dev = [
   "pymc >= 5.20.1",
   "numba >= 0.60.0",
   "jax >= 0.4.27",
-  "mlx >= 0.29.0,!=0.31.*",
+  "mlx >= 0.29.0,!=0.31.*; sys_platform == 'darwin' and platform_machine == 'arm64'",
   "flowjax >= 17.0.2",
   "pytest",
   "pytest-timeout",
@@ -55,7 +55,7 @@ all = [
   "pymc >= 5.20.1",
   "numba >= 0.60.0",
   "jax >= 0.4.27",
-  "mlx >= 0.29.0,!=0.31.*",
+  "mlx >= 0.29.0,!=0.31.*; sys_platform == 'darwin' and platform_machine == 'arm64'",
   "flowjax >= 17.1.0",
   "equinox >= 0.11.12",
 ]
