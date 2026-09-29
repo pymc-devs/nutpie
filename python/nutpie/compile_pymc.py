@@ -29,6 +29,7 @@ except ImportError:
 if TYPE_CHECKING:
     import numba.core.ccallback
     import pymc as pm
+    from pytensor.graph import Apply, FunctionGraph
     from pytensor.tensor import TensorVariable, Variable
 
 
@@ -520,6 +521,79 @@ def _compile_pymc_model_jax(
     )
 
 
+def _logp_accumulation_nodes(fgraph: "FunctionGraph") -> set["Apply"]:
+    """
+    Find the nodes that reduce the elementwise logp terms to the logp scalar.
+
+    These are the reductions of an array to a scalar that feed only the first
+    output of ``fgraph``, together with every node between them and that output.
+    """
+    from pytensor.graph.fg import Output
+    from pytensor.tensor.elemwise import CAReduce
+
+    logp = fgraph.outputs[0]
+    nodes = fgraph.toposort()
+    scalar_logp_ancestors = set()
+
+    def feeds_only_logp(variable):
+        return variable.ndim == 0 and all(
+            client in scalar_logp_ancestors
+            or (isinstance(client.op, Output) and client.inputs[0] is logp)
+            for client, _ in fgraph.clients[variable]
+        )
+
+    for node in reversed(nodes):
+        if all(feeds_only_logp(output) for output in node.outputs):
+            scalar_logp_ancestors.add(node)
+
+    accumulation_nodes = set()
+    for node in nodes:
+        if node not in scalar_logp_ancestors:
+            continue
+        reduces_array = isinstance(node.op, CAReduce) and node.inputs[0].ndim > 0
+        follows_reduction = any(
+            variable.owner in accumulation_nodes for variable in node.inputs
+        )
+        if reduces_array or follows_reduction:
+            accumulation_nodes.add(node)
+
+    return accumulation_nodes
+
+
+def _mlx_funcify_with_float64_accumulation(fgraph: "FunctionGraph") -> Callable:
+    """
+    Compile ``fgraph`` to MLX, reducing its logp output in float64 on the CPU.
+
+    Every other node runs on the default device.
+    """
+    import mlx.core as mx
+    from pytensor.link.mlx.dispatch import mlx_funcify
+
+    accumulation_nodes = _logp_accumulation_nodes(fgraph)
+
+    def as_float64(value):
+        if isinstance(value, mx.array) and mx.issubdtype(value.dtype, mx.floating):
+            return value.astype(mx.float64)
+        return value
+
+    def conversion_func(op, node=None, **kwargs):
+        if node not in accumulation_nodes:
+            return mlx_funcify(op, node=node, **kwargs)
+
+        # Converting under the CPU stream keeps the float64 dtypes the node
+        # declares, which the default GPU device would narrow to float32.
+        with mx.stream(mx.cpu):
+            node_fn = mlx_funcify(op, node=node, **kwargs)
+
+        def on_cpu_float64(*inputs):
+            with mx.stream(mx.cpu):
+                return node_fn(*(as_float64(value) for value in inputs))
+
+        return on_cpu_float64
+
+    return mx.compile(mlx_funcify(fgraph, conversion_func=conversion_func))
+
+
 def _compile_pymc_model_mlx(
     model,
     *,
@@ -553,7 +627,9 @@ def _compile_pymc_model_mlx(
         var_names=var_names,
     )
 
-    logp_fn = logp_fn_pt.vm.jit_fn
+    # A float32 logp cannot resolve the energy changes NUTS acts on once the
+    # model is large, so only its reduction runs in float64.
+    logp_fn = _mlx_funcify_with_float64_accumulation(logp_fn_pt.maker.fgraph)
     expand_fn = expand_fn_pt.vm.jit_fn
 
     logp_shared_names = [var.name for var in logp_fn_pt.get_shared()]
@@ -581,7 +657,12 @@ def _compile_pymc_model_mlx(
             # bit-reproducible across machines; see test_deterministic_sampling_mlx.
             _x_mlx = mx.array(_x, dtype=mx.float32)
             logp, grad = logp_fn(_x_mlx, *[shared[name] for name in logp_shared_names])
-            return float(logp), np.asarray(grad, dtype="float64", order="C")
+            # Launching the gradient first overlaps the GPU work with the CPU
+            # reduction. A single mx.eval(grad, logp) would fail: it joins its
+            # outputs in a node on the first output's stream, and a GPU node
+            # cannot take the float64 logp as an input.
+            mx.async_eval(grad)
+            return logp.item(), np.asarray(grad, dtype="float64", order="C")
 
         return logp
 
@@ -648,7 +729,9 @@ def compile_pymc_model(
     model : pymc.Model
         The model to compile.
     backend : ["jax", "numba", "mlx"]
-        The pytensor backend that is used to compile the logp function.
+        The pytensor backend that is used to compile the logp function. The
+        "mlx" backend computes the logp and its gradient in float32 on the GPU,
+        and sums the logp terms in float64 on the CPU.
     gradient_backend: ["pytensor", "jax"]
         Which library is used to compute the gradients. This can only be changed
         to "jax" if the jax backend is used.
