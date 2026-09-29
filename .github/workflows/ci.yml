@@ -396,9 +396,8 @@ jobs:
           python3 -m venv .venv
           source .venv/bin/activate
           uv pip install nutpie --no-deps --find-links dist --no-index
-          # --find-links dist keeps the locally-built wheel as the preferred
-          # candidate; without it uv re-resolves nutpie from PyPI and downgrades
-          # to a release that lacks the 'dev' extra (so pytest isn't installed).
+          # Without --find-links, uv resolves nutpie from PyPI to a release
+          # that lacks the dev extra.
           uv pip install 'nutpie[dev]' --find-links dist --constraint .github/uv-constraints-dev.txt
           pytest -m "pymc" --arraydiff
 
@@ -432,10 +431,8 @@ jobs:
         run: |
           source .venv/bin/activate
           uv pip install nutpie --no-deps --find-links dist --no-index
-          # --find-links dist keeps the locally-built wheel as the preferred
-          # candidate; without it uv re-resolves nutpie from PyPI and downgrades
-          # to a release that lacks the 'docs' extra (so jupyter/nbformat aren't
-          # installed and `quarto render` fails to start the kernel).
+          # Without --find-links, uv resolves nutpie from PyPI to a release
+          # that lacks the docs extra.
           uv pip install --find-links dist --constraint .github/uv-constraints-dev.txt "nutpie[docs]"
       - name: Render docs
         env:
