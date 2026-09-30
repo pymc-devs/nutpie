@@ -1,3 +1,4 @@
+import contextlib
 import dataclasses
 import itertools
 import threading
@@ -34,6 +35,33 @@ if TYPE_CHECKING:
 
 
 _UNCONSTRAINED_PARAMETER = "unconstrained_parameter"
+
+# Serializes the MLX work that is unsafe across sampler threads: mx.stream
+# switches the default stream for the whole process, so building or tracing code
+# that enters one must not overlap, and the first evaluation of a compiled graph
+# builds Metal kernels, which segfaults when threads do it concurrently.
+_MLX_LOCK = threading.Lock()
+
+
+class _FirstEvaluationGuard:
+    """Hold the MLX lock while each input signature is evaluated the first time."""
+
+    def __init__(self):
+        self._evaluated = set()
+
+    @contextlib.contextmanager
+    def __call__(self, signature):
+        if signature in self._evaluated:
+            yield
+            return
+
+        with _MLX_LOCK:
+            yield
+            self._evaluated.add(signature)
+
+
+def _mlx_signature(arrays) -> tuple:
+    return tuple((tuple(array.shape), array.dtype) for array in arrays)
 
 
 def _rv_dict_to_flat_array_wrapper(
@@ -582,7 +610,7 @@ def _mlx_funcify_with_float64_accumulation(fgraph: "FunctionGraph") -> Callable:
 
         # Converting under the CPU stream keeps the float64 dtypes the node
         # declares, which the default GPU device would narrow to float32.
-        with mx.stream(mx.cpu):
+        with _MLX_LOCK, mx.stream(mx.cpu):
             node_fn = mlx_funcify(op, node=node, **kwargs)
 
         def on_cpu_float64(*inputs):
@@ -643,16 +671,22 @@ def _compile_pymc_model_mlx(
         shared_data[val.name] = mx.array(val.get_value())
         seen.add(val)
 
+    logp_guard = _FirstEvaluationGuard()
+    expand_guard = _FirstEvaluationGuard()
+
     def make_logp_func():
         def logp(_x, **shared):
             x = mx.array(_x, dtype=mx.float32)
-            logp, grad = logp_fn(x, *[shared[name] for name in logp_shared_names])
-            # Launching the gradient first overlaps the GPU work with the CPU
-            # reduction. A single mx.eval(grad, logp) would fail: it joins its
-            # outputs in a node on the first output's stream, and a GPU node
-            # cannot take the float64 logp as an input.
-            mx.async_eval(grad)
-            return logp.item(), np.asarray(grad, dtype="float64", order="C")
+            shared_values = [shared[name] for name in logp_shared_names]
+            with _MLX_LOCK:
+                logp, grad = logp_fn(x, *shared_values)
+            with logp_guard(_mlx_signature(shared_values)):
+                # Launching the gradient first overlaps the GPU work with the
+                # CPU reduction. A single mx.eval(grad, logp) would fail: it
+                # joins its outputs in a node on the first output's stream, and
+                # a GPU node cannot take the float64 logp as an input.
+                mx.async_eval(grad)
+                return logp.item(), np.asarray(grad, dtype="float64", order="C")
 
         return logp
 
@@ -662,13 +696,16 @@ def _compile_pymc_model_mlx(
     def make_expand_func(seed1, seed2, chain):
         def expand(_x, **shared):
             x = mx.array(_x, dtype=mx.float32)
-            values = expand_fn(x, *[shared[name] for name in expand_shared_names])
-            return {
-                name: np.asarray(val, order="C", dtype=dtype).reshape(shape)
-                for name, val, dtype, shape in zip(
-                    names, values, dtypes, shapes, strict=True
-                )
-            }
+            shared_values = [shared[name] for name in expand_shared_names]
+            with _MLX_LOCK:
+                values = expand_fn(x, *shared_values)
+            with expand_guard(_mlx_signature(shared_values)):
+                return {
+                    name: np.asarray(val, order="C", dtype=dtype).reshape(shape)
+                    for name, val, dtype, shape in zip(
+                        names, values, dtypes, shapes, strict=True
+                    )
+                }
 
         return expand
 
