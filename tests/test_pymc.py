@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 import pymc as pm
 import pytensor
+import pytensor.tensor as pt
 import pytest
 
 import nutpie
@@ -185,8 +186,6 @@ def test_deprecated_use_grad_based_mass_matrix(backend, gradient_backend):
 @pytest.mark.pymc
 @parameterize_backends
 def test_zero_size(backend, gradient_backend):
-    import pytensor.tensor as pt
-
     with pm.Model() as model:
         a = pm.Normal("a", shape=(0, 0, 10))
         pm.Deterministic("b", pt.exp(a))
