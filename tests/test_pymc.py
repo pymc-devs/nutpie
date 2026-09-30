@@ -723,8 +723,7 @@ def test_dims_model(backend, gradient_backend, request):
         request.applymarker(
             pytest.mark.xfail(
                 reason="ZeroSumNormal checks its mean against atol=1e-9, which "
-                "float32 cannot meet, and check_bounds=False does not remove "
-                "the check from a pymc.dims model",
+                "its float32 transform cannot meet",
                 raises=RuntimeError,
             )
         )
