@@ -1,3 +1,5 @@
+import sys
+import threading
 import time
 from importlib.util import find_spec
 
@@ -612,6 +614,57 @@ def test_mlx_logp_accumulates_in_float64():
         atol=2e-3,
         rtol=0,
     )
+
+
+@pytest.mark.pymc
+@pytest.mark.skipif(not MLX_AVAILABLE, reason="MLX not installed")
+def test_mlx_concurrent_first_calls():
+    import mlx.core as mx
+
+    n_threads = 8
+    default_device = mx.default_device()
+    switch_interval = sys.getswitchinterval()
+    rng = np.random.default_rng(0)
+
+    try:
+        for _ in range(3):
+            with pm.Model() as model:
+                mu = pm.Normal("mu", 0, 10, shape=10)
+                sigma = pm.HalfNormal("sigma")
+                pm.Normal("obs", mu, sigma, observed=rng.normal(size=(200, 10)))
+
+            compiled = nutpie.compile_pymc_model(model, backend="mlx")
+            x = np.zeros(compiled.n_dim)
+            barrier = threading.Barrier(n_threads)
+            logps = []
+            errors = []
+
+            def first_call(
+                compiled=compiled, x=x, barrier=barrier, logps=logps, errors=errors
+            ):
+                logp_fn = compiled._make_logp_func()
+                barrier.wait()
+                try:
+                    logps.append(logp_fn(x, **compiled._shared_data)[0])
+                except ValueError as error:
+                    errors.append(error)
+
+            # A tiny switch interval makes the threads interleave while the
+            # first call traces the compiled function.
+            sys.setswitchinterval(1e-6)
+            threads = [threading.Thread(target=first_call) for _ in range(n_threads)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            sys.setswitchinterval(switch_interval)
+
+            assert errors == []
+            assert logps == [logps[0]] * n_threads
+            assert mx.default_device() == default_device
+    finally:
+        sys.setswitchinterval(switch_interval)
+        mx.set_default_device(default_device)
 
 
 @pytest.mark.pymc
