@@ -570,7 +570,7 @@ def test_sampling_mlx():
 
     compiled = nutpie.compile_pymc_model(model, backend="mlx")
     trace = nutpie.sample(
-        compiled, chains=2, seed=123, draws=1000, tune=1000, progress_bar=False
+        compiled, chains=4, seed=123, draws=4000, tune=1000, progress_bar=False
     )
     a = trace.posterior.a.values
 
