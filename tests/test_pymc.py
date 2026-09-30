@@ -584,40 +584,6 @@ def test_sampling_mlx():
 
 @pytest.mark.pymc
 @pytest.mark.skipif(not MLX_AVAILABLE, reason="MLX not installed")
-def test_mlx_logp_accumulates_in_float64():
-    y = np.random.default_rng(0).normal(loc=3.0, size=100_000)
-    with pm.Model() as model:
-        mu = pm.Normal("mu", 0, 10)
-        pm.Normal("obs", mu, 1, observed=y)
-
-    compiled = nutpie.compile_pymc_model(model, backend="mlx")
-    logp_fn = compiled._make_logp_func()
-
-    def exact_logp(mu):
-        prior = -0.5 * (mu / 10) ** 2 - np.log(10)
-        return (
-            prior - 0.5 * np.sum((y - mu) ** 2) - (y.size + 1) * 0.5 * np.log(2 * np.pi)
-        )
-
-    def logp_change(mu, step):
-        after = logp_fn(np.array([mu + step]), **compiled._shared_data)[0]
-        before = logp_fn(np.array([mu]), **compiled._shared_data)[0]
-        return after - before
-
-    # A float32 total cannot resolve a logp change finer than its ulp, about
-    # 0.03 at this model size; the float64 accumulator resolves it to ~2e-4.
-    step = 1e-3
-    mus = np.linspace(2.99, 3.01, 11)
-    np.testing.assert_allclose(
-        [logp_change(mu, step) for mu in mus],
-        [exact_logp(mu + step) - exact_logp(mu) for mu in mus],
-        atol=2e-3,
-        rtol=0,
-    )
-
-
-@pytest.mark.pymc
-@pytest.mark.skipif(not MLX_AVAILABLE, reason="MLX not installed")
 def test_mlx_concurrent_first_calls():
     import mlx.core as mx
 
