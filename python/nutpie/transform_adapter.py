@@ -38,6 +38,9 @@ _BIJECTION_TRACE = []
 
 _LOG_STOP_VALUE = -5
 _LOG_SKIP_TRAINING_VALUE = -4
+# Fewest distinct draws a diagonal fit needs; with fewer, it matches them
+# exactly and its scales are arbitrary.
+_MIN_DIAG_DRAWS = 5
 
 # Remat toggle for the per-draw residual, see `FisherLoss.residuals`.
 CHECKPOINT_RESIDUAL = False
@@ -1304,20 +1307,37 @@ class TransformAdapter:
             return
         try:
             if self.index <= self._num_diag_windows:
+                positions = np.asarray(positions)
+                gradients = np.asarray(gradients)
+                logps = np.asarray(logps)
+
+                # The newest `size // 5 + 3` distinct draws. Repeats (rejected
+                # transitions) say nothing new about the score, and a fit to
+                # a few distinct points matches them exactly.
                 size = len(positions)
-                lower_idx = -size // 5 + 3
-                positions_slice = positions[lower_idx:]
-                gradients_slice = gradients[lower_idx:]
-                logp_slice = logps[lower_idx:]
+                target = max(size // 5 + 3, _MIN_DIAG_DRAWS)
+                seen, keep, start = set(), [], 0
+                for i in range(size - 1, -1, -1):
+                    key = positions[i].tobytes()
+                    if key not in seen:
+                        seen.add(key)
+                        keep.append(i)
+                        if len(keep) == target:
+                            start = i
+                            break
+                n_repeats = size - start - len(keep)
+                repeats = f", {n_repeats} repeats skipped" if n_repeats else ""
+                if len(keep) < _MIN_DIAG_DRAWS:
+                    self._report(
+                        n_draws,
+                        f"keep diag, only {len(keep)} distinct draws{repeats}",
+                    )
+                    return
 
-                if len(positions_slice) > 0:
-                    positions = positions_slice
-                    gradients = gradients_slice
-                    logps = logp_slice
-
-                positions = np.array(positions)
-                gradients = np.array(gradients)
-                logps = np.array(logps)
+                keep = keep[::-1]
+                positions = positions[keep]
+                gradients = gradients[keep]
+                logps = logps[keep]
 
                 fit = self._make_flow_fn(seed, positions, gradients, n_layers=0)
 
@@ -1329,7 +1349,11 @@ class TransformAdapter:
                 new_loss = self._loss_fn(params, static, positions, gradients, logps)
                 self._record_fisher_divergence(new_loss)
 
-                self._report(n_draws, f"log F  diag {_format_log_f(new_loss)}")
+                self._report(
+                    n_draws,
+                    f"log F  diag {_format_log_f(new_loss)}  "
+                    f"({len(keep)} draws{repeats})",
+                )
 
                 if np.isfinite(new_loss):
                     self._bijection = fit
