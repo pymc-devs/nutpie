@@ -31,6 +31,10 @@ class CompiledModel:
     def coords(self):
         raise NotImplementedError()
 
+    @property
+    def supports_flow_adaptation(self) -> bool:
+        return True
+
     def _make_sampler(self, *args, **kwargs):
         raise NotImplementedError()
 
@@ -1008,6 +1012,13 @@ def sample(
             "`use_grad_based_mass_matrix=False`.",
             FutureWarning,
             stacklevel=2,
+        )
+
+    if adaptation == "flow" and not compiled_model.supports_flow_adaptation:
+        raise ValueError(
+            "adaptation='flow' needs the model's raw logp function, which this "
+            "compiled model does not provide. Compile it with backend='jax' and "
+            "gradient_backend='jax' instead."
         )
 
     if sampler == "nuts":

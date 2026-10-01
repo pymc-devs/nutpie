@@ -1,3 +1,6 @@
+import os
+import subprocess
+import sys
 import time
 from importlib.util import find_spec
 
@@ -10,14 +13,25 @@ import numpy as np
 import pandas as pd
 import pymc as pm
 import pytensor
+import pytensor.tensor as pt
 import pytest
 
 import nutpie
 import nutpie.compile_pymc
 
+MLX_AVAILABLE = find_spec("mlx") is not None
+
+# CI sets this where MLX must be tested, so a failed install fails instead of skipping.
+if os.environ.get("NUTPIE_REQUIRE_MLX") and not MLX_AVAILABLE:
+    raise RuntimeError("NUTPIE_REQUIRE_MLX is set, but mlx is not installed")
+
+backend_params = [("numba", None), ("jax", "pytensor"), ("jax", "jax")]
+if MLX_AVAILABLE:
+    backend_params.append(("mlx", "pytensor"))
+
 parameterize_backends = pytest.mark.parametrize(
     "backend, gradient_backend",
-    [("numba", None), ("jax", "pytensor"), ("jax", "jax")],
+    backend_params,
 )
 
 
@@ -177,8 +191,6 @@ def test_deprecated_use_grad_based_mass_matrix(backend, gradient_backend):
 @pytest.mark.pymc
 @parameterize_backends
 def test_zero_size(backend, gradient_backend):
-    import pytensor.tensor as pt
-
     with pm.Model() as model:
         a = pm.Normal("a", shape=(0, 0, 10))
         pm.Deterministic("b", pt.exp(a))
@@ -552,6 +564,164 @@ def test_deterministic_sampling_jax():
     return trace.posterior.a.values.ravel()
 
 
+# MLX computes in float32 on the GPU, whose rounding differs between machines,
+# so the draws are checked against analytic moments instead of reference values.
+@pytest.mark.pymc
+@pytest.mark.skipif(not MLX_AVAILABLE, reason="MLX not installed")
+def test_sampling_mlx():
+    with pm.Model() as model:
+        pm.HalfNormal("a")
+
+    compiled = nutpie.compile_pymc_model(model, backend="mlx")
+    trace = nutpie.sample(
+        compiled, chains=4, seed=123, draws=4000, tune=1000, progress_bar=False
+    )
+    a = trace.posterior.a.values
+
+    assert (a >= 0).all()
+
+    expected_mean = np.sqrt(2.0 / np.pi)
+    expected_std = np.sqrt(1.0 - 2.0 / np.pi)
+    assert a.mean() == pytest.approx(expected_mean, abs=0.05)
+    assert a.std() == pytest.approx(expected_std, abs=0.05)
+
+
+MLX_CONCURRENT_FIRST_CALLS = """
+import sys
+import threading
+
+import mlx.core as mx
+import numpy as np
+import pymc as pm
+
+import nutpie
+
+n_threads = 8
+default_device = mx.default_device()
+# A tiny switch interval makes the threads interleave while the first call traces
+# the compiled function.
+sys.setswitchinterval(1e-6)
+rng = np.random.default_rng(0)
+
+for _ in range(3):
+    with pm.Model() as model:
+        mu = pm.Normal("mu", 0, 10, shape=10)
+        sigma = pm.HalfNormal("sigma")
+        pm.Normal("obs", mu, sigma, observed=rng.normal(size=(200, 10)))
+
+    compiled = nutpie.compile_pymc_model(model, backend="mlx")
+    x = np.zeros(compiled.n_dim)
+    barrier = threading.Barrier(n_threads)
+    logps = []
+    errors = []
+
+    def first_call():
+        logp_fn = compiled._make_logp_func()
+        barrier.wait()
+        try:
+            logps.append(logp_fn(x, **compiled._shared_data)[0])
+        except Exception as error:
+            errors.append(repr(error))
+
+    threads = [threading.Thread(target=first_call) for _ in range(n_threads)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == [], errors
+    assert logps == [logps[0]] * n_threads, logps
+    assert mx.default_device() == default_device, mx.default_device()
+"""
+
+
+@pytest.mark.pymc
+@pytest.mark.skipif(not MLX_AVAILABLE, reason="MLX not installed")
+def test_mlx_concurrent_first_calls():
+    # A race here can segfault, so each attempt runs in its own process.
+    for _ in range(3):
+        result = subprocess.run(
+            [sys.executable, "-c", MLX_CONCURRENT_FIRST_CALLS],
+            capture_output=True,
+            text=True,
+            timeout=600,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr[-3000:]
+
+
+@pytest.mark.pymc
+@pytest.mark.skipif(not MLX_AVAILABLE, reason="MLX not installed")
+def test_mlx_keeps_float64_on_cpu():
+    import mlx.core as mx
+
+    with pm.Model() as model:
+        pm.Normal("a")
+
+    default_device = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        compiled = nutpie.compile_pymc_model(model, backend="mlx")
+        point = np.array([1 + 1e-9])
+        _, grad = compiled._make_logp_func()(point, **compiled._shared_data)
+    finally:
+        mx.set_default_device(default_device)
+
+    # float32 would round the point, and so the gradient, to exactly -1.
+    assert grad[0] == -(1 + 1e-9)
+
+
+@pytest.mark.pymc
+@pytest.mark.skipif(not MLX_AVAILABLE, reason="MLX not installed")
+def test_mlx_rejects_other_gradient_backends():
+    with pm.Model() as model:
+        pm.Normal("a")
+
+    with pytest.raises(ValueError, match="Gradient backend cannot be bogus"):
+        nutpie.compile_pymc_model(model, backend="mlx", gradient_backend="bogus")
+
+
+@pytest.mark.pymc
+@pytest.mark.skipif(not MLX_AVAILABLE, reason="MLX not installed")
+def test_mlx_flow_adaptation_fails_before_sampling():
+    with pm.Model() as model:
+        pm.Normal("a")
+    compiled = nutpie.compile_pymc_model(model, backend="mlx")
+
+    with pytest.raises(ValueError, match="adaptation='flow'"):
+        nutpie.sample(compiled, adaptation="flow")
+
+
+@pytest.mark.pymc
+@pytest.mark.skipif(
+    not os.environ.get("NUTPIE_REQUIRE_MLX"),
+    reason="only checked where MLX must run on the GPU",
+)
+def test_mlx_default_device_is_gpu():
+    import mlx.core as mx
+
+    assert mx.default_device() == mx.gpu
+
+
+@pytest.mark.pymc
+@pytest.mark.parametrize(
+    "backend",
+    [
+        "numba",
+        pytest.param(
+            "mlx",
+            marks=pytest.mark.skipif(not MLX_AVAILABLE, reason="MLX not installed"),
+        ),
+    ],
+)
+def test_jax_gradient_requires_jax_backend(backend):
+    with pm.Model() as model:
+        pm.Normal("a")
+
+    with pytest.raises(ValueError, match="Gradient backend cannot be jax"):
+        nutpie.compile_pymc_model(model, backend=backend, gradient_backend="jax")
+
+
 @pytest.mark.pymc
 def test_zarr_store(tmp_path):
     coords = {
@@ -616,8 +786,18 @@ def tmp_path():
 
 @pytest.mark.pymc
 @parameterize_backends
-def test_dims_model(backend, gradient_backend):
+def test_dims_model(backend, gradient_backend, request):
     import pymc.dims as pmd
+
+    if backend == "mlx":
+        request.applymarker(
+            pytest.mark.xfail(
+                reason="ZeroSumNormal checks its mean against atol=1e-9, which "
+                "its float32 transform cannot meet",
+                raises=RuntimeError,
+                strict=True,
+            )
+        )
 
     coords = {"a": range(3), "b": range(5)}
     with pm.Model(coords=coords) as model:

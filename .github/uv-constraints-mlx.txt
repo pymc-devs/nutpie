@@ -1,4 +1,5 @@
-arviz < 1.0.0
+# The pymc-mlx extra needs pymc >= 6.3.2, which requires arviz >= 1.1, so this
+# file drops the arviz cap in uv-constraints-main.txt and keeps its pandas pin.
 # pandas 3.0 needs the numpy 2.5 C ABI but declares numpy>=1.26, and numba caps
 # numpy<2.5, so the pair segfaults (pd.date_range in test_zarr_store).
 pandas < 3.0.0

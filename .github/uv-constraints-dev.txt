@@ -1,1 +1,4 @@
 pymc @ git+https://github.com/pymc-devs/pymc.git@main
+# pandas 3.0 needs the numpy 2.5 C ABI but declares numpy>=1.26, and numba caps
+# numpy<2.5, so the pair segfaults (pd.date_range in test_zarr_store).
+pandas < 3.0.0

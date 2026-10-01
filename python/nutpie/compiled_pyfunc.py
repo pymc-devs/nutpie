@@ -24,6 +24,7 @@ class PyFuncModel(CompiledModel):
     _coords: dict[str, Any]
     _raw_logp_fn: Callable | None
     _transform_adapt_args: dict | None = None
+    _shared_data_converter: Callable[[Any], Any] | None = None
 
     @property
     def shapes(self) -> dict[str, tuple[int, ...]]:
@@ -37,13 +38,23 @@ class PyFuncModel(CompiledModel):
     def n_dim(self):
         return self._n_dim
 
+    @property
+    def supports_flow_adaptation(self) -> bool:
+        return self._raw_logp_fn is not None
+
     def with_data(self, **updates):
         for name in updates:
             if name not in self._shared_data:
                 raise ValueError(f"Unknown data variable: {name}")
 
+        if self._shared_data_converter is not None:
+            updates = {
+                name: self._shared_data_converter(value)
+                for name, value in updates.items()
+            }
+
         updated = self._shared_data.copy()
-        updated.update(**updates)
+        updated.update(updates)
         return dataclasses.replace(self, _shared_data=updated)
 
     def with_transform_adapt(self, **kwargs):
@@ -121,6 +132,7 @@ def from_pyfunc(
     make_transform_adapter=None,
     raw_logp_fn=None,
     reparameterized_names=None,
+    shared_data_converter: Callable[[Any], Any] | None = None,
 ):
     if coords is None:
         coords = {}
@@ -153,4 +165,5 @@ def from_pyfunc(
         _shared_data=shared_data,
         _raw_logp_fn=raw_logp_fn,
         reparameterized_names=reparameterized_names,
+        _shared_data_converter=shared_data_converter,
     )
