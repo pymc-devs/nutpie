@@ -361,6 +361,7 @@ jobs:
               uv pip install 'nutpie[pymc]' jax --constraint .github/uv-constraints-main.txt
               if [ "${{ matrix.target }}" = "aarch64" ]; then
                 uv pip install 'nutpie[pymc-mlx]' --find-links dist --constraint .github/uv-constraints-mlx.txt
+                export NUTPIE_REQUIRE_MLX=1
               fi
               pytest -m "pymc and not flow" --arraydiff
               ;;
