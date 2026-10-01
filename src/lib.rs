@@ -1,5 +1,6 @@
 mod common;
 mod hessian_sparsity;
+mod lm_optimizer;
 mod progress;
 mod pyfunc;
 mod pymc;

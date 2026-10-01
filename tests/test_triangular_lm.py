@@ -170,3 +170,100 @@ def test_unpack_inverts_pack():
     theta = pack_params(tmap)
     shifted = unpack_params(tmap, theta + 1.0)
     np.testing.assert_array_equal(pack_params(shifted), theta + 1.0)
+
+
+def _flow_problem(dim=7, n_draw=64, rho=None, seed=0):
+    """A `make_flow(kind="triangular")` flow near its init, its data and a
+    `FisherLoss`."""
+    import flowjax
+
+    from nutpie.normalizing_flow import make_flow
+    from nutpie.transform_adapter import FisherLoss
+
+    jax.config.update("jax_enable_x64", True)
+    rng = np.random.default_rng(seed)
+    x = 0.5 + rng.normal(size=(n_draw, dim)) * np.exp(rng.normal(size=dim))
+    g = -(x - 0.5) / np.exp(2 * rng.normal(size=dim)) + 0.3 * rng.normal(
+        size=(n_draw, dim)
+    )
+    bijection = make_flow(
+        seed,
+        x,
+        g,
+        n_layers=1,
+        kind="triangular",
+        sparsity=_blanket(dim, "banded", rng),
+        order=rng.permutation(dim),
+        nn_width=4,
+        nn_depth=1,
+        activation=jax.nn.softplus,
+        contract_transformer=2,
+        n_buckets=2,
+    )
+    flow = flowjax.flows.Transformed(
+        flowjax.distributions.StandardNormal((dim,)), bijection
+    )
+    params, static = eqx.partition(flow, eqx.is_inexact_array)
+    params = jax.tree.map(
+        lambda leaf: leaf + 0.05 * jnp.asarray(rng.normal(size=leaf.shape)), params
+    )
+    data = (jnp.asarray(x), jnp.asarray(g), jnp.zeros(n_draw))
+    return params, static, data, FisherLoss(fisher_regularization=rho)
+
+
+@pytest.mark.parametrize("rho", [None, 0.1])
+def test_rust_lm_steps_match_lmopt(rho):
+    """With every conditioner in one sub-block, both preconditioners are the
+    same matrix, so the steps agree up to rounding."""
+    from nutpie import lmopt
+    from nutpie.transform_adapter import gn_factor_fn, res_fn
+    from nutpie.triangular_lm import fit, map_data
+
+    params, static, data, loss_fn = _flow_problem(rho=rho)
+    n_steps = 4
+    _, reference = lmopt.fit(
+        params,
+        res_fn,
+        (loss_fn, static),
+        data=data,
+        fit_affine=False,
+        line_search=True,
+        factor_fn=gn_factor_fn,
+        max_exact_block_size=10_000,
+        n_steps=n_steps,
+        verbose=False,
+    )
+
+    tmap, y, g = map_data(eqx.combine(params, static), data[0], data[1])
+    problem = make_residuals(tmap, y, g, fisher_regularization=rho)
+    _, _, hist = fit(problem, pack_params(tmap), n_steps=n_steps, max_block_size=10_000)
+
+    assert len(hist) == n_steps
+    for ours, ref in zip(hist, reference):
+        assert ours["accept"] == bool(ref["accept"])
+        assert ours["n_cg"] == int(ref["n_cg"])
+        for key in ["F", "F_new", "rho_full", "lam_out", "step_length"]:
+            np.testing.assert_allclose(ours[key], float(ref[key]), rtol=1e-6)
+
+
+def test_lm_rust_method_updates_the_flow():
+    """`fit_to_data(method="lm-rust")` writes the fitted conditioners back:
+    the returned flow's loss is the one the fit reports."""
+    from nutpie.transform_adapter import fit_to_data
+
+    params, static, data, loss_fn = _flow_problem(rho=0.1)
+    initial = float(jnp.sum(loss_fn.residuals(params, static, *data) ** 2))
+    flow, losses, _ = fit_to_data(
+        jax.random.key(0),
+        eqx.combine(params, static),
+        data,
+        loss_fn=loss_fn,
+        method="lm-rust",
+        max_epochs=5,
+        lm_min_loss=0.0,
+    )
+    fitted, _ = eqx.partition(flow, eqx.is_inexact_array)
+    r = loss_fn.residuals(fitted, static, *data)
+    assert losses["lm_steps"] == 5
+    assert losses["train"][0] < initial
+    np.testing.assert_allclose(float(jnp.sum(r**2)), losses["train"][0], rtol=1e-10)
