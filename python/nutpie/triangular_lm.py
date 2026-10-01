@@ -166,9 +166,7 @@ def _transformer_dicts(specs):
     return out
 
 
-def make_residuals(
-    tmap, y=None, g=None, *, fisher_regularization=None, cholesky_jitter=None
-):
+def make_residuals(tmap, y=None, g=None, *, fisher_regularization=None):
     """A `FisherResiduals` for `tmap` (unwrapped), with data `y`, `g` if
     given (see `map_data`)."""
     from nutpie._lib import FisherResiduals
@@ -196,7 +194,6 @@ def make_residuals(
         location_index=int(tmap.conditioners[0].location_index),
         transformer=_transformer_dicts(specs),
         fisher_regularization=fisher_regularization,
-        cholesky_jitter=cholesky_jitter,
     )
     if y is not None:
         problem.set_data(
