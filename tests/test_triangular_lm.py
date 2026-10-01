@@ -154,11 +154,12 @@ def test_gauss_newton_blocks_match_dense_gram(case, max_block_size, rho):
         offset += size * size
         covered[start : start + size] += 1
         expected = gram[start : start + size, start : start + size]
-        # The factored form reads `Sigma = (J^T J)^-1` on `{i} + P(i)` and
-        # cancels down to the block, so it loses about `cond(K) eps`. These
-        # random maps reach `cond(K) ~ 1e11` on some draws.
+        # The blocks read `Sigma = (J^T J)^-1` from Takahashi's recurrence,
+        # whose error grows like `cond(J)^2 eps`. The random blanket gives
+        # some draws `cond(K) ~ 1e11`; everything else is exact to rounding.
+        tol = 1e-5 if case.get("blanket") == "random" else 1e-10
         np.testing.assert_allclose(
-            block, expected, rtol=0, atol=1e-5 * np.abs(expected).max()
+            block, expected, rtol=0, atol=tol * np.abs(expected).max()
         )
     assert offset == data.size
     assert np.all(covered == 1)
