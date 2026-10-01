@@ -46,7 +46,9 @@ itertools = "0.15.0"
 bridgestan = "2.7.0"
 rand_distr = "0.6.0"
 smallvec = "1.15.0"
-faer = { version = "0.24.0", default-features = false, features = ["linalg"] }
+# `std` is what lets faer's matmul (gemm) detect AVX2/AVX-512 at runtime;
+# without it, it runs baseline x86-64 kernels.
+faer = { version = "0.24.0", default-features = false, features = ["linalg", "std"] }
 upon = { version = "0.11.0", default-features = false, features = [] }
 time-humanize = { version = "0.1.3", default-features = false }
 indicatif = "0.18.0"
@@ -71,7 +73,6 @@ criterion = "0.8.0"
 
 [profile.release]
 lto = "fat"
-codegen-units = 1
 opt-level = 3
 
 [profile.bench]
