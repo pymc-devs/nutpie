@@ -214,7 +214,8 @@ def _flow_problem(dim=7, n_draw=64, rho=None, seed=0):
 @pytest.mark.parametrize("rho", [None, 0.1])
 def test_rust_lm_steps_match_lmopt(rho):
     """With every conditioner in one sub-block, both preconditioners are the
-    same matrix, so the steps agree up to rounding."""
+    same matrix, so the steps agree up to rounding. `lmopt` has neither the
+    `lam_lo` reset nor the larger `lam0`."""
     from nutpie import lmopt
     from nutpie.transform_adapter import gn_factor_fn, res_fn
     from nutpie.triangular_lm import fit, map_data
@@ -236,7 +237,14 @@ def test_rust_lm_steps_match_lmopt(rho):
 
     tmap, y, g = map_data(eqx.combine(params, static), data[0], data[1])
     problem = make_residuals(tmap, y, g, fisher_regularization=rho)
-    _, _, hist = fit(problem, pack_params(tmap), n_steps=n_steps, max_block_size=10_000)
+    _, _, hist = fit(
+        problem,
+        pack_params(tmap),
+        n_steps=n_steps,
+        lam0=1e-2,
+        max_block_size=10_000,
+        lam_lo_reset=0.0,
+    )
 
     assert len(hist) == n_steps
     for ours, ref in zip(hist, reference):
@@ -244,6 +252,25 @@ def test_rust_lm_steps_match_lmopt(rho):
         assert ours["n_cg"] == int(ref["n_cg"])
         for key in ["F", "F_new", "rho_full", "lam_out", "step_length"]:
             np.testing.assert_allclose(ours[key], float(ref[key]), rtol=1e-6)
+
+
+def test_rust_lm_with_limited_memory_preconditioner():
+    """The limited-memory preconditioner only changes the CG solves: the fit
+    still converges to about the same loss, and it is actually used."""
+    from nutpie.triangular_lm import fit, map_data
+
+    params, static, data, loss_fn = _flow_problem(rho=0.1)
+    tmap, y, g = map_data(eqx.combine(params, static), data[0], data[1])
+    problem = make_residuals(tmap, y, g, fisher_regularization=0.1)
+    settings = dict(n_steps=15, max_block_size=8, cg_tol=1e-6, verbose=False)
+
+    _, _, base = fit(problem, pack_params(tmap), **settings)
+    _, _, hist = fit(problem, pack_params(tmap), lmp_size=8, **settings)
+
+    assert hist[0]["lmp_rank"] == 0
+    assert all(0 < info["lmp_rank"] <= 8 for info in hist[1:])
+    assert hist[-1]["F_out"] < 0.1 * hist[0]["F"]
+    np.testing.assert_allclose(hist[-1]["F_out"], base[-1]["F_out"], rtol=0.1)
 
 
 def test_lm_rust_method_updates_the_flow():
