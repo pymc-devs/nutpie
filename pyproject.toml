@@ -37,7 +37,11 @@ pymc = ["pymc >= 5.20.1", "numba >= 0.60.0"]
 pymc-jax = ["pymc >= 5.20.1", "jax >= 0.4.27"]
 # mlx 0.31.x segfaults in fused Metal kernels:
 # https://github.com/ml-explore/mlx/issues/3329
-pymc-mlx = ["pymc >= 6.3.2", "pytensor >= 3.3.2", "mlx >= 0.29.0,!=0.31.*"]
+pymc-mlx = [
+  "pymc >= 6.3.2",
+  "pytensor >= 3.3.2",
+  "mlx >= 0.29.0,!=0.31.*; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
 nnflow = ["flowjax >= 17.1.0", "equinox >= 0.11.12"]
 dev = [
   "bridgestan >= 2.7.0",
