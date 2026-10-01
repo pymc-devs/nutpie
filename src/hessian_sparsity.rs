@@ -21,6 +21,10 @@
 //! like `+1` and `-1` in a row cancel exactly, which is common in
 //! statistical models.
 //!
+//! The products of each stage are independent and run in parallel with
+//! rayon. The random weights are drawn up front, so the result does not
+//! depend on the number of threads.
+//!
 //! Autodiff Hessian-vector products give exact zeros for entries that do
 //! not depend on each other, so the result is exact at the evaluated points.
 //! Dependencies in branches of the model that are not taken at any point
@@ -29,13 +33,15 @@
 use anyhow::{bail, Result};
 use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
+use rayon::prelude::*;
 
-/// Something that can compute products of its Hessian with vectors.
-pub trait HessianVectorProduct {
+/// Something that can compute products of its Hessian with vectors, from
+/// several threads at once.
+pub trait HessianVectorProduct: Sync {
     fn dim(&self) -> usize;
 
     /// Store the product of the Hessian at `point` with `vector` in `out`.
-    fn hvp(&mut self, point: &[f64], vector: &[f64], out: &mut [f64]) -> Result<()>;
+    fn hvp(&self, point: &[f64], vector: &[f64], out: &mut [f64]) -> Result<()>;
 }
 
 #[derive(Clone, Debug)]
@@ -104,12 +110,18 @@ fn default_bloom_size(n: usize) -> usize {
 }
 
 /// Detect the sparsity pattern of the Hessian, as the union of the patterns
-/// at `points`.
-pub fn hessian_sparsity<H: HessianVectorProduct + ?Sized>(
-    hessian: &mut H,
+/// at `points`. `interrupt` is called before every HVP, from all threads; an
+/// error from it stops the detection and is returned.
+pub fn hessian_sparsity<H, I>(
+    hessian: &H,
     points: &[Vec<f64>],
     options: &SparsityOptions,
-) -> Result<SparsityPattern> {
+    interrupt: I,
+) -> Result<SparsityPattern>
+where
+    H: HessianVectorProduct + ?Sized,
+    I: Fn() -> Result<()> + Sync,
+{
     let n = hessian.dim();
     if points.is_empty() {
         bail!("Need at least one point to detect the Hessian sparsity");
@@ -129,8 +141,14 @@ pub fn hessian_sparsity<H: HessianVectorProduct + ?Sized>(
     // verification stage alone with unit vectors is cheaper.
     let use_bloom = bloom_size >= options.num_hashes && 2 * bloom_size < n;
     let candidates = if use_bloom {
-        let (candidates, hvps) =
-            bloom_candidates(hessian, points, bloom_size, options.num_hashes, &mut rng)?;
+        let (candidates, hvps) = bloom_candidates(
+            hessian,
+            points,
+            bloom_size,
+            options.num_hashes,
+            &mut rng,
+            &interrupt,
+        )?;
         num_hvps += hvps;
         Some(candidates)
     } else {
@@ -138,8 +156,8 @@ pub fn hessian_sparsity<H: HessianVectorProduct + ?Sized>(
     };
 
     let (nonzeros, num_colors, hvps) = match candidates {
-        Some(candidates) => verify_candidates(hessian, points, &candidates)?,
-        None => unit_vector_pattern(hessian, points)?,
+        Some(candidates) => verify_candidates(hessian, points, &candidates, &interrupt)?,
+        None => unit_vector_pattern(hessian, points, &interrupt)?,
     };
     num_hvps += hvps;
 
@@ -164,14 +182,59 @@ pub fn hessian_sparsity<H: HessianVectorProduct + ?Sized>(
     })
 }
 
+/// One HVP per point and probe, in parallel. `fill(point, probe, vector)`
+/// sets the probe vector (zeroed before), and `read(probe, out)` extracts
+/// what the caller needs from the product. The results are ordered by point,
+/// then probe. `interrupt` is called before each HVP.
+fn parallel_hvps<H, T, F, G>(
+    hessian: &H,
+    points: &[Vec<f64>],
+    num_probes: usize,
+    interrupt: &(dyn Fn() -> Result<()> + Sync),
+    fill: F,
+    read: G,
+) -> Result<Vec<T>>
+where
+    H: HessianVectorProduct + ?Sized,
+    T: Send,
+    F: Fn(usize, usize, &mut [f64]) + Sync,
+    G: Fn(usize, &[f64]) -> T + Sync,
+{
+    let n = hessian.dim();
+    (0..points.len() * num_probes)
+        .into_par_iter()
+        .map_init(
+            || (vec![0f64; n], vec![0f64; n]),
+            |(vector, out), job| {
+                interrupt()?;
+                let (point, probe) = (job / num_probes, job % num_probes);
+                vector.fill(0.);
+                fill(point, probe, vector);
+                hessian.hvp(&points[point], vector, out)?;
+                Ok(read(probe, out))
+            },
+        )
+        .collect()
+}
+
+/// The rows where `out` is nonzero.
+fn nonzero_rows(out: &[f64]) -> Vec<usize> {
+    out.iter()
+        .enumerate()
+        .filter(|(_, &val)| val != 0.0)
+        .map(|(i, _)| i)
+        .collect()
+}
+
 /// Stage 1: Candidates for the nonzeros of each row, as sorted column
 /// indices. Returns the candidates and the number of HVPs.
 fn bloom_candidates<H: HessianVectorProduct + ?Sized>(
-    hessian: &mut H,
+    hessian: &H,
     points: &[Vec<f64>],
     bloom_size: usize,
     num_hashes: usize,
     rng: &mut ChaCha8Rng,
+    interrupt: &(dyn Fn() -> Result<()> + Sync),
 ) -> Result<(Vec<Vec<usize>>, usize)> {
     let n = hessian.dim();
 
@@ -192,32 +255,43 @@ fn bloom_candidates<H: HessianVectorProduct + ?Sized>(
         }
     }
 
+    // The random weights of the columns of each bit, by point and bit.
+    let weights: Vec<Vec<f64>> = (0..points.len() * bloom_size)
+        .map(|job| {
+            bit_columns[job % bloom_size]
+                .iter()
+                .map(|_| rng.random_range(1.0..2.0))
+                .collect()
+        })
+        .collect();
+    let bit_rows = parallel_hvps(
+        hessian,
+        points,
+        bloom_size,
+        interrupt,
+        |point, bit, vector| {
+            let weights = &weights[point * bloom_size + bit];
+            for (&j, &weight) in bit_columns[bit].iter().zip(weights) {
+                vector[j] = weight;
+            }
+        },
+        |_, out| nonzero_rows(out),
+    )?;
+
     let words = bloom_size.div_ceil(64);
     let mut row_bits = vec![0u64; n * words];
-    let mut vector = vec![0f64; n];
-    let mut out = vec![0f64; n];
     let mut hit_count = vec![0usize; n];
     let mut touched = Vec::new();
     let mut candidates: Vec<Vec<usize>> = vec![vec![]; n];
-    let mut num_hvps = 0;
 
-    for point in points {
+    for point_rows in bit_rows.chunks(bloom_size) {
         // Which bits are nonzero in each row
         row_bits.fill(0);
-        for (bit, columns) in bit_columns.iter().enumerate() {
-            vector.fill(0.);
-            for &j in columns {
-                vector[j] = rng.random_range(1.0..2.0);
-            }
-            hessian.hvp(point, &vector, &mut out)?;
-            num_hvps += 1;
-            for (i, &val) in out.iter().enumerate() {
-                if val != 0.0 {
-                    row_bits[i * words + bit / 64] |= 1 << (bit % 64);
-                }
+        for (bit, rows) in point_rows.iter().enumerate() {
+            for &i in rows {
+                row_bits[i * words + bit / 64] |= 1 << (bit % 64);
             }
         }
-
         // Row i has candidate j if all bits of column j are set in row i.
         let mut point_candidates: Vec<Vec<usize>> = vec![vec![]; n];
         for (i, row_candidates) in point_candidates.iter_mut().enumerate() {
@@ -259,7 +333,7 @@ fn bloom_candidates<H: HessianVectorProduct + ?Sized>(
         row.sort_unstable();
         row.dedup();
     }
-    Ok((candidates, num_hvps))
+    Ok((candidates, points.len() * bloom_size))
 }
 
 /// Choose columns that get a colour of their own ("dense" columns).
@@ -275,7 +349,11 @@ fn bloom_candidates<H: HessianVectorProduct + ?Sized>(
 /// row`, which estimates the number of colours. Taking only one of several
 /// dense columns often doesn't help, so we don't stop at the first step
 /// without improvement.
-fn choose_dense_columns(candidates: &[Vec<usize>]) -> Vec<bool> {
+///
+/// Returns the dense columns and that estimate, which is a lower bound on
+/// the number of colours: a non-dense row needs a colour for each of its
+/// candidates in non-dense columns.
+fn choose_dense_columns(candidates: &[Vec<usize>]) -> (Vec<bool>, usize) {
     let n = candidates.len();
     let mut dense = vec![false; n];
     // Number of candidates of each row in non-dense columns
@@ -314,7 +392,7 @@ fn choose_dense_columns(candidates: &[Vec<usize>]) -> Vec<bool> {
     for &column in sequence[best_len..].iter() {
         dense[column] = false;
     }
-    dense
+    (dense, best_cost)
 }
 
 /// Colour the columns for the verification stage.
@@ -322,38 +400,47 @@ fn choose_dense_columns(candidates: &[Vec<usize>]) -> Vec<bool> {
 /// Dense columns (see `choose_dense_columns`) get a colour of their own. The
 /// other columns are coloured greedily, such that no non-dense row has
 /// candidates in two non-dense columns of the same colour. Returns the
-/// colours of the columns, the number of colours and which columns are
-/// dense.
-fn color_columns(candidates: &[Vec<usize>]) -> (Vec<usize>, usize, Vec<bool>) {
-    const UNCOLORED: usize = usize::MAX;
+/// colours of the columns and the number of colours.
+///
+/// Each non-dense row keeps a bitset of the colours of its candidates so
+/// far, so colouring a column costs one bitset union per row instead of a
+/// pass over the candidates of each of its rows.
+fn color_columns(candidates: &[Vec<usize>], dense: &[bool]) -> (Vec<usize>, usize) {
     let n = candidates.len();
-    let dense = choose_dense_columns(candidates);
 
     // The candidates are symmetric, so the rows with a candidate in column
     // j are `candidates[j]`. Colour columns with many candidates first.
     let mut order: Vec<usize> = (0..n).filter(|&j| !dense[j]).collect();
     order.sort_by_key(|&j| std::cmp::Reverse(candidates[j].len()));
 
-    let mut colors = vec![UNCOLORED; n];
-    // `forbidden[c] == j` marks colour c as taken by a neighbour of column j
-    let mut forbidden: Vec<usize> = vec![];
-    let mut num_colors = 0;
+    let mut colors = vec![usize::MAX; n];
+    let mut row_colors: Vec<Vec<u64>> = vec![vec![]; n];
+    let mut forbidden: Vec<u64> = vec![];
+    let mut num_colors: usize = 0;
     for &j in order.iter() {
-        for &i in candidates[j].iter().filter(|&&i| !dense[i]) {
-            for &k in candidates[i].iter() {
-                let color = colors[k];
-                if color != UNCOLORED && !dense[k] {
-                    forbidden[color] = j;
-                }
+        let rows = || candidates[j].iter().copied().filter(|&i| !dense[i]);
+        forbidden.clear();
+        forbidden.resize(num_colors.div_ceil(64), 0);
+        for i in rows() {
+            for (forbidden, &used) in forbidden.iter_mut().zip(&row_colors[i]) {
+                *forbidden |= used;
             }
         }
-        let color = (0..num_colors)
-            .find(|&color| forbidden[color] != j)
-            .unwrap_or_else(|| {
-                num_colors += 1;
-                forbidden.push(UNCOLORED);
-                num_colors - 1
-            });
+        let color = forbidden
+            .iter()
+            .enumerate()
+            .find(|(_, &word)| word != u64::MAX)
+            .map(|(w, &word)| w * 64 + word.trailing_ones() as usize)
+            .filter(|&color| color < num_colors)
+            .unwrap_or(num_colors);
+        num_colors = num_colors.max(color + 1);
+        for i in rows() {
+            let used = &mut row_colors[i];
+            if used.len() <= color / 64 {
+                used.resize(color / 64 + 1, 0);
+            }
+            used[color / 64] |= 1 << (color % 64);
+        }
         colors[j] = color;
     }
 
@@ -361,78 +448,90 @@ fn color_columns(candidates: &[Vec<usize>]) -> (Vec<usize>, usize, Vec<bool>) {
         colors[j] = num_colors;
         num_colors += 1;
     }
-    (colors, num_colors, dense)
+    (colors, num_colors)
 }
 
 /// Stage 2: Check which candidates are actually nonzero. Returns the
 /// nonzeros of each row, the number of colours and the number of HVPs.
 fn verify_candidates<H: HessianVectorProduct + ?Sized>(
-    hessian: &mut H,
+    hessian: &H,
     points: &[Vec<f64>],
     candidates: &[Vec<usize>],
+    interrupt: &(dyn Fn() -> Result<()> + Sync),
 ) -> Result<(Vec<Vec<usize>>, usize, usize)> {
     let n = hessian.dim();
-    let (colors, num_colors, dense) = color_columns(candidates);
+    let (dense, min_colors) = choose_dense_columns(candidates);
+    // The colouring needs at least `min_colors` HVPs per point. Close to `n`,
+    // unit vectors cost about the same and need no colouring, which is
+    // slowest for exactly these patterns (dense blocks).
+    if 4 * min_colors >= 3 * n {
+        return unit_vector_pattern(hessian, points, interrupt);
+    }
+    let (colors, num_colors) = color_columns(candidates, &dense);
     let mut color_columns: Vec<Vec<usize>> = vec![vec![]; num_colors];
     for (j, &color) in colors.iter().enumerate() {
         color_columns[color].push(j);
     }
 
-    let mut vector = vec![0f64; n];
-    let mut out = vec![0f64; n];
-    let mut nonzeros: Vec<Vec<usize>> = vec![vec![]; n];
-    let mut num_hvps = 0;
-
-    for point in points {
-        for columns in color_columns.iter() {
-            vector.fill(0.);
-            for &j in columns {
+    let found = parallel_hvps(
+        hessian,
+        points,
+        num_colors,
+        interrupt,
+        |_, color, vector| {
+            for &j in color_columns[color].iter() {
                 vector[j] = 1.;
             }
-            hessian.hvp(point, &vector, &mut out)?;
-            num_hvps += 1;
-            // A dense column is alone in its colour, so `out` is the whole
-            // column. Otherwise a non-dense row i has at most one candidate
-            // in this colour, so out[i] is exactly the entry (i, j) of that
-            // candidate. Entries in dense rows are known from the dense
-            // column by symmetry.
-            for &j in columns {
+        },
+        // A dense column is alone in its colour, so `out` is the whole
+        // column. Otherwise a non-dense row i has at most one candidate in
+        // this colour, so out[i] is exactly the entry (i, j) of that
+        // candidate. Entries in dense rows are known from the dense column
+        // by symmetry.
+        |color, out| {
+            let mut pairs = vec![];
+            for &j in color_columns[color].iter() {
                 for &i in candidates[j].iter() {
                     if (dense[j] || !dense[i]) && out[i] != 0.0 {
-                        nonzeros[i].push(j);
+                        pairs.push((i, j));
                     }
                 }
             }
-        }
+            pairs
+        },
+    )?;
+
+    let mut nonzeros: Vec<Vec<usize>> = vec![vec![]; n];
+    for (i, j) in found.into_iter().flatten() {
+        nonzeros[i].push(j);
     }
-    Ok((nonzeros, num_colors, num_hvps))
+    Ok((nonzeros, num_colors, points.len() * num_colors))
 }
 
 /// Compute the pattern column by column with unit vectors. Returns the
 /// nonzeros of each row, the number of colours and the number of HVPs.
 fn unit_vector_pattern<H: HessianVectorProduct + ?Sized>(
-    hessian: &mut H,
+    hessian: &H,
     points: &[Vec<f64>],
+    interrupt: &(dyn Fn() -> Result<()> + Sync),
 ) -> Result<(Vec<Vec<usize>>, usize, usize)> {
     let n = hessian.dim();
-    let mut vector = vec![0f64; n];
-    let mut out = vec![0f64; n];
+    let columns = parallel_hvps(
+        hessian,
+        points,
+        n,
+        interrupt,
+        |_, j, vector| vector[j] = 1.,
+        |_, out| nonzero_rows(out),
+    )?;
+
     let mut nonzeros: Vec<Vec<usize>> = vec![vec![]; n];
-    let mut num_hvps = 0;
-    for point in points {
-        for j in 0..n {
-            vector.fill(0.);
-            vector[j] = 1.;
-            hessian.hvp(point, &vector, &mut out)?;
-            num_hvps += 1;
-            for (i, &val) in out.iter().enumerate() {
-                if val != 0.0 {
-                    nonzeros[i].push(j);
-                }
-            }
+    for (job, rows) in columns.into_iter().enumerate() {
+        for i in rows {
+            nonzeros[i].push(job % n);
         }
     }
-    Ok((nonzeros, n, num_hvps))
+    Ok((nonzeros, n, points.len() * n))
 }
 
 #[cfg(test)]
@@ -469,7 +568,7 @@ mod tests {
             self.n
         }
 
-        fn hvp(&mut self, _point: &[f64], vector: &[f64], out: &mut [f64]) -> Result<()> {
+        fn hvp(&self, _point: &[f64], vector: &[f64], out: &mut [f64]) -> Result<()> {
             for (i, out) in out.iter_mut().enumerate() {
                 *out = (0..self.n)
                     .map(|j| self.values[i * self.n + j] * vector[j])
@@ -492,36 +591,36 @@ mod tests {
         DenseHessian::new(n, &entries)
     }
 
-    fn check(hessian: &mut DenseHessian, options: &SparsityOptions) -> SparsityPattern {
+    fn check(hessian: &DenseHessian, options: &SparsityOptions) -> SparsityPattern {
         let points = vec![vec![0.; hessian.n]];
-        let pattern = hessian_sparsity(hessian, &points, options).unwrap();
+        let pattern = hessian_sparsity(hessian, &points, options, || Ok(())).unwrap();
         assert_eq!(pattern.to_dense(), hessian.pattern());
         pattern
     }
 
     #[test]
     fn unit_vectors_for_small_problems() {
-        let mut hessian = DenseHessian::new(5, &[(0, 1, 2.), (1, 3, -1.), (2, 2, 1.)]);
-        let pattern = check(&mut hessian, &SparsityOptions::default());
+        let hessian = DenseHessian::new(5, &[(0, 1, 2.), (1, 3, -1.), (2, 2, 1.)]);
+        let pattern = check(&hessian, &SparsityOptions::default());
         assert_eq!(pattern.num_hvps, 5);
     }
 
     #[test]
     fn bloom_random_sparse() {
-        let mut hessian = random_sparse(1000, 10, 1);
-        let pattern = check(&mut hessian, &SparsityOptions::default());
+        let hessian = random_sparse(1000, 10, 1);
+        let pattern = check(&hessian, &SparsityOptions::default());
         assert!(pattern.num_hvps < 1000, "{} HVPs", pattern.num_hvps);
     }
 
     #[test]
     fn bloom_small_filter() {
         // Many false positives in stage 1, which stage 2 must remove
-        let mut hessian = random_sparse(500, 10, 2);
+        let hessian = random_sparse(500, 10, 2);
         let options = SparsityOptions {
             bloom_size: Some(40),
             ..Default::default()
         };
-        check(&mut hessian, &options);
+        check(&hessian, &options);
     }
 
     #[test]
@@ -536,8 +635,8 @@ mod tests {
                 entries.push((i, i - 1, 1.));
             }
         }
-        let mut hessian = DenseHessian::new(n, &entries);
-        let pattern = check(&mut hessian, &SparsityOptions::default());
+        let hessian = DenseHessian::new(n, &entries);
+        let pattern = check(&hessian, &SparsityOptions::default());
         assert!(pattern.num_hvps < n, "{} HVPs", pattern.num_hvps);
     }
 
@@ -547,8 +646,8 @@ mod tests {
         let n = 2000;
         let mut entries: Vec<_> = (0..n).map(|i| (i, i, -1.)).collect();
         entries.extend((1..n).map(|j| (0, j, 0.5)));
-        let mut hessian = DenseHessian::new(n, &entries);
-        let pattern = check(&mut hessian, &SparsityOptions::default());
+        let hessian = DenseHessian::new(n, &entries);
+        let pattern = check(&hessian, &SparsityOptions::default());
         assert!(pattern.num_colors <= 3, "{} colours", pattern.num_colors);
     }
 
@@ -567,9 +666,34 @@ mod tests {
             entries.push((1, effect, -0.5));
             entries.push((effect, local, 0.2));
         }
-        let mut hessian = DenseHessian::new(n, &entries);
-        let pattern = check(&mut hessian, &SparsityOptions::default());
+        let hessian = DenseHessian::new(n, &entries);
+        let pattern = check(&hessian, &SparsityOptions::default());
         assert!(pattern.num_colors <= 6, "{} colours", pattern.num_colors);
+    }
+
+    #[test]
+    fn dense_block_uses_unit_vectors() {
+        // A dense block of 800 columns needs at least 800 colours, so the
+        // verification falls back to unit vectors.
+        let n = 1000;
+        let mut entries: Vec<_> = (0..n).map(|i| (i, i, -1.)).collect();
+        for i in 0..800 {
+            entries.extend((0..i).map(|j| (i, j, 0.1)));
+        }
+        entries.extend((800..n - 1).map(|i| (i, i + 1, 0.5)));
+        let hessian = DenseHessian::new(n, &entries);
+        let pattern = check(&hessian, &SparsityOptions::default());
+        assert_eq!(pattern.num_colors, n);
+    }
+
+    #[test]
+    fn interrupt_stops_detection() {
+        let hessian = random_sparse(1000, 10, 3);
+        let points = vec![vec![0.; hessian.n]];
+        let result = hessian_sparsity(&hessian, &points, &SparsityOptions::default(), || {
+            bail!("interrupted")
+        });
+        assert_eq!(result.unwrap_err().to_string(), "interrupted");
     }
 
     #[test]
@@ -580,7 +704,7 @@ mod tests {
             fn dim(&self) -> usize {
                 3
             }
-            fn hvp(&mut self, point: &[f64], vector: &[f64], out: &mut [f64]) -> Result<()> {
+            fn hvp(&self, point: &[f64], vector: &[f64], out: &mut [f64]) -> Result<()> {
                 out.copy_from_slice(vector);
                 if point[0] > 0. {
                     out[1] += vector[2];
@@ -591,7 +715,7 @@ mod tests {
         }
         let points = vec![vec![-1., 0., 0.], vec![1., 0., 0.]];
         let pattern =
-            hessian_sparsity(&mut Switching, &points, &SparsityOptions::default()).unwrap();
+            hessian_sparsity(&Switching, &points, &SparsityOptions::default(), || Ok(())).unwrap();
         assert_eq!(pattern.rows, vec![vec![0], vec![1, 2], vec![1, 2]]);
     }
 }
