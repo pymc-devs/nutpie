@@ -795,6 +795,7 @@ def test_dims_model(backend, gradient_backend, request):
                 reason="ZeroSumNormal checks its mean against atol=1e-9, which "
                 "its float32 transform cannot meet",
                 raises=RuntimeError,
+                strict=True,
             )
         )
 
