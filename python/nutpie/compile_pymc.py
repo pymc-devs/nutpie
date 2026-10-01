@@ -619,6 +619,7 @@ def _compile_pymc_model_mlx(
             with _MLX_LOCK:
                 values = expand_fn(_x, *shared_values)
             with expand_guard(_mlx_signature(shared_values)):
+                mx.eval(*values)
                 return {
                     name: np.asarray(val, order="C", dtype=dtype).reshape(shape)
                     for name, val, dtype, shape in zip(
