@@ -77,6 +77,8 @@ def fit_to_data(
     lm_lam0: float | None = None,
     lm_exact_blocks: bool = False,
     lm_max_exact_block_size: int = 256,
+    lm_lmp_size: int = 0,
+    lm_lmp_tol: float = 1e-8,
     lm_print_blocks: bool = False,
     lm_diagnose: bool = False,
     should_stop: Callable[[], bool] | None = None,
@@ -174,8 +176,10 @@ def fit_to_data(
         lm_forcing: How the CG tolerance adapts between LM steps:
             ``"residual"`` (Eisenstat-Walker choice 1) or ``"rho"``
             (``|1 - rho|``), which keeps adapting when the loss plateaus well
-            above zero (see `lmopt.step`). Only used when ``method`` is
-            ``"lm"``.
+            above zero (see `lmopt.step`). With ``method="lm-rust"`` also
+            ``"model"``: CG stops once an iteration barely lowers the
+            quadratic model (Nash-Sofer). Used when ``method`` is ``"lm"``
+            or ``"lm-rust"``.
         lm_diagnose: Print, below each LM step, whether geodesic acceleration
             would have helped and how the step splits over the conditioners
             (see `lmopt.describe_diagnostics`). Costs about one more CG solve
@@ -192,6 +196,12 @@ def fit_to_data(
             more parameters are split into sub-blocks of at most this size.
             This only bounds the cost of the preconditioner, roughly
             ``size**2`` memory and ``size**3`` time per sub-block.
+        lm_lmp_size: Number of earlier CG search directions the limited-memory
+            preconditioner keeps on top of the block preconditioner; ``0``
+            disables it. Only used when ``method`` is ``"lm-rust"``.
+        lm_lmp_tol: Relative eigenvalue cutoff below which near-dependent
+            stored directions are dropped. Only used when ``method`` is
+            ``"lm-rust"``.
         lm_min_loss: Stop the LM fit once the Fisher divergence falls below
             this. Note that the divergence is a *sum* over dimensions, so this
             is an absolute, dimension-independent target: it bounds each
@@ -230,6 +240,8 @@ def fit_to_data(
             forcing=lm_forcing,
             lam0=lm_lam0,
             max_exact_block_size=lm_max_exact_block_size,
+            lmp_size=lm_lmp_size,
+            lmp_tol=lm_lmp_tol,
             verbose=verbose,
             should_stop=should_stop,
         )
@@ -503,6 +515,8 @@ def _fit_lm_rust(
     forcing,
     lam0,
     max_exact_block_size,
+    lmp_size,
+    lmp_tol,
     verbose,
     should_stop,
 ):
@@ -538,6 +552,8 @@ def _fit_lm_rust(
         cg_max=linear_steps,
         forcing=forcing,
         max_block_size=max_exact_block_size,
+        lmp_size=lmp_size,
+        lmp_tol=lmp_tol,
     )
 
     fitted = eqx.filter(
@@ -547,13 +563,18 @@ def _fit_lm_rust(
         raise RuntimeError("The fitted conditioners do not match the flow's.")
     params = eqx.tree_at(_conditioners, params, fitted)
 
-    n_accepted = sum(bool(info["accept"]) for info in hist)
+    accepted = [info for info in hist if info["accept"]]
     if hist:
         loss = hist[-1]["F_out"]
     else:
         r = problem.residuals(theta, record=False)
         loss = float(r @ r)
-    return params, loss, float(lam), len(hist), n_accepted
+    # The damping to carry over is the one after the last accepted step:
+    # each rejection in a final streak (typical of a patience stop) only
+    # multiplied `lam` by a growing `nu`.
+    if accepted:
+        lam = accepted[-1]["lam_out"]
+    return params, loss, float(lam), len(hist), len(accepted)
 
 
 @eqx.filter_jit
@@ -1138,6 +1159,8 @@ class TransformAdapter:
         lm_forcing="residual",
         lm_exact_blocks=False,
         lm_max_exact_block_size=256,
+        lm_lmp_size=0,
+        lm_lmp_tol=1e-8,
         native_flow=True,
         stop_event=None,
     ):
@@ -1198,6 +1221,8 @@ class TransformAdapter:
         self._lm_forcing = lm_forcing
         self._lm_exact_blocks = lm_exact_blocks
         self._lm_max_exact_block_size = lm_max_exact_block_size
+        self._lm_lmp_size = lm_lmp_size
+        self._lm_lmp_tol = lm_lmp_tol
         # Whether the sampler may run the flow natively in its leapfrog steps,
         # see `flow_transform_layout`.
         self._native_flow = native_flow
@@ -1499,6 +1524,8 @@ class TransformAdapter:
                 lm_lam0=self._lm_lam,
                 lm_exact_blocks=self._lm_exact_blocks,
                 lm_max_exact_block_size=self._lm_max_exact_block_size,
+                lm_lmp_size=self._lm_lmp_size,
+                lm_lmp_tol=self._lm_lmp_tol,
                 lm_diagnose=self._verbose >= 3,
                 should_stop=self._should_stop,
             )
@@ -1769,6 +1796,8 @@ def make_transform_adapter(
     lm_forcing="residual",
     lm_exact_blocks=True,
     lm_max_exact_block_size=256,
+    lm_lmp_size=0,
+    lm_lmp_tol=1e-8,
     native_flow=True,
     stop_event=None,
 ):
@@ -1839,6 +1868,8 @@ def make_transform_adapter(
         lm_forcing=lm_forcing,
         lm_exact_blocks=lm_exact_blocks,
         lm_max_exact_block_size=lm_max_exact_block_size,
+        lm_lmp_size=lm_lmp_size,
+        lm_lmp_tol=lm_lmp_tol,
         native_flow=native_flow,
         stop_event=stop_event,
     )
