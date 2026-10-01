@@ -116,7 +116,12 @@ def fit_to_data(
             of ``x`` rather than in epochs of shuffled mini-batches. ``"lm"``
             requires ``loss_fn`` to expose a ``residuals`` method (as
             ``FisherLoss`` does) and only supports losses that are a sum of
-            squared residuals.
+            squared residuals. ``"lm-rust"`` is the same fit in Rust
+            (`nutpie.triangular_lm.fit`), for a ``FisherLoss`` on a flow from
+            ``make_flow(kind="triangular")`` with softplus depth-1
+            conditioners: always exact blocks, the line search and a frozen
+            affine, so the probe, ``lm_fit_affine``, ``lm_line_search``,
+            ``lm_exact_blocks`` and ``lm_diagnose`` options do not apply.
         solver_rtol: Relative tolerance used by the L-BFGS/LM solver's convergence
             check. Only used when ``method`` is ``"lbfgs"`` or ``"lm"``.
         solver_atol: Absolute tolerance used by the L-BFGS/LM solver's convergence
@@ -211,6 +216,32 @@ def fit_to_data(
         is_leaf=lambda leaf: isinstance(leaf, NonTrainable),
     )
 
+    if method == "lm-rust":
+        params, loss_val, lam, n_steps, n_accepted = _fit_lm_rust(
+            params,
+            static,
+            data,
+            loss_fn,
+            max_steps=max_epochs,
+            rtol=solver_rtol,
+            linear_steps=lm_linear_steps,
+            min_loss=lm_min_loss,
+            patience=lm_patience,
+            forcing=lm_forcing,
+            lam0=lm_lam0,
+            max_exact_block_size=lm_max_exact_block_size,
+            verbose=verbose,
+            should_stop=should_stop,
+        )
+        losses = {
+            "train": [float(loss_val)],
+            "val": [float(loss_val)],
+            "lm_lam": lam,
+            "lm_steps": n_steps,
+            "lm_accepted": n_accepted,
+        }
+        return eqx.combine(params, static), losses, None
+
     if method in ("lbfgs", "lm"):
         fit_solver = _fit_lbfgs if method == "lbfgs" else _fit_lm
         extra_kwargs = (
@@ -256,7 +287,7 @@ def fit_to_data(
         return dist, losses, None
     elif method != "adam":
         raise ValueError(
-            f"Unknown method {method!r}, expected 'adam', 'lbfgs' or 'lm'."
+            f"Unknown method {method!r}, expected 'adam', 'lbfgs', 'lm' or 'lm-rust'."
         )
 
     if optimizer is None:
@@ -456,6 +487,73 @@ def _fit_lm(
         len(hist),
         n_accepted,
     )
+
+
+def _fit_lm_rust(
+    params,
+    static,
+    data,
+    loss_fn,
+    *,
+    max_steps,
+    rtol,
+    linear_steps,
+    min_loss,
+    patience,
+    forcing,
+    lam0,
+    max_exact_block_size,
+    verbose,
+    should_stop,
+):
+    """`_fit_lm` with exact blocks and the line search, in Rust (see
+    `nutpie.triangular_lm.fit`). Fits the conditioners of the flow's
+    `SparseTriangularMap`; everything else stays as it is."""
+    from nutpie.lmopt import _conditioners
+    from nutpie.triangular_lm import (
+        fit,
+        make_residuals,
+        map_data,
+        pack_params,
+        unpack_params,
+    )
+
+    if not isinstance(loss_fn, FisherLoss) or loss_fn.gamma is not None:
+        raise ValueError("method='lm-rust' needs a FisherLoss with gamma=None.")
+    draws, grads, *_ = data
+    tmap, y, g = map_data(eqx.combine(params, static), draws, grads)
+    problem = make_residuals(
+        tmap, y, g, fisher_regularization=loss_fn.fisher_regularization
+    )
+    theta, lam, hist = fit(
+        problem,
+        pack_params(tmap),
+        n_steps=max_steps,
+        **({} if lam0 is None else {"lam0": lam0}),
+        min_loss=min_loss,
+        rtol=rtol,
+        patience=patience,
+        verbose=verbose,
+        should_stop=should_stop,
+        cg_max=linear_steps,
+        forcing=forcing,
+        max_block_size=max_exact_block_size,
+    )
+
+    fitted = eqx.filter(
+        unpack_params(tmap, jnp.asarray(theta)).conditioners, eqx.is_inexact_array
+    )
+    if jax.tree.structure(fitted) != jax.tree.structure(_conditioners(params)):
+        raise RuntimeError("The fitted conditioners do not match the flow's.")
+    params = eqx.tree_at(_conditioners, params, fitted)
+
+    n_accepted = sum(bool(info["accept"]) for info in hist)
+    if hist:
+        loss = hist[-1]["F_out"]
+    else:
+        r = problem.residuals(theta, record=False)
+        loss = float(r @ r)
+    return params, loss, float(lam), len(hist), n_accepted
 
 
 @eqx.filter_jit

@@ -18,6 +18,8 @@ Usage::
     r = problem.residuals(theta)            # (n_draw, n_residuals), records
     Jv = problem.pushforward(v)
     g = problem.pullback(r)
+
+    theta, lam, hist = fit(problem, theta)  # LM, `src/lm_optimizer.rs`
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ import numpy as np
 
 __all__ = [
     "check_supported",
+    "fit",
     "make_residuals",
     "map_data",
     "pack_params",
@@ -201,3 +204,85 @@ def make_residuals(tmap, y=None, g=None, *, fisher_regularization=None):
             np.ascontiguousarray(g, dtype=np.float64).ravel(),
         )
     return problem
+
+
+def _describe_step(i, info):
+    fallbacks = "".join(
+        f"  {label}: {info[key]}"
+        for key, label in [
+            ("nonfinite_blocks", "non-finite blocks"),
+            ("failed_inverses", "diagonal inverses"),
+        ]
+        if info[key]
+    )
+    return (
+        f"{i:3d}  log F={np.log(info['F_new']):+.2f}  "
+        f"rho={info['rho']:+.2f}  "
+        f"rho_full={info['rho_full']:+.2f}  "
+        f"lam={info['lam_out']:.1e}  "
+        f"cg={info['n_cg']:3d}{' ' if info['cg_converged'] else '*'} "
+        f"eta={info['cg_eta']:.2f}"
+        f"{' ' if info['rebuilt_blocks'] else '~'}  "
+        f"|g|={info['grad_norm']:.2e}  "
+        f"|p|={info['full_step_norm']:.2e}  "
+        f"a={info['step_length']:.2f}"
+        + fallbacks
+        + ("" if info["accept"] else "   REJECT")
+    )
+
+
+def fit(
+    problem,
+    theta,
+    *,
+    n_steps=60,
+    lam0=1e-2,
+    min_loss=None,
+    rtol=None,
+    patience=5,
+    verbose=True,
+    should_stop=None,
+    **settings,
+):
+    """Levenberg-Marquardt fit of `problem` (a `FisherResiduals` with data)
+    from `theta`, in Rust (`src/lm_optimizer.rs`).
+
+    The step is `lmopt.step` with exact blocks, Marquardt damping and the line
+    search; this loop is `lmopt.fit`'s. Stops after `n_steps`, below
+    `min_loss`, when `patience` steps (rejections included) lowered the loss
+    by less than a fraction `rtol`, or when `should_stop()` is true.
+    `settings` go to `LmOptimizer` (``cg_max``, ``forcing``,
+    ``max_block_size``, ...).
+
+    Returns ``(theta, lam, hist)``: the fitted parameters, the final damping
+    and one info dict per step.
+    """
+    from nutpie._lib import LmOptimizer
+
+    optimizer = LmOptimizer(
+        problem, np.asarray(theta, np.float64), lam=lam0, **settings
+    )
+    best_loss, stalled = optimizer.loss, 0
+    hist = []
+    for i in range(n_steps):
+        info = optimizer.step()
+        hist.append(info)
+        if should_stop is not None and should_stop():
+            break
+        if verbose:
+            print(_describe_step(i, info))
+
+        if info["F_out"] < best_loss * (1.0 - (rtol or 0.0)):
+            best_loss, stalled = info["F_out"], 0
+        else:
+            stalled += 1
+        if min_loss and info["F_out"] < min_loss:
+            break
+        if rtol is not None and stalled >= patience:
+            if verbose:
+                print(
+                    f"loss improved by less than {rtol:g} (relative) in the last "
+                    f"{patience} steps; stopping"
+                )
+            break
+    return np.asarray(optimizer.theta), optimizer.lam, hist

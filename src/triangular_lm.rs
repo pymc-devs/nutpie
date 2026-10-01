@@ -481,7 +481,7 @@ struct DrawTapeMut<'a> {
 }
 
 #[derive(Default)]
-struct Tape {
+pub(crate) struct Tape {
     theta: Vec<f64>,
     a: Vec<f64>,
     edge_a: Vec<f64>,
@@ -524,15 +524,16 @@ impl DrawScratch {
     }
 }
 
-pub struct FisherResiduals {
-    n_var: usize,
+#[derive(Clone)]
+pub(crate) struct FisherResiduals {
+    pub(crate) n_var: usize,
     n_unit: usize,
     n_par: usize,
     location: usize,
     parent_indptr: Vec<usize>,
     parent_index: Vec<usize>,
     max_parent: usize,
-    param_offset: Vec<usize>,
+    pub(crate) param_offset: Vec<usize>,
     layers: Vec<Layer>,
     /// `sqrt(fisher_regularization)`, if regularized.
     regularization: Option<f64>,
@@ -540,10 +541,9 @@ pub struct FisherResiduals {
     /// inverse is stored. Equal to the parents for a chordal pattern.
     filled_indptr: Vec<usize>,
     filled_index: Vec<usize>,
-    n_draw: usize,
+    pub(crate) n_draw: usize,
     y: Vec<f64>,
     g: Vec<f64>,
-    tape: Option<Tape>,
 }
 
 impl FisherResiduals {
@@ -651,7 +651,6 @@ impl FisherResiduals {
             n_draw: 0,
             y: Vec::new(),
             g: Vec::new(),
-            tape: None,
         })
     }
 
@@ -659,11 +658,11 @@ impl FisherResiduals {
         self.parent_index.len()
     }
 
-    fn n_params(&self) -> usize {
+    pub(crate) fn n_params(&self) -> usize {
         self.param_offset[self.n_var]
     }
 
-    fn n_residuals(&self) -> usize {
+    pub(crate) fn n_residuals(&self) -> usize {
         self.n_var
             + if self.regularization.is_some() {
                 self.n_edge()
@@ -696,7 +695,7 @@ impl FisherResiduals {
         self.param_offset[i]..self.param_offset[i + 1]
     }
 
-    fn set_data(&mut self, y: Vec<f64>, g: Vec<f64>) -> Result<()> {
+    pub(crate) fn set_data(&mut self, y: Vec<f64>, g: Vec<f64>) -> Result<()> {
         if self.n_var == 0 || !y.len().is_multiple_of(self.n_var) || y.len() != g.len() {
             bail!("y and g must both have shape (n_draw, {})", self.n_var);
         }
@@ -706,15 +705,7 @@ impl FisherResiduals {
         }
         self.y = y;
         self.g = g;
-        self.tape = None;
         Ok(())
-    }
-
-    fn tape(&self) -> Result<&Tape> {
-        match &self.tape {
-            Some(tape) => Ok(tape),
-            None => bail!("no tape: call `residuals(theta, record=True)` first"),
-        }
     }
 
     fn draw_tape<'a>(&self, tape: &'a Tape, draw: usize) -> DrawTape<'a> {
@@ -1191,9 +1182,9 @@ impl FisherResiduals {
         Ok(())
     }
 
-    /// `(n_draw, n_residuals)` residuals at `theta`, recording the tape every
-    /// derivative reads if `record`.
-    fn residuals(&mut self, theta: &[f64], record: bool) -> Result<Vec<f64>> {
+    /// `(n_draw, n_residuals)` residuals at `theta`, and the tape every
+    /// derivative at `theta` reads.
+    pub(crate) fn residuals(&self, theta: &[f64]) -> Result<(Vec<f64>, Tape)> {
         self.check_params(theta, "theta")?;
         if self.n_draw == 0 {
             bail!("no data: call `set_data` first");
@@ -1240,15 +1231,11 @@ impl FisherResiduals {
                 |s, (draw, tape, out)| self.primal_draw(theta, draw, tape, out, s),
             );
         }
-        if record {
-            self.tape = Some(tape);
-        }
-        Ok(out)
+        Ok((out, tape))
     }
 
-    fn pushforward(&self, v: &[f64]) -> Result<Vec<f64>> {
+    pub(crate) fn pushforward(&self, tape: &Tape, v: &[f64]) -> Result<Vec<f64>> {
         self.check_params(v, "v")?;
-        let tape = self.tape()?;
         let n_res = self.n_residuals();
         let mut out = vec![0.0; self.n_draw * n_res];
         out.par_chunks_mut(n_res.max(1)).enumerate().for_each_init(
@@ -1261,12 +1248,11 @@ impl FisherResiduals {
         Ok(out)
     }
 
-    fn pullback(&self, r_bar: &[f64]) -> Result<Vec<f64>> {
+    pub(crate) fn pullback(&self, tape: &Tape, r_bar: &[f64]) -> Result<Vec<f64>> {
         let n_res = self.n_residuals();
         if r_bar.len() != self.n_draw * n_res {
             bail!("r_bar must have shape ({}, {n_res})", self.n_draw);
         }
-        let tape = self.tape()?;
         Ok(self.sum_over_draws(|draw, grad, s| {
             let draw_tape = self.draw_tape(tape, draw);
             let r_bar = &r_bar[draw * n_res..(draw + 1) * n_res];
@@ -1275,9 +1261,8 @@ impl FisherResiduals {
     }
 
     /// `J^T J v`, one draw at a time, without forming `J v` for all draws.
-    fn gauss_newton_product(&self, v: &[f64]) -> Result<Vec<f64>> {
+    pub(crate) fn gauss_newton_product(&self, tape: &Tape, v: &[f64]) -> Result<Vec<f64>> {
         self.check_params(v, "v")?;
-        let tape = self.tape()?;
         Ok(self.sum_over_draws(|draw, grad, s| {
             let draw_tape = self.draw_tape(tape, draw);
             let mut residual = std::mem::take(&mut s.residual);
@@ -1361,14 +1346,14 @@ impl FisherResiduals {
     /// to the sub-blocks of `block_ranges`. Returns, per sub-block, its first
     /// global parameter index and size, and the blocks as concatenated
     /// row-major squares.
-    fn gauss_newton_blocks(
+    pub(crate) fn gauss_newton_blocks(
         &self,
+        tape: &Tape,
         max_block_size: usize,
     ) -> Result<(Vec<usize>, Vec<usize>, Vec<f64>)> {
         if max_block_size == 0 {
             bail!("max_block_size must be positive");
         }
-        let tape = self.tape()?;
         let n_store = self.n_var + self.filled_index.len();
         let mut stores = vec![0.0; self.n_draw * n_store];
         stores
@@ -1582,7 +1567,17 @@ fn as_usize(values: &[i64]) -> Result<Vec<usize>> {
 /// see `nutpie.triangular_lm`.
 #[pyclass(name = "FisherResiduals")]
 pub struct PyFisherResiduals {
-    inner: FisherResiduals,
+    pub(crate) inner: FisherResiduals,
+    tape: Option<Tape>,
+}
+
+impl PyFisherResiduals {
+    fn tape(&self) -> Result<&Tape> {
+        match &self.tape {
+            Some(tape) => Ok(tape),
+            None => bail!("no tape: call `residuals(theta, record=True)` first"),
+        }
+    }
 }
 
 #[pymethods]
@@ -1619,6 +1614,7 @@ impl PyFisherResiduals {
                 specs,
                 fisher_regularization,
             )?,
+            tape: None,
         })
     }
 
@@ -1653,6 +1649,7 @@ impl PyFisherResiduals {
         y: PyReadonlyArray1<'_, f64>,
         g: PyReadonlyArray1<'_, f64>,
     ) -> Result<()> {
+        self.tape = None;
         self.inner
             .set_data(y.as_slice()?.to_vec(), g.as_slice()?.to_vec())
     }
@@ -1667,7 +1664,10 @@ impl PyFisherResiduals {
         record: bool,
     ) -> Result<Bound<'py, PyArray1<f64>>> {
         let theta = theta.as_slice()?.to_vec();
-        let out = py.detach(|| self.inner.residuals(&theta, record))?;
+        let (out, tape) = py.detach(|| self.inner.residuals(&theta))?;
+        if record {
+            self.tape = Some(tape);
+        }
         Ok(PyArray1::from_vec(py, out))
     }
 
@@ -1678,7 +1678,8 @@ impl PyFisherResiduals {
         v: PyReadonlyArray1<'py, f64>,
     ) -> Result<Bound<'py, PyArray1<f64>>> {
         let v = v.as_slice()?.to_vec();
-        let out = py.detach(|| self.inner.pushforward(&v))?;
+        let tape = self.tape()?;
+        let out = py.detach(|| self.inner.pushforward(tape, &v))?;
         Ok(PyArray1::from_vec(py, out))
     }
 
@@ -1689,7 +1690,8 @@ impl PyFisherResiduals {
         r_bar: PyReadonlyArray1<'py, f64>,
     ) -> Result<Bound<'py, PyArray1<f64>>> {
         let r_bar = r_bar.as_slice()?.to_vec();
-        let out = py.detach(|| self.inner.pullback(&r_bar))?;
+        let tape = self.tape()?;
+        let out = py.detach(|| self.inner.pullback(tape, &r_bar))?;
         Ok(PyArray1::from_vec(py, out))
     }
 
@@ -1700,7 +1702,8 @@ impl PyFisherResiduals {
         v: PyReadonlyArray1<'py, f64>,
     ) -> Result<Bound<'py, PyArray1<f64>>> {
         let v = v.as_slice()?.to_vec();
-        let out = py.detach(|| self.inner.gauss_newton_product(&v))?;
+        let tape = self.tape()?;
+        let out = py.detach(|| self.inner.gauss_newton_product(tape, &v))?;
         Ok(PyArray1::from_vec(py, out))
     }
 
@@ -1716,7 +1719,9 @@ impl PyFisherResiduals {
         Bound<'py, PyArray1<i64>>,
         Bound<'py, PyArray1<f64>>,
     )> {
-        let (starts, sizes, data) = py.detach(|| self.inner.gauss_newton_blocks(max_block_size))?;
+        let tape = self.tape()?;
+        let (starts, sizes, data) =
+            py.detach(|| self.inner.gauss_newton_blocks(tape, max_block_size))?;
         Ok((
             PyArray1::from_vec(py, starts.into_iter().map(|v| v as i64).collect()),
             PyArray1::from_vec(py, sizes.into_iter().map(|v| v as i64).collect()),
