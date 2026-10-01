@@ -35,10 +35,11 @@ if TYPE_CHECKING:
 
 _UNCONSTRAINED_PARAMETER = "unconstrained_parameter"
 
-# Serializes the MLX work that is unsafe across sampler threads: mx.stream
+# Serializes the MLX work that is unsafe across nutpie's sampler threads: mx.stream
 # switches the default stream for the whole process, so building or tracing code
 # that enters one must not overlap, and the first evaluation of a compiled graph
-# builds Metal kernels, which segfaults when threads do it concurrently.
+# builds Metal kernels, which segfaults when threads do it concurrently. It covers
+# only nutpie's own MLX calls, not MLX work elsewhere in the process.
 _MLX_LOCK = threading.Lock()
 
 
@@ -671,7 +672,9 @@ def compile_pymc_model(
         The model to compile.
     backend : ["jax", "numba", "mlx"]
         The pytensor backend that is used to compile the logp function. The
-        "mlx" backend computes in float32 on the GPU.
+        "mlx" backend computes in float32 on the GPU, which pays off only for
+        models with large data; float32 also quantizes parameters with large
+        magnitudes relative to their posterior scale, so center such data first.
     gradient_backend: ["pytensor", "jax"]
         Which library is used to compute the gradients. This can only be changed
         to "jax" if the jax backend is used.
