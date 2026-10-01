@@ -1874,6 +1874,7 @@ pub fn _lib(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTrace>()?;
     m.add_class::<crate::triangular::PySparseTriangularTransform>()?;
     m.add_class::<crate::triangular::PyFlowTransform>()?;
+    m.add_class::<crate::triangular_lm::PyFisherResiduals>()?;
     m.add_function(wrap_pyfunction!(
         crate::triangular::activation_for_testing,
         m
