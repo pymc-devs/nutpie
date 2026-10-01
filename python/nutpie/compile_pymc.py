@@ -590,6 +590,7 @@ def _compile_pymc_model_mlx(
             "and restart your kernel in case you are in an interactive session."
         )
     import mlx.core as mx
+    from pytensor.link.mlx.dispatch import mlx_typify
 
     (
         n_dim,
@@ -619,7 +620,7 @@ def _compile_pymc_model_mlx(
     for val in [*logp_fn_pt.get_shared(), *expand_fn_pt.get_shared()]:
         if val.name in shared_data and val not in seen:
             raise ValueError(f"Shared variables must have unique names: {val.name}")
-        shared_data[val.name] = mx.array(val.get_value())
+        shared_data[val.name] = mlx_typify(np.asarray(val.get_value()))
         seen.add(val)
 
     logp_guard = _FirstEvaluationGuard()
@@ -627,10 +628,9 @@ def _compile_pymc_model_mlx(
 
     def make_logp_func():
         def logp(_x, **shared):
-            x = mx.array(_x, dtype=mx.float32)
             shared_values = [shared[name] for name in logp_shared_names]
             with _MLX_LOCK:
-                logp, grad = logp_fn(x, *shared_values)
+                logp, grad = logp_fn(_x, *shared_values)
             with logp_guard(_mlx_signature(shared_values)):
                 mx.eval(logp, grad)
                 return logp.item(), np.asarray(grad, dtype="float64", order="C")
@@ -642,10 +642,9 @@ def _compile_pymc_model_mlx(
 
     def make_expand_func(seed1, seed2, chain):
         def expand(_x, **shared):
-            x = mx.array(_x, dtype=mx.float32)
             shared_values = [shared[name] for name in expand_shared_names]
             with _MLX_LOCK:
-                values = expand_fn(x, *shared_values)
+                values = expand_fn(_x, *shared_values)
             with expand_guard(_mlx_signature(shared_values)):
                 return {
                     name: np.asarray(val, order="C", dtype=dtype).reshape(shape)
@@ -671,7 +670,7 @@ def _compile_pymc_model_mlx(
         coords=coords,
         raw_logp_fn=None,
         reparameterized_names=reparameterized_names,
-        shared_data_converter=mx.array,
+        shared_data_converter=lambda value: mlx_typify(np.asarray(value)),
     )
 
 
