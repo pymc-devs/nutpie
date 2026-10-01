@@ -652,6 +652,14 @@ class FisherLoss(eqx.Module):
     dominate the fit, see `_huberise`. ``__call__`` deliberately keeps
     reporting the *raw* divergence either way, so numbers stay comparable
     across windows and across the setting; only what LM minimises changes.
+
+    ``fisher_regularization`` (``lambda``) adds, for a triangular flow, the
+    residuals ``sqrt(lambda) d/dy_j log q(y_i | y_pa)`` for every draw,
+    variable and parent (`SparseTriangularMap.parent_scores`, in the map's
+    standardized coordinates): an empirical penalty on how fast each
+    conditional changes with its parents, in the Fisher metric (option B of
+    `notes/flow_fisher_regularizer.md`). Like the Huber rescaling it only
+    changes what LM minimises, ``__call__`` still reports the divergence.
     """
 
     gamma: float | None = eqx.field(static=True, default=None)
@@ -661,6 +669,7 @@ class FisherLoss(eqx.Module):
     huber_delta: float | None = eqx.field(static=True, default=None)
     # See `SparseTriangularMap.gauss_newton_factors`
     cholesky_jitter: float | None = eqx.field(static=True, default=None)
+    fisher_regularization: float | None = eqx.field(static=True, default=None)
 
     @eqx.filter_jit
     def __call__(
@@ -770,10 +779,21 @@ class FisherLoss(eqx.Module):
 
         def compute_residual(draw_grad_logp):
             draw, grad, logp = draw_grad_logp
-            draw, grad, logp = inverse_gradient_and_val(
-                flow.bijection, draw, grad, logp
+            if self.fisher_regularization is None:
+                x, grad_x, _ = inverse_gradient_and_val(
+                    flow.bijection, draw, grad, logp
+                )
+                return x + grad_x
+            # One pass for both. The Fisher part stays in the map's order,
+            # without the final permutation, which doesn't change its norm.
+            tmap, y, grad_y = _triangular_map_input(flow, draw, grad, logp)
+            x, grad_x, _, scores = tmap.inverse_gradient_and_val(
+                y, grad_y, logp, parent_scores=True
             )
-            return draw + grad
+            scores = jnp.concatenate([s.ravel() for s in scores])
+            return jnp.concatenate(
+                [x + grad_x, jnp.sqrt(self.fisher_regularization) * scores]
+            )
 
         # `jax.vjp(res_fn, theta)` in `lmopt.step` otherwise saves every draw's
         # intermediates, and `inverse_gradient_and_val` nests autodiff (an inner
@@ -818,15 +838,26 @@ class FisherLoss(eqx.Module):
         on the flow `make_flow(kind="triangular")` builds.
         """
         flow = unwrap(eqx.combine(params, static, is_leaf=eqx.is_inexact_array))
-        sandwich = flow.bijection.bijections[0].bijections[0]
-        affine = flow.bijection.bijections[1]
-        draw, grad, _ = inverse_gradient_and_val(affine, draw, grad, logp)
-        draw, grad, _ = inverse_gradient_and_val(
-            bijections.Invert(sandwich.outer), draw, grad, logp
+        tmap, draw, grad = _triangular_map_input(flow, draw, grad, logp)
+        return tmap.gauss_newton_factors(
+            draw,
+            grad,
+            cholesky_jitter=self.cholesky_jitter,
+            fisher_regularization=self.fisher_regularization,
         )
-        return sandwich.inner.gauss_newton_factors(
-            draw, grad, cholesky_jitter=self.cholesky_jitter
-        )
+
+
+def _triangular_map_input(flow, draw, grad, logp):
+    """``(tmap, y, grad_y)``: the `SparseTriangularMap` of a flow
+    `make_flow(kind="triangular")` builds, and a draw and its gradient as
+    that map sees them (after the diagonal affine and the permutation)."""
+    sandwich = flow.bijection.bijections[0].bijections[0]
+    affine = flow.bijection.bijections[1]
+    draw, grad, _ = inverse_gradient_and_val(affine, draw, grad, logp)
+    draw, grad, _ = inverse_gradient_and_val(
+        bijections.Invert(sandwich.outer), draw, grad, logp
+    )
+    return sandwich.inner, draw, grad
 
 
 def _describe_flow(bijection):
@@ -1000,6 +1031,7 @@ class TransformAdapter:
         lm_probes=64,
         lm_residual_batch=256,
         lm_cholesky_jitter=None,
+        lm_fisher_regularization=None,
         lm_probe_groups=None,
         lm_probe_rounds=1,
         lm_fit_affine=True,
@@ -1033,6 +1065,7 @@ class TransformAdapter:
             residual_batch_size=lm_residual_batch,
             huber_delta=None,
             cholesky_jitter=lm_cholesky_jitter,
+            fisher_regularization=lm_fisher_regularization,
         )
         self._fisher_ema = None
         self._fisher_ema_alpha = fisher_ema_alpha
@@ -1629,6 +1662,7 @@ def make_transform_adapter(
     lm_probes=1024,
     lm_residual_batch=128,
     lm_cholesky_jitter=None,
+    lm_fisher_regularization=None,
     lm_probe_groups=None,
     lm_probe_rounds=1,
     lm_fit_affine=False,
@@ -1698,6 +1732,7 @@ def make_transform_adapter(
         lm_probes=lm_probes,
         lm_residual_batch=lm_residual_batch,
         lm_cholesky_jitter=lm_cholesky_jitter,
+        lm_fisher_regularization=lm_fisher_regularization,
         lm_probe_groups=lm_probe_groups,
         lm_probe_rounds=lm_probe_rounds,
         lm_fit_affine=lm_fit_affine,

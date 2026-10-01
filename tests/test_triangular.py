@@ -5,6 +5,7 @@ jax = pytest.importorskip("jax")
 
 import equinox as eqx  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
+from paramax import unwrap  # noqa: E402
 
 from nutpie.normalizing_flow import _scale_last_layer, make_transformer  # noqa: E402
 from nutpie.triangular import LocationSkipMlp, SparseTriangularMap  # noqa: E402
@@ -66,6 +67,145 @@ def test_location_skip_is_the_conditional_mean(transformer_kwargs):
     y = rng.normal(size=dim)
     x, _ = flow.inverse_and_log_det(jnp.asarray(y))
     np.testing.assert_allclose(np.asarray(x), y - weights @ y, atol=1e-3)
+
+
+@pytest.mark.parametrize("feature_degree", [None, 2])
+def test_parent_scores_and_their_gauss_newton_rows(feature_degree):
+    """`parent_scores` against the Jacobian of ``log q(y_i | y_pa)`` from the
+    full map, and the regularizer rows of `gauss_newton_factors` against the
+    Jacobian of the scaled scores over each conditioner's weights."""
+    jax.config.update("jax_enable_x64", True)
+    dim = 8
+    flow = unwrap(
+        SparseTriangularMap(
+            jax.random.key(0),
+            blanket=_banded(dim),
+            n_buckets=2,
+            feature_degree=feature_degree,
+        )
+    )
+    rng = np.random.default_rng(0)
+    # Nonzero skips and transformer shapes, so every score term contributes.
+    flow = eqx.tree_at(
+        lambda f: f.conditioners,
+        flow,
+        jax.tree.map(
+            lambda a: (
+                a + 0.3 * jnp.asarray(rng.normal(size=a.shape))
+                if eqx.is_inexact_array(a)
+                else a
+            ),
+            flow.conditioners,
+        ),
+    )
+    y = jnp.asarray(rng.normal(size=dim))
+
+    def log_q(y):
+        x, _ = flow.inverse_and_log_det(y)
+        own_derivative = jnp.diagonal(jax.jacfwd(lambda y: flow.inverse(y))(y))
+        return jnp.log(own_derivative) - x**2 / 2
+
+    expected = np.asarray(jax.jit(jax.jacfwd(log_q))(y))
+    scores = eqx.filter_jit(lambda f, y: f.parent_scores(y))(flow, y)
+    for bucket, score in enumerate(scores):
+        members = np.asarray(flow.bucket_members[bucket])
+        parents = np.asarray(flow.bucket_parent_indices[bucket])
+        for local, variable in enumerate(members):
+            for slot, parent in enumerate(parents[local]):
+                want = expected[variable, parent] if parent < dim else 0.0
+                np.testing.assert_allclose(score[local, slot], want, atol=1e-10)
+
+    lam = 0.7
+    grad = jnp.asarray(rng.normal(size=dim))
+    factors = eqx.filter_jit(
+        lambda f, y, g: f.gauss_newton_factors(y, g, fisher_regularization=lam)
+    )(flow, y, grad)
+    plain = eqx.filter_jit(lambda f, y, g: f.gauss_newton_factors(y, g))(flow, y, grad)
+
+    def scaled_scores(conditioners):
+        tmap = eqx.tree_at(lambda f: f.conditioners, flow, conditioners)
+        return [jnp.sqrt(lam) * s for s in tmap.parent_scores(y)]
+
+    arrays, static = eqx.partition(flow.conditioners, eqx.is_inexact_array)
+    jac = jax.jit(jax.jacrev(lambda a: scaled_scores(eqx.combine(a, static))))(arrays)
+    for bucket, (V, V_plain) in enumerate(zip(factors, plain)):
+        n_block = V_plain.shape[1]
+        np.testing.assert_allclose(V[:, :n_block], V_plain)
+        if V.shape[1] == n_block:  # no parents
+            continue
+        n_slots = V.shape[1] - n_block
+        for local in range(V.shape[0]):
+            # Jacobian of this member's scores over its own weights, in
+            # `ravel_pytree` order
+            rows = jnp.concatenate(
+                [
+                    leaf[local, :, local].reshape(n_slots, -1)
+                    for leaf in jax.tree.leaves(jac[bucket][bucket])
+                ],
+                axis=1,
+            )
+            np.testing.assert_allclose(V[local, n_block:], rows, atol=1e-10)
+
+
+def test_fisher_regularization_residuals():
+    """`FisherLoss.residuals` with `fisher_regularization`: the Fisher part
+    has the unregularized norm per draw (it skips the final permutation), and
+    the rest are the scaled parent scores of the map's input."""
+    import flowjax
+
+    from nutpie.normalizing_flow import make_flow
+    from nutpie.transform_adapter import FisherLoss, _triangular_map_input
+
+    jax.config.update("jax_enable_x64", True)
+    rng = np.random.default_rng(0)
+    dim, n = 7, 20
+    x = 0.5 + rng.normal(size=(n, dim)) * np.exp(rng.normal(size=dim))
+    g = -rng.normal(size=(n, dim))
+    bijection = make_flow(
+        0,
+        x,
+        g,
+        n_layers=1,
+        kind="triangular",
+        sparsity=_banded(dim),
+        order=rng.permutation(dim),
+        zero_init=False,
+        # Three parent counts in two buckets: covers padded slots.
+        n_buckets=2,
+    )
+    flow = flowjax.flows.Transformed(
+        flowjax.distributions.StandardNormal((dim,)), bijection
+    )
+    params, static = eqx.partition(flow, eqx.is_inexact_array)
+    params = jax.tree.map(
+        lambda leaf: leaf + 0.1 * jnp.asarray(rng.normal(size=leaf.shape)), params
+    )
+    data = (jnp.asarray(x), jnp.asarray(g), jnp.zeros(n))
+
+    lam = 0.3
+    residuals = eqx.filter_jit(
+        lambda loss, p: loss.residuals(p, static, *data) * np.sqrt(n)
+    )
+    plain = residuals(FisherLoss(), params)
+    regularized = residuals(FisherLoss(fisher_regularization=lam), params)
+    np.testing.assert_allclose(
+        (regularized[:, :dim] ** 2).sum(1), (plain**2).sum(1), rtol=1e-10
+    )
+
+    @eqx.filter_jit
+    def scores(p, draw, grad):
+        tmap, y, _ = _triangular_map_input(
+            unwrap(eqx.combine(p, static)), draw, grad, 0.0
+        )
+        return jnp.concatenate([s.ravel() for s in tmap.parent_scores(y)])
+
+    for i in range(3):
+        np.testing.assert_allclose(
+            regularized[i, dim:],
+            np.sqrt(lam) * scores(params, data[0][i], data[1][i]),
+            rtol=1e-10,
+            atol=1e-12,
+        )
 
 
 def test_no_location_skip_without_an_output_shift():
@@ -131,6 +271,7 @@ def test_native_flow_transform_matches_jax(nn_width, feature_degree):
         nn_width=nn_width,
         zero_init=False,
         feature_degree=feature_degree,
+        n_buckets=2,
     )
     # Off the initialization, so every parameter matters.
     params, static = eqx.partition(bijection, eqx.is_inexact_array)
