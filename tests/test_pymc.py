@@ -664,6 +664,17 @@ def test_mlx_rejects_other_gradient_backends():
 
 
 @pytest.mark.pymc
+@pytest.mark.skipif(not MLX_AVAILABLE, reason="MLX not installed")
+def test_mlx_flow_adaptation_fails_before_sampling():
+    with pm.Model() as model:
+        pm.Normal("a")
+    compiled = nutpie.compile_pymc_model(model, backend="mlx")
+
+    with pytest.raises(ValueError, match="adaptation='flow'"):
+        nutpie.sample(compiled, adaptation="flow")
+
+
+@pytest.mark.pymc
 @pytest.mark.parametrize(
     "backend",
     [

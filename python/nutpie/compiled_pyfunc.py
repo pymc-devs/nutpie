@@ -38,6 +38,10 @@ class PyFuncModel(CompiledModel):
     def n_dim(self):
         return self._n_dim
 
+    @property
+    def supports_flow_adaptation(self) -> bool:
+        return self._raw_logp_fn is not None
+
     def with_data(self, **updates):
         for name in updates:
             if name not in self._shared_data:
