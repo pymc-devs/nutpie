@@ -1,3 +1,4 @@
+import os
 import sys
 import threading
 import time
@@ -19,6 +20,10 @@ import nutpie
 import nutpie.compile_pymc
 
 MLX_AVAILABLE = find_spec("mlx") is not None
+
+# CI sets this where MLX must be tested, so a failed install fails instead of skipping.
+if os.environ.get("NUTPIE_REQUIRE_MLX") and not MLX_AVAILABLE:
+    raise RuntimeError("NUTPIE_REQUIRE_MLX is set, but mlx is not installed")
 
 backend_params = [("numba", None), ("jax", "pytensor"), ("jax", "jax")]
 if MLX_AVAILABLE:
@@ -672,6 +677,17 @@ def test_mlx_flow_adaptation_fails_before_sampling():
 
     with pytest.raises(ValueError, match="adaptation='flow'"):
         nutpie.sample(compiled, adaptation="flow")
+
+
+@pytest.mark.pymc
+@pytest.mark.skipif(
+    not os.environ.get("NUTPIE_REQUIRE_MLX"),
+    reason="only checked where MLX must run on the GPU",
+)
+def test_mlx_default_device_is_gpu():
+    import mlx.core as mx
+
+    assert mx.default_device() == mx.gpu
 
 
 @pytest.mark.pymc
