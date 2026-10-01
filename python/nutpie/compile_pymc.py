@@ -750,8 +750,10 @@ def compile_pymc_model(
             **kwargs,
         )
     elif backend.lower() == "mlx":
-        if gradient_backend == "jax":
-            raise ValueError("Gradient backend cannot be jax when using mlx backend")
+        if gradient_backend not in (None, "pytensor"):
+            raise ValueError(
+                f"Gradient backend cannot be {gradient_backend} when using mlx backend"
+            )
         return _compile_pymc_model_mlx(
             model=model,
             pymc_initial_point_fn=initial_point_fn,
