@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::{ffi::CString, path::PathBuf};
 
@@ -458,11 +458,10 @@ impl StanModel {
         };
         let inner = &self.inner;
         let pattern = py.detach(|| {
-            let mut hessian = StanHessian {
-                inner,
-                last_signal_check: Instant::now(),
-            };
-            hessian_sparsity(&mut hessian, &points, &options)
+            let signals = SignalCheck::new();
+            hessian_sparsity(&StanHessian { inner }, &points, &options, || {
+                signals.check()
+            })
         })?;
 
         let (indptr, indices) = pattern.to_csr();
@@ -1040,18 +1039,34 @@ const SIGNAL_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 
 struct StanHessian<'a> {
     inner: &'a InnerModel,
-    last_signal_check: Instant,
 }
 
-impl StanHessian<'_> {
-    /// Let Python handle signals, since the detection runs without the GIL.
-    /// A KeyboardInterrupt is returned as the plain `PyErr`, so that pyo3
-    /// raises it unchanged.
-    fn check_signals(&mut self) -> Result<()> {
-        if self.last_signal_check.elapsed() < SIGNAL_CHECK_INTERVAL {
-            return Ok(());
+/// Lets Python handle signals at most every `SIGNAL_CHECK_INTERVAL`, since
+/// the detection runs without the GIL. A KeyboardInterrupt is returned as
+/// the plain `PyErr`, so that pyo3 raises it unchanged.
+struct SignalCheck {
+    last: Mutex<Instant>,
+}
+
+impl SignalCheck {
+    fn new() -> Self {
+        Self {
+            last: Mutex::new(Instant::now()),
         }
-        self.last_signal_check = Instant::now();
+    }
+
+    /// Called from all detection threads; whichever finds the interval
+    /// elapsed checks, the others skip.
+    fn check(&self) -> Result<()> {
+        {
+            let Ok(mut last) = self.last.try_lock() else {
+                return Ok(());
+            };
+            if last.elapsed() < SIGNAL_CHECK_INTERVAL {
+                return Ok(());
+            }
+            *last = Instant::now();
+        }
         Python::attach(|py| py.check_signals())?;
         Ok(())
     }
@@ -1062,8 +1077,7 @@ impl HessianVectorProduct for StanHessian<'_> {
         self.inner.param_unc_num()
     }
 
-    fn hvp(&mut self, point: &[f64], vector: &[f64], out: &mut [f64]) -> Result<()> {
-        self.check_signals()?;
+    fn hvp(&self, point: &[f64], vector: &[f64], out: &mut [f64]) -> Result<()> {
         self.inner
             .log_density_hessian_vector_product(point, vector, true, true, out)
             .context("Failed to compute Hessian-vector product")?;
