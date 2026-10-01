@@ -633,6 +633,27 @@ def test_mlx_concurrent_first_calls():
 
 
 @pytest.mark.pymc
+@pytest.mark.skipif(not MLX_AVAILABLE, reason="MLX not installed")
+def test_mlx_keeps_float64_on_cpu():
+    import mlx.core as mx
+
+    with pm.Model() as model:
+        pm.Normal("a")
+
+    default_device = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        compiled = nutpie.compile_pymc_model(model, backend="mlx")
+        point = np.array([1 + 1e-9])
+        _, grad = compiled._make_logp_func()(point, **compiled._shared_data)
+    finally:
+        mx.set_default_device(default_device)
+
+    # float32 would round the point, and so the gradient, to exactly -1.
+    assert grad[0] == -(1 + 1e-9)
+
+
+@pytest.mark.pymc
 @pytest.mark.parametrize(
     "backend",
     [
