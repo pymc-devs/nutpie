@@ -2,7 +2,108 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.16.11] - 2026-06-16
+## [0.17.0] - 2026-10-02
+
+### Bug Fixes
+
+- Incorrect layout for arrays of complex (Adrian Seyboldt)
+
+- Frozen models did not honer bound_checks (Adrian Seyboldt)
+
+- Incorrect sample_stats.unconstrained_parameter in stan models (Adrian Seyboldt)
+
+
+### Features
+
+- Update nuts-rs (Adrian Seyboldt)
+
+- User overrides for initial points (Adrian Seyboldt)
+
+- Support wasm builds (Adrian Seyboldt)
+
+- Add marquard damping in the LM optimizer (Adrian Seyboldt)
+
+- Implement stan sparsity detection (Adrian Seyboldt)
+
+- Sparsity and factorization in compiled models (Adrian Seyboldt)
+
+- Better verbose output and optional cholesky jitter (Adrian Seyboldt)
+
+- Support KeyboardInterrupt in hessian calculation (Adrian Seyboldt)
+
+- Forward keyboard interrupts to flow training (Adrian Seyboldt)
+
+- Diagnostic plots for the fitted flows (Adrian Seyboldt)
+
+- Describe new flows in verbose mode (Adrian Seyboldt)
+
+- Improve flow_influence estimation (Adrian Seyboldt)
+
+- Add a little more verbose optimizer output (Adrian Seyboldt)
+
+- Add some optional diagnostics at verbose = 3. Maybe delete? (Adrian Seyboldt)
+
+- Support walnuts (Adrian Seyboldt)
+
+- Add flow nn_width capacity diagnostics (Adrian Seyboldt)
+
+- Add hermite features and predictor normalization (Adrian Seyboldt)
+
+- Implement fisher regularization (Adrian Seyboldt)
+
+- LM steps in rust (Adrian Seyboldt)
+
+- Improve numerical stability of exact lm blocks (Adrian Seyboldt)
+
+- Implement flow optimization in rust (Adrian Seyboldt)
+
+- Implement limited memory preconditioner (Adrian Seyboldt)
+
+- More robust diagonal early windows (Adrian Seyboldt)
+
+- Change flow defaults (Adrian Seyboldt)
+
+
+### Miscellaneous Tasks
+
+- Update ruff with some reformatting (Adrian Seyboldt)
+
+- Update dependencies and bump version (Adrian Seyboldt)
+
+- Bump astral-sh/setup-uv from 8.2.0 to 9.0.0 (dependabot[bot])
+
+- Bump actions/attest from 4.1.0 to 4.2.1 (dependabot[bot])
+
+- Bump softprops/action-gh-release from 3.0.0 to 3.0.2 (dependabot[bot])
+
+- Bump actions/setup-python from 6.2.0 to 7.0.0 (dependabot[bot])
+
+- Bump actions/checkout from 6.0.3 to 7.0.1 (dependabot[bot])
+
+
+### Performance
+
+- Speed up flow LM fitting (Adrian Seyboldt)
+
+- Parallel stan sparsity detection (Adrian Seyboldt)
+
+
+### Styling
+
+- Some ruff fixes (Adrian Seyboldt)
+
+
+### Testing
+
+- Add lmopt tests (Adrian Seyboldt)
+
+
+### Ci
+
+- Remove dev pin for pytensor (Adrian Seyboldt)
+
+
+## [0.16.11] - 2026-06-18
 
 ### Bug Fixes
 
@@ -716,8 +817,6 @@ All notable changes to this project will be documented in this file.
 
 ### Ci
 
-- Fix uploads of releases (Adrian Seyboldt)
-
 - Fix architectures in CI (Adrian Seyboldt)
 
 
@@ -740,6 +839,8 @@ All notable changes to this project will be documented in this file.
 
 
 ### Miscellaneous Tasks
+
+- Bump actions/download-artifact from 3 to 4 (dependabot[bot])
 
 - Bump actions/setup-python from 4 to 5 (dependabot[bot])
 
@@ -765,6 +866,11 @@ All notable changes to this project will be documented in this file.
 - Set the number of parallel chains dynamically (Adrian Seyboldt)
 
 
+### Ci
+
+- Fix uploads of releases (Adrian Seyboldt)
+
+
 ## [0.9.2] - 2024-02-19
 
 ### Bug Fixes
@@ -782,11 +888,6 @@ All notable changes to this project will be documented in this file.
 ### Features
 
 - Handle missing libraries more robustly (#72) (Ben Mares)
-
-
-### Miscellaneous Tasks
-
-- Bump actions/download-artifact from 3 to 4 (dependabot[bot])
 
 
 ### Ci

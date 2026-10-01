@@ -2459,7 +2459,7 @@ dependencies = [
 
 [[package]]
 name = "nutpie"
-version = "0.16.12"
+version = "0.17.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -2813,9 +2813,9 @@ dependencies = [
 
 [[package]]
 name = "private-gemm-x86"
-version = "0.1.20"
+version = "0.1.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0af8c3e5087969c323f667ccb4b789fa0954f5aa650550e38e81cf9108be21b5"
+checksum = "bba0a7831d1297712e7e7b33759b0c837941e79196dd05df506d5f36f7f78619"
 dependencies = [
  "defer",
  "interpol",
