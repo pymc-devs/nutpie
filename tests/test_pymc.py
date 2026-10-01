@@ -654,6 +654,16 @@ def test_mlx_keeps_float64_on_cpu():
 
 
 @pytest.mark.pymc
+@pytest.mark.skipif(not MLX_AVAILABLE, reason="MLX not installed")
+def test_mlx_rejects_other_gradient_backends():
+    with pm.Model() as model:
+        pm.Normal("a")
+
+    with pytest.raises(ValueError, match="Gradient backend cannot be bogus"):
+        nutpie.compile_pymc_model(model, backend="mlx", gradient_backend="bogus")
+
+
+@pytest.mark.pymc
 @pytest.mark.parametrize(
     "backend",
     [
