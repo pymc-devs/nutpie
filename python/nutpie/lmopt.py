@@ -460,8 +460,10 @@ def _block_inv(H, lam, floor, shrinkage):
     ``D = I`` if `floor` is ``None`` (Levenberg), else ``diag(H)`` floored at
     `floor` (Marquardt); it must match `step`'s `Av`. `H` is first shrunk
     towards its diagonal by `shrinkage`, so directions the probes missed fall
-    back to Jacobi. A small ridge keeps the Cholesky stable. If the inverse
-    is still not finite, the inverse of the damped diagonal is used instead.
+    back to Jacobi. For probed blocks (``shrinkage > 0``) a small ridge keeps
+    the Cholesky stable; exact blocks get none, so the preconditioner is
+    exactly the block diagonal of `Av`. If the inverse is still not finite,
+    the inverse of the damped diagonal is used instead.
     """
     if False:
         w, V = jnp.linalg.eigh(H)
@@ -473,7 +475,8 @@ def _block_inv(H, lam, floor, shrinkage):
     if floor is None:
         damped = H + (lam + 1e-12 * jnp.maximum(jnp.mean(jnp.diagonal(H)), 1.0)) * eye
     else:
-        diag = lam * jnp.maximum(jnp.diagonal(H), floor) + 1e-4 * floor
+        ridge = 1e-4 * floor if shrinkage > 0 else 0.0
+        diag = lam * jnp.maximum(jnp.diagonal(H), floor) + ridge
         damped = H + jnp.diag(diag)
     factor = jnp.linalg.cholesky(damped)
     inv_factor = solve_triangular(factor, eye, lower=True)
