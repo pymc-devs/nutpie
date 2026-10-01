@@ -7,12 +7,17 @@
 //!
 //! 1. Rebuild the exact blocks if due, replace non-finite sub-blocks by their
 //!    diagonal, and set the Marquardt floors and `D = max(diag H, floor)`.
-//! 2. Factor the damped sub-blocks `H + diag(lam max(diag H, floor) + 1e-4
-//!    floor)` as the preconditioner.
-//! 3. Solve `(J^T J + lam D) p = -J^T r` by preconditioned CG.
+//! 2. Factor the damped sub-blocks `H + lam diag(D)` as the preconditioner,
+//!    exactly the block diagonal of the CG operator. A sub-block that is
+//!    indefinite from rounding falls back to its damped diagonal.
+//! 3. Solve `(J^T J + lam D) p = -J^T r` by preconditioned CG, optionally
+//!    with a limited-memory preconditioner from earlier solves on top.
 //! 4. Evaluate `theta + p`, shorten the step to a fitted parabola's minimum
 //!    if that is better, and accept or reject on the gain ratio.
-//! 5. Update `lam` (Nielsen) and the CG forcing term (Eisenstat-Walker).
+//! 5. Update `lam` (Nielsen) and the CG forcing term (Eisenstat-Walker),
+//!    unless CG stops on the quadratic model instead.
+
+use std::collections::VecDeque;
 
 use anyhow::{bail, Result};
 use faer::linalg::solvers::Solve;
@@ -21,7 +26,7 @@ use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 use serde::Serialize;
 
-use crate::triangular_lm::{FisherResiduals, PyFisherResiduals, Tape};
+use crate::triangular_lm::{FisherResiduals, GnBlock, PyFisherResiduals, Tape};
 
 /// Marquardt floor, as a fraction of each conditioner's largest curvature.
 const MARQUARDT_FLOOR: f64 = 1e-4;
@@ -32,12 +37,20 @@ const MARQUARDT_GLOBAL_FLOOR: f64 = 1e-10;
 enum Forcing {
     Residual,
     Rho,
+    /// Stop CG once it barely lowers the quadratic model; the residual
+    /// test only caps it at `cg_tol`.
+    Model,
 }
 
 #[derive(Debug, Clone)]
 struct Settings {
     cg_max: usize,
     cg_tol: f64,
+    /// With `Forcing::Model`, the Nash-Sofer threshold.
+    cg_model_tol: f64,
+    /// With `Forcing::Model`, the fixed cost of an LM step besides CG, in
+    /// Gauss-Newton products; 0 is plain Nash-Sofer.
+    cg_model_cost: f64,
     cg_eta_max: f64,
     cg_gamma: f64,
     cg_alpha: f64,
@@ -46,18 +59,24 @@ struct Settings {
     lam_min: f64,
     lam_max: f64,
     lam_lo_decay: f64,
+    /// `lam_lo` is reset after two good, unshortened full steps in a row
+    /// with `|rho_full - 1|` below this; 0 never resets.
+    lam_lo_reset: f64,
     ls_min_fraction: f64,
     forcing: Forcing,
     max_block_size: usize,
     rebuild_every: usize,
+    /// CG directions kept for the limited-memory preconditioner; 0 disables
+    /// it.
+    lmp_size: usize,
+    /// Directions of `S^T A S` with eigenvalues below `lmp_tol` times the
+    /// largest are dropped.
+    lmp_tol: f64,
 }
 
 /// Exact Gauss-Newton sub-blocks, sanitized, with their Marquardt diagonal.
 struct Blocks {
-    starts: Vec<usize>,
-    sizes: Vec<usize>,
-    offsets: Vec<usize>,
-    data: Vec<f64>,
+    blocks: Vec<GnBlock>,
     /// Marquardt floor of the variable each sub-block belongs to.
     floor: Vec<f64>,
     /// `max(diag H, floor)`, per parameter.
@@ -70,6 +89,110 @@ struct Blocks {
 enum Inverse {
     Cholesky(faer::linalg::solvers::Llt<f64>),
     Diagonal(Vec<f64>),
+}
+
+/// A CG search direction `s` and its undamped product `H s = J^T J s`.
+/// Stored without the damping, so `A s = H s + lam D s` stays exact when
+/// `lam` or `D` change; only a change of `theta` makes `H s` stale.
+struct Pair {
+    s: Vec<f64>,
+    hs: Vec<f64>,
+}
+
+/// Limited-memory preconditioner (Gratton, Sartenaer and Tshimanga 2011)
+/// around the block preconditioner `M`:
+///
+/// ```text
+/// P = (I - W (AW)^T) M^-1 (I - AW W^T) + W W^T,
+/// ```
+///
+/// with `W` an `A`-orthonormal basis of the stored directions. `P A` is the
+/// identity on `span W`, which deflates the modes earlier solves already
+/// found, and `P` is SPD for any SPD `M`.
+struct Lmp {
+    w: Vec<Vec<f64>>,
+    aw: Vec<Vec<f64>>,
+}
+
+impl Lmp {
+    /// From the stored pairs at the current `lam` and `D`: orthonormalize
+    /// in `S^T A S` by an eigendecomposition, dropping near-dependent
+    /// directions. `None` if nothing is left.
+    fn new(pairs: &VecDeque<Pair>, diagonal: &[f64], lam: f64, tol: f64) -> Option<Self> {
+        let k = pairs.len();
+        if k == 0 {
+            return None;
+        }
+        let a_s: Vec<Vec<f64>> = pairs
+            .iter()
+            .map(|pair| {
+                pair.hs
+                    .iter()
+                    .zip(&pair.s)
+                    .zip(diagonal)
+                    .map(|((h, s), d)| h + lam * d * s)
+                    .collect()
+            })
+            .collect();
+        let mut g = Mat::<f64>::zeros(k, k);
+        for a in 0..k {
+            for b in 0..=a {
+                let v = 0.5 * (dot(&pairs[a].s, &a_s[b]) + dot(&pairs[b].s, &a_s[a]));
+                g[(a, b)] = v;
+                g[(b, a)] = v;
+            }
+        }
+        if !(0..k).all(|c| g.col_as_slice(c).iter().all(|v| v.is_finite())) {
+            return None;
+        }
+        let eigen = g.self_adjoint_eigen(Side::Lower).ok()?;
+        let values = eigen.S().column_vector();
+        let vectors = eigen.U();
+        // Ascending order: the largest is last.
+        let largest = values[k - 1];
+        if largest <= 0.0 {
+            return None;
+        }
+        let n = diagonal.len();
+        let (mut w, mut aw) = (Vec::new(), Vec::new());
+        for l in 0..k {
+            if values[l] <= tol * largest {
+                continue;
+            }
+            let scale = 1.0 / values[l].sqrt();
+            let (mut wl, mut awl) = (vec![0.0; n], vec![0.0; n]);
+            for j in 0..k {
+                let c = vectors[(j, l)] * scale;
+                axpy(c, &pairs[j].s, &mut wl);
+                axpy(c, &a_s[j], &mut awl);
+            }
+            w.push(wl);
+            aw.push(awl);
+        }
+        if w.is_empty() {
+            None
+        } else {
+            Some(Self { w, aw })
+        }
+    }
+
+    fn rank(&self) -> usize {
+        self.w.len()
+    }
+
+    fn apply(&self, v: &[f64], minv: impl Fn(&[f64]) -> Vec<f64>) -> Vec<f64> {
+        let c: Vec<f64> = self.w.iter().map(|w| dot(w, v)).collect();
+        let mut u = v.to_vec();
+        for (c, aw) in c.iter().zip(&self.aw) {
+            axpy(-c, aw, &mut u);
+        }
+        let mut z = minv(&u);
+        let d: Vec<f64> = self.aw.iter().map(|aw| dot(aw, &z)).collect();
+        for ((c, d), w) in c.iter().zip(&d).zip(&self.w) {
+            axpy(c - d, w, &mut z);
+        }
+        z
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -99,6 +222,7 @@ pub struct StepInfo {
     step_length: f64,
     nonfinite_blocks: usize,
     failed_inverses: usize,
+    lmp_rank: usize,
 }
 
 pub struct LmOptimizer {
@@ -110,10 +234,14 @@ pub struct LmOptimizer {
     lam: f64,
     nu: f64,
     lam_lo: f64,
+    /// Consecutive clean full steps, see `step`.
+    clean_steps: usize,
     eta: f64,
     p_prev: Vec<f64>,
     blocks: Option<Blocks>,
     accepted_since_build: usize,
+    /// The latest `lmp_size` CG directions, oldest first.
+    lmp_pairs: VecDeque<Pair>,
 }
 
 fn dot(a: &[f64], b: &[f64]) -> f64 {
@@ -161,52 +289,52 @@ impl LmOptimizer {
             lam,
             nu: settings.nu0,
             lam_lo: 0.0,
+            clean_steps: 0,
             eta: settings.cg_eta_max,
             p_prev: vec![0.0; n_params],
             blocks: None,
             accepted_since_build: settings.rebuild_every,
+            lmp_pairs: VecDeque::new(),
             settings,
         })
     }
 
     fn build_blocks(&self) -> Result<Blocks> {
-        let (starts, sizes, mut data) = self
+        let mut blocks = self
             .problem
             .gauss_newton_blocks(&self.tape, self.settings.max_block_size)?;
-        let mut offsets = Vec::with_capacity(sizes.len());
-        let mut offset = 0;
-        for &size in &sizes {
-            offsets.push(offset);
-            offset += size * size;
-        }
 
         // Non-finite sub-blocks fall back to their finite diagonal; one would
         // otherwise spread through the global floor into every damping.
         let mut nonfinite = 0;
-        for (&size, &offset) in sizes.iter().zip(&offsets) {
-            let block = &mut data[offset..offset + size * size];
-            if block.iter().all(|v| v.is_finite()) {
+        for block in &mut blocks {
+            let m = &mut block.matrix;
+            let size = m.nrows();
+            let finite = (0..size).all(|c| m.col_as_slice(c).iter().all(|v| v.is_finite()));
+            if finite {
                 continue;
             }
             nonfinite += 1;
-            for r in 0..size {
-                for c in 0..size {
-                    let value = &mut block[r * size + c];
-                    if r != c || !value.is_finite() {
-                        *value = 0.0;
+            let diagonal: Vec<f64> = (0..size)
+                .map(|k| {
+                    if m[(k, k)].is_finite() {
+                        m[(k, k)]
+                    } else {
+                        0.0
                     }
-                }
-            }
+                })
+                .collect();
+            *m = Mat::from_fn(size, size, |r, c| if r == c { diagonal[r] } else { 0.0 });
         }
 
         // Marquardt floors per variable (conditioner).
-        let offsets_by_var = &self.problem.param_offset;
-        let var_of = |start: usize| offsets_by_var.partition_point(|&o| o <= start) - 1;
+        let param_offset = &self.problem.param_offset;
+        let var_of = |start: usize| param_offset.partition_point(|&o| o <= start) - 1;
         let mut local = vec![f64::NEG_INFINITY; self.problem.n_var];
-        for ((&start, &size), &offset) in starts.iter().zip(&sizes).zip(&offsets) {
-            let var = var_of(start);
-            for k in 0..size {
-                local[var] = local[var].max(data[offset + k * size + k]);
+        for block in &blocks {
+            let var = var_of(block.start);
+            for k in 0..block.matrix.nrows() {
+                local[var] = local[var].max(block.matrix[(k, k)]);
             }
         }
         let global = local
@@ -219,20 +347,17 @@ impl LmOptimizer {
             .map(|&l| (MARQUARDT_FLOOR * l).max(MARQUARDT_GLOBAL_FLOOR * global))
             .collect();
 
-        let mut floor = Vec::with_capacity(sizes.len());
+        let mut floor = Vec::with_capacity(blocks.len());
         let mut diagonal = vec![0.0; self.theta.len()];
-        for ((&start, &size), &offset) in starts.iter().zip(&sizes).zip(&offsets) {
-            let var_floor = floor_of_var[var_of(start)];
+        for block in &blocks {
+            let var_floor = floor_of_var[var_of(block.start)];
             floor.push(var_floor);
-            for k in 0..size {
-                diagonal[start + k] = data[offset + k * size + k].max(var_floor);
+            for k in 0..block.matrix.nrows() {
+                diagonal[block.start + k] = block.matrix[(k, k)].max(var_floor);
             }
         }
         Ok(Blocks {
-            starts,
-            sizes,
-            offsets,
-            data,
+            blocks,
             floor,
             diagonal,
             nonfinite,
@@ -243,18 +368,17 @@ impl LmOptimizer {
     /// diagonal.
     fn preconditioner(&self, blocks: &Blocks, lam: f64) -> (Vec<Inverse>, usize) {
         use rayon::prelude::*;
-        let inverses: Vec<Inverse> = (0..blocks.sizes.len())
-            .into_par_iter()
-            .map(|b| {
-                let size = blocks.sizes[b];
-                let block = &blocks.data[blocks.offsets[b]..blocks.offsets[b] + size * size];
-                let floor = blocks.floor[b];
-                let damping: Vec<f64> = (0..size)
-                    .map(|k| lam * block[k * size + k].max(floor) + 1e-4 * floor)
-                    .collect();
-                let damped = Mat::from_fn(size, size, |r, c| {
-                    block[r * size + c] + if r == c { damping[r] } else { 0.0 }
-                });
+        let inverses: Vec<Inverse> = blocks
+            .blocks
+            .par_iter()
+            .zip(&blocks.floor)
+            .map(|(block, &floor)| {
+                let m = &block.matrix;
+                let size = m.nrows();
+                let mut damped = m.clone();
+                for k in 0..size {
+                    damped[(k, k)] += lam * m[(k, k)].max(floor);
+                }
                 match damped.llt(Side::Lower) {
                     Ok(llt)
                         if llt
@@ -264,11 +388,7 @@ impl LmOptimizer {
                     {
                         Inverse::Cholesky(llt)
                     }
-                    _ => Inverse::Diagonal(
-                        (0..size)
-                            .map(|k| 1.0 / (block[k * size + k] + damping[k]))
-                            .collect(),
-                    ),
+                    _ => Inverse::Diagonal((0..size).map(|k| 1.0 / damped[(k, k)]).collect()),
                 }
             })
             .collect();
@@ -281,13 +401,12 @@ impl LmOptimizer {
 
     fn apply_preconditioner(blocks: &Blocks, inverses: &[Inverse], v: &[f64]) -> Vec<f64> {
         let mut out = v.to_vec();
-        for (b, inverse) in inverses.iter().enumerate() {
-            let range = blocks.starts[b]..blocks.starts[b] + blocks.sizes[b];
-            let slice = &mut out[range];
+        for (block, inverse) in blocks.blocks.iter().zip(inverses) {
+            let size = block.matrix.nrows();
+            let slice = &mut out[block.start..block.start + size];
             match inverse {
                 Inverse::Cholesky(llt) => {
-                    let n = slice.len();
-                    llt.solve_in_place(MatMut::from_column_major_slice_mut(slice, n, 1));
+                    llt.solve_in_place(MatMut::from_column_major_slice_mut(slice, size, 1));
                 }
                 Inverse::Diagonal(inv) => {
                     for (v, d) in slice.iter_mut().zip(inv) {
@@ -309,22 +428,47 @@ impl LmOptimizer {
     }
 
     /// PCG as `lmopt.pcg`: warm start from the best multiple of `x0`, stop
-    /// once `||r||_{M^-1} < rtol ||b||_{M^-1}`. Returns `(x, n_iters)`.
+    /// once `||r||_{M^-1} < rtol ||b||_{M^-1}`, with `M^-1` the block
+    /// preconditioner, wrapped in `lmp` if given. With `Forcing::Model`,
+    /// also stop once iteration `i` lowered the quadratic model `q(x) =
+    /// -b.x + x.Ax/2` by less than `cg_model_tol Q / (i + cg_model_cost)`,
+    /// with `Q` the decrease of all CG iterations so far: Nash and Sofer
+    /// (1990), with the fixed cost of an LM step added to the iteration
+    /// count. Returns `(x, n_iters)`,
+    /// and the last `lmp_size` search directions with their undamped
+    /// products.
+    #[allow(clippy::too_many_arguments)]
     fn pcg(
         &self,
         blocks: &Blocks,
         inverses: &[Inverse],
+        lmp: Option<&Lmp>,
         lam: f64,
         b: &[f64],
         x0: &[f64],
         rtol: f64,
-    ) -> Result<(Vec<f64>, usize)> {
-        let minv = |v: &[f64]| Self::apply_preconditioner(blocks, inverses, v);
+    ) -> Result<(Vec<f64>, usize, VecDeque<Pair>)> {
+        let base = |v: &[f64]| Self::apply_preconditioner(blocks, inverses, v);
+        let minv = |v: &[f64]| match lmp {
+            Some(lmp) => lmp.apply(v, base),
+            None => base(v),
+        };
         let av = |v: &[f64]| self.damped_product(&blocks.diagonal, lam, v);
+        let lmp_size = self.settings.lmp_size;
+        let mut pairs = VecDeque::with_capacity(lmp_size);
         let tol_sq = rtol * rtol * dot(b, &minv(b));
+        let model_tol = match self.settings.forcing {
+            Forcing::Model => Some(self.settings.cg_model_tol),
+            _ => None,
+        };
+        let model_cost = self.settings.cg_model_cost;
 
         let mut x = vec![0.0; b.len()];
         let mut r = b.to_vec();
+        // How much the CG iterations lowered the quadratic model; each one
+        // by `alpha (r.z) / 2`, since `p.r = r.z` in PCG. The warm start is
+        // left out: with it, a good `x0` would stop CG after one iteration.
+        let mut q_decrease = 0.0;
         if x0.iter().any(|&v| v != 0.0) {
             let ax0 = av(x0)?;
             let (bx, xax) = (dot(b, x0), dot(x0, &ax0));
@@ -339,9 +483,29 @@ impl LmOptimizer {
         while rz > tol_sq && k < self.settings.cg_max && rz.is_finite() {
             let ap = av(&p)?;
             let pap = dot(&p, &ap);
+            if lmp_size > 0 && pap > 0.0 && pap.is_finite() {
+                if pairs.len() == lmp_size {
+                    pairs.pop_front();
+                }
+                let hs = ap
+                    .iter()
+                    .zip(&p)
+                    .zip(&blocks.diagonal)
+                    .map(|((a, p), d)| a - lam * d * p)
+                    .collect();
+                pairs.push_back(Pair { s: p.clone(), hs });
+            }
             let alpha = rz / if pap > 0.0 { pap } else { 1.0 };
             axpy(alpha, &p, &mut x);
             axpy(-alpha, &ap, &mut r);
+            k += 1;
+            if let Some(model_tol) = model_tol {
+                let decrease = 0.5 * alpha * rz;
+                q_decrease += decrease;
+                if pap > 0.0 && (k as f64 + model_cost) * decrease < model_tol * q_decrease {
+                    break;
+                }
+            }
             z = minv(&r);
             let rz_next = dot(&r, &z);
             let beta = rz_next / rz;
@@ -349,9 +513,8 @@ impl LmOptimizer {
                 *p = beta * *p + z;
             }
             rz = rz_next;
-            k += 1;
         }
-        Ok((x, k))
+        Ok((x, k, pairs))
     }
 
     fn step(&mut self) -> Result<StepInfo> {
@@ -365,11 +528,32 @@ impl LmOptimizer {
         }
         let blocks = self.blocks.as_ref().expect("built above");
         let (inverses, failed_inverses) = self.preconditioner(blocks, lam);
+        // Pairs from steps before the last accepted one are stale (`H` was
+        // taken at an earlier `theta`), which only slows CG down.
+        let lmp = Lmp::new(&self.lmp_pairs, &blocks.diagonal, lam, s.lmp_tol);
+        let lmp_rank = lmp.as_ref().map_or(0, Lmp::rank);
 
         let g = self.problem.pullback(&self.tape, &self.r)?;
         let rhs: Vec<f64> = g.iter().map(|v| -v).collect();
-        let eta = self.eta.clamp(s.cg_tol, s.cg_eta_max);
-        let (mut p, n_cg) = self.pcg(blocks, &inverses, lam, &rhs, &self.p_prev, eta)?;
+        let eta = match s.forcing {
+            Forcing::Model => s.cg_tol,
+            _ => self.eta.clamp(s.cg_tol, s.cg_eta_max),
+        };
+        let (mut p, n_cg, new_pairs) = self.pcg(
+            blocks,
+            &inverses,
+            lmp.as_ref(),
+            lam,
+            &rhs,
+            &self.p_prev,
+            eta,
+        )?;
+        for pair in new_pairs {
+            if self.lmp_pairs.len() == s.lmp_size {
+                self.lmp_pairs.pop_front();
+            }
+            self.lmp_pairs.push_back(pair);
+        }
 
         let step_to =
             |p: &[f64]| -> Vec<f64> { self.theta.iter().zip(p).map(|(t, p)| t + p).collect() };
@@ -416,11 +600,19 @@ impl LmOptimizer {
         let accept = rho > s.accept_rho && pred > 0.0 && ok;
 
         // Nielsen's update, graded by `rho`; no further down than the
-        // log-midpoint to `lam_lo`, the last `lam` that overshot.
+        // log-midpoint to `lam_lo`, the last `lam` that overshot. Two clean
+        // full steps in a row, each predicted almost exactly by the GN model,
+        // show that the overshoot is behind us, so `lam_lo` is forgotten. One
+        // is not enough: right after a shortened step, the raised `lam` makes
+        // the next step clean too, and forgetting `lam_lo` there drops `lam`
+        // straight back to where it overshot.
+        let clean = full_step_good && step_length == 1.0 && (rho_full - 1.0).abs() < s.lam_lo_reset;
+        let clean_steps = if clean { self.clean_steps + 1 } else { 0 };
+        let lam_lo = if clean_steps >= 2 { 0.0 } else { self.lam_lo };
         let lam_decrease = (1.0 / 3.0_f64).max(1.0 - (2.0 * rho_full - 1.0).powi(3));
-        let lam_decreased = (lam * lam_decrease).max(lam.min((lam * self.lam_lo).sqrt()));
+        let lam_decreased = (lam * lam_decrease).max(lam.min((lam * lam_lo).sqrt()));
         let (mut lam_next, mut nu_out, mut lam_lo_out) = if full_step_good {
-            (lam_decreased, s.nu0, self.lam_lo / s.lam_lo_decay)
+            (lam_decreased, s.nu0, lam_lo / s.lam_lo_decay)
         } else {
             (lam * self.nu, 2.0 * self.nu, self.lam_lo)
         };
@@ -453,6 +645,7 @@ impl LmOptimizer {
                     .sqrt();
                 (f_new.sqrt() - linear).abs() / (if f > 0.0 { f } else { 1.0 }).sqrt()
             }
+            Forcing::Model => s.cg_tol,
         };
         // Eisenstat-Walker safeguard against decreasing `eta` too fast.
         let safeguard = s.cg_gamma * eta.powf(s.cg_alpha);
@@ -486,6 +679,7 @@ impl LmOptimizer {
             step_length,
             nonfinite_blocks: blocks.nonfinite,
             failed_inverses,
+            lmp_rank,
         };
 
         if accept {
@@ -501,6 +695,7 @@ impl LmOptimizer {
         self.lam = lam_out;
         self.nu = nu_out;
         self.lam_lo = lam_lo_out;
+        self.clean_steps = clean_steps;
         self.eta = eta_next;
         Ok(info)
     }
@@ -520,9 +715,11 @@ impl PyLmOptimizer {
         problem,
         theta,
         *,
-        lam = 1e-2,
+        lam = 1e-1,
         cg_max = 300,
         cg_tol = 1e-2,
+        cg_model_tol = 0.5,
+        cg_model_cost = 15.0,
         cg_eta_max = 0.5,
         cg_gamma = 0.9,
         cg_alpha = 1.618,
@@ -531,10 +728,13 @@ impl PyLmOptimizer {
         lam_min = 1e-6,
         lam_max = 1e10,
         lam_lo_decay = 1.7320508075688772,
+        lam_lo_reset = 0.25,
         ls_min_fraction = 0.1,
         forcing = "residual",
         max_block_size = 256,
         rebuild_every = 1,
+        lmp_size = 0,
+        lmp_tol = 1e-8,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -544,6 +744,8 @@ impl PyLmOptimizer {
         lam: f64,
         cg_max: usize,
         cg_tol: f64,
+        cg_model_tol: f64,
+        cg_model_cost: f64,
         cg_eta_max: f64,
         cg_gamma: f64,
         cg_alpha: f64,
@@ -552,19 +754,25 @@ impl PyLmOptimizer {
         lam_min: f64,
         lam_max: f64,
         lam_lo_decay: f64,
+        lam_lo_reset: f64,
         ls_min_fraction: f64,
         forcing: &str,
         max_block_size: usize,
         rebuild_every: usize,
+        lmp_size: usize,
+        lmp_tol: f64,
     ) -> Result<Self> {
         let forcing = match forcing {
             "residual" => Forcing::Residual,
             "rho" => Forcing::Rho,
-            other => bail!("unknown forcing {other:?}, expected 'residual' or 'rho'"),
+            "model" => Forcing::Model,
+            other => bail!("unknown forcing {other:?}, expected 'residual', 'rho' or 'model'"),
         };
         let settings = Settings {
             cg_max,
             cg_tol,
+            cg_model_tol,
+            cg_model_cost,
             cg_eta_max,
             cg_gamma,
             cg_alpha,
@@ -573,10 +781,13 @@ impl PyLmOptimizer {
             lam_min,
             lam_max,
             lam_lo_decay,
+            lam_lo_reset,
             ls_min_fraction,
             forcing,
             max_block_size,
             rebuild_every,
+            lmp_size,
+            lmp_tol,
         };
         let theta = theta.as_slice()?.to_vec();
         let problem = problem.inner.clone();
@@ -611,5 +822,56 @@ impl PyLmOptimizer {
     #[getter]
     fn lam(&self) -> f64 {
         self.inner.lam
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `P A s = s` for every stored direction, whatever `M`, also when one
+    /// direction depends on the others.
+    #[test]
+    fn lmp_inverts_a_on_the_stored_directions() {
+        let n = 12;
+        let value = |a: usize, b: usize| {
+            (0.37 * (a * a) as f64 + 1.3 * b as f64 + 0.71 * (a * b) as f64).sin()
+        };
+        let b = Mat::from_fn(n, n, &value);
+        let h = &b * b.transpose();
+        let diagonal: Vec<f64> = (0..n).map(|k| 1.0 + 0.1 * k as f64).collect();
+        let lam = 0.3;
+        let product = |s: &[f64]| -> Vec<f64> {
+            (0..n)
+                .map(|r| (0..n).map(|c| h[(r, c)] * s[c]).sum())
+                .collect()
+        };
+
+        let mut directions: Vec<Vec<f64>> = (0..3)
+            .map(|j| (0..n).map(|k| value(j + 20, k)).collect())
+            .collect();
+        let dependent = directions[0].iter().zip(&directions[1]).map(|(a, b)| a + b);
+        directions.push(dependent.collect());
+        let pairs: VecDeque<Pair> = directions
+            .iter()
+            .map(|s| Pair {
+                s: s.clone(),
+                hs: product(s),
+            })
+            .collect();
+
+        let lmp = Lmp::new(&pairs, &diagonal, lam, 1e-8).expect("rank > 0");
+        assert_eq!(lmp.rank(), 3);
+        let minv = |v: &[f64]| v.iter().map(|v| 2.0 * v).collect::<Vec<_>>();
+        for s in &directions {
+            let mut a_s = product(s);
+            for ((a, d), s) in a_s.iter_mut().zip(&diagonal).zip(s) {
+                *a += lam * d * s;
+            }
+            let back = lmp.apply(&a_s, minv);
+            for (x, y) in back.iter().zip(s) {
+                assert!((x - y).abs() < 1e-8 * (1.0 + y.abs()), "{x} != {y}");
+            }
+        }
     }
 }

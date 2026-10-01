@@ -218,10 +218,10 @@ def _describe_step(i, info):
     return (
         f"{i:3d}  log F={np.log(info['F_new']):+.2f}  "
         f"rho={info['rho']:+.2f}  "
-        f"rho_full={info['rho_full']:+.2f}  "
+        # f"rho_full={info['rho_full']:+.2f}  "
         f"lam={info['lam_out']:.1e}  "
         f"cg={info['n_cg']:3d}{' ' if info['cg_converged'] else '*'} "
-        f"eta={info['cg_eta']:.2f}"
+        f"eta={info['cg_eta']:.3f}"
         f"{' ' if info['rebuilt_blocks'] else '~'}  "
         f"|g|={info['grad_norm']:.2e}  "
         f"|p|={info['full_step_norm']:.2e}  "
@@ -236,7 +236,7 @@ def fit(
     theta,
     *,
     n_steps=60,
-    lam0=1e-2,
+    lam0=1e-1,
     min_loss=None,
     rtol=None,
     patience=5,
