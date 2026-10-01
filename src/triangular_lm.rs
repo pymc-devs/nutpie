@@ -536,7 +536,6 @@ pub struct FisherResiduals {
     layers: Vec<Layer>,
     /// `sqrt(fisher_regularization)`, if regularized.
     regularization: Option<f64>,
-    cholesky_jitter: Option<f64>,
     /// The parent sets closed under elimination, on which the selected
     /// inverse is stored. Equal to the parents for a chordal pattern.
     filled_indptr: Vec<usize>,
@@ -557,7 +556,6 @@ impl FisherResiduals {
         location: usize,
         specs: Vec<Contract2Spec>,
         fisher_regularization: Option<f64>,
-        cholesky_jitter: Option<f64>,
     ) -> Result<Self> {
         let Some(n_var) = parent_indptr.len().checked_sub(1) else {
             bail!("parent_indptr must not be empty");
@@ -648,7 +646,6 @@ impl FisherResiduals {
             param_offset,
             layers,
             regularization: fisher_regularization.map(f64::sqrt),
-            cholesky_jitter,
             filled_indptr,
             filled_index,
             n_draw: 0,
@@ -1360,7 +1357,7 @@ impl FisherResiduals {
             .collect()
     }
 
-    /// Exact Gauss-Newton blocks, `sum_draws V_i^T V_i / n_draw` restricted
+    /// Exact Gauss-Newton blocks, `sum_draws (dr/dtheta_i)^T (dr/dtheta_i) / n_draw`, restricted
     /// to the sub-blocks of `block_ranges`. Returns, per sub-block, its first
     /// global parameter index and size, and the blocks as concatenated
     /// row-major squares.
@@ -1437,11 +1434,10 @@ impl FisherResiduals {
         let mut blocks = vec![0.0; ranges.iter().map(|r| r.len() * r.len()).sum()];
 
         let mut rows = vec![0.0; n_rows * n_theta];
-        let mut v = vec![0.0; n_rows * n_theta];
+        let mut k_b = vec![0.0; n_s * n_theta];
         let mut cot_a = vec![0.0; n_p];
         let mut cot_l = vec![0.0; n_p];
         let mut k_mat = vec![0.0; n_s * n_s];
-        let mut d = vec![0.0; n_s];
         let mut index = Vec::with_capacity(n_s);
         index.push(i);
         index.extend_from_slice(parents);
@@ -1497,73 +1493,62 @@ impl FisherResiduals {
                 seed(1 + n_s + j, -edge_a[j], 0.0, 0.0, Some((j, -x_i, 1.0)), s);
             }
 
-            // K = Sigma on {i} + P(i), and its Cholesky factor.
+            // Row `i` of `J` is `alpha = (delta_i, A[i, P(i)])` on `S_i`, so
+            // `e_i = J^{-T} E_i alpha` and the direct part folds into the
+            // solve: `dr/dtheta_i = J^{-T} E_i B'` with `B' = B + alpha a`.
+            // Then `G_i = sum B'^T K B'`, with no factor of `K` and nothing
+            // that cancels between terms.
+            let (a_row, rest) = rows.split_at_mut(n_theta);
+            axpy(draw_tape.delta[i], a_row, &mut rest[..n_theta]);
+            for j in 0..n_p {
+                axpy(
+                    edge_a[j],
+                    a_row,
+                    &mut rest[(1 + j) * n_theta..(2 + j) * n_theta],
+                );
+            }
+            let b_prime = &rest[..n_s * n_theta];
+
+            // K = Sigma on {i} + P(i), and K B'.
             let store = &stores[draw * n_store..(draw + 1) * n_store];
             for r in 0..n_s {
                 for c in 0..n_s {
                     k_mat[r * n_s + c] = self.sigma(store, index[r], index[c]);
                 }
             }
-            let mut factor = cholesky(&k_mat, n_s);
-            if factor.is_none() {
-                if let Some(jitter) = self.cholesky_jitter {
-                    let max_diag = (0..n_s).map(|r| k_mat[r * n_s + r]).fold(0.0, f64::max);
-                    let mut jittered = k_mat.clone();
-                    for r in 0..n_s {
-                        jittered[r * n_s + r] += jitter * max_diag;
-                    }
-                    factor = cholesky(&jittered, n_s);
-                }
-            }
-            let factor = factor.unwrap_or_else(|| vec![f64::NAN; n_s * n_s]);
-
-            // d = L^{-1} e_0 / delta_i
+            k_b.fill(0.0);
             for r in 0..n_s {
-                let mut acc = if r == 0 {
-                    1.0 / draw_tape.delta[i]
-                } else {
-                    0.0
-                };
-                for c in 0..r {
-                    acc -= factor[r * n_s + c] * d[c];
-                }
-                d[r] = acc / factor[r * n_s + r];
-            }
-            let outside = (1.0 - dot(&d, &d)).max(0.0).sqrt();
-
-            // V = [outside a; L^T B + d a; sqrt(rho) scores]
-            let (a_row, rest) = rows.split_at(n_theta);
-            v.fill(0.0);
-            for (out, &value) in v[..n_theta].iter_mut().zip(a_row) {
-                *out = outside * value;
-            }
-            for r in 0..n_s {
-                let out = &mut v[(1 + r) * n_theta..(2 + r) * n_theta];
-                axpy(d[r], a_row, out);
-                for m in r..n_s {
+                let out = &mut k_b[r * n_theta..(r + 1) * n_theta];
+                for m in 0..n_s {
                     axpy(
-                        factor[m * n_s + r],
-                        &rest[m * n_theta..(m + 1) * n_theta],
+                        k_mat[r * n_s + m],
+                        &b_prime[m * n_theta..(m + 1) * n_theta],
                         out,
                     );
                 }
             }
-            if let Some(reg) = self.regularization {
-                for j in 0..n_score {
-                    let row = 1 + n_s + j;
-                    let out = &mut v[row * n_theta..(row + 1) * n_theta];
-                    axpy(reg, &rows[row * n_theta..(row + 1) * n_theta], out);
-                }
-            }
 
+            // Lower triangles of `B'^T (K B') + rho scores^T scores`.
+            let scores = &rest[n_s * n_theta..];
+            let reg_sq = self.regularization.map_or(0.0, |reg| reg * reg);
             for (range, &offset) in ranges.iter().zip(&block_offset) {
                 let size = range.len();
                 let block = &mut blocks[offset..offset + size * size];
-                for row in v.chunks_exact(n_theta) {
-                    let row = &row[range.clone()];
-                    for (r, &value) in row.iter().enumerate() {
+                let pairs = b_prime
+                    .chunks_exact(n_theta)
+                    .zip(k_b.chunks_exact(n_theta))
+                    .map(|(left, right)| (left, right, 1.0))
+                    .chain(scores.chunks_exact(n_theta).map(|row| (row, row, reg_sq)));
+                for (left, right, weight) in pairs {
+                    let left = &left[range.clone()];
+                    let right = &right[range.clone()];
+                    for (r, &value) in left.iter().enumerate() {
                         if value != 0.0 {
-                            axpy(value, &row[..=r], &mut block[r * size..r * size + r + 1]);
+                            axpy(
+                                weight * value,
+                                &right[..=r],
+                                &mut block[r * size..r * size + r + 1],
+                            );
                         }
                     }
                 }
@@ -1584,28 +1569,6 @@ impl FisherResiduals {
         }
         (ranges, blocks)
     }
-}
-
-/// Lower Cholesky factor of a small row-major SPD matrix, or `None`.
-fn cholesky(matrix: &[f64], n: usize) -> Option<Vec<f64>> {
-    let mut factor = vec![0.0; n * n];
-    for r in 0..n {
-        for c in 0..=r {
-            let mut acc = matrix[r * n + c];
-            for k in 0..c {
-                acc -= factor[r * n + k] * factor[c * n + k];
-            }
-            if r == c {
-                if acc.is_nan() || acc <= 0.0 {
-                    return None;
-                }
-                factor[r * n + r] = acc.sqrt();
-            } else {
-                factor[r * n + c] = acc / factor[c * n + c];
-            }
-        }
-    }
-    Some(factor)
 }
 
 fn as_usize(values: &[i64]) -> Result<Vec<usize>> {
@@ -1634,7 +1597,6 @@ impl PyFisherResiduals {
         location_index,
         transformer,
         fisher_regularization = None,
-        cholesky_jitter = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -1645,7 +1607,6 @@ impl PyFisherResiduals {
         location_index: usize,
         transformer: &Bound<'_, PyAny>,
         fisher_regularization: Option<f64>,
-        cholesky_jitter: Option<f64>,
     ) -> Result<Self> {
         let specs: Vec<Contract2Spec> = pythonize::depythonize(transformer)?;
         Ok(Self {
@@ -1657,7 +1618,6 @@ impl PyFisherResiduals {
                 location_index,
                 specs,
                 fisher_regularization,
-                cholesky_jitter,
             )?,
         })
     }
