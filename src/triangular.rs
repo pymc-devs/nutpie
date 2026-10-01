@@ -353,9 +353,9 @@ mod softplus {
 
 /// `field = conditioner_output[index] + offset`.
 #[derive(Debug, Clone, Copy, Deserialize)]
-struct Param {
-    index: usize,
-    offset: f64,
+pub(crate) struct Param {
+    pub(crate) index: usize,
+    pub(crate) offset: f64,
 }
 
 impl Param {
@@ -366,13 +366,13 @@ impl Param {
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
-struct Contract2Spec {
-    alpha: Option<Param>,
-    beta: Option<Param>,
-    sigma: Option<Param>,
-    mu: Option<Param>,
-    nu: Option<Param>,
-    log_gamma_bounds: Option<(f64, f64)>,
+pub(crate) struct Contract2Spec {
+    pub(crate) alpha: Option<Param>,
+    pub(crate) beta: Option<Param>,
+    pub(crate) sigma: Option<Param>,
+    pub(crate) mu: Option<Param>,
+    pub(crate) nu: Option<Param>,
+    pub(crate) log_gamma_bounds: Option<(f64, f64)>,
 }
 
 /// `_bounded_log_gamma` from `nutpie/normalizing_flow.py`, with the constants
