@@ -2385,6 +2385,7 @@ def make_flow(
     sparsity: ArrayLike | None = None,
     location_skip: bool = True,
     feature_degree: int | None = None,
+    n_buckets: int = 8,
 ):
     if activation is None:
         activation = jax.nn.leaky_relu
@@ -2538,6 +2539,7 @@ def make_flow(
             contract_transformer=contract_transformer,
             asymmetric_transformer=asymmetric_transformer,
             feature_degree=feature_degree,
+            n_buckets=n_buckets,
         )
         if feature_degree is not None:
             # The marginal maps of the features, fitted on the draws as the
