@@ -733,7 +733,6 @@ def test_stan_repr():
     )
 
 
-
 _UNCONSTRAINED_MODEL = """
 parameters {
     real a;

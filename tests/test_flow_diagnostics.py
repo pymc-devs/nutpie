@@ -286,9 +286,12 @@ def test_conditioner_capacity_matches_residuals(x64, fitted_flow):
             gram = np.einsum("dku,dkv->uv", J, J) / len(draws)
             hidden, skip = gram[:width, :width], gram[:width, width:]
             if skip.size:
-                hidden = hidden - skip @ np.linalg.pinv(
-                    gram[width:, width:], rcond=1e-10, hermitian=True
-                ) @ skip.T
+                hidden = (
+                    hidden
+                    - skip
+                    @ np.linalg.pinv(gram[width:, width:], rcond=1e-10, hermitian=True)
+                    @ skip.T
+                )
             expected = np.maximum(np.linalg.eigvalsh(hidden)[::-1], 0.0)
             np.testing.assert_allclose(
                 capacity.eigenvalues.iloc[order[member]],

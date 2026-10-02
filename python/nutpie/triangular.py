@@ -864,9 +864,7 @@ class SparseTriangularMap(bijections.AbstractBijection):
         self.shape = (dim,)
         self.feature_degree = feature_degree
         self.feature_params = (
-            None
-            if feature_degree is None
-            else NonTrainable(jnp.zeros((dim, 5)))
+            None if feature_degree is None else NonTrainable(jnp.zeros((dim, 5)))
         )
 
         self.jacobian_layout = _build_layout(
