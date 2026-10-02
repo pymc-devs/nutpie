@@ -16,7 +16,13 @@ from numpy.typing import NDArray
 
 from nutpie import _lib
 from nutpie.compiled_pyfunc import SeedType, from_pyfunc
-from nutpie.sample import CompiledModel
+from nutpie.sample import (
+    CompiledModel,
+    _check_reserved_names,
+    _flatten_point,
+    _wrap_init_point_fn,
+)
+from nutpie.sparsity import variables_from_layout
 
 try:
     from numba.extending import intrinsic
@@ -32,14 +38,11 @@ if TYPE_CHECKING:
     from pytensor.tensor import TensorVariable, Variable
 
 
-_UNCONSTRAINED_PARAMETER = "unconstrained_parameter"
-
-
 def _rv_dict_to_flat_array_wrapper(
     fn: Callable[[SeedType | None], dict[str, np.ndarray]],
     names: list[str],
     shapes: list[tuple[int]],
-) -> Callable[[SeedType], np.ndarray]:
+) -> Callable[[SeedType, int], np.ndarray]:
     """
     Wraps a function that returns a dictionary of string:array key:value pairs
     and returns a single flat float64 array. Also checks that the shapes of
@@ -59,31 +62,14 @@ def _rv_dict_to_flat_array_wrapper(
     Returns
     -------
     seeded_array_fn: Callable
-        Function that takes a seed and returns a flat, contiguous float64
-        array of initial values. The ordering of the random variables inside
+        Function that takes a seed and a chain id (ignored) and returns a
+        flat, contiguous float64 array of initial values. The ordering of the random variables inside
         the array is controlled by the ``names`` parameter.
     """
 
     @wraps(fn)
-    def seeded_array_fn(seed: SeedType | None = None):
-        initial_value_dict = fn(seed)
-        total_size = sum(np.prod(shape).astype(int) for shape in shapes)
-        flat_array = np.empty(total_size, dtype="float64", order="C")
-        cursor = 0
-
-        for name, shape in zip(names, shapes, strict=True):
-            initial_value = initial_value_dict[name]
-            n = int(np.prod(initial_value.shape))
-            if tuple(initial_value.shape) != tuple(shape):
-                raise ValueError(
-                    f"Size of initial value for {name} is {initial_value.shape}, "
-                    f"expected {shape}"
-                )
-
-            flat_array[cursor : cursor + n] = initial_value.ravel().astype("float64")
-            cursor += n
-
-        return flat_array
+    def seeded_array_fn(seed: SeedType | None = None, chain_id: int | None = None):
+        return _flatten_point(fn(seed), names, shapes)
 
     return seeded_array_fn
 
@@ -101,11 +87,12 @@ def address_as_void_pointer(typingctx, src):
     return sig, codegen
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class CompiledPyMCModel(CompiledModel):
     compiled_logp_func: "numba.core.ccallback.CFunc"
     compiled_expand_func: "numba.core.ccallback.CFunc"
-    initial_point_func: Callable[[SeedType], np.ndarray]
+    # Called as `fn(seed, chain_id)`
+    initial_point_func: Callable[[SeedType, int], np.ndarray]
 
     # The value of the shared variables with a specific key
     shared_data: dict[str, NDArray]
@@ -124,6 +111,8 @@ class CompiledPyMCModel(CompiledModel):
     _shapes: dict[str, tuple[int, ...]]
     _coords: dict[str, Any] | None
     _transform_adapt_args: dict | None = None
+    # User init function `fn(model, rng, chain_id)`, see `with_init_point_fn`
+    _init_point_fn: Callable | None = None
 
     @property
     def n_dim(self):
@@ -163,19 +152,48 @@ class CompiledPyMCModel(CompiledModel):
             self,
             shared_data=shared_data,
             user_data=user_data,
+            _hessian_sparsity=None,
+            _factorization=None,
         )
+
+    def with_init_point_fn(self, init_point_fn):
+        """Use a custom function to generate the initial point of each chain.
+
+        Parameters
+        ----------
+        init_point_fn : Callable[[CompiledPyMCModel, np.random.Generator, int], np.ndarray | dict]
+            Called as ``init_point_fn(model, rng, chain_id)``. Must return
+            either a flat point on the unconstrained space with shape
+            ``(n_dim,)``, or a dict mapping the names of the (transformed)
+            value variables, e.g. ``"sigma_log__"``, to their values.
+            Variables missing from the dict are initialized with the default
+            initialization of the model.
+        """
+        return dataclasses.replace(self, _init_point_fn=init_point_fn)
+
+    def _make_init_point_func(self):
+        if self._init_point_fn is None:
+            return self.initial_point_func
+
+        names, shapes = _unconstrained_layout(self.shape_info, self.n_dim)
+
+        def convert_dict(values, seed, chain_id):
+            base = self.initial_point_func(seed, chain_id)
+            return _flatten_point(values, names, shapes, base)
+
+        return _wrap_init_point_fn(self._init_point_fn, self, convert_dict)
 
     def _make_sampler(
         self,
         settings,
-        init_mean,
         cores,
         progress_type,
         extra_callback,
         extra_callback_rate,
         store,
+        stop_event=None,
     ):
-        model = self._make_model(init_mean)
+        model = self._make_model(self._adapter_kwargs(settings, stop_event))
         return _lib.PySampler.from_pymc(
             settings,
             cores,
@@ -186,7 +204,7 @@ class CompiledPyMCModel(CompiledModel):
             store,
         )
 
-    def _make_model(self, init_mean):
+    def _make_model(self, adapter_kwargs=None):
         expand_fn = _lib.ExpandFunc(
             self.n_dim,
             self.n_expanded,
@@ -212,9 +230,10 @@ class CompiledPyMCModel(CompiledModel):
             var_names, var_types, var_shapes, dim_sizes, dims
         )
 
-        outer_kwargs = self._transform_adapt_args
-        if outer_kwargs is None:
-            outer_kwargs = {}
+        outer_kwargs = {
+            **(self._transform_adapt_args or {}),
+            **(adapter_kwargs or {}),
+        }
 
         def make_adapter(*args, **kwargs):
             from nutpie.transform_adapter import make_transform_adapter
@@ -228,12 +247,52 @@ class CompiledPyMCModel(CompiledModel):
             self.n_dim,
             dim_sizes,
             coords,
-            self.initial_point_func,
+            self._make_init_point_func(),
             make_adapter,
+            self._unconstrained_names,
         )
 
     def with_transform_adapt(self, **kwargs):
         return dataclasses.replace(self, _transform_adapt_args=kwargs)
+
+    def _detect_hessian_sparsity(self, **kwargs):
+        raise NotImplementedError(
+            "Detecting the Hessian sparsity is not available for the numba "
+            "backend yet. Use `backend='jax', gradient_backend='jax'`, or pass "
+            "the pattern with `with_hessian_sparsity(array)`."
+        )
+
+    def _unconstrained_variables(self):
+        return variables_from_layout(
+            *_unconstrained_layout(self.shape_info, self.n_dim)
+        )
+
+    def _repr_header(self):
+        return f"CompiledPyMCModel (numba, n_dim={self.n_dim})"
+
+    def _repr_items(self):
+        items = []
+        if self.shared_var_keys:
+            names = ", ".join(var.name for var in self.shared_var_keys)
+            items.append(("data", names))
+        if self._coords:
+            coords = ", ".join(f"{k} ({len(v)})" for k, v in self._coords.items())
+            items.append(("coords", coords))
+        return items + super()._repr_items()
+
+
+def _unconstrained_layout(shape_info, n_dim):
+    """Names and shapes of the value variables that make up the
+    unconstrained point. They are the leading entries of ``shape_info``.
+    Empty variables are skipped, as they can't be told apart from empty
+    expanded variables at the boundary."""
+    names, slices, shapes = shape_info
+    layout = [
+        (name, tuple(shape))
+        for name, slice_, shape in zip(names, slices, shapes, strict=True)
+        if slice_.start < slice_.stop <= n_dim
+    ]
+    return [name for name, _ in layout], [shape for _, shape in layout]
 
 
 def update_user_data(user_data, user_data_storage):
@@ -346,7 +405,9 @@ def _compile_pymc_model_numba(
 
         expand_numba = numba.cfunc(c_sig_expand, **kwargs)(expand_numba_raw)
 
-    dims, coords = _prepare_dims_and_coords(model, shape_info, reparameterized_names)
+    dims, coords, unconstrained_names = _prepare_dims_and_coords(
+        model, shape_info, reparameterized_names
+    )
 
     return CompiledPyMCModel(
         _n_dim=n_dim,
@@ -364,6 +425,7 @@ def _compile_pymc_model_numba(
         logp_func=logp_fn_pt,
         expand_func=expand_fn_pt,
         reparameterized_names=reparameterized_names,
+        _unconstrained_names=unconstrained_names,
     )
 
 
@@ -374,19 +436,15 @@ def _prepare_dims_and_coords(model, shape_info, reparameterized_names):
             vals = pd.RangeIndex(int(model.dim_lengths[name].eval()))
         coords[name] = pd.Index(vals)
 
-    if _UNCONSTRAINED_PARAMETER in coords:
-        raise ValueError(f"Model contains invalid name '{_UNCONSTRAINED_PARAMETER}'.")
-
-    names = []
+    unconstrained_names = []
     for base, _, shape in zip(*shape_info):
         if base not in [var.name for var in model.value_vars]:
             continue
         for idx in itertools.product(*[range(length) for length in shape]):
             if len(idx) == 0:
-                names.append(base)
+                unconstrained_names.append(base)
             else:
-                names.append(f"{base}_{'.'.join(str(i) for i in idx)}")
-    coords[_UNCONSTRAINED_PARAMETER] = pd.Index(names)
+                unconstrained_names.append(f"{base}_{'.'.join(str(i) for i in idx)}")
 
     names, _, shape_list = shape_info
 
@@ -404,7 +462,8 @@ def _prepare_dims_and_coords(model, shape_info, reparameterized_names):
         if shape_by_name.get(rv_name) == shape_by_name.get(value_name):
             dims[value_name] = rv_dims
 
-    return dims, coords
+    _check_reserved_names(coords, dims)
+    return dims, coords, unconstrained_names
 
 
 def _compile_pymc_model_jax(
@@ -502,13 +561,16 @@ def _compile_pymc_model_jax(
 
         return expand
 
-    dims, coords = _prepare_dims_and_coords(model, shape_info, reparameterized_names)
+    dims, coords, unconstrained_names = _prepare_dims_and_coords(
+        model, shape_info, reparameterized_names
+    )
 
     return from_pyfunc(
         ndim=n_dim,
         make_logp_fn=make_logp_func,
         make_expand_fn=make_expand_func,
         make_initial_point_fn=initial_point_fn,
+        init_point_layout=_unconstrained_layout(shape_info, n_dim),
         expanded_dtypes=dtypes,
         expanded_shapes=shapes,
         expanded_names=names,
@@ -517,6 +579,7 @@ def _compile_pymc_model_jax(
         coords=coords,
         raw_logp_fn=orig_logp_fn,
         reparameterized_names=reparameterized_names,
+        unconstrained_names=unconstrained_names,
     )
 
 
@@ -588,7 +651,11 @@ def compile_pymc_model(
         freeze_model = backend == "jax"
 
     if freeze_model:
+        # The fgraph roundtrip in freeze_dims_and_data does not carry over
+        # check_bounds, so restore it explicitly.
+        check_bounds = model.check_bounds
         model = freeze_dims_and_data(model)
+        model.check_bounds = check_bounds
 
     if default_initialization_strategy == "support_point" and jitter_rvs is None:
         jitter_rvs = set(model.free_RVs)

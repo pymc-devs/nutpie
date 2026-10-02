@@ -1,8 +1,10 @@
 use std::{collections::HashMap, ffi::c_void, sync::Arc};
 
-use anyhow::{anyhow, bail, Context, Result};
-use numpy::{AsSliceError, PyReadonlyArray1};
-use nuts_rs::{CpuLogpFunc, CpuMath, HasDims, LogpError, Model, Storable, Value};
+use anyhow::{Context, Result};
+use numpy::AsSliceError;
+use nuts_rs::{
+    CpuLogpFunc, CpuMath, HasDims, InitPositionError, LogpError, Model, Storable, Value,
+};
 use pyo3::{
     exceptions::PyRuntimeError,
     pyclass, pymethods,
@@ -14,8 +16,8 @@ use rand::Rng;
 use thiserror::Error;
 
 use crate::{
-    common::{PyValue, PyVariable},
-    wrapper::PyTransformAdapt,
+    common::{call_init_point_func, PyValue, PyVariable},
+    wrapper::{soft_clip, NativeFlow, PyTransformAdapt},
 };
 
 type UserData = *const std::ffi::c_void;
@@ -97,7 +99,7 @@ impl ExpandFunc {
 unsafe impl Send for ExpandFunc {}
 unsafe impl Sync for ExpandFunc {}
 
-impl HasDims for PyMcModelRef<'_> {
+impl HasDims for PyMcModelRef {
     fn dim_sizes(&self) -> HashMap<String, u64> {
         self.model.dim_sizes.clone()
     }
@@ -109,8 +111,8 @@ impl HasDims for PyMcModelRef<'_> {
 
 pub struct ExpandedVector(Vec<Option<nuts_rs::Value>>);
 
-impl<'f> Storable<PyMcModelRef<'f>> for ExpandedVector {
-    fn names<'a>(parent: &'a PyMcModelRef<'f>) -> Vec<&'a str> {
+impl Storable<PyMcModelRef> for ExpandedVector {
+    fn names<'a>(parent: &'a PyMcModelRef) -> Vec<&'a str> {
         parent
             .model
             .variables
@@ -119,7 +121,7 @@ impl<'f> Storable<PyMcModelRef<'f>> for ExpandedVector {
             .collect()
     }
 
-    fn item_type(parent: &PyMcModelRef<'f>, item: &str) -> nuts_rs::ItemType {
+    fn item_type(parent: &PyMcModelRef, item: &str) -> nuts_rs::ItemType {
         parent
             .model
             .variables
@@ -129,7 +131,7 @@ impl<'f> Storable<PyMcModelRef<'f>> for ExpandedVector {
             .expect("Item not found")
     }
 
-    fn dims<'a>(parent: &'a PyMcModelRef<'f>, item: &str) -> Vec<&'a str> {
+    fn dims<'a>(parent: &'a PyMcModelRef, item: &str) -> Vec<&'a str> {
         parent
             .model
             .variables
@@ -141,7 +143,7 @@ impl<'f> Storable<PyMcModelRef<'f>> for ExpandedVector {
 
     fn get_all<'a>(
         &'a mut self,
-        parent: &'a PyMcModelRef<'f>,
+        parent: &'a PyMcModelRef,
     ) -> Vec<(&'a str, Option<nuts_rs::Value>)> {
         self.0
             .iter_mut()
@@ -180,18 +182,23 @@ impl LogpError for PyMcLogpError {
     }
 }
 
-pub struct PyMcModelRef<'a> {
-    model: &'a PyMcModel,
+pub struct PyMcModelRef {
+    model: Arc<PyMcModel>,
     transform_adapter: Option<PyTransformAdapt>,
+    native_flow: NativeFlow,
 }
 
-impl CpuLogpFunc for PyMcModelRef<'_> {
+impl CpuLogpFunc for PyMcModelRef {
     type LogpError = PyMcLogpError;
     type FlowParameters = Py<PyAny>;
     type ExpandedVector = ExpandedVector;
 
     fn dim(&self) -> usize {
         self.model.dim
+    }
+
+    fn vector_coord(&self) -> Option<Value> {
+        self.model.unconstrained_names.clone().map(Value::Strings)
     }
 
     fn logp(&mut self, position: &[f64], gradient: &mut [f64]) -> Result<f64, Self::LogpError> {
@@ -313,18 +320,60 @@ impl CpuLogpFunc for PyMcModelRef<'_> {
         untransformed_gradient: &mut [f64],
         transformed_position: &[f64],
         transformed_gradient: &mut [f64],
+        clip: Option<f64>,
     ) -> std::result::Result<(f64, f64), Self::LogpError> {
-        let (logp, logdet) = self
+        // Native path: flow and the compiled logp both in Rust, no Python.
+        // `native_flow` is moved out so the logp closure can borrow `self`.
+        let adapter = self
+            .transform_adapter
+            .clone()
+            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?;
+        let mut native = std::mem::take(&mut self.native_flow);
+        let result = native.init_from_transformed_position(
+            &adapter,
+            params,
+            untransformed_position,
+            untransformed_gradient,
+            transformed_position,
+            transformed_gradient,
+            clip,
+            |y, grad| self.logp(y, grad),
+        );
+        self.native_flow = native;
+        if let Some(out) = result? {
+            return Ok(out);
+        }
+
+        // The flow has no native form (e.g. the diagonal-only one of the early
+        // windows): transform in Python, but the logp stays the compiled one
+        // here -- the adapter is built without a `logp_fn` for these models.
+        let adapter = self
             .transform_adapter
             .as_mut()
-            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?
-            .init_from_transformed_position(
+            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?;
+        let part1 = adapter
+            .init_from_transformed_position_part1(
                 params,
                 untransformed_position,
-                untransformed_gradient,
                 transformed_position,
+            )
+            .context("Failed init_from_transformed_position_part1")?;
+
+        let logp = self.logp(untransformed_position, untransformed_gradient)?;
+        soft_clip(untransformed_gradient, clip);
+
+        let adapter = self
+            .transform_adapter
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?;
+        let logdet = adapter
+            .init_from_transformed_position_part2(
+                params,
+                part1,
+                untransformed_gradient,
                 transformed_gradient,
-            )?;
+            )
+            .context("Failed init_from_transformed_position_part2")?;
         Ok((logp, logdet))
     }
 
@@ -335,18 +384,24 @@ impl CpuLogpFunc for PyMcModelRef<'_> {
         untransformed_gradient: &mut [f64],
         transformed_position: &mut [f64],
         transformed_gradient: &mut [f64],
+        clip: Option<f64>,
     ) -> std::result::Result<(f64, f64), Self::LogpError> {
-        let (logp, logdet) = self
+        // As in `init_from_transformed_position`: the compiled logp here, only
+        // the transform in Python.
+        let logp = self.logp(untransformed_position, untransformed_gradient)?;
+        soft_clip(untransformed_gradient, clip);
+        let logdet = self
             .transform_adapter
             .as_mut()
             .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?
-            .init_from_untransformed_position(
+            .inv_transform_normalize(
                 params,
                 untransformed_position,
                 untransformed_gradient,
                 transformed_position,
                 transformed_gradient,
-            )?;
+            )
+            .context("Failed inv_transform_normalize in init_from_untransformed_position")?;
         Ok((logp, logdet))
     }
 
@@ -358,6 +413,7 @@ impl CpuLogpFunc for PyMcModelRef<'_> {
         untransformed_logp: impl ExactSizeIterator<Item = &'a f64>,
         params: &'a mut Py<PyAny>,
     ) -> std::result::Result<(), Self::LogpError> {
+        self.native_flow.invalidate();
         self.transform_adapter
             .as_mut()
             .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?
@@ -378,6 +434,7 @@ impl CpuLogpFunc for PyMcModelRef<'_> {
         untransformed_gradient: &[f64],
         chain: u64,
     ) -> std::result::Result<Py<PyAny>, Self::LogpError> {
+        self.native_flow.invalidate();
         let trafo = self
             .transform_adapter
             .as_mut()
@@ -419,11 +476,14 @@ pub(crate) struct PyMcModel {
     variables: Arc<Vec<PyVariable>>,
     dim_sizes: HashMap<String, u64>,
     coords: HashMap<String, Value>,
+    /// Labels of the `unconstrained_parameter` dim of the sampler stats
+    unconstrained_names: Option<Vec<String>>,
 }
 
 #[pymethods]
 impl PyMcModel {
     #[new]
+    #[pyo3(signature = (density, expand, variables, dim, dim_sizes, coords, init_func, transform_adapter=None, unconstrained_names=None))]
     fn new<'py>(
         py: Python<'py>,
         density: LogpFunc,
@@ -434,6 +494,7 @@ impl PyMcModel {
         coords: Py<PyDict>,
         init_func: Py<PyAny>,
         transform_adapter: Option<Py<PyAny>>,
+        unconstrained_names: Option<Vec<String>>,
     ) -> PyResult<Self> {
         let dim_sizes = dim_sizes
             .bind(py)
@@ -468,6 +529,7 @@ impl PyMcModel {
             dim_sizes,
             transform_adapter: transform_adapter.map(PyTransformAdapt::new),
             variables: Arc::new(variables),
+            unconstrained_names,
         })
     }
 
@@ -493,43 +555,27 @@ impl PyMcModel {
 }
 
 impl Model for PyMcModel {
-    type Math<'model> = CpuMath<PyMcModelRef<'model>>;
+    type Math = CpuMath<PyMcModelRef>;
 
-    fn math<R: Rng + ?Sized>(&self, _rng: &mut R) -> Result<Self::Math<'_>> {
+    fn math<R: Rng + ?Sized>(self: Arc<PyMcModel>, _rng: &mut R) -> Result<Self::Math> {
         Ok(CpuMath::new(PyMcModelRef {
-            model: self,
+            model: self.clone(),
             transform_adapter: self.transform_adapter.clone(),
+            native_flow: NativeFlow::default(),
         }))
     }
 
     fn init_position<R: rand::Rng + ?Sized>(
         &self,
         rng: &mut R,
+        chain_id: u64,
         position: &mut [f64],
-    ) -> Result<()> {
-        let seed = rng.next_u64();
-
-        Python::attach(|py| {
-            let init_point = self
-                .init_func
-                .call1(py, (seed,))
-                .context("Failed to initialize point")?;
-
-            let init_point: PyReadonlyArray1<f64> = init_point
-                .extract(py)
-                .map_err(|_| anyhow!("Initialization array returned incorrect argument"))?;
-
-            let init_point = init_point
-                .as_slice()
-                .context("Initial point must be contiguous")?;
-
-            if init_point.len() != position.len() {
-                bail!("Initial point has incorrect length");
-            }
-
-            position.copy_from_slice(init_point);
-            Ok(())
-        })?;
-        Ok(())
+    ) -> Result<(), InitPositionError> {
+        Ok(call_init_point_func(
+            &self.init_func,
+            rng.next_u64(),
+            chain_id,
+            position,
+        )?)
     }
 }

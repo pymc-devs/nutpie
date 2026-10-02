@@ -1,8 +1,10 @@
 use std::{collections::HashMap, sync::Arc};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result};
 use numpy::{AsSliceError, PyArray1, PyReadonlyArray1, PyReadonlyArrayDyn, PyUntypedArrayMethods};
-use nuts_rs::{CpuLogpFunc, CpuMath, HasDims, LogpError, Model, Storable, Value};
+use nuts_rs::{
+    CpuLogpFunc, CpuMath, HasDims, InitPositionError, LogpError, Model, Storable, Value,
+};
 use pyo3::{
     exceptions::PyRuntimeError,
     pyclass, pymethods,
@@ -14,8 +16,8 @@ use rand_distr::{Distribution, Uniform};
 use thiserror::Error;
 
 use crate::{
-    common::{PyValue, PyVariable},
-    wrapper::PyTransformAdapt,
+    common::{call_init_point_func, PyValue, PyVariable},
+    wrapper::{NativeFlow, PyTransformAdapt},
 };
 
 #[pyclass(from_py_object)]
@@ -29,12 +31,14 @@ pub struct PyModel {
     ndim: usize,
     dim_sizes: HashMap<String, u64>,
     coords: HashMap<String, Value>,
+    /// Labels of the `unconstrained_parameter` dim of the sampler stats
+    unconstrained_names: Option<Vec<String>>,
 }
 
 #[pymethods]
 impl PyModel {
     #[new]
-    #[pyo3(signature = (make_logp_func, make_expand_func, variables, ndim, dim_sizes, coords, *, init_point_func=None, transform_adapter=None))]
+    #[pyo3(signature = (make_logp_func, make_expand_func, variables, ndim, dim_sizes, coords, *, init_point_func=None, transform_adapter=None, unconstrained_names=None))]
     fn new<'py>(
         py: Python<'py>,
         make_logp_func: Py<PyAny>,
@@ -45,6 +49,7 @@ impl PyModel {
         coords: Py<PyDict>,
         init_point_func: Option<Py<PyAny>>,
         transform_adapter: Option<Py<PyAny>>,
+        unconstrained_names: Option<Vec<String>>,
     ) -> Result<Self> {
         let dim_sizes = dim_sizes
             .bind(py)
@@ -79,6 +84,7 @@ impl PyModel {
             transform_adapter: transform_adapter.map(PyTransformAdapt::new),
             dim_sizes,
             coords,
+            unconstrained_names,
         })
     }
 }
@@ -123,6 +129,8 @@ pub struct PyDensity {
     variables: Arc<Vec<PyVariable>>,
     dim_sizes: HashMap<String, u64>,
     coords: HashMap<String, Value>,
+    unconstrained_names: Option<Vec<String>>,
+    native_flow: NativeFlow,
 }
 
 impl PyDensity {
@@ -134,6 +142,7 @@ impl PyDensity {
         variables: Arc<Vec<PyVariable>>,
         dim_sizes: HashMap<String, u64>,
         coords: HashMap<String, Value>,
+        unconstrained_names: Option<Vec<String>>,
     ) -> Result<Self> {
         let logp_func = Python::attach(|py| logp_clone_func.call0(py))?;
         let expand_func = Python::attach(|py| expand_clone_func.call1(py, (0u64, 0u64, 0u64)))?;
@@ -146,6 +155,8 @@ impl PyDensity {
             variables,
             dim_sizes,
             coords,
+            unconstrained_names,
+            native_flow: NativeFlow::default(),
         })
     }
 }
@@ -231,6 +242,10 @@ impl CpuLogpFunc for PyDensity {
 
     fn dim(&self) -> usize {
         self.dim
+    }
+
+    fn vector_coord(&self) -> Option<Value> {
+        self.unconstrained_names.clone().map(Value::Strings)
     }
 
     fn expand_vector<R>(
@@ -419,7 +434,30 @@ impl CpuLogpFunc for PyDensity {
         untransformed_gradient: &mut [f64],
         transformed_position: &[f64],
         transformed_gradient: &mut [f64],
+        clip: Option<f64>,
     ) -> std::result::Result<(f64, f64), Self::LogpError> {
+        // Native path: only the model's logp runs in Python, the flow does
+        // not. `native_flow` is moved out so the logp closure can borrow `self`.
+        let adapter = self
+            .transform_adapter
+            .clone()
+            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?;
+        let mut native = std::mem::take(&mut self.native_flow);
+        let result = native.init_from_transformed_position(
+            &adapter,
+            params,
+            untransformed_position,
+            untransformed_gradient,
+            transformed_position,
+            transformed_gradient,
+            clip,
+            |y, grad| self.logp(y, grad),
+        );
+        self.native_flow = native;
+        if let Some(out) = result? {
+            return Ok(out);
+        }
+
         let (logp, logdet) = self
             .transform_adapter
             .as_mut()
@@ -430,6 +468,7 @@ impl CpuLogpFunc for PyDensity {
                 untransformed_gradient,
                 transformed_position,
                 transformed_gradient,
+                clip,
             )?;
         Ok((logp, logdet))
     }
@@ -441,6 +480,7 @@ impl CpuLogpFunc for PyDensity {
         untransformed_gradient: &mut [f64],
         transformed_position: &mut [f64],
         transformed_gradient: &mut [f64],
+        clip: Option<f64>,
     ) -> std::result::Result<(f64, f64), Self::LogpError> {
         let (logp, logdet) = self
             .transform_adapter
@@ -452,6 +492,7 @@ impl CpuLogpFunc for PyDensity {
                 untransformed_gradient,
                 transformed_position,
                 transformed_gradient,
+                clip,
             )?;
         Ok((logp, logdet))
     }
@@ -464,6 +505,7 @@ impl CpuLogpFunc for PyDensity {
         untransformed_logp: impl ExactSizeIterator<Item = &'a f64>,
         params: &'a mut Py<PyAny>,
     ) -> std::result::Result<(), Self::LogpError> {
+        self.native_flow.invalidate();
         self.transform_adapter
             .as_mut()
             .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?
@@ -484,6 +526,7 @@ impl CpuLogpFunc for PyDensity {
         untransformed_gradient: &[f64],
         chain: u64,
     ) -> std::result::Result<Py<PyAny>, Self::LogpError> {
+        self.native_flow.invalidate();
         let trafo = self
             .transform_adapter
             .as_mut()
@@ -515,12 +558,9 @@ impl CpuLogpFunc for PyDensity {
 }
 
 impl Model for PyModel {
-    type Math<'model>
-        = CpuMath<PyDensity>
-    where
-        Self: 'model;
+    type Math = CpuMath<PyDensity>;
 
-    fn math<R: Rng + ?Sized>(&self, _rng: &mut R) -> Result<Self::Math<'_>> {
+    fn math<R: Rng + ?Sized>(self: Arc<PyModel>, _rng: &mut R) -> Result<Self::Math> {
         Ok(CpuMath::new(PyDensity::new(
             &self.make_logp_func,
             &self.make_expand_func,
@@ -529,42 +569,27 @@ impl Model for PyModel {
             self.variables.clone(),
             self.dim_sizes.clone(),
             self.coords.clone(),
+            self.unconstrained_names.clone(),
         )?))
     }
 
     fn init_position<R: rand::prelude::Rng + ?Sized>(
         &self,
         rng: &mut R,
+        chain_id: u64,
         position: &mut [f64],
-    ) -> Result<()> {
+    ) -> Result<(), InitPositionError> {
         let Some(init_func) = self.init_point_func.as_ref() else {
             let dist = Uniform::new(-2f64, 2f64).expect("Could not create uniform distribution");
             position.iter_mut().for_each(|x| *x = dist.sample(rng));
             return Ok(());
         };
 
-        let seed = rng.next_u64();
-
-        Python::attach(|py| {
-            let init_point = init_func
-                .call1(py, (seed,))
-                .context("Failed to initialize point")?;
-
-            let init_point: PyReadonlyArray1<f64> = init_point
-                .extract(py)
-                .map_err(|_| anyhow!("Initialization array returned incorrect argument"))?;
-
-            let init_point = init_point
-                .as_slice()
-                .context("Initial point must be contiguous")?;
-
-            if init_point.len() != position.len() {
-                bail!("Initial point has incorrect length");
-            }
-
-            position.copy_from_slice(init_point);
-            Ok(())
-        })?;
-        Ok(())
+        Ok(call_init_point_func(
+            init_func,
+            rng.next_u64(),
+            chain_id,
+            position,
+        )?)
     }
 }

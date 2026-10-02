@@ -1,0 +1,1774 @@
+//! Residuals of the Levenberg-Marquardt fit of a `SparseTriangularMap`, and
+//! the derivatives `lmopt` needs from them: the pushforward `J v`, the
+//! pullback `J^T r`, and the exact Gauss-Newton blocks. The derivation and the
+//! notation are in `notes/lm_derivatives.md`.
+//!
+//! Only the conditioners are fitted. The map's inputs `y` and the gradients
+//! `g` are fixed data, already mapped through the frozen affine and
+//! permutation, so the residual of one draw is
+//!
+//! ```text
+//! r = (x + w) / sqrt(n_draw),   J^T w = g - grad_y log_det,
+//! ```
+//!
+//! followed, with a Fisher regularization `rho`, by one parent score per edge,
+//! `sqrt(rho) (L[i,j] - x_i A[i,j]) / sqrt(n_draw)`.
+//!
+//! Supported conditioners: one hidden layer with softplus, and the linear
+//! location skip. The transformer is a `Contract2` chain, evaluated in the
+//! density direction.
+//!
+//! Parameters are laid out per variable, with no bucketing or padding.
+//! Variable `i`'s slice holds, for each hidden unit `u`, the unit's input
+//! weights `W1[u, :]`, its bias `b1[u]` and its output weights `W2[:, u]`,
+//! followed by `b2` and the skip weights `s`. Every kernel walks the
+//! conditioner unit by unit, so this keeps each unit's weights contiguous.
+
+use anyhow::{bail, Result};
+use numpy::{PyArray1, PyReadonlyArray1};
+use pyo3::prelude::*;
+use rayon::prelude::*;
+
+use faer::linalg::matmul::matmul;
+use faer::{Accum, Mat, Par};
+
+use crate::triangular::{Contract2Spec, Param};
+
+/// Capacity of a [`Jet`]: the transformer input `y` and up to 15 transformer
+/// parameters (three `Contract2` layers).
+const N: usize = 16;
+/// Number of directions a [`Jet`] carries second derivatives along.
+const K: usize = 2;
+/// Draws per matrix product when accumulating the exact blocks.
+const BLOCK_DRAW_BATCH: usize = 32;
+
+/// A scalar function of `z = (y, pi)`, with its gradient and the products of
+/// its Hessian with `K` fixed directions: `e[k] = g . d_k`, `h[k] = H d_k`.
+///
+/// Forward-over-forward, but sharing the value and gradient across the
+/// directions, so every operation is O(N) instead of the O(N^2) a full
+/// Hessian would cost.
+#[derive(Clone, Copy)]
+struct Jet {
+    v: f64,
+    g: [f64; N],
+    e: [f64; K],
+    h: [[f64; N]; K],
+}
+
+impl Jet {
+    #[inline(always)]
+    fn constant(v: f64) -> Self {
+        Self {
+            v,
+            g: [0.0; N],
+            e: [0.0; K],
+            h: [[0.0; N]; K],
+        }
+    }
+
+    #[inline(always)]
+    fn variable(v: f64, index: usize, dirs: &[[f64; N]; K]) -> Self {
+        let mut out = Self::constant(v);
+        out.g[index] = 1.0;
+        for k in 0..K {
+            out.e[k] = dirs[k][index];
+        }
+        out
+    }
+
+    /// `f(self)`, given `f`, `f'` and `f''` at `self.v`.
+    #[inline(always)]
+    fn chain(self, f0: f64, f1: f64, f2: f64) -> Self {
+        let mut out = Self::constant(f0);
+        for n in 0..N {
+            out.g[n] = f1 * self.g[n];
+        }
+        for k in 0..K {
+            out.e[k] = f1 * self.e[k];
+            let curvature = f2 * self.e[k];
+            for n in 0..N {
+                out.h[k][n] = f1 * self.h[k][n] + curvature * self.g[n];
+            }
+        }
+        out
+    }
+
+    #[inline(always)]
+    fn asinh(self) -> Self {
+        let a = self.v;
+        // `1 + a*a` overflows above ~1e154, where `|a|` is the root to full
+        // precision anyway; `hypot` is markedly slower.
+        let root = if a.abs() > 1e150 {
+            a.abs()
+        } else {
+            (1.0 + a * a).sqrt()
+        };
+        self.chain(a.asinh(), 1.0 / root, -a / (root * root * root))
+    }
+
+    #[inline(always)]
+    fn sinh(self) -> Self {
+        let s = self.v.sinh();
+        self.chain(s, self.v.cosh(), s)
+    }
+
+    #[inline(always)]
+    fn exp(self) -> Self {
+        let e = self.v.exp();
+        self.chain(e, e, e)
+    }
+
+    #[inline(always)]
+    fn ln_1p(self) -> Self {
+        let inv = 1.0 / (1.0 + self.v);
+        self.chain(self.v.ln_1p(), inv, -inv * inv)
+    }
+
+    /// `log(cosh(v))`, in `_log_cosh`'s stable form.
+    #[inline(always)]
+    fn log_cosh(self) -> Self {
+        let a = self.v.abs();
+        let t = self.v.tanh();
+        self.chain(
+            a + (-2.0 * a).exp().ln_1p() - std::f64::consts::LN_2,
+            t,
+            1.0 - t * t,
+        )
+    }
+
+    #[inline(always)]
+    fn sigmoid(self) -> Self {
+        let s = 1.0 / (1.0 + (-self.v).exp());
+        let ds = s * (1.0 - s);
+        self.chain(s, ds, ds * (1.0 - 2.0 * s))
+    }
+
+    #[inline(always)]
+    fn square(self) -> Self {
+        self * self
+    }
+}
+
+impl std::ops::Add for Jet {
+    type Output = Jet;
+    #[inline(always)]
+    fn add(mut self, other: Jet) -> Jet {
+        self.v += other.v;
+        for n in 0..N {
+            self.g[n] += other.g[n];
+        }
+        for k in 0..K {
+            self.e[k] += other.e[k];
+            for n in 0..N {
+                self.h[k][n] += other.h[k][n];
+            }
+        }
+        self
+    }
+}
+
+impl std::ops::Neg for Jet {
+    type Output = Jet;
+    #[inline(always)]
+    fn neg(self) -> Jet {
+        self * -1.0
+    }
+}
+
+impl std::ops::Sub for Jet {
+    type Output = Jet;
+    #[inline(always)]
+    fn sub(self, other: Jet) -> Jet {
+        self + (-other)
+    }
+}
+
+impl std::ops::Mul for Jet {
+    type Output = Jet;
+    #[inline(always)]
+    fn mul(self, other: Jet) -> Jet {
+        let (a, b) = (self, other);
+        let mut out = Jet::constant(a.v * b.v);
+        for n in 0..N {
+            out.g[n] = a.v * b.g[n] + b.v * a.g[n];
+        }
+        for k in 0..K {
+            out.e[k] = a.v * b.e[k] + b.v * a.e[k];
+            for n in 0..N {
+                out.h[k][n] = a.v * b.h[k][n] + b.v * a.h[k][n] + a.e[k] * b.g[n] + b.e[k] * a.g[n];
+            }
+        }
+        out
+    }
+}
+
+impl std::ops::Mul<f64> for Jet {
+    type Output = Jet;
+    #[inline(always)]
+    fn mul(mut self, c: f64) -> Jet {
+        self.v *= c;
+        for n in 0..N {
+            self.g[n] *= c;
+        }
+        for k in 0..K {
+            self.e[k] *= c;
+            for n in 0..N {
+                self.h[k][n] *= c;
+            }
+        }
+        self
+    }
+}
+
+impl std::ops::Add<f64> for Jet {
+    type Output = Jet;
+    #[inline(always)]
+    fn add(mut self, c: f64) -> Jet {
+        self.v += c;
+        self
+    }
+}
+
+/// `_bounded_log_gamma`'s constants for one pair of bounds.
+#[derive(Debug, Clone, Copy)]
+struct GammaBound {
+    low: f64,
+    width: f64,
+    slope: f64,
+    offset: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Layer {
+    alpha: Option<Param>,
+    beta: Option<Param>,
+    sigma: Option<Param>,
+    mu: Option<Param>,
+    nu: Option<Param>,
+    bound: Option<GammaBound>,
+}
+
+impl Layer {
+    fn new(spec: Contract2Spec) -> Result<Self> {
+        let bound = match spec.log_gamma_bounds {
+            None => None,
+            Some((low, high)) => {
+                if !(low < 0.0 && 0.0 < high) {
+                    bail!("log_gamma_bounds must satisfy low < 0 < high, got ({low}, {high})");
+                }
+                let width = high - low;
+                let at_zero = -low / width;
+                Some(GammaBound {
+                    low,
+                    width,
+                    slope: width / (-low * high),
+                    offset: (at_zero / (1.0 - at_zero)).ln(),
+                })
+            }
+        };
+        Ok(Self {
+            alpha: spec.alpha,
+            beta: spec.beta,
+            sigma: spec.sigma,
+            mu: spec.mu,
+            nu: spec.nu,
+            bound,
+        })
+    }
+
+    fn params(&self) -> impl Iterator<Item = Param> {
+        [self.alpha, self.beta, self.sigma, self.mu, self.nu]
+            .into_iter()
+            .flatten()
+    }
+}
+
+/// `T(y; pi)` and `Lambda(y; pi) = log |dT/dy|` of the inverted `Contract2`
+/// chain (`Contract2.inverse_and_log_det`, last layer first), as jets in
+/// `z = (y, pi)` along the directions `dirs`.
+fn transformer(layers: &[Layer], y: f64, pi: &[f64], dirs: &[[f64; N]; K]) -> (Jet, Jet) {
+    let field = |param: Option<Param>| {
+        param.map(|p| Jet::variable(pi[p.index] + p.offset, 1 + p.index, dirs))
+    };
+
+    let mut x = Jet::variable(y, 0, dirs);
+    let mut log_det = Jet::constant(0.0);
+    for layer in layers.iter().rev() {
+        let log_gamma = field(layer.alpha).map(|alpha| {
+            let log_gamma = alpha.asinh();
+            match layer.bound {
+                None => log_gamma,
+                Some(b) => (log_gamma * b.slope + b.offset).sigmoid() * b.width + b.low,
+            }
+        });
+        let log_delta = field(layer.beta).map(Jet::asinh);
+        let log_sigma = field(layer.sigma).map(Jet::asinh);
+
+        let centred = match field(layer.mu) {
+            Some(mu) => x - mu,
+            None => x,
+        };
+        let log_scale = match (log_gamma, log_sigma) {
+            (Some(g), Some(s)) => Some(g - s),
+            (Some(g), None) => Some(g),
+            (None, Some(s)) => Some(-s),
+            (None, None) => None,
+        };
+        let half_a = match log_scale {
+            Some(scale) => scale.exp() * centred * 0.5,
+            None => centred * 0.5,
+        };
+        let arg = half_a.asinh();
+        let shifted = match log_delta {
+            Some(delta) => arg - delta * 2.0,
+            None => arg,
+        };
+        let u = match log_gamma {
+            Some(g) => shifted * (-g).exp(),
+            None => shifted,
+        };
+
+        let mut out = u.sinh() * 2.0;
+        if let Some(nu) = field(layer.nu) {
+            out = out + nu;
+        }
+        let mut ld = u.log_cosh() - half_a.square().ln_1p() * 0.5;
+        if let Some(s) = log_sigma {
+            ld = ld - s;
+        }
+        x = out;
+        log_det = log_det + ld;
+    }
+    (x, log_det)
+}
+
+/// Softplus and its first two derivatives.
+#[inline(always)]
+fn softplus(a: f64) -> (f64, f64, f64) {
+    let e = (-a.abs()).exp();
+    let sigmoid = if a >= 0.0 {
+        1.0 / (1.0 + e)
+    } else {
+        e / (1.0 + e)
+    };
+    (e.ln_1p() + a.max(0.0), sigmoid, sigmoid * (1.0 - sigmoid))
+}
+
+#[inline(always)]
+fn dot(a: &[f64], b: &[f64]) -> f64 {
+    a.iter().zip(b).map(|(a, b)| a * b).sum()
+}
+
+#[inline(always)]
+fn axpy(alpha: f64, x: &[f64], y: &mut [f64]) {
+    for (y, x) in y.iter_mut().zip(x) {
+        *y += alpha * x;
+    }
+}
+
+/// Where one variable's conditioner parameters sit in its slice.
+#[derive(Clone, Copy)]
+struct Shape {
+    n_parent: usize,
+    n_unit: usize,
+    n_par: usize,
+}
+
+impl Shape {
+    #[inline(always)]
+    fn stride(&self) -> usize {
+        self.n_parent + 1 + self.n_par
+    }
+
+    fn size(&self) -> usize {
+        self.n_unit * self.stride() + self.n_par + self.n_parent
+    }
+
+    #[inline(always)]
+    fn w1(&self, u: usize) -> std::ops::Range<usize> {
+        let start = u * self.stride();
+        start..start + self.n_parent
+    }
+
+    #[inline(always)]
+    fn b1(&self, u: usize) -> usize {
+        u * self.stride() + self.n_parent
+    }
+
+    #[inline(always)]
+    fn w2(&self, u: usize) -> std::ops::Range<usize> {
+        let start = u * self.stride() + self.n_parent + 1;
+        start..start + self.n_par
+    }
+
+    #[inline(always)]
+    fn b2(&self) -> std::ops::Range<usize> {
+        let start = self.n_unit * self.stride();
+        start..start + self.n_par
+    }
+
+    #[inline(always)]
+    fn skip(&self) -> std::ops::Range<usize> {
+        let start = self.n_unit * self.stride() + self.n_par;
+        start..start + self.n_parent
+    }
+}
+
+/// A cotangent on one variable's local outputs `(x_i, delta_i, mu_i, A[i, :],
+/// L[i, :])`.
+struct Cotangent<'a> {
+    x: f64,
+    delta: f64,
+    mu: f64,
+    edge_a: &'a [f64],
+    edge_l: &'a [f64],
+}
+
+/// Per-thread scratch for the local kernels.
+#[derive(Default)]
+struct Scratch {
+    y_parents: Vec<f64>,
+    unit_a: Vec<f64>,
+    unit_b: Vec<f64>,
+    pi: Vec<f64>,
+    pi_dot: Vec<f64>,
+    t_bar: Vec<f64>,
+    l_bar: Vec<f64>,
+    pi_bar: Vec<f64>,
+}
+
+impl Scratch {
+    fn new(n_unit: usize, n_par: usize, max_parent: usize) -> Self {
+        Self {
+            y_parents: vec![0.0; max_parent],
+            unit_a: vec![0.0; n_unit],
+            unit_b: vec![0.0; n_unit],
+            pi: vec![0.0; n_par],
+            pi_dot: vec![0.0; n_par],
+            t_bar: vec![0.0; n_par],
+            l_bar: vec![0.0; n_par],
+            pi_bar: vec![0.0; n_par],
+        }
+    }
+}
+
+/// One variable's linearization at one draw, recorded by the primal: the
+/// softplus values and derivatives at its hidden units, and the gradients
+/// and Hessians of `T` and `Lambda` in `z = (y, pi)`.
+///
+/// `theta` is fixed while CG runs, so everything that needs a transcendental
+/// function is evaluated once per primal; the pushforward and the pullback
+/// only take Hessian-vector products of it.
+#[derive(Clone, Copy)]
+struct Local<'a> {
+    h: &'a [f64],
+    h1: &'a [f64],
+    h2: &'a [f64],
+    /// `dT/dpi` and `dLambda/dpi`.
+    t: &'a [f64],
+    l: &'a [f64],
+    /// Lower triangles in `z = (y, pi)`, packed row by row.
+    hess_t: &'a [f64],
+    hess_l: &'a [f64],
+}
+
+/// Length of a packed lower triangle of an `n x n` matrix.
+fn packed_len(n: usize) -> usize {
+    n * (n + 1) / 2
+}
+
+/// `out = H d` for a symmetric `H` stored as a packed lower triangle.
+fn packed_product(packed: &[f64], d: &[f64], out: &mut [f64]) {
+    out.fill(0.0);
+    let mut index = 0;
+    for r in 0..d.len() {
+        for c in 0..r {
+            let value = packed[index];
+            out[r] += value * d[c];
+            out[c] += value * d[r];
+            index += 1;
+        }
+        out[r] += packed[index] * d[r];
+        index += 1;
+    }
+}
+
+/// One exact Gauss-Newton sub-block: parameters `start..start + n` of the
+/// flat parameter vector, `n = matrix.nrows()`.
+pub(crate) struct GnBlock {
+    pub(crate) start: usize,
+    pub(crate) matrix: Mat<f64>,
+}
+
+/// One draw's quantities from the primal, which every later operation reads.
+struct DrawTape<'a> {
+    /// Per variable: `h`, `h'` and `h''` at its hidden units.
+    units: &'a [f64],
+    /// Per variable: `t`, `l` and the packed Hessians of `T` and `Lambda`.
+    record: &'a [f64],
+    edge_a: &'a [f64],
+    delta: &'a [f64],
+    x: &'a [f64],
+    w: &'a [f64],
+}
+
+struct DrawTapeMut<'a> {
+    units: &'a mut [f64],
+    record: &'a mut [f64],
+    edge_a: &'a mut [f64],
+    edge_l: &'a mut [f64],
+    delta: &'a mut [f64],
+    x: &'a mut [f64],
+    w: &'a mut [f64],
+}
+
+#[derive(Default)]
+pub(crate) struct Tape {
+    theta: Vec<f64>,
+    units: Vec<f64>,
+    record: Vec<f64>,
+    edge_a: Vec<f64>,
+    edge_l: Vec<f64>,
+    delta: Vec<f64>,
+    x: Vec<f64>,
+    w: Vec<f64>,
+}
+
+/// Splits `values` into `n` consecutive chunks of `size`, which may be zero.
+fn chunks(values: &mut [f64], size: usize, n: usize) -> Vec<&mut [f64]> {
+    let mut out = Vec::with_capacity(n);
+    let mut rest = values;
+    for _ in 0..n {
+        let (head, tail) = rest.split_at_mut(size);
+        out.push(head);
+        rest = tail;
+    }
+    out
+}
+
+/// Per-draw scratch for the global sweeps.
+struct DrawScratch {
+    local: Scratch,
+    by_var: [Vec<f64>; 4],
+    by_edge: [Vec<f64>; 2],
+    residual: Vec<f64>,
+}
+
+impl DrawScratch {
+    fn new(problem: &FisherResiduals) -> Self {
+        let n_var = problem.n_var;
+        let n_edge = problem.n_edge();
+        Self {
+            local: problem.scratch(),
+            by_var: std::array::from_fn(|_| vec![0.0; n_var]),
+            by_edge: std::array::from_fn(|_| vec![0.0; n_edge]),
+            residual: vec![0.0; problem.n_residuals()],
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct FisherResiduals {
+    pub(crate) n_var: usize,
+    n_unit: usize,
+    n_par: usize,
+    location: usize,
+    parent_indptr: Vec<usize>,
+    parent_index: Vec<usize>,
+    max_parent: usize,
+    pub(crate) param_offset: Vec<usize>,
+    layers: Vec<Layer>,
+    /// `sqrt(fisher_regularization)`, if regularized.
+    regularization: Option<f64>,
+    /// The parent sets closed under elimination, on which the selected
+    /// inverse is stored. Equal to the parents for a chordal pattern.
+    filled_indptr: Vec<usize>,
+    filled_index: Vec<usize>,
+    pub(crate) n_draw: usize,
+    y: Vec<f64>,
+    g: Vec<f64>,
+}
+
+impl FisherResiduals {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        parent_indptr: Vec<usize>,
+        parent_index: Vec<usize>,
+        n_unit: usize,
+        n_par: usize,
+        location: usize,
+        specs: Vec<Contract2Spec>,
+        fisher_regularization: Option<f64>,
+    ) -> Result<Self> {
+        let Some(n_var) = parent_indptr.len().checked_sub(1) else {
+            bail!("parent_indptr must not be empty");
+        };
+        if parent_indptr[0] != 0
+            || parent_indptr.windows(2).any(|w| w[0] > w[1])
+            || parent_indptr[n_var] != parent_index.len()
+        {
+            bail!("parent_indptr is not a valid CSR index pointer");
+        }
+        for i in 0..n_var {
+            for &p in &parent_index[parent_indptr[i]..parent_indptr[i + 1]] {
+                if p >= i {
+                    bail!("variable {i} has parent {p}, which does not precede it");
+                }
+            }
+        }
+        if n_par + 1 > N {
+            bail!(
+                "the transformer has {n_par} parameters; at most {} are supported",
+                N - 1
+            );
+        }
+        if location >= n_par {
+            bail!("location index {location} out of range for {n_par} parameters");
+        }
+        let layers = specs
+            .into_iter()
+            .map(Layer::new)
+            .collect::<Result<Vec<_>>>()?;
+        for param in layers.iter().flat_map(Layer::params) {
+            if param.index >= n_par {
+                bail!("transformer parameter index {} out of range", param.index);
+            }
+        }
+        if let Some(rho) = fisher_regularization {
+            if rho.is_nan() || rho < 0.0 {
+                bail!("fisher_regularization must be non-negative, got {rho}");
+            }
+        }
+
+        let max_parent = (0..n_var)
+            .map(|i| parent_indptr[i + 1] - parent_indptr[i])
+            .max()
+            .unwrap_or(0);
+        let mut param_offset = vec![0usize; n_var + 1];
+        for i in 0..n_var {
+            let shape = Shape {
+                n_parent: parent_indptr[i + 1] - parent_indptr[i],
+                n_unit,
+                n_par,
+            };
+            param_offset[i + 1] = param_offset[i] + shape.size();
+        }
+
+        // Symbolic fill, as `_build_selected_inverse`: each `p` in `P*(i)`
+        // must see the earlier part of `P*(i)`. Walking backwards finalizes
+        // `P*(i)` before it propagates.
+        let mut filled: Vec<std::collections::BTreeSet<usize>> = (0..n_var)
+            .map(|i| {
+                parent_index[parent_indptr[i]..parent_indptr[i + 1]]
+                    .iter()
+                    .copied()
+                    .collect()
+            })
+            .collect();
+        for i in (0..n_var).rev() {
+            let members: Vec<usize> = filled[i].iter().copied().collect();
+            for (k, &p) in members.iter().enumerate() {
+                filled[p].extend(members[..k].iter().copied());
+            }
+        }
+        let mut filled_indptr = vec![0usize; n_var + 1];
+        let mut filled_index = Vec::new();
+        for i in 0..n_var {
+            filled_index.extend(filled[i].iter().copied());
+            filled_indptr[i + 1] = filled_index.len();
+        }
+
+        Ok(Self {
+            n_var,
+            n_unit,
+            n_par,
+            location,
+            parent_indptr,
+            parent_index,
+            max_parent,
+            param_offset,
+            layers,
+            regularization: fisher_regularization.map(f64::sqrt),
+            filled_indptr,
+            filled_index,
+            n_draw: 0,
+            y: Vec::new(),
+            g: Vec::new(),
+        })
+    }
+
+    fn n_edge(&self) -> usize {
+        self.parent_index.len()
+    }
+
+    pub(crate) fn n_params(&self) -> usize {
+        self.param_offset[self.n_var]
+    }
+
+    pub(crate) fn n_residuals(&self) -> usize {
+        self.n_var
+            + if self.regularization.is_some() {
+                self.n_edge()
+            } else {
+                0
+            }
+    }
+
+    fn scale(&self) -> f64 {
+        1.0 / (self.n_draw as f64).sqrt()
+    }
+
+    fn scratch(&self) -> Scratch {
+        Scratch::new(self.n_unit, self.n_par, self.max_parent)
+    }
+
+    fn shape(&self, i: usize) -> Shape {
+        Shape {
+            n_parent: self.parent_indptr[i + 1] - self.parent_indptr[i],
+            n_unit: self.n_unit,
+            n_par: self.n_par,
+        }
+    }
+
+    fn edges(&self, i: usize) -> std::ops::Range<usize> {
+        self.parent_indptr[i]..self.parent_indptr[i + 1]
+    }
+
+    fn params(&self, i: usize) -> std::ops::Range<usize> {
+        self.param_offset[i]..self.param_offset[i + 1]
+    }
+
+    pub(crate) fn set_data(&mut self, y: Vec<f64>, g: Vec<f64>) -> Result<()> {
+        if self.n_var == 0 || !y.len().is_multiple_of(self.n_var) || y.len() != g.len() {
+            bail!("y and g must both have shape (n_draw, {})", self.n_var);
+        }
+        self.n_draw = y.len() / self.n_var;
+        if self.n_draw == 0 {
+            bail!("need at least one draw");
+        }
+        self.y = y;
+        self.g = g;
+        Ok(())
+    }
+
+    /// Tape entries per variable and draw for the units and the transformer
+    /// record.
+    fn units_len(&self) -> usize {
+        3 * self.n_unit
+    }
+
+    fn record_len(&self) -> usize {
+        2 * self.n_par + 2 * packed_len(1 + self.n_par)
+    }
+
+    fn draw_tape<'a>(&self, tape: &'a Tape, draw: usize) -> DrawTape<'a> {
+        let (n_var, n_edge) = (self.n_var, self.n_edge());
+        let (units, record) = (n_var * self.units_len(), n_var * self.record_len());
+        DrawTape {
+            units: &tape.units[draw * units..(draw + 1) * units],
+            record: &tape.record[draw * record..(draw + 1) * record],
+            edge_a: &tape.edge_a[draw * n_edge..(draw + 1) * n_edge],
+            delta: &tape.delta[draw * n_var..(draw + 1) * n_var],
+            x: &tape.x[draw * n_var..(draw + 1) * n_var],
+            w: &tape.w[draw * n_var..(draw + 1) * n_var],
+        }
+    }
+
+    /// Variable `i`'s linearization in one draw's tape.
+    fn local<'a>(&self, tape: &DrawTape<'a>, i: usize) -> Local<'a> {
+        let n_unit = self.n_unit;
+        let units = &tape.units[i * self.units_len()..(i + 1) * self.units_len()];
+        let record = &tape.record[i * self.record_len()..(i + 1) * self.record_len()];
+        let (t, rest) = record.split_at(self.n_par);
+        let (l, hessians) = rest.split_at(self.n_par);
+        let (hess_t, hess_l) = hessians.split_at(packed_len(1 + self.n_par));
+        Local {
+            h: &units[..n_unit],
+            h1: &units[n_unit..2 * n_unit],
+            h2: &units[2 * n_unit..],
+            t,
+            l,
+            hess_t,
+            hess_l,
+        }
+    }
+
+    fn gather_parents(&self, i: usize, y: &[f64], out: &mut Vec<f64>) {
+        out.clear();
+        out.extend(self.parent_index[self.edges(i)].iter().map(|&p| y[p]));
+    }
+
+    // ------------------------------------------------------------ local kernels
+
+    /// Variable `i`'s primal. Records its linearization in `units` and
+    /// `record`, writes its edge values to `edge_a` and `edge_l`, and returns
+    /// `(x, delta, mu)`.
+    ///
+    /// The transformer's Hessians take `ceil((1 + n_par) / K)` jet passes,
+    /// against one for the values alone, but every later product reuses them.
+    #[allow(clippy::too_many_arguments)]
+    fn local_primal(
+        &self,
+        i: usize,
+        theta: &[f64],
+        y_own: f64,
+        units: &mut [f64],
+        record: &mut [f64],
+        edge_a: &mut [f64],
+        edge_l: &mut [f64],
+        s: &mut Scratch,
+    ) -> (f64, f64, f64) {
+        let shape = self.shape(i);
+        let n_unit = shape.n_unit;
+        let n_par = self.n_par;
+        let n_z = 1 + n_par;
+
+        s.pi.copy_from_slice(&theta[shape.b2()]);
+        for u in 0..n_unit {
+            let a = dot(&theta[shape.w1(u)], &s.y_parents) + theta[shape.b1(u)];
+            let (h, h1, h2) = softplus(a);
+            units[u] = h;
+            units[n_unit + u] = h1;
+            units[2 * n_unit + u] = h2;
+            axpy(h, &theta[shape.w2(u)], &mut s.pi);
+        }
+        s.pi[self.location] += dot(&theta[shape.skip()], &s.y_parents);
+
+        // Hessian columns `K` at a time; the values and gradients come out of
+        // every pass.
+        let (t, rest) = record.split_at_mut(n_par);
+        let (l, hessians) = rest.split_at_mut(n_par);
+        let (hess_t, hess_l) = hessians.split_at_mut(packed_len(n_z));
+        let mut values = (0.0, 0.0, 0.0);
+        for first in (0..n_z).step_by(K) {
+            let mut dirs = [[0.0; N]; K];
+            for k in 0..K {
+                if first + k < n_z {
+                    dirs[k][first + k] = 1.0;
+                }
+            }
+            let (x, log_det) = transformer(&self.layers, y_own, &s.pi, &dirs);
+            for k in 0..K {
+                let column = first + k;
+                if column >= n_z {
+                    continue;
+                }
+                // Row `r >= column` of the lower triangle.
+                for r in column..n_z {
+                    let index = packed_len(r) + column;
+                    hess_t[index] = x.h[k][r];
+                    hess_l[index] = log_det.h[k][r];
+                }
+            }
+            t.copy_from_slice(&x.g[1..n_z]);
+            l.copy_from_slice(&log_det.g[1..n_z]);
+            values = (x.v, x.g[0], log_det.g[0]);
+        }
+
+        let (h1, t, l) = (&units[n_unit..2 * n_unit], &*t, &*l);
+        let skip = &theta[shape.skip()];
+        for j in 0..shape.n_parent {
+            edge_a[j] = t[self.location] * skip[j];
+            edge_l[j] = l[self.location] * skip[j];
+        }
+        for u in 0..n_unit {
+            let w2 = &theta[shape.w2(u)];
+            let w1 = &theta[shape.w1(u)];
+            axpy(dot(t, w2) * h1[u], w1, edge_a);
+            axpy(dot(l, w2) * h1[u], w1, edge_l);
+        }
+        values
+    }
+
+    /// Variable `i`'s tangents along `v` (its slice). Writes `A`'s and `L`'s
+    /// to `edge_a` and `edge_l`; returns those of `(x, delta, mu)`.
+    #[allow(clippy::too_many_arguments)]
+    fn local_pushforward(
+        &self,
+        shape: Shape,
+        theta: &[f64],
+        v: &[f64],
+        local: Local,
+        edge_a: &mut [f64],
+        edge_l: &mut [f64],
+        s: &mut Scratch,
+    ) -> (f64, f64, f64) {
+        let n_z = 1 + self.n_par;
+        s.pi_dot.copy_from_slice(&v[shape.b2()]);
+        for u in 0..shape.n_unit {
+            let a_dot = dot(&v[shape.w1(u)], &s.y_parents) + v[shape.b1(u)];
+            s.unit_a[u] = a_dot;
+            axpy(local.h[u], &v[shape.w2(u)], &mut s.pi_dot);
+            axpy(local.h1[u] * a_dot, &theta[shape.w2(u)], &mut s.pi_dot);
+        }
+        s.pi_dot[self.location] += dot(&v[shape.skip()], &s.y_parents);
+
+        let mut dir = [0.0; N];
+        dir[1..n_z].copy_from_slice(&s.pi_dot);
+        let (mut dot_t, mut dot_l) = ([0.0; N], [0.0; N]);
+        packed_product(local.hess_t, &dir[..n_z], &mut dot_t[..n_z]);
+        packed_product(local.hess_l, &dir[..n_z], &mut dot_l[..n_z]);
+        let (t, l) = (local.t, local.l);
+        let t_dot = &dot_t[1..n_z];
+        let l_dot = &dot_l[1..n_z];
+
+        let skip = &theta[shape.skip()];
+        let skip_dot = &v[shape.skip()];
+        let loc = self.location;
+        for j in 0..shape.n_parent {
+            edge_a[j] = t_dot[loc] * skip[j] + t[loc] * skip_dot[j];
+            edge_l[j] = l_dot[loc] * skip[j] + l[loc] * skip_dot[j];
+        }
+        for u in 0..shape.n_unit {
+            let w2 = &theta[shape.w2(u)];
+            let w2_dot = &v[shape.w2(u)];
+            let (p_t, p_l) = (dot(t, w2), dot(l, w2));
+            let h1 = local.h1[u];
+            let curvature = local.h2[u] * s.unit_a[u];
+            let alpha_t = (dot(t_dot, w2) + dot(t, w2_dot)) * h1 + p_t * curvature;
+            let alpha_l = (dot(l_dot, w2) + dot(l, w2_dot)) * h1 + p_l * curvature;
+            let w1 = &theta[shape.w1(u)];
+            let w1_dot = &v[shape.w1(u)];
+            axpy(alpha_t, w1, edge_a);
+            axpy(p_t * h1, w1_dot, edge_a);
+            axpy(alpha_l, w1, edge_l);
+            axpy(p_l * h1, w1_dot, edge_l);
+        }
+        (dot(t, &s.pi_dot), dot_t[0], dot_l[0])
+    }
+
+    /// Variable `i`'s local pullback of `cot`, accumulated into `grad`, its
+    /// slice of the gradient.
+    fn local_pullback(
+        &self,
+        shape: Shape,
+        theta: &[f64],
+        local: Local,
+        cot: &Cotangent,
+        s: &mut Scratch,
+        grad: &mut [f64],
+    ) {
+        let n_z = 1 + self.n_par;
+        let loc = self.location;
+        let skip = &theta[shape.skip()];
+
+        // The cotangents of `t` and `l`, from the edge cotangents, keeping
+        // `zeta` for `A` and `L` in `unit_a` and `unit_b`.
+        s.t_bar.fill(0.0);
+        s.l_bar.fill(0.0);
+        for u in 0..shape.n_unit {
+            let w1 = &theta[shape.w1(u)];
+            let zeta_a = dot(cot.edge_a, w1);
+            let zeta_l = dot(cot.edge_l, w1);
+            s.unit_a[u] = zeta_a;
+            s.unit_b[u] = zeta_l;
+            let w2 = &theta[shape.w2(u)];
+            axpy(local.h1[u] * zeta_a, w2, &mut s.t_bar);
+            axpy(local.h1[u] * zeta_l, w2, &mut s.l_bar);
+        }
+        s.t_bar[loc] += dot(cot.edge_a, skip);
+        s.l_bar[loc] += dot(cot.edge_l, skip);
+
+        // `T` along `(delta_bar, t_bar)` and `Lambda` along `(mu_bar,
+        // l_bar)`: every second-order path into `pi` at once.
+        let (mut dir_t, mut dir_l) = ([0.0; N], [0.0; N]);
+        dir_t[0] = cot.delta;
+        dir_t[1..n_z].copy_from_slice(&s.t_bar);
+        dir_l[0] = cot.mu;
+        dir_l[1..n_z].copy_from_slice(&s.l_bar);
+        let (mut bar_t, mut bar_l) = ([0.0; N], [0.0; N]);
+        packed_product(local.hess_t, &dir_t[..n_z], &mut bar_t[..n_z]);
+        packed_product(local.hess_l, &dir_l[..n_z], &mut bar_l[..n_z]);
+        let (t, l) = (local.t, local.l);
+        for m in 0..self.n_par {
+            s.pi_bar[m] = cot.x * t[m] + bar_t[1 + m] + bar_l[1 + m];
+        }
+
+        for u in 0..shape.n_unit {
+            let w2 = &theta[shape.w2(u)];
+            let (p_t, p_l) = (dot(t, w2), dot(l, w2));
+            let (zeta_a, zeta_l) = (s.unit_a[u], s.unit_b[u]);
+            let (h, h1) = (local.h[u], local.h1[u]);
+            let a_bar = local.h2[u] * (p_t * zeta_a + p_l * zeta_l) + h1 * dot(&s.pi_bar, w2);
+
+            let g_w2 = &mut grad[shape.w2(u)];
+            axpy(h1 * zeta_a, t, g_w2);
+            axpy(h1 * zeta_l, l, g_w2);
+            axpy(h, &s.pi_bar, g_w2);
+
+            let g_w1 = &mut grad[shape.w1(u)];
+            axpy(h1 * p_t, cot.edge_a, g_w1);
+            axpy(h1 * p_l, cot.edge_l, g_w1);
+            axpy(a_bar, &s.y_parents, g_w1);
+            grad[shape.b1(u)] += a_bar;
+        }
+        for (g, p) in grad[shape.b2()].iter_mut().zip(&s.pi_bar) {
+            *g += p;
+        }
+        let g_skip = &mut grad[shape.skip()];
+        axpy(t[loc], cot.edge_a, g_skip);
+        axpy(l[loc], cot.edge_l, g_skip);
+        axpy(s.pi_bar[loc], &s.y_parents, g_skip);
+    }
+
+    // ------------------------------------------------------------ global sweeps
+
+    /// Solves `J^T w = b` in place (back substitution, children first).
+    fn solve_transpose(&self, edge_a: &[f64], delta: &[f64], b: &mut [f64]) {
+        for i in (0..self.n_var).rev() {
+            let w_i = b[i] / delta[i];
+            b[i] = w_i;
+            for e in self.edges(i) {
+                b[self.parent_index[e]] -= edge_a[e] * w_i;
+            }
+        }
+    }
+
+    /// Solves `J z = b` in place (forward substitution, parents first).
+    fn solve(&self, edge_a: &[f64], delta: &[f64], b: &mut [f64]) {
+        for i in 0..self.n_var {
+            let mut acc = b[i];
+            for e in self.edges(i) {
+                acc -= edge_a[e] * b[self.parent_index[e]];
+            }
+            b[i] = acc / delta[i];
+        }
+    }
+
+    fn primal_draw(
+        &self,
+        theta: &[f64],
+        draw: usize,
+        tape: DrawTapeMut,
+        out: &mut [f64],
+        s: &mut DrawScratch,
+    ) {
+        let n_var = self.n_var;
+        let y = &self.y[draw * n_var..(draw + 1) * n_var];
+        let g = &self.g[draw * n_var..(draw + 1) * n_var];
+        let [grad_log_det, ..] = &mut s.by_var;
+        grad_log_det.fill(0.0);
+
+        for i in 0..n_var {
+            self.gather_parents(i, y, &mut s.local.y_parents);
+            let edges = self.edges(i);
+            let (units, record) = (self.units_len(), self.record_len());
+            let (x, delta, mu) = self.local_primal(
+                i,
+                &theta[self.params(i)],
+                y[i],
+                &mut tape.units[i * units..(i + 1) * units],
+                &mut tape.record[i * record..(i + 1) * record],
+                &mut tape.edge_a[edges.clone()],
+                &mut tape.edge_l[edges.clone()],
+                &mut s.local,
+            );
+            tape.x[i] = x;
+            tape.delta[i] = delta;
+            grad_log_det[i] += mu;
+            for e in edges {
+                grad_log_det[self.parent_index[e]] += tape.edge_l[e];
+            }
+        }
+
+        for i in 0..n_var {
+            tape.w[i] = g[i] - grad_log_det[i];
+        }
+        self.solve_transpose(tape.edge_a, tape.delta, tape.w);
+
+        let scale = self.scale();
+        for i in 0..n_var {
+            out[i] = scale * (tape.x[i] + tape.w[i]);
+        }
+        if let Some(reg) = self.regularization {
+            for i in 0..n_var {
+                for e in self.edges(i) {
+                    out[n_var + e] = scale * reg * (tape.edge_l[e] - tape.x[i] * tape.edge_a[e]);
+                }
+            }
+        }
+    }
+
+    fn pushforward_draw(
+        &self,
+        theta: &[f64],
+        v: &[f64],
+        draw: usize,
+        tape: &DrawTape,
+        out: &mut [f64],
+        s: &mut DrawScratch,
+    ) {
+        let n_var = self.n_var;
+        let y = &self.y[draw * n_var..(draw + 1) * n_var];
+        let [x_dot, rhs, ..] = &mut s.by_var;
+        let [a_dot, l_dot] = &mut s.by_edge;
+        rhs.fill(0.0);
+
+        for i in 0..n_var {
+            self.gather_parents(i, y, &mut s.local.y_parents);
+            let edges = self.edges(i);
+            let params = self.params(i);
+            let (xd, delta_dot, mu_dot) = self.local_pushforward(
+                self.shape(i),
+                &theta[params.clone()],
+                &v[params],
+                self.local(tape, i),
+                &mut a_dot[edges.clone()],
+                &mut l_dot[edges.clone()],
+                &mut s.local,
+            );
+            x_dot[i] = xd;
+            // J^T w_dot = -(grad_y log_det)_dot - J_dot^T w
+            rhs[i] -= mu_dot + delta_dot * tape.w[i];
+            for e in edges {
+                rhs[self.parent_index[e]] -= l_dot[e] + a_dot[e] * tape.w[i];
+            }
+        }
+        self.solve_transpose(tape.edge_a, tape.delta, rhs);
+
+        let scale = self.scale();
+        for i in 0..n_var {
+            out[i] = scale * (x_dot[i] + rhs[i]);
+        }
+        if let Some(reg) = self.regularization {
+            for i in 0..n_var {
+                for e in self.edges(i) {
+                    out[n_var + e] =
+                        scale * reg * (l_dot[e] - x_dot[i] * tape.edge_a[e] - tape.x[i] * a_dot[e]);
+                }
+            }
+        }
+    }
+
+    /// Accumulates this draw's `J^T r_bar` into `grad`.
+    fn pullback_draw(
+        &self,
+        theta: &[f64],
+        r_bar: &[f64],
+        draw: usize,
+        tape: &DrawTape,
+        grad: &mut [f64],
+        s: &mut DrawScratch,
+    ) {
+        let n_var = self.n_var;
+        let y = &self.y[draw * n_var..(draw + 1) * n_var];
+        let scale = self.scale();
+        let [z, ..] = &mut s.by_var;
+        let [cot_a, cot_l] = &mut s.by_edge;
+
+        for i in 0..n_var {
+            z[i] = scale * r_bar[i];
+        }
+        self.solve(tape.edge_a, tape.delta, z);
+
+        for i in 0..n_var {
+            self.gather_parents(i, y, &mut s.local.y_parents);
+            let edges = self.edges(i);
+            let mut x_bar = scale * r_bar[i];
+            for e in edges.clone() {
+                let z_p = z[self.parent_index[e]];
+                cot_a[e] = -tape.w[i] * z_p;
+                cot_l[e] = -z_p;
+                if let Some(reg) = self.regularization {
+                    let o = scale * reg * r_bar[n_var + e];
+                    x_bar -= o * tape.edge_a[e];
+                    cot_a[e] -= tape.x[i] * o;
+                    cot_l[e] += o;
+                }
+            }
+            let cot = Cotangent {
+                x: x_bar,
+                delta: -tape.w[i] * z[i],
+                mu: -z[i],
+                edge_a: &cot_a[edges.clone()],
+                edge_l: &cot_l[edges],
+            };
+            let params = self.params(i);
+            self.local_pullback(
+                self.shape(i),
+                &theta[params.clone()],
+                self.local(tape, i),
+                &cot,
+                &mut s.local,
+                &mut grad[params],
+            );
+        }
+    }
+
+    // ------------------------------------------------------------ operators
+
+    fn check_params(&self, values: &[f64], name: &str) -> Result<()> {
+        if values.len() != self.n_params() {
+            bail!(
+                "{name} has length {}, expected {}",
+                values.len(),
+                self.n_params()
+            );
+        }
+        Ok(())
+    }
+
+    /// `(n_draw, n_residuals)` residuals at `theta`, and the tape every
+    /// derivative at `theta` reads.
+    pub(crate) fn residuals(&self, theta: &[f64]) -> Result<(Vec<f64>, Tape)> {
+        self.check_params(theta, "theta")?;
+        if self.n_draw == 0 {
+            bail!("no data: call `set_data` first");
+        }
+        let (n_draw, n_var, n_edge) = (self.n_draw, self.n_var, self.n_edge());
+        let (units, record) = (n_var * self.units_len(), n_var * self.record_len());
+        let mut tape = Tape {
+            theta: theta.to_vec(),
+            units: vec![0.0; n_draw * units],
+            record: vec![0.0; n_draw * record],
+            edge_a: vec![0.0; n_draw * n_edge],
+            edge_l: vec![0.0; n_draw * n_edge],
+            delta: vec![0.0; n_draw * n_var],
+            x: vec![0.0; n_draw * n_var],
+            w: vec![0.0; n_draw * n_var],
+        };
+        let n_res = self.n_residuals();
+        let mut out = vec![0.0; n_draw * n_res];
+        {
+            let views: Vec<_> = chunks(&mut tape.units, units, n_draw)
+                .into_iter()
+                .zip(chunks(&mut tape.record, record, n_draw))
+                .zip(chunks(&mut tape.edge_a, n_edge, n_draw))
+                .zip(chunks(&mut tape.edge_l, n_edge, n_draw))
+                .zip(chunks(&mut tape.delta, n_var, n_draw))
+                .zip(chunks(&mut tape.x, n_var, n_draw))
+                .zip(chunks(&mut tape.w, n_var, n_draw))
+                .zip(chunks(&mut out, n_res, n_draw))
+                .enumerate()
+                .map(
+                    |(draw, (((((((units, record), edge_a), edge_l), delta), x), w), out))| {
+                        (
+                            draw,
+                            DrawTapeMut {
+                                units,
+                                record,
+                                edge_a,
+                                edge_l,
+                                delta,
+                                x,
+                                w,
+                            },
+                            out,
+                        )
+                    },
+                )
+                .collect();
+            views.into_par_iter().for_each_init(
+                || DrawScratch::new(self),
+                |s, (draw, tape, out)| self.primal_draw(theta, draw, tape, out, s),
+            );
+        }
+        Ok((out, tape))
+    }
+
+    pub(crate) fn pushforward(&self, tape: &Tape, v: &[f64]) -> Result<Vec<f64>> {
+        self.check_params(v, "v")?;
+        let n_res = self.n_residuals();
+        let mut out = vec![0.0; self.n_draw * n_res];
+        out.par_chunks_mut(n_res.max(1)).enumerate().for_each_init(
+            || DrawScratch::new(self),
+            |s, (draw, out)| {
+                let draw_tape = self.draw_tape(tape, draw);
+                self.pushforward_draw(&tape.theta, v, draw, &draw_tape, out, s)
+            },
+        );
+        Ok(out)
+    }
+
+    pub(crate) fn pullback(&self, tape: &Tape, r_bar: &[f64]) -> Result<Vec<f64>> {
+        let n_res = self.n_residuals();
+        if r_bar.len() != self.n_draw * n_res {
+            bail!("r_bar must have shape ({}, {n_res})", self.n_draw);
+        }
+        Ok(self.sum_over_draws(|draw, grad, s| {
+            let draw_tape = self.draw_tape(tape, draw);
+            let r_bar = &r_bar[draw * n_res..(draw + 1) * n_res];
+            self.pullback_draw(&tape.theta, r_bar, draw, &draw_tape, grad, s);
+        }))
+    }
+
+    /// `J^T J v`, one draw at a time, without forming `J v` for all draws.
+    pub(crate) fn gauss_newton_product(&self, tape: &Tape, v: &[f64]) -> Result<Vec<f64>> {
+        self.check_params(v, "v")?;
+        Ok(self.sum_over_draws(|draw, grad, s| {
+            let draw_tape = self.draw_tape(tape, draw);
+            let mut residual = std::mem::take(&mut s.residual);
+            self.pushforward_draw(&tape.theta, v, draw, &draw_tape, &mut residual, s);
+            self.pullback_draw(&tape.theta, &residual, draw, &draw_tape, grad, s);
+            s.residual = residual;
+        }))
+    }
+
+    fn sum_over_draws(&self, f: impl Fn(usize, &mut [f64], &mut DrawScratch) + Sync) -> Vec<f64> {
+        let n_params = self.n_params();
+        (0..self.n_draw)
+            .into_par_iter()
+            .fold(
+                || (vec![0.0; n_params], DrawScratch::new(self)),
+                |(mut grad, mut s), draw| {
+                    f(draw, &mut grad, &mut s);
+                    (grad, s)
+                },
+            )
+            .map(|(grad, _)| grad)
+            .reduce(
+                || vec![0.0; n_params],
+                |mut a, b| {
+                    for (a, b) in a.iter_mut().zip(&b) {
+                        *a += b;
+                    }
+                    a
+                },
+            )
+    }
+
+    // ------------------------------------------------------------ exact blocks
+
+    /// `Sigma = (J^T J)^{-1}` on the diagonal and the filled pattern, by
+    /// Takahashi's recurrence: the diagonal, then one slot per entry of
+    /// `filled_index`.
+    fn selected_inverse(&self, edge_a: &[f64], delta: &[f64], store: &mut [f64]) {
+        for i in 0..self.n_var {
+            let filled = self.filled_indptr[i]..self.filled_indptr[i + 1];
+            for slot in filled {
+                let j = self.filled_index[slot];
+                let mut acc = 0.0;
+                for e in self.edges(i) {
+                    acc += edge_a[e] * self.sigma(store, self.parent_index[e], j);
+                }
+                store[self.n_var + slot] = -acc / delta[i];
+            }
+            let mut acc = 0.0;
+            for e in self.edges(i) {
+                acc += edge_a[e] * self.sigma(store, i, self.parent_index[e]);
+            }
+            store[i] = (1.0 / delta[i] - acc) / delta[i];
+        }
+    }
+
+    fn sigma(&self, store: &[f64], a: usize, b: usize) -> f64 {
+        if a == b {
+            return store[a];
+        }
+        let (row, col) = if a > b { (a, b) } else { (b, a) };
+        let start = self.filled_indptr[row];
+        let filled = &self.filled_index[start..self.filled_indptr[row + 1]];
+        let k = filled
+            .binary_search(&col)
+            .expect("selected inverse entry outside the filled pattern");
+        store[self.n_var + start + k]
+    }
+
+    /// Exact Gauss-Newton blocks, `sum_draws (dr/dtheta_i)^T (dr/dtheta_i) /
+    /// n_draw`, for each variable restricted to consecutive sub-blocks of at
+    /// most `max_block_size` parameters of its slice. Ordered by variable,
+    /// then position.
+    pub(crate) fn gauss_newton_blocks(
+        &self,
+        tape: &Tape,
+        max_block_size: usize,
+    ) -> Result<Vec<GnBlock>> {
+        if max_block_size == 0 {
+            bail!("max_block_size must be positive");
+        }
+        let n_store = self.n_var + self.filled_index.len();
+        let mut stores = vec![0.0; self.n_draw * n_store];
+        stores
+            .par_chunks_mut(n_store)
+            .enumerate()
+            .for_each(|(draw, store)| {
+                let draw_tape = self.draw_tape(tape, draw);
+                self.selected_inverse(draw_tape.edge_a, draw_tape.delta, store);
+            });
+
+        let per_var: Vec<Vec<GnBlock>> = (0..self.n_var)
+            .into_par_iter()
+            .map_init(
+                || self.scratch(),
+                |s, i| self.variable_blocks(tape, &stores, n_store, i, max_block_size, s),
+            )
+            .collect();
+        Ok(per_var.into_iter().flatten().collect())
+    }
+
+    fn variable_blocks(
+        &self,
+        tape: &Tape,
+        stores: &[f64],
+        n_store: usize,
+        i: usize,
+        max_block_size: usize,
+        s: &mut Scratch,
+    ) -> Vec<GnBlock> {
+        let shape = self.shape(i);
+        let n_theta = shape.size();
+        let n_p = shape.n_parent;
+        let n_s = n_p + 1;
+        let theta = &tape.theta[self.params(i)];
+        let parents = &self.parent_index[self.edges(i)];
+        let n_score = if self.regularization.is_some() {
+            n_p
+        } else {
+            0
+        };
+        let reg = self.regularization.unwrap_or(0.0);
+
+        let mut blocks: Vec<GnBlock> = (0..n_theta)
+            .step_by(max_block_size)
+            .map(|start| GnBlock {
+                start: self.param_offset[i] + start,
+                matrix: Mat::zeros(
+                    max_block_size.min(n_theta - start),
+                    max_block_size.min(n_theta - start),
+                ),
+            })
+            .collect();
+
+        // Columns of `rows` are the Jacobian rows `a`, `B` (then `B'`) and the
+        // scores, so that each local pullback writes a contiguous column.
+        let mut rows = Mat::<f64>::zeros(n_theta, 1 + n_s + n_score);
+        let mut a_row = vec![0.0; n_theta];
+        let mut k_mat = Mat::<f64>::zeros(n_s, n_s);
+        let mut k_b = Mat::<f64>::zeros(n_theta, n_s);
+        let mut cot_a = vec![0.0; n_p];
+        let mut cot_l = vec![0.0; n_p];
+        let mut index = Vec::with_capacity(n_s);
+        index.push(i);
+        index.extend_from_slice(parents);
+
+        // `G += P Q^T` over batches of draws, with the columns of `P` each
+        // draw's `B'` and scaled score rows, and those of `Q` the matching
+        // `K B'` and score rows: one matrix product per batch and sub-block,
+        // instead of streaming every block once per row.
+        let per_draw = n_s + n_score;
+        let batch = BLOCK_DRAW_BATCH.min(self.n_draw);
+        let mut p_mat = Mat::<f64>::zeros(n_theta, batch * per_draw);
+        let mut q_mat = Mat::<f64>::zeros(n_theta, batch * per_draw);
+        let mut in_batch = 0;
+
+        for draw in 0..self.n_draw {
+            let draw_tape = self.draw_tape(tape, draw);
+            let y = &self.y[draw * self.n_var..(draw + 1) * self.n_var];
+            self.gather_parents(i, y, &mut s.y_parents);
+            let local = self.local(&draw_tape, i);
+
+            let w_i = draw_tape.w[i];
+            let x_i = draw_tape.x[i];
+            let edge_a = &draw_tape.edge_a[self.edges(i)];
+
+            // Each Jacobian row is a local pullback of one seed.
+            rows.fill(0.0);
+            let mut seed = |row: usize,
+                            x: f64,
+                            delta: f64,
+                            mu: f64,
+                            parent: Option<(usize, f64, f64)>,
+                            s: &mut Scratch| {
+                cot_a.fill(0.0);
+                cot_l.fill(0.0);
+                if let Some((j, value_a, value_l)) = parent {
+                    cot_a[j] = value_a;
+                    cot_l[j] = value_l;
+                }
+                let cot = Cotangent {
+                    x,
+                    delta,
+                    mu,
+                    edge_a: &cot_a,
+                    edge_l: &cot_l,
+                };
+                let out = rows.col_as_slice_mut(row);
+                self.local_pullback(shape, theta, local, &cot, s, out);
+            };
+            // a = dx_i / dtheta_i
+            seed(0, 1.0, 0.0, 0.0, None, s);
+            // q_own = -mu_i - delta_i w_i
+            seed(1, 0.0, -w_i, -1.0, None, s);
+            // q_j = -L[i,j] - A[i,j] w_i
+            for j in 0..n_p {
+                seed(2 + j, 0.0, 0.0, 0.0, Some((j, -w_i, -1.0)), s);
+            }
+            // score_j = L[i,j] - x_i A[i,j]
+            for j in 0..n_score {
+                seed(1 + n_s + j, -edge_a[j], 0.0, 0.0, Some((j, -x_i, 1.0)), s);
+            }
+
+            // Row `i` of `J` is `alpha = (delta_i, A[i, P(i)])` on `S_i`, so
+            // `e_i = J^{-T} E_i alpha` and the direct part folds into the
+            // solve: `dr/dtheta_i = J^{-T} E_i B'` with `B' = B + alpha a`.
+            // Then `G_i = sum B'^T K B'`, with no factor of `K` and nothing
+            // that cancels between terms.
+            a_row.copy_from_slice(rows.col_as_slice(0));
+            axpy(draw_tape.delta[i], &a_row, rows.col_as_slice_mut(1));
+            for j in 0..n_p {
+                axpy(edge_a[j], &a_row, rows.col_as_slice_mut(2 + j));
+            }
+            let b_prime = rows.as_ref().subcols(1, n_s);
+
+            // K = Sigma on {i} + P(i), and K B' (as columns, B' K).
+            let store = &stores[draw * n_store..(draw + 1) * n_store];
+            for r in 0..n_s {
+                for c in 0..n_s {
+                    k_mat[(r, c)] = self.sigma(store, index[r], index[c]);
+                }
+            }
+            matmul(
+                k_b.as_mut(),
+                Accum::Replace,
+                b_prime,
+                k_mat.as_ref(),
+                1.0,
+                Par::Seq,
+            );
+
+            let first = in_batch * per_draw;
+            p_mat.as_mut().subcols_mut(first, n_s).copy_from(b_prime);
+            q_mat
+                .as_mut()
+                .subcols_mut(first, n_s)
+                .copy_from(k_b.as_ref());
+            for j in 0..n_score {
+                let score = rows.col_as_slice(1 + n_s + j);
+                for (out, &value) in p_mat
+                    .col_as_slice_mut(first + n_s + j)
+                    .iter_mut()
+                    .zip(score)
+                {
+                    *out = reg * value;
+                }
+                for (out, &value) in q_mat
+                    .col_as_slice_mut(first + n_s + j)
+                    .iter_mut()
+                    .zip(score)
+                {
+                    *out = reg * value;
+                }
+            }
+            in_batch += 1;
+
+            if in_batch == batch || draw + 1 == self.n_draw {
+                let n_cols = in_batch * per_draw;
+                let local_start = self.param_offset[i];
+                for block in &mut blocks {
+                    let start = block.start - local_start;
+                    let size = block.matrix.nrows();
+                    matmul(
+                        block.matrix.as_mut(),
+                        Accum::Add,
+                        p_mat.as_ref().subrows(start, size).subcols(0, n_cols),
+                        q_mat
+                            .as_ref()
+                            .subrows(start, size)
+                            .subcols(0, n_cols)
+                            .transpose(),
+                        1.0,
+                        Par::Seq,
+                    );
+                }
+                in_batch = 0;
+            }
+        }
+
+        // `P Q^T` is symmetric only up to rounding.
+        let half_inv_n = 0.5 / self.n_draw as f64;
+        for block in &mut blocks {
+            let m = &mut block.matrix;
+            for r in 0..m.nrows() {
+                for c in 0..=r {
+                    let value = (m[(r, c)] + m[(c, r)]) * half_inv_n;
+                    m[(r, c)] = value;
+                    m[(c, r)] = value;
+                }
+            }
+        }
+        blocks
+    }
+}
+
+fn as_usize(values: &[i64]) -> Result<Vec<usize>> {
+    values
+        .iter()
+        .map(|&v| usize::try_from(v).map_err(|_| anyhow::anyhow!("negative index {v}")))
+        .collect()
+}
+
+/// Residuals of the LM fit of a `SparseTriangularMap` and their derivatives,
+/// see `nutpie.triangular_lm`.
+#[pyclass(name = "FisherResiduals")]
+pub struct PyFisherResiduals {
+    pub(crate) inner: FisherResiduals,
+    tape: Option<Tape>,
+}
+
+impl PyFisherResiduals {
+    fn tape(&self) -> Result<&Tape> {
+        match &self.tape {
+            Some(tape) => Ok(tape),
+            None => bail!("no tape: call `residuals(theta, record=True)` first"),
+        }
+    }
+}
+
+#[pymethods]
+impl PyFisherResiduals {
+    #[new]
+    #[pyo3(signature = (
+        *,
+        parent_indptr,
+        parent_index,
+        n_unit,
+        n_par,
+        location_index,
+        transformer,
+        fisher_regularization = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        parent_indptr: PyReadonlyArray1<'_, i64>,
+        parent_index: PyReadonlyArray1<'_, i64>,
+        n_unit: usize,
+        n_par: usize,
+        location_index: usize,
+        transformer: &Bound<'_, PyAny>,
+        fisher_regularization: Option<f64>,
+    ) -> Result<Self> {
+        let specs: Vec<Contract2Spec> = pythonize::depythonize(transformer)?;
+        Ok(Self {
+            inner: FisherResiduals::new(
+                as_usize(parent_indptr.as_slice()?)?,
+                as_usize(parent_index.as_slice()?)?,
+                n_unit,
+                n_par,
+                location_index,
+                specs,
+                fisher_regularization,
+            )?,
+            tape: None,
+        })
+    }
+
+    #[getter]
+    fn n_params(&self) -> usize {
+        self.inner.n_params()
+    }
+
+    #[getter]
+    fn n_residuals(&self) -> usize {
+        self.inner.n_residuals()
+    }
+
+    #[getter]
+    fn n_draw(&self) -> usize {
+        self.inner.n_draw
+    }
+
+    /// Start of each variable's parameter slice, plus the total.
+    #[getter]
+    fn param_offsets<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<i64>> {
+        PyArray1::from_vec(
+            py,
+            self.inner.param_offset.iter().map(|&o| o as i64).collect(),
+        )
+    }
+
+    /// Set the map-space draws and gradients, each ``(n_draw, n_var)``
+    /// flattened. Drops the tape.
+    fn set_data(
+        &mut self,
+        y: PyReadonlyArray1<'_, f64>,
+        g: PyReadonlyArray1<'_, f64>,
+    ) -> Result<()> {
+        self.tape = None;
+        self.inner
+            .set_data(y.as_slice()?.to_vec(), g.as_slice()?.to_vec())
+    }
+
+    /// Flattened ``(n_draw, n_residuals)`` residuals at `theta`; with
+    /// `record`, keeps the tape the derivatives below use.
+    #[pyo3(signature = (theta, record = true))]
+    fn residuals<'py>(
+        &mut self,
+        py: Python<'py>,
+        theta: PyReadonlyArray1<'py, f64>,
+        record: bool,
+    ) -> Result<Bound<'py, PyArray1<f64>>> {
+        let theta = theta.as_slice()?.to_vec();
+        let (out, tape) = py.detach(|| self.inner.residuals(&theta))?;
+        if record {
+            self.tape = Some(tape);
+        }
+        Ok(PyArray1::from_vec(py, out))
+    }
+
+    /// ``J v``, flattened ``(n_draw, n_residuals)``, at the recorded `theta`.
+    fn pushforward<'py>(
+        &self,
+        py: Python<'py>,
+        v: PyReadonlyArray1<'py, f64>,
+    ) -> Result<Bound<'py, PyArray1<f64>>> {
+        let v = v.as_slice()?.to_vec();
+        let tape = self.tape()?;
+        let out = py.detach(|| self.inner.pushforward(tape, &v))?;
+        Ok(PyArray1::from_vec(py, out))
+    }
+
+    /// ``J^T r_bar`` for a flattened ``(n_draw, n_residuals)`` `r_bar`.
+    fn pullback<'py>(
+        &self,
+        py: Python<'py>,
+        r_bar: PyReadonlyArray1<'py, f64>,
+    ) -> Result<Bound<'py, PyArray1<f64>>> {
+        let r_bar = r_bar.as_slice()?.to_vec();
+        let tape = self.tape()?;
+        let out = py.detach(|| self.inner.pullback(tape, &r_bar))?;
+        Ok(PyArray1::from_vec(py, out))
+    }
+
+    /// ``J^T J v``.
+    fn gauss_newton_product<'py>(
+        &self,
+        py: Python<'py>,
+        v: PyReadonlyArray1<'py, f64>,
+    ) -> Result<Bound<'py, PyArray1<f64>>> {
+        let v = v.as_slice()?.to_vec();
+        let tape = self.tape()?;
+        let out = py.detach(|| self.inner.gauss_newton_product(tape, &v))?;
+        Ok(PyArray1::from_vec(py, out))
+    }
+
+    /// Exact Gauss-Newton sub-blocks: ``(starts, sizes, data)``, where block
+    /// ``k`` covers parameters ``starts[k]:starts[k] + sizes[k]`` and is
+    /// stored row-major in `data`, after the blocks before it.
+    fn gauss_newton_blocks<'py>(
+        &self,
+        py: Python<'py>,
+        max_block_size: usize,
+    ) -> Result<(
+        Bound<'py, PyArray1<i64>>,
+        Bound<'py, PyArray1<i64>>,
+        Bound<'py, PyArray1<f64>>,
+    )> {
+        let tape = self.tape()?;
+        let blocks = py.detach(|| self.inner.gauss_newton_blocks(tape, max_block_size))?;
+        let starts = blocks.iter().map(|b| b.start as i64).collect();
+        let sizes = blocks.iter().map(|b| b.matrix.nrows() as i64).collect();
+        // Symmetric, so row- and column-major agree.
+        let data = blocks
+            .iter()
+            .flat_map(|b| {
+                (0..b.matrix.ncols()).flat_map(move |c| b.matrix.col_as_slice(c).iter().copied())
+            })
+            .collect();
+        Ok((
+            PyArray1::from_vec(py, starts),
+            PyArray1::from_vec(py, sizes),
+            PyArray1::from_vec(py, data),
+        ))
+    }
+}

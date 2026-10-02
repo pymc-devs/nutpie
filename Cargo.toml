@@ -1,6 +1,6 @@
 [package]
 name = "nutpie"
-version = "0.16.12"
+version = "0.17.0"
 authors = [
   "Adrian Seyboldt <adrian.seyboldt@gmail.com>",
   "PyMC Developers <pymc.devs@gmail.com>",
@@ -14,35 +14,58 @@ rust-version = "1.89"
 
 [features]
 extension-module = ["pyo3/extension-module"]
-default = ["extension-module"]
+# Sample chains on background threads. Without it (e.g. on wasm), chains only
+# advance while python is inside `wait`.
+parallel = ["nuts-rs/parallel"]
+zarr = [
+  "nuts-rs/zarr",
+  "dep:zarrs",
+  "dep:zarrs_object_store",
+  "dep:pyo3-object_store",
+  "dep:tokio",
+]
+default = ["extension-module", "parallel", "zarr"]
 
 [lib]
 name = "_lib"
 crate-type = ["cdylib"]
 
 [dependencies]
-nuts-rs = { version = "0.18.3", features = ["zarr", "arrow"] }
+nuts-rs = { version = "0.19.0", default-features = false, features = [
+  "arrow",
+  "relaxed-simd",
+] }
 numpy = "0.29.0"
 rand = "0.10.0"
 thiserror = "2.0.3"
 rand_chacha = "0.10.0"
 rayon = "1.11.0"
+pulp = "0.22.2"
 anyhow = "1.0.72"
 itertools = "0.15.0"
 bridgestan = "2.7.0"
 rand_distr = "0.6.0"
 smallvec = "1.15.0"
+# `std` is what lets faer's matmul (gemm) detect AVX2/AVX-512 at runtime;
+# without it, it runs baseline x86-64 kernels.
+faer = { version = "0.24.0", default-features = false, features = [
+  "linalg",
+  "std",
+] }
 upon = { version = "0.11.0", default-features = false, features = [] }
 time-humanize = { version = "0.1.3", default-features = false }
 indicatif = "0.18.0"
 tch = { version = "0.24.0", optional = true }
-pyo3-object_store = "0.12.0"
+pyo3-object_store = { version = "0.12.0", optional = true }
 # Keep zarrs crates in sync with nuts-rs requirements
-zarrs = { version = "0.23.2", features = ["async"] }
-zarrs_object_store = "0.7.0"
+zarrs = { version = "0.23.2", features = ["async"], optional = true }
+zarrs_object_store = { version = "0.7.0", optional = true }
 pyo3-arrow = "0.19.0"
 arrow = { version = "59.0.0", features = ["json"] }
-tokio = { version = "1.47.1", features = ["rt", "rt-multi-thread"] }
+tokio = { version = "1.47.1", features = [
+  "rt",
+  "rt-multi-thread",
+], optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 pythonize = "0.29.0"
@@ -56,7 +79,6 @@ criterion = "0.8.0"
 
 [profile.release]
 lto = "fat"
-codegen-units = 1
 opt-level = 3
 
 [profile.bench]

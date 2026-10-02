@@ -11,6 +11,7 @@ use crate::{
     pyfunc::PyModel,
     pymc::{ExpandFunc, LogpFunc, PyMcModel},
     stan::{StanLibrary, StanModel},
+    triangular::FlowTransform,
 };
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -19,7 +20,7 @@ use nuts_rs::{
     ArrowConfig, ArrowTrace, ChainProgress, DiagMclmcSettings, DiagNutsSettings, FlowMclmcSettings,
     FlowNutsSettings, KineticEnergyKind, LowRankMclmcSettings, LowRankNutsSettings,
     MclmcTrajectoryKind, Model, ProgressCallback, Sampler, SamplerWaitResult, StepSizeAdaptMethod,
-    ZarrAsyncConfig,
+    WalnutsEnergyCriterion,
 };
 use pyo3::{
     exceptions::{PyAttributeError, PyTimeoutError, PyValueError},
@@ -28,12 +29,24 @@ use pyo3::{
     types::{PyDict, PyList},
 };
 use pyo3_arrow::PyRecordBatch;
-use pyo3_object_store::AnyObjectStore;
 use pythonize::{depythonize, pythonize};
 use rand::{rng, Rng};
 use serde_json::Value as JsonValue;
+
+#[cfg(feature = "zarr")]
+use nuts_rs::ZarrAsyncConfig;
+#[cfg(feature = "zarr")]
+use pyo3_object_store::AnyObjectStore;
+#[cfg(feature = "zarr")]
 use tokio::runtime::Runtime;
+#[cfg(feature = "zarr")]
 use zarrs_object_store::{object_store::limit::LimitStore, AsyncObjectStore};
+
+/// Keeps the runtime that drives zarr writes alive for as long as the sampler.
+#[cfg(feature = "zarr")]
+type StoreRuntime = Option<Runtime>;
+#[cfg(not(feature = "zarr"))]
+type StoreRuntime = ();
 
 #[pyclass]
 pub struct PyChainProgress(ChainProgress);
@@ -582,6 +595,50 @@ impl PyNutsSettings {
                 let value: u64 = value.extract()?;
                 set_all_settings_field!(self, NutsSettingsKind, extra_doublings = value);
             }
+            "walnuts" => {
+                let value: bool = value.extract()?;
+                with_all_settings_mut!(self, NutsSettingsKind, settings => {
+                    settings.walnuts = if value {
+                        Some(settings.walnuts.unwrap_or_default())
+                    } else {
+                        None
+                    };
+                });
+            }
+            "walnuts_max_step_halvings" => {
+                let value: u64 = value.extract()?;
+                with_all_settings_mut!(self, NutsSettingsKind, settings => {
+                    settings.walnuts.get_or_insert_default().max_step_halvings = value;
+                });
+            }
+            "walnuts_max_error" => {
+                let value: f64 = value.extract()?;
+                with_all_settings_mut!(self, NutsSettingsKind, settings => {
+                    settings.walnuts.get_or_insert_default().max_error = value;
+                });
+            }
+            "walnuts_min_micro_steps" => {
+                let value: u64 = value.extract()?;
+                with_all_settings_mut!(self, NutsSettingsKind, settings => {
+                    settings.walnuts.get_or_insert_default().min_micro_steps = value;
+                });
+            }
+            "walnuts_energy_criterion" => {
+                let value: String = value.extract()?;
+                let value = match value.as_str() {
+                    "max_min" => WalnutsEnergyCriterion::MaxMin,
+                    "endpoint" => WalnutsEnergyCriterion::Endpoint,
+                    _ => {
+                        return Err(PyValueError::new_err(format!(
+                            "Unknown walnuts_energy_criterion: {value}. \
+                             Expected 'max_min' or 'endpoint'."
+                        )))
+                    }
+                };
+                with_all_settings_mut!(self, NutsSettingsKind, settings => {
+                    settings.walnuts.get_or_insert_default().energy_criterion = value;
+                });
+            }
             _ => {
                 if try_shared_euclidean_adapt_update!(self, NutsSettingsKind, name, value) {
                     // handled above
@@ -930,6 +987,7 @@ impl ProgressType {
 }
 
 enum InnerPyStorage {
+    #[cfg(feature = "zarr")]
     Zarr(Option<AnyObjectStore>),
     Arrow,
 }
@@ -939,6 +997,7 @@ struct PyStorage(InnerPyStorage);
 
 #[pymethods]
 impl PyStorage {
+    #[cfg(feature = "zarr")]
     #[staticmethod]
     fn zarr(object_store: AnyObjectStore) -> Self {
         Self(InnerPyStorage::Zarr(Some(object_store)))
@@ -950,8 +1009,59 @@ impl PyStorage {
     }
 }
 
-#[pyclass]
-struct PySampler(Mutex<(SamplerState, Runtime)>);
+// Without `parallel` the chains live in the sampler and are not `Send`, so it
+// has to stay on the thread that created it.
+#[cfg_attr(feature = "parallel", pyclass)]
+#[cfg_attr(not(feature = "parallel"), pyclass(unsendable))]
+struct PySampler(Mutex<(SamplerState, StoreRuntime)>);
+
+/// Release the GIL while the sampler works on this thread.
+#[cfg(feature = "parallel")]
+fn detach<T: Send, F: Send + FnOnce() -> T>(py: Python<'_>, f: F) -> T {
+    py.detach(f)
+}
+
+/// Without `parallel` the sampler is not `Send`, so it can not cross `detach`.
+/// Nothing else runs meanwhile anyway, the chains sample on this thread.
+///
+/// On stable pyo3 `Ungil` is just `Send`. If it becomes an auto trait that only
+/// excludes GIL-bound types (as with pyo3's `nightly` feature), this helper can
+/// go and we can call `py.detach` directly again.
+#[cfg(not(feature = "parallel"))]
+fn detach<T, F: FnOnce() -> T>(_py: Python<'_>, f: F) -> T {
+    f()
+}
+
+/// Start a sampler for whichever settings kind was requested, wrapped in the
+/// `SamplerState` variant `$running` of the storage backend.
+macro_rules! start_sampler {
+    ($model:expr, $settings:expr, $storage:expr, $cores:expr, $callback:expr, $running:path) => {
+        match $settings {
+            PySamplerSettings::Nuts(settings) => match settings.inner {
+                NutsSettingsKind::LowRank(settings) => {
+                    $running(Sampler::new($model, settings, $storage, $cores, $callback)?)
+                }
+                NutsSettingsKind::Diag(settings) => {
+                    $running(Sampler::new($model, settings, $storage, $cores, $callback)?)
+                }
+                NutsSettingsKind::Flow(settings) => {
+                    $running(Sampler::new($model, settings, $storage, $cores, $callback)?)
+                }
+            },
+            PySamplerSettings::Mclmc(settings) => match settings.inner {
+                MclmcSettingsKind::LowRank(settings) => {
+                    $running(Sampler::new($model, settings, $storage, $cores, $callback)?)
+                }
+                MclmcSettingsKind::Diag(settings) => {
+                    $running(Sampler::new($model, settings, $storage, $cores, $callback)?)
+                }
+                MclmcSettingsKind::Flow(settings) => {
+                    $running(Sampler::new($model, settings, $storage, $cores, $callback)?)
+                }
+            },
+        }
+    };
+}
 
 impl PySampler {
     fn new<M: Model>(
@@ -966,66 +1076,23 @@ impl PySampler {
         let extra_callback = extra_callback.map(Arc::new);
         let extra_rate = Duration::from_millis(extra_callback_rate);
         let callback = progress_type.into_callback(extra_callback, extra_rate)?;
-        let tokio_rt = Runtime::new().context("Failed to create Tokio runtime")?;
+        let model = Arc::new(model);
         match &mut store.0 {
             InnerPyStorage::Arrow => {
                 let storage_config = ArrowConfig::default();
-                match settings {
-                    PySamplerSettings::Nuts(settings) => match settings.inner {
-                        NutsSettingsKind::LowRank(settings) => {
-                            let sampler =
-                                Sampler::new(model, settings, storage_config, cores, callback)?;
-                            Ok(PySampler(Mutex::new((
-                                SamplerState::RunningArrow(sampler).into(),
-                                tokio_rt,
-                            ))))
-                        }
-                        NutsSettingsKind::Diag(settings) => {
-                            let sampler =
-                                Sampler::new(model, settings, storage_config, cores, callback)?;
-                            Ok(PySampler(Mutex::new((
-                                SamplerState::RunningArrow(sampler).into(),
-                                tokio_rt,
-                            ))))
-                        }
-                        NutsSettingsKind::Flow(settings) => {
-                            let sampler =
-                                Sampler::new(model, settings, storage_config, cores, callback)?;
-                            Ok(PySampler(Mutex::new((
-                                SamplerState::RunningArrow(sampler).into(),
-                                tokio_rt,
-                            ))))
-                        }
-                    },
-                    PySamplerSettings::Mclmc(settings) => match settings.inner {
-                        MclmcSettingsKind::LowRank(settings) => {
-                            let sampler =
-                                Sampler::new(model, settings, storage_config, cores, callback)?;
-                            Ok(PySampler(Mutex::new((
-                                SamplerState::RunningArrow(sampler).into(),
-                                tokio_rt,
-                            ))))
-                        }
-                        MclmcSettingsKind::Diag(settings) => {
-                            let sampler =
-                                Sampler::new(model, settings, storage_config, cores, callback)?;
-                            Ok(PySampler(Mutex::new((
-                                SamplerState::RunningArrow(sampler).into(),
-                                tokio_rt,
-                            ))))
-                        }
-                        MclmcSettingsKind::Flow(settings) => {
-                            let sampler =
-                                Sampler::new(model, settings, storage_config, cores, callback)?;
-                            Ok(PySampler(Mutex::new((
-                                SamplerState::RunningArrow(sampler).into(),
-                                tokio_rt,
-                            ))))
-                        }
-                    },
-                }
+                let state = start_sampler!(
+                    model,
+                    settings,
+                    storage_config,
+                    cores,
+                    callback,
+                    SamplerState::RunningArrow
+                );
+                Ok(PySampler(Mutex::new((state, Default::default()))))
             }
+            #[cfg(feature = "zarr")]
             InnerPyStorage::Zarr(store) => {
+                let tokio_rt = Runtime::new().context("Failed to create Tokio runtime")?;
                 zarrs::config::global_config_mut().set_include_zarrs_metadata(false);
                 let object_store = store
                     .take()
@@ -1036,60 +1103,15 @@ impl PySampler {
                 let store = Arc::new(store);
                 let storage_config = ZarrAsyncConfig::new(tokio_rt.handle().clone(), store);
                 let storage_config = storage_config.with_chunk_size(16);
-                match settings {
-                    PySamplerSettings::Nuts(settings) => match settings.inner {
-                        NutsSettingsKind::LowRank(settings) => {
-                            let sampler =
-                                Sampler::new(model, settings, storage_config, cores, callback)?;
-                            Ok(PySampler(Mutex::new((
-                                SamplerState::RunningZarr(sampler).into(),
-                                tokio_rt,
-                            ))))
-                        }
-                        NutsSettingsKind::Diag(settings) => {
-                            let sampler =
-                                Sampler::new(model, settings, storage_config, cores, callback)?;
-                            Ok(PySampler(Mutex::new((
-                                SamplerState::RunningZarr(sampler).into(),
-                                tokio_rt,
-                            ))))
-                        }
-                        NutsSettingsKind::Flow(settings) => {
-                            let sampler =
-                                Sampler::new(model, settings, storage_config, cores, callback)?;
-                            Ok(PySampler(Mutex::new((
-                                SamplerState::RunningZarr(sampler).into(),
-                                tokio_rt,
-                            ))))
-                        }
-                    },
-                    PySamplerSettings::Mclmc(settings) => match settings.inner {
-                        MclmcSettingsKind::LowRank(settings) => {
-                            let sampler =
-                                Sampler::new(model, settings, storage_config, cores, callback)?;
-                            Ok(PySampler(Mutex::new((
-                                SamplerState::RunningZarr(sampler).into(),
-                                tokio_rt,
-                            ))))
-                        }
-                        MclmcSettingsKind::Diag(settings) => {
-                            let sampler =
-                                Sampler::new(model, settings, storage_config, cores, callback)?;
-                            Ok(PySampler(Mutex::new((
-                                SamplerState::RunningZarr(sampler).into(),
-                                tokio_rt,
-                            ))))
-                        }
-                        MclmcSettingsKind::Flow(settings) => {
-                            let sampler =
-                                Sampler::new(model, settings, storage_config, cores, callback)?;
-                            Ok(PySampler(Mutex::new((
-                                SamplerState::RunningZarr(sampler).into(),
-                                tokio_rt,
-                            ))))
-                        }
-                    },
-                }
+                let state = start_sampler!(
+                    model,
+                    settings,
+                    storage_config,
+                    cores,
+                    callback,
+                    SamplerState::RunningZarr
+                );
+                Ok(PySampler(Mutex::new((state, Some(tokio_rt)))))
             }
         }
     }
@@ -1251,7 +1273,7 @@ impl PySampler {
 
     fn is_finished(&mut self, py: Python<'_>) -> PyResult<bool> {
         self.wait(py, Some(0.001))?;
-        py.detach(|| {
+        detach(py, || {
             let guard = &mut self.0.lock().expect("Poisoned sampler state mutex");
             Ok(matches!(
                 guard.deref_mut().0,
@@ -1261,7 +1283,7 @@ impl PySampler {
     }
 
     fn pause(&mut self, py: Python<'_>) -> PyResult<()> {
-        py.detach(|| {
+        detach(py, || {
             match self
                 .0
                 .lock()
@@ -1282,7 +1304,7 @@ impl PySampler {
     }
 
     fn resume(&mut self, py: Python<'_>) -> PyResult<()> {
-        py.detach(|| {
+        detach(py, || {
             match self
                 .0
                 .lock()
@@ -1304,7 +1326,7 @@ impl PySampler {
 
     #[pyo3(signature = (timeout_seconds=None))]
     fn wait(&mut self, py: Python<'_>, timeout_seconds: Option<f64>) -> PyResult<()> {
-        py.detach(|| {
+        detach(py, || {
             let guard = &mut self.0.lock().expect("Poisoned sampler state mutex");
             let slot = guard.deref_mut();
             let slot = &mut slot.0;
@@ -1330,7 +1352,7 @@ impl PySampler {
     }
 
     fn abort(&mut self, py: Python<'_>) -> PyResult<()> {
-        py.detach(|| {
+        detach(py, || {
             let guard = &mut self.0.lock().expect("Poisoned sampler state mutex");
             let slot = guard.deref_mut();
             let slot = &mut slot.0;
@@ -1388,11 +1410,11 @@ impl PySampler {
             SamplerState::FinishedArrow(_) => Ok(()),
             SamplerState::Empty => Ok(()),
             SamplerState::RunningZarr(ref mut control) => {
-                py.detach(|| control.flush())?;
+                detach(py, || control.flush())?;
                 Ok(())
             }
             SamplerState::RunningArrow(ref mut control) => {
-                py.detach(|| control.flush())?;
+                detach(py, || control.flush())?;
                 Ok(())
             }
         }
@@ -1412,14 +1434,14 @@ impl PySampler {
             }
             SamplerState::Empty => Ok(None),
             SamplerState::RunningZarr(control) => {
-                let (res, _) = py.detach(|| control.inspect())?;
+                let (res, _) = detach(py, || control.inspect())?;
                 if let Some(err) = res {
                     return Err(err.into());
                 }
                 Ok(Some(PyTrace(InnerPyTrace::Zarr)))
             }
             SamplerState::RunningArrow(control) => {
-                let (res, trace) = py.detach(|| control.inspect())?;
+                let (res, trace) = detach(py, || control.inspect())?;
                 if let Some(err) = res {
                     return Err(err.into());
                 }
@@ -1491,6 +1513,84 @@ impl PyTrace {
                 })
                 .collect()),
         }
+    }
+}
+
+/// Soft-clip a model gradient in place, `clip * asinh(g / clip)`, as the
+/// Python side's `_init_from_transformed_position` does before pulling it back.
+pub fn soft_clip(gradient: &mut [f64], clip: Option<f64>) {
+    if let Some(clip) = clip {
+        for g in gradient.iter_mut() {
+            *g = clip * (*g / clip).asinh();
+        }
+    }
+}
+
+/// Per-chain native form of the adapter's flow, so a leapfrog step never
+/// calls into Python: only the model's own logp runs outside Rust, if it is a
+/// Python function at all.
+///
+/// Keyed by the adapter object it came from, and must be `invalidate`d
+/// whenever that object's transformation is (re)initialized or updated.
+#[derive(Default)]
+pub struct NativeFlow {
+    cache: FlowCache,
+}
+
+#[derive(Default)]
+enum FlowCache {
+    #[default]
+    Stale,
+    /// The adapter's current flow has no native form: use the Python path.
+    Missing(usize),
+    Ready(usize, FlowTransform),
+}
+
+impl NativeFlow {
+    pub fn invalidate(&mut self) {
+        self.cache = FlowCache::Stale;
+    }
+
+    /// `PyTransformAdapt::init_from_transformed_position`, natively: the
+    /// transformed position mapped to the untransformed one, `logp` there, and
+    /// its gradient pulled back, returning `(logp, logdet)` -- including the
+    /// optional soft clip of the model gradient. `Ok(None)` if the adapter's
+    /// flow has no native form; the caller then takes the Python path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn init_from_transformed_position<E: From<anyhow::Error>>(
+        &mut self,
+        adapter: &PyTransformAdapt,
+        params: &Py<PyAny>,
+        untransformed_position: &mut [f64],
+        untransformed_gradient: &mut [f64],
+        transformed_position: &[f64],
+        transformed_gradient: &mut [f64],
+        clip: Option<f64>,
+        logp: impl FnOnce(&[f64], &mut [f64]) -> std::result::Result<f64, E>,
+    ) -> std::result::Result<Option<(f64, f64)>, E> {
+        let key = params.as_ptr() as usize;
+        let current = matches!(
+            &self.cache,
+            FlowCache::Missing(k) | FlowCache::Ready(k, _) if *k == key
+        );
+        if !current {
+            self.cache = match adapter
+                .flow_transform(params)
+                .context("Failed to build the native flow transform")?
+            {
+                Some(flow) => FlowCache::Ready(key, flow),
+                None => FlowCache::Missing(key),
+            };
+        }
+        let FlowCache::Ready(_, flow) = &mut self.cache else {
+            return Ok(None);
+        };
+
+        let logdet = flow.transform_and_log_det(transformed_position, untransformed_position)?;
+        let logp = logp(untransformed_position, untransformed_gradient)?;
+        soft_clip(untransformed_gradient, clip);
+        flow.pullback(untransformed_gradient, transformed_gradient)?;
+        Ok(Some((logp, logdet)))
     }
 }
 
@@ -1569,13 +1669,14 @@ impl PyTransformAdapt {
         untransformed_gradient: &mut [f64],
         transformed_position: &[f64],
         transformed_gradient: &mut [f64],
+        clip: Option<f64>,
     ) -> Result<(f64, f64)> {
         Python::attach(|py| {
             let transformed_position = PyArray1::from_slice(py, transformed_position);
 
             let output = params
                 .getattr(py, intern!(py, "init_from_transformed_position"))?
-                .call1(py, (transformed_position,))?;
+                .call1(py, (transformed_position, clip))?;
             let (
                 logp,
                 logdet,
@@ -1645,6 +1746,7 @@ impl PyTransformAdapt {
         untransformed_gradient: &mut [f64],
         transformed_position: &mut [f64],
         transformed_gradient: &mut [f64],
+        clip: Option<f64>,
     ) -> Result<(f64, f64)> {
         Python::attach(|py| {
             let untransformed_position = PyArray1::from_slice(py, untransformed_position);
@@ -1652,7 +1754,7 @@ impl PyTransformAdapt {
             let output = params
                 .getattr(py, intern!(py, "init_from_untransformed_position"))
                 .context("No attribute init_from_untransformed_position")?
-                .call1(py, (untransformed_position,))
+                .call1(py, (untransformed_position, clip))
                 .context("Failed adapter.init_from_untransformed_position")?;
             let (
                 logp,
@@ -1724,6 +1826,25 @@ impl PyTransformAdapt {
         })
     }
 
+    /// The adapter's current flow as a native transform for the leapfrog
+    /// step, or `None` if it has none (see `TransformAdapter.flow_transform_layout`).
+    pub fn flow_transform(&self, params: &Py<PyAny>) -> Result<Option<FlowTransform>> {
+        Python::attach(|py| {
+            let layout = params
+                .getattr(py, intern!(py, "flow_transform_layout"))
+                .context("No attribute flow_transform_layout")?
+                .call0(py)
+                .context("Failed adapter.flow_transform_layout")?;
+            let layout: Option<Bound<'_, PyDict>> = layout
+                .extract(py)
+                .map_err(PyErr::from)
+                .context("flow_transform_layout must return a dict or None")?;
+            layout
+                .map(|layout| FlowTransform::from_layout(&layout))
+                .transpose()
+        })
+    }
+
     pub fn transformation_id(&self, params: &Py<PyAny>) -> Result<i64> {
         Python::attach(|py| {
             let id: i64 = params
@@ -1751,8 +1872,21 @@ pub fn _lib(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyVariable>()?;
     m.add_class::<PyStorage>()?;
     m.add_class::<PyTrace>()?;
+    m.add_class::<crate::triangular::PySparseTriangularTransform>()?;
+    m.add_class::<crate::triangular::PyFlowTransform>()?;
+    m.add_class::<crate::triangular_lm::PyFisherResiduals>()?;
+    m.add_class::<crate::lm_optimizer::PyLmOptimizer>()?;
+    m.add_function(wrap_pyfunction!(
+        crate::triangular::activation_for_testing,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(crate::symbolic::py_amd_order, m)?)?;
+    m.add_function(wrap_pyfunction!(crate::symbolic::py_symbolic_fill, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
-    pyo3_object_store::register_store_module(m.py(), m, "_lib", "store")?;
-    pyo3_object_store::register_exceptions_module(m.py(), m, "_lib", "exceptions")?;
+    #[cfg(feature = "zarr")]
+    {
+        pyo3_object_store::register_store_module(m.py(), m, "_lib", "store")?;
+        pyo3_object_store::register_exceptions_module(m.py(), m, "_lib", "exceptions")?;
+    }
     Ok(())
 }
