@@ -3,12 +3,12 @@ import pytest
 
 jax = pytest.importorskip("jax")
 
-import equinox as eqx  # noqa: E402
-import jax.numpy as jnp  # noqa: E402
+import equinox as eqx
+import jax.numpy as jnp
 
-from nutpie.normalizing_flow import make_transformer  # noqa: E402
-from nutpie.triangular import SparseTriangularMap  # noqa: E402
-from nutpie.triangular_lm import (  # noqa: E402
+from nutpie.normalizing_flow import make_transformer
+from nutpie.triangular import SparseTriangularMap
+from nutpie.triangular_lm import (
     make_residuals,
     pack_params,
     param_index,
