@@ -3,12 +3,12 @@ import pytest
 
 jax = pytest.importorskip("jax")
 
-import equinox as eqx  # noqa: E402
-import jax.numpy as jnp  # noqa: E402
-from paramax import unwrap  # noqa: E402
+import equinox as eqx
+import jax.numpy as jnp
+from paramax import unwrap
 
-from nutpie.normalizing_flow import _scale_last_layer, make_transformer  # noqa: E402
-from nutpie.triangular import LocationSkipMlp, SparseTriangularMap  # noqa: E402
+from nutpie.normalizing_flow import _scale_last_layer, make_transformer
+from nutpie.triangular import LocationSkipMlp, SparseTriangularMap
 
 
 def _banded(dim):
@@ -246,7 +246,6 @@ def test_native_flow_transform_matches_jax(nn_width, feature_degree):
     forward, log det, and the gradient pulled back with a unit log det
     cotangent. With parent features, their marginal maps are fitted to the
     draws and then perturbed like every other parameter."""
-    import flowjax
     from paramax import unwrap
 
     from nutpie._lib import FlowTransform
@@ -300,7 +299,6 @@ def test_native_flow_transform_matches_jax(nn_width, feature_degree):
 
 def test_native_flow_transform_diagonal_flow():
     """The diagonal-only flow of the early windows runs natively too."""
-    import flowjax
     from paramax import unwrap
 
     from nutpie._lib import FlowTransform
@@ -315,9 +313,13 @@ def test_native_flow_transform_diagonal_flow():
     native = FlowTransform(flow_transform_layout(bijection))
 
     z, grad_y = rng.normal(size=3), rng.normal(size=3)
-    (y_ref, log_det_ref), pull = jax.vjp(bijection.transform_and_log_det, jnp.asarray(z))
+    (y_ref, log_det_ref), pull = jax.vjp(
+        bijection.transform_and_log_det, jnp.asarray(z)
+    )
     (grad_z_ref,) = pull((jnp.asarray(grad_y), jnp.ones(())))
     y, log_det = native.transform_and_log_det(z)
     np.testing.assert_allclose(y, np.asarray(y_ref), rtol=1e-12)
     np.testing.assert_allclose(log_det, float(log_det_ref), rtol=1e-12)
-    np.testing.assert_allclose(native.pullback(grad_y), np.asarray(grad_z_ref), rtol=1e-12)
+    np.testing.assert_allclose(
+        native.pullback(grad_y), np.asarray(grad_z_ref), rtol=1e-12
+    )

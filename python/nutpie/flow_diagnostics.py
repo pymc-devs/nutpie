@@ -355,9 +355,7 @@ def fisher_influence(bijection, trace, *, num_nodes=16, batch_size=256):
     def bucket_sums(conditioner, parent_values, parent_indices):
         # vmap over the draws, then over the conditioners of the bucket
         per_draw = jax.vmap(
-            lambda values: eqx.filter_vmap(speeds)(
-                conditioner, values, parent_indices
-            )
+            lambda values: eqx.filter_vmap(speeds)(conditioner, values, parent_indices)
         )(parent_values)
         return [part.sum(0) for part in per_draw]
 
@@ -570,9 +568,7 @@ def _gradients(trace, gradients, n_draws):
         values = np.asarray(gradients, dtype=np.float64)
         return values.reshape(n_draws, -1)
     if hasattr(trace, "shape"):
-        raise ValueError(
-            "Pass the log density gradients at the draws as `gradients`."
-        )
+        raise ValueError("Pass the log density gradients at the draws as `gradients`.")
     stats = trace["sample_stats"]
     if "gradient" not in stats:
         raise ValueError(
@@ -718,9 +714,12 @@ def conditioner_capacity(
         for member, gram in zip(members, bucket_grams, strict=True):
             hidden, skip = gram[:width, :width], gram[:width, width:]
             if skip.size:
-                hidden = hidden - skip @ np.linalg.pinv(
-                    gram[width:, width:], rcond=1e-10, hermitian=True
-                ) @ skip.T
+                hidden = (
+                    hidden
+                    - skip
+                    @ np.linalg.pinv(gram[width:, width:], rcond=1e-10, hermitian=True)
+                    @ skip.T
+                )
             values = np.linalg.eigvalsh(hidden)[::-1]
             eigenvalues[order[member]] = np.maximum(values, 0.0)
 

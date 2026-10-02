@@ -782,7 +782,9 @@ def test_hessian_sparsity_jax():
     factorization = compiled.with_factorization(front=["theta"]).factorization
     # Names as in the `unconstrained_parameter` coordinate of the trace
     assert factorization.summary().index[0] == "theta_0"
-    assert factorization.unconstrained_parameters == compiled._unconstrained_parameters()
+    assert (
+        factorization.unconstrained_parameters == compiled._unconstrained_parameters()
+    )
 
     assert "hessian sparsity: 41 of 231 pairs nonzero" in repr(compiled)
     assert compiled.with_data().hessian_sparsity is None
