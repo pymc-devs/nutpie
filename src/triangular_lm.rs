@@ -15,8 +15,8 @@
 //! `sqrt(rho) (L[i,j] - x_i A[i,j]) / sqrt(n_draw)`.
 //!
 //! Supported conditioners: one hidden layer with softplus, and the linear
-//! location skip. The transformer is a `Contract2` chain, evaluated in the
-//! density direction.
+//! location skip. The transformer is a chain of `Contract2`, `TangentSAS` and
+//! `PositiveAffine` layers, evaluated in the density direction.
 //!
 //! Parameters are laid out per variable, with no bucketing or padding.
 //! Variable `i`'s slice holds, for each hidden unit `u`, the unit's input
@@ -32,10 +32,11 @@ use rayon::prelude::*;
 use faer::linalg::matmul::matmul;
 use faer::{Accum, Mat, Par};
 
-use crate::triangular::{Contract2Spec, Param};
+use crate::triangular::{Contract2Spec, LayerSpec, Param, PositiveAffineSpec, TangentSasSpec};
 
 /// Capacity of a [`Jet`]: the transformer input `y` and up to 15 transformer
-/// parameters (three `Contract2` layers).
+/// parameters (three `Contract2` layers, or three `TangentSAS` layers and
+/// their `PositiveAffine`).
 const N: usize = 16;
 /// Number of directions a [`Jet`] carries second derivatives along.
 const K: usize = 2;
@@ -111,6 +112,26 @@ impl Jet {
     fn sinh(self) -> Self {
         let s = self.v.sinh();
         self.chain(s, self.v.cosh(), s)
+    }
+
+    #[inline(always)]
+    fn cosh(self) -> Self {
+        let c = self.v.cosh();
+        self.chain(c, self.v.sinh(), c)
+    }
+
+    /// `v + sqrt(1 + v*v)`, in `exp_asinh`'s cancellation-free form.
+    #[inline(always)]
+    fn positive(self) -> Self {
+        let a = self.v;
+        let root = if a.abs() > 1e150 {
+            a.abs()
+        } else {
+            (1.0 + a * a).sqrt()
+        };
+        let value = if a >= 0.0 { a + root } else { 1.0 / (root - a) };
+        // d/da (value / root) = (value (root - a)) / root^3 = 1 / root^3.
+        self.chain(value, value / root, 1.0 / (root * root * root))
     }
 
     #[inline(always)]
@@ -240,7 +261,7 @@ struct GammaBound {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct Layer {
+struct Contract2Layer {
     alpha: Option<Param>,
     beta: Option<Param>,
     sigma: Option<Param>,
@@ -249,7 +270,7 @@ struct Layer {
     bound: Option<GammaBound>,
 }
 
-impl Layer {
+impl Contract2Layer {
     fn new(spec: Contract2Spec) -> Result<Self> {
         let bound = match spec.log_gamma_bounds {
             None => None,
@@ -277,35 +298,19 @@ impl Layer {
         })
     }
 
-    fn params(&self) -> impl Iterator<Item = Param> {
-        [self.alpha, self.beta, self.sigma, self.mu, self.nu]
-            .into_iter()
-            .flatten()
-    }
-}
-
-/// `T(y; pi)` and `Lambda(y; pi) = log |dT/dy|` of the inverted `Contract2`
-/// chain (`Contract2.inverse_and_log_det`, last layer first), as jets in
-/// `z = (y, pi)` along the directions `dirs`.
-fn transformer(layers: &[Layer], y: f64, pi: &[f64], dirs: &[[f64; N]; K]) -> (Jet, Jet) {
-    let field = |param: Option<Param>| {
-        param.map(|p| Jet::variable(pi[p.index] + p.offset, 1 + p.index, dirs))
-    };
-
-    let mut x = Jet::variable(y, 0, dirs);
-    let mut log_det = Jet::constant(0.0);
-    for layer in layers.iter().rev() {
-        let log_gamma = field(layer.alpha).map(|alpha| {
+    /// `Contract2.inverse_and_log_det`.
+    fn inverse(&self, field: &impl Fn(Option<Param>) -> Option<Jet>, x: Jet) -> (Jet, Jet) {
+        let log_gamma = field(self.alpha).map(|alpha| {
             let log_gamma = alpha.asinh();
-            match layer.bound {
+            match self.bound {
                 None => log_gamma,
                 Some(b) => (log_gamma * b.slope + b.offset).sigmoid() * b.width + b.low,
             }
         });
-        let log_delta = field(layer.beta).map(Jet::asinh);
-        let log_sigma = field(layer.sigma).map(Jet::asinh);
+        let log_delta = field(self.beta).map(Jet::asinh);
+        let log_sigma = field(self.sigma).map(Jet::asinh);
 
-        let centred = match field(layer.mu) {
+        let centred = match field(self.mu) {
             Some(mu) => x - mu,
             None => x,
         };
@@ -330,13 +335,90 @@ fn transformer(layers: &[Layer], y: f64, pi: &[f64], dirs: &[[f64; N]; K]) -> (J
         };
 
         let mut out = u.sinh() * 2.0;
-        if let Some(nu) = field(layer.nu) {
+        if let Some(nu) = field(self.nu) {
             out = out + nu;
         }
         let mut ld = u.log_cosh() - half_a.square().ln_1p() * 0.5;
         if let Some(s) = log_sigma {
             ld = ld - s;
         }
+        (out, ld)
+    }
+}
+
+/// `TangentSAS.inverse_and_log_det`: with
+/// `q = r b cosh(eps) (y - nu) + sinh(eps)` and `a = (asinh(q) - eps) / r`,
+/// `x = nu + sinh(a) / b` and `log_det = logcosh(a) + logcosh(eps) -
+/// 0.5 log1p(q^2)`. `1 / b = 1 + exp(-b_raw)` and
+/// `1 / r = positive(-r_raw)`.
+fn tangent_sas_inverse(
+    layer: &TangentSasSpec,
+    field: &impl Fn(Option<Param>) -> Option<Jet>,
+    x: Jet,
+) -> (Jet, Jet) {
+    let zero = || Jet::constant(0.0);
+    let nu = field(layer.nu).unwrap_or_else(zero);
+    let eps = field(layer.eps).unwrap_or_else(zero);
+    let b_raw = field(layer.b).unwrap_or_else(zero);
+    let r_raw = field(layer.r).unwrap_or_else(zero);
+
+    let q = (x - nu) * b_raw.sigmoid() * r_raw.positive() * eps.cosh() + eps.sinh();
+    let a = (q.asinh() - eps) * (-r_raw).positive();
+    let out = a.sinh() * ((-b_raw).exp() + 1.0) + nu;
+    let ld = a.log_cosh() + eps.log_cosh() - q.square().ln_1p() * 0.5;
+    (out, ld)
+}
+
+/// `PositiveAffine.inverse_and_log_det`: `x = (y - loc) / scale_mod`, and
+/// `1 / scale_mod = positive(-scale)`.
+fn positive_affine_inverse(
+    layer: &PositiveAffineSpec,
+    field: &impl Fn(Option<Param>) -> Option<Jet>,
+    x: Jet,
+) -> (Jet, Jet) {
+    let centred = match field(layer.loc) {
+        Some(loc) => x - loc,
+        None => x,
+    };
+    match field(layer.scale) {
+        Some(scale) => (centred * (-scale).positive(), -scale.asinh()),
+        None => (centred, Jet::constant(0.0)),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Layer {
+    Contract2(Contract2Layer),
+    TangentSas(TangentSasSpec),
+    PositiveAffine(PositiveAffineSpec),
+}
+
+impl Layer {
+    fn new(spec: LayerSpec) -> Result<Self> {
+        Ok(match spec {
+            LayerSpec::Contract2(spec) => Layer::Contract2(Contract2Layer::new(spec)?),
+            LayerSpec::TangentSas(spec) => Layer::TangentSas(spec),
+            LayerSpec::PositiveAffine(spec) => Layer::PositiveAffine(spec),
+        })
+    }
+}
+
+/// `T(y; pi)` and `Lambda(y; pi) = log |dT/dy|` of the inverted transformer
+/// chain (each layer's `inverse_and_log_det`, last layer first), as jets in
+/// `z = (y, pi)` along the directions `dirs`.
+fn transformer(layers: &[Layer], y: f64, pi: &[f64], dirs: &[[f64; N]; K]) -> (Jet, Jet) {
+    let field = |param: Option<Param>| {
+        param.map(|p| Jet::variable(pi[p.index] + p.offset, 1 + p.index, dirs))
+    };
+
+    let mut x = Jet::variable(y, 0, dirs);
+    let mut log_det = Jet::constant(0.0);
+    for layer in layers.iter().rev() {
+        let (out, ld) = match layer {
+            Layer::Contract2(layer) => layer.inverse(&field, x),
+            Layer::TangentSas(layer) => tangent_sas_inverse(layer, &field, x),
+            Layer::PositiveAffine(layer) => positive_affine_inverse(layer, &field, x),
+        };
         x = out;
         log_det = log_det + ld;
     }
@@ -598,7 +680,7 @@ impl FisherResiduals {
         n_unit: usize,
         n_par: usize,
         location: usize,
-        specs: Vec<Contract2Spec>,
+        specs: Vec<LayerSpec>,
         fisher_regularization: Option<f64>,
     ) -> Result<Self> {
         let Some(n_var) = parent_indptr.len().checked_sub(1) else {
@@ -626,15 +708,15 @@ impl FisherResiduals {
         if location >= n_par {
             bail!("location index {location} out of range for {n_par} parameters");
         }
-        let layers = specs
-            .into_iter()
-            .map(Layer::new)
-            .collect::<Result<Vec<_>>>()?;
-        for param in layers.iter().flat_map(Layer::params) {
+        for param in specs.iter().flat_map(LayerSpec::params) {
             if param.index >= n_par {
                 bail!("transformer parameter index {} out of range", param.index);
             }
         }
+        let layers = specs
+            .into_iter()
+            .map(Layer::new)
+            .collect::<Result<Vec<_>>>()?;
         if let Some(rho) = fisher_regularization {
             if rho.is_nan() || rho < 0.0 {
                 bail!("fisher_regularization must be non-negative, got {rho}");
@@ -1638,7 +1720,7 @@ impl PyFisherResiduals {
         transformer: &Bound<'_, PyAny>,
         fisher_regularization: Option<f64>,
     ) -> Result<Self> {
-        let specs: Vec<Contract2Spec> = pythonize::depythonize(transformer)?;
+        let specs: Vec<LayerSpec> = pythonize::depythonize(transformer)?;
         Ok(Self {
             inner: FisherResiduals::new(
                 as_usize(parent_indptr.as_slice()?)?,
