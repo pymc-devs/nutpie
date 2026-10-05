@@ -23,8 +23,20 @@
 //! weights `W1[u, :]`, its bias `b1[u]` and its output weights `W2[:, u]`,
 //! followed by `b2` and the skip weights `s`. Every kernel walks the
 //! conditioner unit by unit, so this keeps each unit's weights contiguous.
+//!
+//! Draws are processed in tiles of one native `f64` SIMD vector each
+//! (`fearless_simd`): every draw walks the same variables, parents and
+//! weights, so a tile runs the per-draw algorithm once with each value
+//! widened to a vector. `n_draw` must be a multiple of the vector width.
+//!
+//! The tape keeps only what the triangular solves need across variables
+//! (`A`, `delta`, `x`, `w`). Everything local to a variable -- the hidden
+//! units and the transformer's derivatives -- is recomputed by each
+//! operator, with one jet pass of the transformer per variable and tile.
 
 use anyhow::{bail, Result};
+use fearless_simd::{dispatch, prelude::*, Level};
+use fearless_simd_macros::simd;
 use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 use rayon::prelude::*;
@@ -32,56 +44,67 @@ use rayon::prelude::*;
 use faer::linalg::matmul::matmul;
 use faer::{Accum, Mat, Par};
 
+use crate::simd_math;
 use crate::triangular::{Contract2Spec, LayerSpec, Param, PositiveAffineSpec, TangentSasSpec};
 
 /// Capacity of a [`Jet`]: the transformer input `y` and up to 15 transformer
 /// parameters (three `Contract2` layers, or three `TangentSAS` layers and
 /// their `PositiveAffine`).
 const N: usize = 16;
-/// Number of directions a [`Jet`] carries second derivatives along.
-const K: usize = 2;
 /// Draws per matrix product when accumulating the exact blocks.
 const BLOCK_DRAW_BATCH: usize = 32;
 
-/// A scalar function of `z = (y, pi)`, with its gradient and the products of
-/// its Hessian with `K` fixed directions: `e[k] = g . d_k`, `h[k] = H d_k`.
+/// `K` directions in `z = (y, pi)`, one vector per entry.
+type Dirs<S, const K: usize> = [[<S as Simd>::f64s; N]; K];
+
+/// A scalar function of `z = (y, pi)`, one lane per draw, with its gradient
+/// and the products of its Hessian with `K` fixed directions:
+/// `e[k] = g . d_k`, `h[k] = H d_k`.
 ///
 /// Forward-over-forward, but sharing the value and gradient across the
 /// directions, so every operation is O(N) instead of the O(N^2) a full
 /// Hessian would cost.
 #[derive(Clone, Copy)]
-struct Jet {
-    v: f64,
-    g: [f64; N],
-    e: [f64; K],
-    h: [[f64; N]; K],
+struct Jet<S: Simd, const K: usize> {
+    simd: S,
+    v: S::f64s,
+    g: [S::f64s; N],
+    e: [S::f64s; K],
+    h: [[S::f64s; N]; K],
 }
 
-impl Jet {
+impl<S: Simd, const K: usize> Jet<S, K> {
     #[inline(always)]
-    fn constant(v: f64) -> Self {
+    fn constant(simd: S, v: S::f64s) -> Self {
+        let zero = S::f64s::splat(simd, 0.0);
         Self {
+            simd,
             v,
-            g: [0.0; N],
-            e: [0.0; K],
-            h: [[0.0; N]; K],
+            g: [zero; N],
+            e: [zero; K],
+            h: [[zero; N]; K],
         }
     }
 
     #[inline(always)]
-    fn variable(v: f64, index: usize, dirs: &[[f64; N]; K]) -> Self {
-        let mut out = Self::constant(v);
-        out.g[index] = 1.0;
+    fn variable(simd: S, v: S::f64s, index: usize, dirs: &Dirs<S, K>) -> Self {
+        let mut out = Self::constant(simd, v);
+        out.g[index] = S::f64s::splat(simd, 1.0);
         for k in 0..K {
             out.e[k] = dirs[k][index];
         }
         out
     }
 
+    #[inline(always)]
+    fn one(&self) -> S::f64s {
+        S::f64s::splat(self.simd, 1.0)
+    }
+
     /// `f(self)`, given `f`, `f'` and `f''` at `self.v`.
     #[inline(always)]
-    fn chain(self, f0: f64, f1: f64, f2: f64) -> Self {
-        let mut out = Self::constant(f0);
+    fn chain(self, f0: S::f64s, f1: S::f64s, f2: S::f64s) -> Self {
+        let mut out = Self::constant(self.simd, f0);
         for n in 0..N {
             out.g[n] = f1 * self.g[n];
         }
@@ -98,71 +121,60 @@ impl Jet {
     #[inline(always)]
     fn asinh(self) -> Self {
         let a = self.v;
-        // `1 + a*a` overflows above ~1e154, where `|a|` is the root to full
-        // precision anyway; `hypot` is markedly slower.
-        let root = if a.abs() > 1e150 {
-            a.abs()
-        } else {
-            (1.0 + a * a).sqrt()
-        };
-        self.chain(a.asinh(), 1.0 / root, -a / (root * root * root))
+        let root = simd_math::hypot_one(self.simd, a);
+        let value = simd_math::asinh(self.simd, a);
+        self.chain(value, self.one() / root, -a / (root * root * root))
     }
 
     #[inline(always)]
     fn sinh(self) -> Self {
-        let s = self.v.sinh();
-        self.chain(s, self.v.cosh(), s)
+        let (s, c) = simd_math::sinh_cosh(self.simd, self.v);
+        self.chain(s, c, s)
     }
 
     #[inline(always)]
     fn cosh(self) -> Self {
-        let c = self.v.cosh();
-        self.chain(c, self.v.sinh(), c)
+        let (s, c) = simd_math::sinh_cosh(self.simd, self.v);
+        self.chain(c, s, c)
     }
 
     /// `v + sqrt(1 + v*v)`, in `exp_asinh`'s cancellation-free form.
     #[inline(always)]
     fn positive(self) -> Self {
         let a = self.v;
-        let root = if a.abs() > 1e150 {
-            a.abs()
-        } else {
-            (1.0 + a * a).sqrt()
-        };
-        let value = if a >= 0.0 { a + root } else { 1.0 / (root - a) };
+        let one = self.one();
+        let root = simd_math::hypot_one(self.simd, a);
+        let value = a.simd_ge(0.0).select(a + root, one / (root - a));
         // d/da (value / root) = (value (root - a)) / root^3 = 1 / root^3.
-        self.chain(value, value / root, 1.0 / (root * root * root))
+        self.chain(value, value / root, one / (root * root * root))
     }
 
     #[inline(always)]
     fn exp(self) -> Self {
-        let e = self.v.exp();
+        let e = simd_math::exp(self.simd, self.v);
         self.chain(e, e, e)
     }
 
     #[inline(always)]
     fn ln_1p(self) -> Self {
-        let inv = 1.0 / (1.0 + self.v);
-        self.chain(self.v.ln_1p(), inv, -inv * inv)
+        let inv = self.one() / (self.v + 1.0);
+        let value = simd_math::ln_1p(self.simd, self.v);
+        self.chain(value, inv, -inv * inv)
     }
 
     /// `log(cosh(v))`, in `_log_cosh`'s stable form.
     #[inline(always)]
     fn log_cosh(self) -> Self {
-        let a = self.v.abs();
-        let t = self.v.tanh();
-        self.chain(
-            a + (-2.0 * a).exp().ln_1p() - std::f64::consts::LN_2,
-            t,
-            1.0 - t * t,
-        )
+        let (value, t) = simd_math::log_cosh_tanh(self.simd, self.v);
+        self.chain(value, t, self.one() - t * t)
     }
 
     #[inline(always)]
     fn sigmoid(self) -> Self {
-        let s = 1.0 / (1.0 + (-self.v).exp());
-        let ds = s * (1.0 - s);
-        self.chain(s, ds, ds * (1.0 - 2.0 * s))
+        let one = self.one();
+        let s = one / (simd_math::exp(self.simd, -self.v) + 1.0);
+        let ds = s * (one - s);
+        self.chain(s, ds, ds * (one - s * 2.0))
     }
 
     #[inline(always)]
@@ -171,10 +183,10 @@ impl Jet {
     }
 }
 
-impl std::ops::Add for Jet {
-    type Output = Jet;
+impl<S: Simd, const K: usize> std::ops::Add for Jet<S, K> {
+    type Output = Self;
     #[inline(always)]
-    fn add(mut self, other: Jet) -> Jet {
+    fn add(mut self, other: Self) -> Self {
         self.v += other.v;
         for n in 0..N {
             self.g[n] += other.g[n];
@@ -189,28 +201,28 @@ impl std::ops::Add for Jet {
     }
 }
 
-impl std::ops::Neg for Jet {
-    type Output = Jet;
+impl<S: Simd, const K: usize> std::ops::Neg for Jet<S, K> {
+    type Output = Self;
     #[inline(always)]
-    fn neg(self) -> Jet {
+    fn neg(self) -> Self {
         self * -1.0
     }
 }
 
-impl std::ops::Sub for Jet {
-    type Output = Jet;
+impl<S: Simd, const K: usize> std::ops::Sub for Jet<S, K> {
+    type Output = Self;
     #[inline(always)]
-    fn sub(self, other: Jet) -> Jet {
+    fn sub(self, other: Self) -> Self {
         self + (-other)
     }
 }
 
-impl std::ops::Mul for Jet {
-    type Output = Jet;
+impl<S: Simd, const K: usize> std::ops::Mul for Jet<S, K> {
+    type Output = Self;
     #[inline(always)]
-    fn mul(self, other: Jet) -> Jet {
+    fn mul(self, other: Self) -> Self {
         let (a, b) = (self, other);
-        let mut out = Jet::constant(a.v * b.v);
+        let mut out = Self::constant(a.simd, a.v * b.v);
         for n in 0..N {
             out.g[n] = a.v * b.g[n] + b.v * a.g[n];
         }
@@ -224,10 +236,10 @@ impl std::ops::Mul for Jet {
     }
 }
 
-impl std::ops::Mul<f64> for Jet {
-    type Output = Jet;
+impl<S: Simd, const K: usize> std::ops::Mul<f64> for Jet<S, K> {
+    type Output = Self;
     #[inline(always)]
-    fn mul(mut self, c: f64) -> Jet {
+    fn mul(mut self, c: f64) -> Self {
         self.v *= c;
         for n in 0..N {
             self.g[n] *= c;
@@ -242,12 +254,39 @@ impl std::ops::Mul<f64> for Jet {
     }
 }
 
-impl std::ops::Add<f64> for Jet {
-    type Output = Jet;
+impl<S: Simd, const K: usize> std::ops::Add<f64> for Jet<S, K> {
+    type Output = Self;
     #[inline(always)]
-    fn add(mut self, c: f64) -> Jet {
+    fn add(mut self, c: f64) -> Self {
         self.v += c;
         self
+    }
+}
+
+/// The transformer parameters `pi` of one variable as jet inputs.
+struct Fields<'a, S: Simd, const K: usize> {
+    simd: S,
+    pi: &'a [S::f64s],
+    dirs: &'a Dirs<S, K>,
+}
+
+impl<S: Simd, const K: usize> Fields<'_, S, K> {
+    #[inline(always)]
+    fn get(&self, param: Option<Param>) -> Option<Jet<S, K>> {
+        param.map(|p| {
+            Jet::variable(
+                self.simd,
+                self.pi[p.index] + p.offset,
+                1 + p.index,
+                self.dirs,
+            )
+        })
+    }
+
+    #[inline(always)]
+    fn get_or_zero(&self, param: Option<Param>) -> Jet<S, K> {
+        self.get(param)
+            .unwrap_or_else(|| Jet::constant(self.simd, S::f64s::splat(self.simd, 0.0)))
     }
 }
 
@@ -299,18 +338,23 @@ impl Contract2Layer {
     }
 
     /// `Contract2.inverse_and_log_det`.
-    fn inverse(&self, field: &impl Fn(Option<Param>) -> Option<Jet>, x: Jet) -> (Jet, Jet) {
-        let log_gamma = field(self.alpha).map(|alpha| {
+    #[inline(always)]
+    fn inverse<S: Simd, const K: usize>(
+        &self,
+        fields: &Fields<S, K>,
+        x: Jet<S, K>,
+    ) -> (Jet<S, K>, Jet<S, K>) {
+        let log_gamma = fields.get(self.alpha).map(|alpha| {
             let log_gamma = alpha.asinh();
             match self.bound {
                 None => log_gamma,
                 Some(b) => (log_gamma * b.slope + b.offset).sigmoid() * b.width + b.low,
             }
         });
-        let log_delta = field(self.beta).map(Jet::asinh);
-        let log_sigma = field(self.sigma).map(Jet::asinh);
+        let log_delta = fields.get(self.beta).map(Jet::asinh);
+        let log_sigma = fields.get(self.sigma).map(Jet::asinh);
 
-        let centred = match field(self.mu) {
+        let centred = match fields.get(self.mu) {
             Some(mu) => x - mu,
             None => x,
         };
@@ -335,7 +379,7 @@ impl Contract2Layer {
         };
 
         let mut out = u.sinh() * 2.0;
-        if let Some(nu) = field(self.nu) {
+        if let Some(nu) = fields.get(self.nu) {
             out = out + nu;
         }
         let mut ld = u.log_cosh() - half_a.square().ln_1p() * 0.5;
@@ -351,16 +395,16 @@ impl Contract2Layer {
 /// `x = nu + sinh(a) / b` and `log_det = logcosh(a) + logcosh(eps) -
 /// 0.5 log1p(q^2)`. `1 / b = 1 + exp(-b_raw)` and
 /// `1 / r = positive(-r_raw)`.
-fn tangent_sas_inverse(
+#[inline(always)]
+fn tangent_sas_inverse<S: Simd, const K: usize>(
     layer: &TangentSasSpec,
-    field: &impl Fn(Option<Param>) -> Option<Jet>,
-    x: Jet,
-) -> (Jet, Jet) {
-    let zero = || Jet::constant(0.0);
-    let nu = field(layer.nu).unwrap_or_else(zero);
-    let eps = field(layer.eps).unwrap_or_else(zero);
-    let b_raw = field(layer.b).unwrap_or_else(zero);
-    let r_raw = field(layer.r).unwrap_or_else(zero);
+    fields: &Fields<S, K>,
+    x: Jet<S, K>,
+) -> (Jet<S, K>, Jet<S, K>) {
+    let nu = fields.get_or_zero(layer.nu);
+    let eps = fields.get_or_zero(layer.eps);
+    let b_raw = fields.get_or_zero(layer.b);
+    let r_raw = fields.get_or_zero(layer.r);
 
     let q = (x - nu) * b_raw.sigmoid() * r_raw.positive() * eps.cosh() + eps.sinh();
     let a = (q.asinh() - eps) * (-r_raw).positive();
@@ -371,18 +415,19 @@ fn tangent_sas_inverse(
 
 /// `PositiveAffine.inverse_and_log_det`: `x = (y - loc) / scale_mod`, and
 /// `1 / scale_mod = positive(-scale)`.
-fn positive_affine_inverse(
+#[inline(always)]
+fn positive_affine_inverse<S: Simd, const K: usize>(
     layer: &PositiveAffineSpec,
-    field: &impl Fn(Option<Param>) -> Option<Jet>,
-    x: Jet,
-) -> (Jet, Jet) {
-    let centred = match field(layer.loc) {
+    fields: &Fields<S, K>,
+    x: Jet<S, K>,
+) -> (Jet<S, K>, Jet<S, K>) {
+    let centred = match fields.get(layer.loc) {
         Some(loc) => x - loc,
         None => x,
     };
-    match field(layer.scale) {
+    match fields.get(layer.scale) {
         Some(scale) => (centred * (-scale).positive(), -scale.asinh()),
-        None => (centred, Jet::constant(0.0)),
+        None => (centred, fields.get_or_zero(None)),
     }
 }
 
@@ -406,18 +451,22 @@ impl Layer {
 /// `T(y; pi)` and `Lambda(y; pi) = log |dT/dy|` of the inverted transformer
 /// chain (each layer's `inverse_and_log_det`, last layer first), as jets in
 /// `z = (y, pi)` along the directions `dirs`.
-fn transformer(layers: &[Layer], y: f64, pi: &[f64], dirs: &[[f64; N]; K]) -> (Jet, Jet) {
-    let field = |param: Option<Param>| {
-        param.map(|p| Jet::variable(pi[p.index] + p.offset, 1 + p.index, dirs))
-    };
-
-    let mut x = Jet::variable(y, 0, dirs);
-    let mut log_det = Jet::constant(0.0);
+#[simd]
+fn transformer<S: Simd, const K: usize>(
+    simd: S,
+    layers: &[Layer],
+    y: S::f64s,
+    pi: &[S::f64s],
+    dirs: &Dirs<S, K>,
+) -> (Jet<S, K>, Jet<S, K>) {
+    let fields = Fields { simd, pi, dirs };
+    let mut x = Jet::variable(simd, y, 0, dirs);
+    let mut log_det = fields.get_or_zero(None);
     for layer in layers.iter().rev() {
         let (out, ld) = match layer {
-            Layer::Contract2(layer) => layer.inverse(&field, x),
-            Layer::TangentSas(layer) => tangent_sas_inverse(layer, &field, x),
-            Layer::PositiveAffine(layer) => positive_affine_inverse(layer, &field, x),
+            Layer::Contract2(layer) => layer.inverse(&fields, x),
+            Layer::TangentSas(layer) => tangent_sas_inverse(layer, &fields, x),
+            Layer::PositiveAffine(layer) => positive_affine_inverse(layer, &fields, x),
         };
         x = out;
         log_det = log_det + ld;
@@ -425,28 +474,57 @@ fn transformer(layers: &[Layer], y: f64, pi: &[f64], dirs: &[[f64; N]; K]) -> (J
     (x, log_det)
 }
 
-/// Softplus and its first two derivatives.
+/// `sum_k w[k] x[k]`: weights shared by the draws, against per-draw values.
 #[inline(always)]
-fn softplus(a: f64) -> (f64, f64, f64) {
-    let e = (-a.abs()).exp();
-    let sigmoid = if a >= 0.0 {
-        1.0 / (1.0 + e)
-    } else {
-        e / (1.0 + e)
-    };
-    (e.ln_1p() + a.max(0.0), sigmoid, sigmoid * (1.0 - sigmoid))
+fn dot<S: Simd>(simd: S, w: &[f64], x: &[S::f64s]) -> S::f64s {
+    let mut acc = S::f64s::splat(simd, 0.0);
+    for (&w, &x) in w.iter().zip(x) {
+        acc += x * w;
+    }
+    acc
 }
 
 #[inline(always)]
-fn dot(a: &[f64], b: &[f64]) -> f64 {
-    a.iter().zip(b).map(|(a, b)| a * b).sum()
+fn dot_lanes<S: Simd>(simd: S, a: &[S::f64s], b: &[S::f64s]) -> S::f64s {
+    let mut acc = S::f64s::splat(simd, 0.0);
+    for (&a, &b) in a.iter().zip(b) {
+        acc += a * b;
+    }
+    acc
 }
 
+/// `y += alpha x` for shared `x`.
 #[inline(always)]
-fn axpy(alpha: f64, x: &[f64], y: &mut [f64]) {
-    for (y, x) in y.iter_mut().zip(x) {
+fn axpy<S: Simd>(_: S, alpha: S::f64s, x: &[f64], y: &mut [S::f64s]) {
+    for (y, &x) in y.iter_mut().zip(x) {
         *y += alpha * x;
     }
+}
+
+#[inline(always)]
+fn axpy_lanes<S: Simd>(_: S, alpha: S::f64s, x: &[S::f64s], y: &mut [S::f64s]) {
+    for (y, &x) in y.iter_mut().zip(x) {
+        *y += alpha * x;
+    }
+}
+
+/// One tile's `dst.len()` vectors from their `(count, width)` block.
+#[simd]
+fn load<S: Simd>(simd: S, src: &[f64], dst: &mut [S::f64s]) {
+    for (dst, src) in dst.iter_mut().zip(src.chunks_exact(S::f64s::LEN)) {
+        *dst = S::f64s::from_slice(simd, src);
+    }
+}
+
+#[simd]
+fn store<S: Simd>(_: S, src: &[S::f64s], dst: &mut [f64]) {
+    for (src, dst) in src.iter().zip(dst.chunks_exact_mut(S::f64s::LEN)) {
+        src.store_slice(dst);
+    }
+}
+
+fn f64_width<S: Simd>(_: S) -> usize {
+    S::f64s::LEN
 }
 
 /// Where one variable's conditioner parameters sit in its slice.
@@ -499,60 +577,70 @@ impl Shape {
 
 /// A cotangent on one variable's local outputs `(x_i, delta_i, mu_i, A[i, :],
 /// L[i, :])`.
-struct Cotangent<'a> {
-    x: f64,
-    delta: f64,
-    mu: f64,
-    edge_a: &'a [f64],
-    edge_l: &'a [f64],
+struct Cotangent<'a, S: Simd> {
+    x: S::f64s,
+    delta: S::f64s,
+    mu: S::f64s,
+    edge_a: &'a [S::f64s],
+    edge_l: &'a [S::f64s],
 }
 
 /// Per-thread scratch for the local kernels.
-#[derive(Default)]
-struct Scratch {
-    y_parents: Vec<f64>,
-    unit_a: Vec<f64>,
-    unit_b: Vec<f64>,
-    pi: Vec<f64>,
-    pi_dot: Vec<f64>,
-    t_bar: Vec<f64>,
-    l_bar: Vec<f64>,
-    pi_bar: Vec<f64>,
+struct Scratch<S: Simd> {
+    y_parents: Vec<S::f64s>,
+    /// Softplus and its first two derivatives at the hidden units.
+    h: Vec<S::f64s>,
+    h1: Vec<S::f64s>,
+    h2: Vec<S::f64s>,
+    unit_a: Vec<S::f64s>,
+    unit_b: Vec<S::f64s>,
+    pi: Vec<S::f64s>,
+    pi_dot: Vec<S::f64s>,
+    t_bar: Vec<S::f64s>,
+    l_bar: Vec<S::f64s>,
+    pi_bar: Vec<S::f64s>,
 }
 
-impl Scratch {
-    fn new(n_unit: usize, n_par: usize, max_parent: usize) -> Self {
+impl<S: Simd> Scratch<S> {
+    fn new(simd: S, n_unit: usize, n_par: usize, max_parent: usize) -> Self {
+        let zero = S::f64s::splat(simd, 0.0);
         Self {
-            y_parents: vec![0.0; max_parent],
-            unit_a: vec![0.0; n_unit],
-            unit_b: vec![0.0; n_unit],
-            pi: vec![0.0; n_par],
-            pi_dot: vec![0.0; n_par],
-            t_bar: vec![0.0; n_par],
-            l_bar: vec![0.0; n_par],
-            pi_bar: vec![0.0; n_par],
+            y_parents: Vec::with_capacity(max_parent),
+            h: vec![zero; n_unit],
+            h1: vec![zero; n_unit],
+            h2: vec![zero; n_unit],
+            unit_a: vec![zero; n_unit],
+            unit_b: vec![zero; n_unit],
+            pi: vec![zero; n_par],
+            pi_dot: vec![zero; n_par],
+            t_bar: vec![zero; n_par],
+            l_bar: vec![zero; n_par],
+            pi_bar: vec![zero; n_par],
         }
     }
 }
 
-/// One variable's linearization at one draw, recorded by the primal: the
-/// softplus values and derivatives at its hidden units, and the gradients
-/// and Hessians of `T` and `Lambda` in `z = (y, pi)`.
-///
-/// `theta` is fixed while CG runs, so everything that needs a transcendental
-/// function is evaluated once per primal; the pushforward and the pullback
-/// only take Hessian-vector products of it.
-#[derive(Clone, Copy)]
-struct Local<'a> {
-    h: &'a [f64],
-    h1: &'a [f64],
-    h2: &'a [f64],
-    /// `dT/dpi` and `dLambda/dpi`.
-    t: &'a [f64],
-    l: &'a [f64],
-    /// Lower triangles in `z = (y, pi)`, packed row by row.
-    hess_t: &'a [f64],
-    hess_l: &'a [f64],
+/// Gradients of `T` and `Lambda` in `z = (y, pi)`, and their Hessians'
+/// products with the directions `dir_t` and `dir_l` of a pullback.
+struct Curvature<S: Simd> {
+    grad_t: [S::f64s; N],
+    grad_l: [S::f64s; N],
+    hess_t: [S::f64s; N],
+    hess_l: [S::f64s; N],
+}
+
+/// Where a local pullback gets its [`Curvature`] from.
+enum CurvatureSource<'a, S: Simd> {
+    /// A jet pass of the transformer at the variable's own `y`.
+    Recompute { y: S::f64s },
+    /// Gradients and packed Hessians from [`FisherResiduals::dense_curvature`],
+    /// for the many seeds of the exact blocks.
+    Dense {
+        grad_t: &'a [S::f64s; N],
+        grad_l: &'a [S::f64s; N],
+        hess_t: &'a [S::f64s],
+        hess_l: &'a [S::f64s],
+    },
 }
 
 /// Length of a packed lower triangle of an `n x n` matrix.
@@ -561,8 +649,9 @@ fn packed_len(n: usize) -> usize {
 }
 
 /// `out = H d` for a symmetric `H` stored as a packed lower triangle.
-fn packed_product(packed: &[f64], d: &[f64], out: &mut [f64]) {
-    out.fill(0.0);
+#[inline(always)]
+fn packed_product<S: Simd>(simd: S, packed: &[S::f64s], d: &[S::f64s], out: &mut [S::f64s]) {
+    out.fill(S::f64s::splat(simd, 0.0));
     let mut index = 0;
     for r in 0..d.len() {
         for c in 0..r {
@@ -583,42 +672,29 @@ pub(crate) struct GnBlock {
     pub(crate) matrix: Mat<f64>,
 }
 
-/// One draw's quantities from the primal, which every later operation reads.
-struct DrawTape<'a> {
-    /// Per variable: `h`, `h'` and `h''` at its hidden units.
-    units: &'a [f64],
-    /// Per variable: `t`, `l` and the packed Hessians of `T` and `Lambda`.
-    record: &'a [f64],
-    edge_a: &'a [f64],
-    delta: &'a [f64],
-    x: &'a [f64],
-    w: &'a [f64],
-}
-
-struct DrawTapeMut<'a> {
-    units: &'a mut [f64],
-    record: &'a mut [f64],
-    edge_a: &'a mut [f64],
-    edge_l: &'a mut [f64],
-    delta: &'a mut [f64],
-    x: &'a mut [f64],
-    w: &'a mut [f64],
-}
-
+/// What every operator at `theta` reads from the primal: the quantities the
+/// triangular solves couple across variables. Each array is laid out
+/// `(n_tile, count, width)`, so a tile's values for one variable or edge are
+/// one SIMD vector.
 #[derive(Default)]
 pub(crate) struct Tape {
     theta: Vec<f64>,
-    units: Vec<f64>,
-    record: Vec<f64>,
     edge_a: Vec<f64>,
-    edge_l: Vec<f64>,
     delta: Vec<f64>,
     x: Vec<f64>,
     w: Vec<f64>,
 }
 
+/// One tile of the [`Tape`], being written by the primal.
+struct TileTapeMut<'a> {
+    edge_a: &'a mut [f64],
+    delta: &'a mut [f64],
+    x: &'a mut [f64],
+    w: &'a mut [f64],
+}
+
 /// Splits `values` into `n` consecutive chunks of `size`, which may be zero.
-fn chunks(values: &mut [f64], size: usize, n: usize) -> Vec<&mut [f64]> {
+fn chunks<T>(values: &mut [T], size: usize, n: usize) -> Vec<&mut [T]> {
     let mut out = Vec::with_capacity(n);
     let mut rest = values;
     for _ in 0..n {
@@ -629,29 +705,60 @@ fn chunks(values: &mut [f64], size: usize, n: usize) -> Vec<&mut [f64]> {
     out
 }
 
-/// Per-draw scratch for the global sweeps.
-struct DrawScratch {
-    local: Scratch,
-    by_var: [Vec<f64>; 4],
-    by_edge: [Vec<f64>; 2],
-    residual: Vec<f64>,
+/// Per-thread scratch for the sweeps over one tile, and that tile's data and
+/// tape as vectors.
+struct TileScratch<S: Simd> {
+    local: Scratch<S>,
+    y: Vec<S::f64s>,
+    g: Vec<S::f64s>,
+    edge_a: Vec<S::f64s>,
+    edge_l: Vec<S::f64s>,
+    delta: Vec<S::f64s>,
+    x: Vec<S::f64s>,
+    w: Vec<S::f64s>,
+    by_var: [Vec<S::f64s>; 2],
+    by_edge: [Vec<S::f64s>; 2],
+    residual: Vec<S::f64s>,
 }
 
-impl DrawScratch {
-    fn new(problem: &FisherResiduals) -> Self {
-        let n_var = problem.n_var;
-        let n_edge = problem.n_edge();
+impl<S: Simd> TileScratch<S> {
+    fn new(simd: S, problem: &FisherResiduals) -> Self {
+        let zero = S::f64s::splat(simd, 0.0);
+        let by_var = || vec![zero; problem.n_var];
+        let by_edge = || vec![zero; problem.n_edge()];
         Self {
-            local: problem.scratch(),
-            by_var: std::array::from_fn(|_| vec![0.0; n_var]),
-            by_edge: std::array::from_fn(|_| vec![0.0; n_edge]),
-            residual: vec![0.0; problem.n_residuals()],
+            local: problem.scratch(simd),
+            y: by_var(),
+            g: by_var(),
+            edge_a: by_edge(),
+            edge_l: by_edge(),
+            delta: by_var(),
+            x: by_var(),
+            w: by_var(),
+            by_var: [by_var(), by_var()],
+            by_edge: [by_edge(), by_edge()],
+            residual: vec![zero; problem.n_residuals()],
         }
     }
 }
 
+/// Per-thread scratch for [`FisherResiduals::variable_blocks`].
+struct BlockScratch<S: Simd> {
+    local: Scratch<S>,
+    /// The Jacobian rows of one tile, `n_theta` per column.
+    rows: Vec<S::f64s>,
+    edge_a: Vec<S::f64s>,
+    cot_a: Vec<S::f64s>,
+    cot_l: Vec<S::f64s>,
+    hess_t: Vec<S::f64s>,
+    hess_l: Vec<S::f64s>,
+}
+
 #[derive(Clone)]
 pub(crate) struct FisherResiduals {
+    level: Level,
+    /// Lanes of `level`'s native `f64` vector: the draws in a tile.
+    width: usize,
     pub(crate) n_var: usize,
     n_unit: usize,
     n_par: usize,
@@ -668,6 +775,8 @@ pub(crate) struct FisherResiduals {
     filled_indptr: Vec<usize>,
     filled_index: Vec<usize>,
     pub(crate) n_draw: usize,
+    n_tile: usize,
+    /// `(n_tile, n_var, width)`, see [`Tape`].
     y: Vec<f64>,
     g: Vec<f64>,
 }
@@ -761,7 +870,10 @@ impl FisherResiduals {
             filled_indptr[i + 1] = filled_index.len();
         }
 
+        let level = Level::new();
         Ok(Self {
+            level,
+            width: dispatch!(level, simd => f64_width(simd)),
             n_var,
             n_unit,
             n_par,
@@ -775,6 +887,7 @@ impl FisherResiduals {
             filled_indptr,
             filled_index,
             n_draw: 0,
+            n_tile: 0,
             y: Vec::new(),
             g: Vec::new(),
         })
@@ -801,8 +914,8 @@ impl FisherResiduals {
         1.0 / (self.n_draw as f64).sqrt()
     }
 
-    fn scratch(&self) -> Scratch {
-        Scratch::new(self.n_unit, self.n_par, self.max_parent)
+    fn scratch<S: Simd>(&self, simd: S) -> Scratch<S> {
+        Scratch::new(simd, self.n_unit, self.n_par, self.max_parent)
     }
 
     fn shape(&self, i: usize) -> Shape {
@@ -825,113 +938,343 @@ impl FisherResiduals {
         if self.n_var == 0 || !y.len().is_multiple_of(self.n_var) || y.len() != g.len() {
             bail!("y and g must both have shape (n_draw, {})", self.n_var);
         }
-        self.n_draw = y.len() / self.n_var;
-        if self.n_draw == 0 {
+        let n_draw = y.len() / self.n_var;
+        if n_draw == 0 {
             bail!("need at least one draw");
         }
-        self.y = y;
-        self.g = g;
+        if !n_draw.is_multiple_of(self.width) {
+            bail!(
+                "the number of draws ({n_draw}) must be a multiple of the SIMD width \
+                 ({}); a multiple of 8 works on every machine",
+                self.width
+            );
+        }
+        self.n_draw = n_draw;
+        self.n_tile = n_draw / self.width;
+        self.y = self.to_tiles(&y, self.n_var);
+        self.g = self.to_tiles(&g, self.n_var);
         Ok(())
     }
 
-    /// Tape entries per variable and draw for the units and the transformer
-    /// record.
-    fn units_len(&self) -> usize {
-        3 * self.n_unit
+    /// Row-major `(n_draw, count)` values in the tiled `(n_tile, count,
+    /// width)` layout.
+    fn to_tiles(&self, values: &[f64], count: usize) -> Vec<f64> {
+        let width = self.width;
+        let mut out = vec![0.0; values.len()];
+        for (draw, row) in values.chunks_exact(count).enumerate() {
+            let (tile, lane) = (draw / width, draw % width);
+            for (k, &value) in row.iter().enumerate() {
+                out[(tile * count + k) * width + lane] = value;
+            }
+        }
+        out
     }
 
-    fn record_len(&self) -> usize {
-        2 * self.n_par + 2 * packed_len(1 + self.n_par)
+    /// The inverse of [`Self::to_tiles`].
+    fn from_tiles(&self, values: &[f64], count: usize) -> Vec<f64> {
+        let width = self.width;
+        let mut out = vec![0.0; values.len()];
+        for (draw, row) in out.chunks_exact_mut(count).enumerate() {
+            let (tile, lane) = (draw / width, draw % width);
+            for (k, value) in row.iter_mut().enumerate() {
+                *value = values[(tile * count + k) * width + lane];
+            }
+        }
+        out
     }
 
-    fn draw_tape<'a>(&self, tape: &'a Tape, draw: usize) -> DrawTape<'a> {
+    /// Tile `tile` of a tiled array with `count` values per draw.
+    fn tile<'a>(&self, values: &'a [f64], count: usize, tile: usize) -> &'a [f64] {
+        let len = count * self.width;
+        &values[tile * len..(tile + 1) * len]
+    }
+
+    /// Value `k` of tile `tile` of a tiled array with `count` values per draw.
+    #[inline(always)]
+    fn tile_value<S: Simd>(
+        &self,
+        simd: S,
+        values: &[f64],
+        count: usize,
+        tile: usize,
+        k: usize,
+    ) -> S::f64s {
+        let start = (tile * count + k) * self.width;
+        S::f64s::from_slice(simd, &values[start..start + self.width])
+    }
+
+    /// Loads tile `tile`'s draws and tape into `s`.
+    #[simd]
+    fn load_tile<S: Simd>(&self, simd: S, tile: usize, tape: &Tape, s: &mut TileScratch<S>) {
         let (n_var, n_edge) = (self.n_var, self.n_edge());
-        let (units, record) = (n_var * self.units_len(), n_var * self.record_len());
-        DrawTape {
-            units: &tape.units[draw * units..(draw + 1) * units],
-            record: &tape.record[draw * record..(draw + 1) * record],
-            edge_a: &tape.edge_a[draw * n_edge..(draw + 1) * n_edge],
-            delta: &tape.delta[draw * n_var..(draw + 1) * n_var],
-            x: &tape.x[draw * n_var..(draw + 1) * n_var],
-            w: &tape.w[draw * n_var..(draw + 1) * n_var],
-        }
+        load(simd, self.tile(&self.y, n_var, tile), &mut s.y);
+        load(simd, self.tile(&tape.edge_a, n_edge, tile), &mut s.edge_a);
+        load(simd, self.tile(&tape.delta, n_var, tile), &mut s.delta);
+        load(simd, self.tile(&tape.x, n_var, tile), &mut s.x);
+        load(simd, self.tile(&tape.w, n_var, tile), &mut s.w);
     }
 
-    /// Variable `i`'s linearization in one draw's tape.
-    fn local<'a>(&self, tape: &DrawTape<'a>, i: usize) -> Local<'a> {
-        let n_unit = self.n_unit;
-        let units = &tape.units[i * self.units_len()..(i + 1) * self.units_len()];
-        let record = &tape.record[i * self.record_len()..(i + 1) * self.record_len()];
-        let (t, rest) = record.split_at(self.n_par);
-        let (l, hessians) = rest.split_at(self.n_par);
-        let (hess_t, hess_l) = hessians.split_at(packed_len(1 + self.n_par));
-        Local {
-            h: &units[..n_unit],
-            h1: &units[n_unit..2 * n_unit],
-            h2: &units[2 * n_unit..],
-            t,
-            l,
-            hess_t,
-            hess_l,
-        }
-    }
-
-    fn gather_parents(&self, i: usize, y: &[f64], out: &mut Vec<f64>) {
+    #[inline(always)]
+    fn gather_parents<T: Copy>(&self, i: usize, y: &[T], out: &mut Vec<T>) {
         out.clear();
         out.extend(self.parent_index[self.edges(i)].iter().map(|&p| y[p]));
     }
 
     // ------------------------------------------------------------ local kernels
 
-    /// Variable `i`'s primal. Records its linearization in `units` and
-    /// `record`, writes its edge values to `edge_a` and `edge_l`, and returns
-    /// `(x, delta, mu)`.
-    ///
-    /// The transformer's Hessians take `ceil((1 + n_par) / K)` jet passes,
-    /// against one for the values alone, but every later product reuses them.
-    #[allow(clippy::too_many_arguments)]
-    fn local_primal(
-        &self,
-        i: usize,
-        theta: &[f64],
-        y_own: f64,
-        units: &mut [f64],
-        record: &mut [f64],
-        edge_a: &mut [f64],
-        edge_l: &mut [f64],
-        s: &mut Scratch,
-    ) -> (f64, f64, f64) {
-        let shape = self.shape(i);
-        let n_unit = shape.n_unit;
-        let n_par = self.n_par;
-        let n_z = 1 + n_par;
-
-        s.pi.copy_from_slice(&theta[shape.b2()]);
-        for u in 0..n_unit {
-            let a = dot(&theta[shape.w1(u)], &s.y_parents) + theta[shape.b1(u)];
-            let (h, h1, h2) = softplus(a);
-            units[u] = h;
-            units[n_unit + u] = h1;
-            units[2 * n_unit + u] = h2;
-            axpy(h, &theta[shape.w2(u)], &mut s.pi);
+    /// Variable `i`'s conditioner at its parents, already in `s.y_parents`:
+    /// the hidden units `h, h', h''` and the transformer parameters `pi`.
+    #[simd]
+    fn conditioner<S: Simd>(&self, simd: S, shape: Shape, theta: &[f64], s: &mut Scratch<S>) {
+        for (pi, &b) in s.pi.iter_mut().zip(&theta[shape.b2()]) {
+            *pi = S::f64s::splat(simd, b);
         }
-        s.pi[self.location] += dot(&theta[shape.skip()], &s.y_parents);
+        for u in 0..shape.n_unit {
+            let a = dot(simd, &theta[shape.w1(u)], &s.y_parents) + theta[shape.b1(u)];
+            let (h, h1, h2) = simd_math::softplus(simd, a);
+            s.h[u] = h;
+            s.h1[u] = h1;
+            s.h2[u] = h2;
+            axpy(simd, h, &theta[shape.w2(u)], &mut s.pi);
+        }
+        s.pi[self.location] += dot(simd, &theta[shape.skip()], &s.y_parents);
+    }
 
-        // Hessian columns `K` at a time; the values and gradients come out of
-        // every pass.
-        let (t, rest) = record.split_at_mut(n_par);
-        let (l, hessians) = rest.split_at_mut(n_par);
-        let (hess_t, hess_l) = hessians.split_at_mut(packed_len(n_z));
-        let mut values = (0.0, 0.0, 0.0);
-        for first in (0..n_z).step_by(K) {
-            let mut dirs = [[0.0; N]; K];
-            for k in 0..K {
-                if first + k < n_z {
-                    dirs[k][first + k] = 1.0;
+    /// Variable `i`'s primal. Writes its edge values to `edge_a` and `edge_l`
+    /// and returns `(x, delta, mu)`.
+    #[simd]
+    #[allow(clippy::too_many_arguments)]
+    fn local_primal<S: Simd>(
+        &self,
+        simd: S,
+        shape: Shape,
+        theta: &[f64],
+        y_own: S::f64s,
+        edge_a: &mut [S::f64s],
+        edge_l: &mut [S::f64s],
+        s: &mut Scratch<S>,
+    ) -> (S::f64s, S::f64s, S::f64s) {
+        let n_z = 1 + self.n_par;
+        let loc = self.location;
+        self.conditioner(simd, shape, theta, s);
+        let (x, log_det) = transformer::<S, 0>(simd, &self.layers, y_own, &s.pi, &[]);
+        let (t, l) = (&x.g[1..n_z], &log_det.g[1..n_z]);
+
+        let skip = &theta[shape.skip()];
+        for j in 0..shape.n_parent {
+            edge_a[j] = t[loc] * skip[j];
+            edge_l[j] = l[loc] * skip[j];
+        }
+        for u in 0..shape.n_unit {
+            let w2 = &theta[shape.w2(u)];
+            let w1 = &theta[shape.w1(u)];
+            axpy(simd, dot(simd, w2, t) * s.h1[u], w1, edge_a);
+            axpy(simd, dot(simd, w2, l) * s.h1[u], w1, edge_l);
+        }
+        (x.v, x.g[0], log_det.g[0])
+    }
+
+    /// Variable `i`'s tangents along `v` (its slice). Writes `A`'s and `L`'s
+    /// to `edge_a` and `edge_l`; returns those of `(x, delta, mu)`.
+    #[simd]
+    #[allow(clippy::too_many_arguments)]
+    fn local_pushforward<S: Simd>(
+        &self,
+        simd: S,
+        shape: Shape,
+        theta: &[f64],
+        v: &[f64],
+        y_own: S::f64s,
+        edge_a: &mut [S::f64s],
+        edge_l: &mut [S::f64s],
+        s: &mut Scratch<S>,
+    ) -> (S::f64s, S::f64s, S::f64s) {
+        let n_z = 1 + self.n_par;
+        let loc = self.location;
+        self.conditioner(simd, shape, theta, s);
+        for (pi_dot, &b) in s.pi_dot.iter_mut().zip(&v[shape.b2()]) {
+            *pi_dot = S::f64s::splat(simd, b);
+        }
+        for u in 0..shape.n_unit {
+            let a_dot = dot(simd, &v[shape.w1(u)], &s.y_parents) + v[shape.b1(u)];
+            s.unit_a[u] = a_dot;
+            axpy(simd, s.h[u], &v[shape.w2(u)], &mut s.pi_dot);
+            axpy(simd, s.h1[u] * a_dot, &theta[shape.w2(u)], &mut s.pi_dot);
+        }
+        s.pi_dot[loc] += dot(simd, &v[shape.skip()], &s.y_parents);
+
+        let mut dir = [S::f64s::splat(simd, 0.0); N];
+        dir[1..n_z].copy_from_slice(&s.pi_dot);
+        let (x, log_det) = transformer::<S, 1>(simd, &self.layers, y_own, &s.pi, &[dir]);
+        let (t, l) = (&x.g[1..n_z], &log_det.g[1..n_z]);
+        let (t_dot, l_dot) = (&x.h[0][1..n_z], &log_det.h[0][1..n_z]);
+
+        let skip = &theta[shape.skip()];
+        let skip_dot = &v[shape.skip()];
+        for j in 0..shape.n_parent {
+            edge_a[j] = t_dot[loc] * skip[j] + t[loc] * skip_dot[j];
+            edge_l[j] = l_dot[loc] * skip[j] + l[loc] * skip_dot[j];
+        }
+        for u in 0..shape.n_unit {
+            let w2 = &theta[shape.w2(u)];
+            let w2_dot = &v[shape.w2(u)];
+            let (p_t, p_l) = (dot(simd, w2, t), dot(simd, w2, l));
+            let h1 = s.h1[u];
+            let curvature = s.h2[u] * s.unit_a[u];
+            let alpha_t = (dot(simd, w2, t_dot) + dot(simd, w2_dot, t)) * h1 + p_t * curvature;
+            let alpha_l = (dot(simd, w2, l_dot) + dot(simd, w2_dot, l)) * h1 + p_l * curvature;
+            let w1 = &theta[shape.w1(u)];
+            let w1_dot = &v[shape.w1(u)];
+            axpy(simd, alpha_t, w1, edge_a);
+            axpy(simd, p_t * h1, w1_dot, edge_a);
+            axpy(simd, alpha_l, w1, edge_l);
+            axpy(simd, p_l * h1, w1_dot, edge_l);
+        }
+        (dot_lanes(simd, t, &s.pi_dot), x.h[0][0], log_det.h[0][0])
+    }
+
+    /// The transformer's gradients, and Hessian products along `dir_t` (of
+    /// `T`) and `dir_l` (of `Lambda`).
+    #[inline(always)]
+    fn curvature<S: Simd>(
+        &self,
+        simd: S,
+        source: &CurvatureSource<S>,
+        pi: &[S::f64s],
+        dir_t: &[S::f64s; N],
+        dir_l: &[S::f64s; N],
+    ) -> Curvature<S> {
+        match source {
+            CurvatureSource::Recompute { y } => {
+                let (x, log_det) =
+                    transformer::<S, 2>(simd, &self.layers, *y, pi, &[*dir_t, *dir_l]);
+                Curvature {
+                    grad_t: x.g,
+                    grad_l: log_det.g,
+                    hess_t: x.h[0],
+                    hess_l: log_det.h[1],
                 }
             }
-            let (x, log_det) = transformer(&self.layers, y_own, &s.pi, &dirs);
-            for k in 0..K {
+            CurvatureSource::Dense {
+                grad_t,
+                grad_l,
+                hess_t,
+                hess_l,
+            } => {
+                let n_z = 1 + self.n_par;
+                let zero = S::f64s::splat(simd, 0.0);
+                let mut out = Curvature {
+                    grad_t: **grad_t,
+                    grad_l: **grad_l,
+                    hess_t: [zero; N],
+                    hess_l: [zero; N],
+                };
+                packed_product(simd, hess_t, &dir_t[..n_z], &mut out.hess_t[..n_z]);
+                packed_product(simd, hess_l, &dir_l[..n_z], &mut out.hess_l[..n_z]);
+                out
+            }
+        }
+    }
+
+    /// Variable `i`'s local pullback of `cot`, accumulated into `grad`, its
+    /// slice of the gradient. Needs [`Self::conditioner`] run on `s` first.
+    #[simd]
+    #[allow(clippy::too_many_arguments)]
+    fn local_pullback<S: Simd>(
+        &self,
+        simd: S,
+        shape: Shape,
+        theta: &[f64],
+        cot: &Cotangent<S>,
+        source: &CurvatureSource<S>,
+        s: &mut Scratch<S>,
+        grad: &mut [S::f64s],
+    ) {
+        let n_z = 1 + self.n_par;
+        let loc = self.location;
+        let skip = &theta[shape.skip()];
+        let zero = S::f64s::splat(simd, 0.0);
+
+        // The cotangents of `t` and `l`, from the edge cotangents, keeping
+        // `zeta` for `A` and `L` in `unit_a` and `unit_b`.
+        s.t_bar.fill(zero);
+        s.l_bar.fill(zero);
+        for u in 0..shape.n_unit {
+            let w1 = &theta[shape.w1(u)];
+            let zeta_a = dot(simd, w1, cot.edge_a);
+            let zeta_l = dot(simd, w1, cot.edge_l);
+            s.unit_a[u] = zeta_a;
+            s.unit_b[u] = zeta_l;
+            let w2 = &theta[shape.w2(u)];
+            axpy(simd, s.h1[u] * zeta_a, w2, &mut s.t_bar);
+            axpy(simd, s.h1[u] * zeta_l, w2, &mut s.l_bar);
+        }
+        s.t_bar[loc] += dot(simd, skip, cot.edge_a);
+        s.l_bar[loc] += dot(simd, skip, cot.edge_l);
+
+        // `T` along `(delta_bar, t_bar)` and `Lambda` along `(mu_bar,
+        // l_bar)`: every second-order path into `pi` at once.
+        let (mut dir_t, mut dir_l) = ([zero; N], [zero; N]);
+        dir_t[0] = cot.delta;
+        dir_t[1..n_z].copy_from_slice(&s.t_bar);
+        dir_l[0] = cot.mu;
+        dir_l[1..n_z].copy_from_slice(&s.l_bar);
+        let curvature = self.curvature(simd, source, &s.pi, &dir_t, &dir_l);
+        let (t, l) = (&curvature.grad_t[1..n_z], &curvature.grad_l[1..n_z]);
+        for m in 0..self.n_par {
+            s.pi_bar[m] = cot.x * t[m] + curvature.hess_t[1 + m] + curvature.hess_l[1 + m];
+        }
+
+        for u in 0..shape.n_unit {
+            let w2 = &theta[shape.w2(u)];
+            let (p_t, p_l) = (dot(simd, w2, t), dot(simd, w2, l));
+            let (zeta_a, zeta_l) = (s.unit_a[u], s.unit_b[u]);
+            let (h, h1) = (s.h[u], s.h1[u]);
+            let a_bar = s.h2[u] * (p_t * zeta_a + p_l * zeta_l) + h1 * dot(simd, w2, &s.pi_bar);
+
+            let g_w2 = &mut grad[shape.w2(u)];
+            axpy_lanes(simd, h1 * zeta_a, t, g_w2);
+            axpy_lanes(simd, h1 * zeta_l, l, g_w2);
+            axpy_lanes(simd, h, &s.pi_bar, g_w2);
+
+            let g_w1 = &mut grad[shape.w1(u)];
+            axpy_lanes(simd, h1 * p_t, cot.edge_a, g_w1);
+            axpy_lanes(simd, h1 * p_l, cot.edge_l, g_w1);
+            axpy_lanes(simd, a_bar, &s.y_parents, g_w1);
+            grad[shape.b1(u)] += a_bar;
+        }
+        for (g, &p) in grad[shape.b2()].iter_mut().zip(&s.pi_bar) {
+            *g += p;
+        }
+        let g_skip = &mut grad[shape.skip()];
+        axpy_lanes(simd, t[loc], cot.edge_a, g_skip);
+        axpy_lanes(simd, l[loc], cot.edge_l, g_skip);
+        axpy_lanes(simd, s.pi_bar[loc], &s.y_parents, g_skip);
+    }
+
+    /// The transformer's gradients in `z = (y, pi)`, and its full Hessians as
+    /// packed lower triangles, from `ceil((1 + n_par) / 2)` jet passes.
+    #[simd]
+    fn dense_curvature<S: Simd>(
+        &self,
+        simd: S,
+        y: S::f64s,
+        pi: &[S::f64s],
+        hess_t: &mut [S::f64s],
+        hess_l: &mut [S::f64s],
+    ) -> ([S::f64s; N], [S::f64s; N]) {
+        let n_z = 1 + self.n_par;
+        let zero = S::f64s::splat(simd, 0.0);
+        let mut grads = ([zero; N], [zero; N]);
+        for first in (0..n_z).step_by(2) {
+            let mut dirs = [[zero; N]; 2];
+            for (k, dir) in dirs.iter_mut().enumerate() {
+                if first + k < n_z {
+                    dir[first + k] = S::f64s::splat(simd, 1.0);
+                }
+            }
+            let (x, log_det) = transformer::<S, 2>(simd, &self.layers, y, pi, &dirs);
+            for k in 0..2 {
                 let column = first + k;
                 if column >= n_z {
                     continue;
@@ -943,161 +1286,22 @@ impl FisherResiduals {
                     hess_l[index] = log_det.h[k][r];
                 }
             }
-            t.copy_from_slice(&x.g[1..n_z]);
-            l.copy_from_slice(&log_det.g[1..n_z]);
-            values = (x.v, x.g[0], log_det.g[0]);
+            grads = (x.g, log_det.g);
         }
-
-        let (h1, t, l) = (&units[n_unit..2 * n_unit], &*t, &*l);
-        let skip = &theta[shape.skip()];
-        for j in 0..shape.n_parent {
-            edge_a[j] = t[self.location] * skip[j];
-            edge_l[j] = l[self.location] * skip[j];
-        }
-        for u in 0..n_unit {
-            let w2 = &theta[shape.w2(u)];
-            let w1 = &theta[shape.w1(u)];
-            axpy(dot(t, w2) * h1[u], w1, edge_a);
-            axpy(dot(l, w2) * h1[u], w1, edge_l);
-        }
-        values
-    }
-
-    /// Variable `i`'s tangents along `v` (its slice). Writes `A`'s and `L`'s
-    /// to `edge_a` and `edge_l`; returns those of `(x, delta, mu)`.
-    #[allow(clippy::too_many_arguments)]
-    fn local_pushforward(
-        &self,
-        shape: Shape,
-        theta: &[f64],
-        v: &[f64],
-        local: Local,
-        edge_a: &mut [f64],
-        edge_l: &mut [f64],
-        s: &mut Scratch,
-    ) -> (f64, f64, f64) {
-        let n_z = 1 + self.n_par;
-        s.pi_dot.copy_from_slice(&v[shape.b2()]);
-        for u in 0..shape.n_unit {
-            let a_dot = dot(&v[shape.w1(u)], &s.y_parents) + v[shape.b1(u)];
-            s.unit_a[u] = a_dot;
-            axpy(local.h[u], &v[shape.w2(u)], &mut s.pi_dot);
-            axpy(local.h1[u] * a_dot, &theta[shape.w2(u)], &mut s.pi_dot);
-        }
-        s.pi_dot[self.location] += dot(&v[shape.skip()], &s.y_parents);
-
-        let mut dir = [0.0; N];
-        dir[1..n_z].copy_from_slice(&s.pi_dot);
-        let (mut dot_t, mut dot_l) = ([0.0; N], [0.0; N]);
-        packed_product(local.hess_t, &dir[..n_z], &mut dot_t[..n_z]);
-        packed_product(local.hess_l, &dir[..n_z], &mut dot_l[..n_z]);
-        let (t, l) = (local.t, local.l);
-        let t_dot = &dot_t[1..n_z];
-        let l_dot = &dot_l[1..n_z];
-
-        let skip = &theta[shape.skip()];
-        let skip_dot = &v[shape.skip()];
-        let loc = self.location;
-        for j in 0..shape.n_parent {
-            edge_a[j] = t_dot[loc] * skip[j] + t[loc] * skip_dot[j];
-            edge_l[j] = l_dot[loc] * skip[j] + l[loc] * skip_dot[j];
-        }
-        for u in 0..shape.n_unit {
-            let w2 = &theta[shape.w2(u)];
-            let w2_dot = &v[shape.w2(u)];
-            let (p_t, p_l) = (dot(t, w2), dot(l, w2));
-            let h1 = local.h1[u];
-            let curvature = local.h2[u] * s.unit_a[u];
-            let alpha_t = (dot(t_dot, w2) + dot(t, w2_dot)) * h1 + p_t * curvature;
-            let alpha_l = (dot(l_dot, w2) + dot(l, w2_dot)) * h1 + p_l * curvature;
-            let w1 = &theta[shape.w1(u)];
-            let w1_dot = &v[shape.w1(u)];
-            axpy(alpha_t, w1, edge_a);
-            axpy(p_t * h1, w1_dot, edge_a);
-            axpy(alpha_l, w1, edge_l);
-            axpy(p_l * h1, w1_dot, edge_l);
-        }
-        (dot(t, &s.pi_dot), dot_t[0], dot_l[0])
-    }
-
-    /// Variable `i`'s local pullback of `cot`, accumulated into `grad`, its
-    /// slice of the gradient.
-    fn local_pullback(
-        &self,
-        shape: Shape,
-        theta: &[f64],
-        local: Local,
-        cot: &Cotangent,
-        s: &mut Scratch,
-        grad: &mut [f64],
-    ) {
-        let n_z = 1 + self.n_par;
-        let loc = self.location;
-        let skip = &theta[shape.skip()];
-
-        // The cotangents of `t` and `l`, from the edge cotangents, keeping
-        // `zeta` for `A` and `L` in `unit_a` and `unit_b`.
-        s.t_bar.fill(0.0);
-        s.l_bar.fill(0.0);
-        for u in 0..shape.n_unit {
-            let w1 = &theta[shape.w1(u)];
-            let zeta_a = dot(cot.edge_a, w1);
-            let zeta_l = dot(cot.edge_l, w1);
-            s.unit_a[u] = zeta_a;
-            s.unit_b[u] = zeta_l;
-            let w2 = &theta[shape.w2(u)];
-            axpy(local.h1[u] * zeta_a, w2, &mut s.t_bar);
-            axpy(local.h1[u] * zeta_l, w2, &mut s.l_bar);
-        }
-        s.t_bar[loc] += dot(cot.edge_a, skip);
-        s.l_bar[loc] += dot(cot.edge_l, skip);
-
-        // `T` along `(delta_bar, t_bar)` and `Lambda` along `(mu_bar,
-        // l_bar)`: every second-order path into `pi` at once.
-        let (mut dir_t, mut dir_l) = ([0.0; N], [0.0; N]);
-        dir_t[0] = cot.delta;
-        dir_t[1..n_z].copy_from_slice(&s.t_bar);
-        dir_l[0] = cot.mu;
-        dir_l[1..n_z].copy_from_slice(&s.l_bar);
-        let (mut bar_t, mut bar_l) = ([0.0; N], [0.0; N]);
-        packed_product(local.hess_t, &dir_t[..n_z], &mut bar_t[..n_z]);
-        packed_product(local.hess_l, &dir_l[..n_z], &mut bar_l[..n_z]);
-        let (t, l) = (local.t, local.l);
-        for m in 0..self.n_par {
-            s.pi_bar[m] = cot.x * t[m] + bar_t[1 + m] + bar_l[1 + m];
-        }
-
-        for u in 0..shape.n_unit {
-            let w2 = &theta[shape.w2(u)];
-            let (p_t, p_l) = (dot(t, w2), dot(l, w2));
-            let (zeta_a, zeta_l) = (s.unit_a[u], s.unit_b[u]);
-            let (h, h1) = (local.h[u], local.h1[u]);
-            let a_bar = local.h2[u] * (p_t * zeta_a + p_l * zeta_l) + h1 * dot(&s.pi_bar, w2);
-
-            let g_w2 = &mut grad[shape.w2(u)];
-            axpy(h1 * zeta_a, t, g_w2);
-            axpy(h1 * zeta_l, l, g_w2);
-            axpy(h, &s.pi_bar, g_w2);
-
-            let g_w1 = &mut grad[shape.w1(u)];
-            axpy(h1 * p_t, cot.edge_a, g_w1);
-            axpy(h1 * p_l, cot.edge_l, g_w1);
-            axpy(a_bar, &s.y_parents, g_w1);
-            grad[shape.b1(u)] += a_bar;
-        }
-        for (g, p) in grad[shape.b2()].iter_mut().zip(&s.pi_bar) {
-            *g += p;
-        }
-        let g_skip = &mut grad[shape.skip()];
-        axpy(t[loc], cot.edge_a, g_skip);
-        axpy(l[loc], cot.edge_l, g_skip);
-        axpy(s.pi_bar[loc], &s.y_parents, g_skip);
+        grads
     }
 
     // ------------------------------------------------------------ global sweeps
 
     /// Solves `J^T w = b` in place (back substitution, children first).
-    fn solve_transpose(&self, edge_a: &[f64], delta: &[f64], b: &mut [f64]) {
+    #[simd]
+    fn solve_transpose<S: Simd>(
+        &self,
+        _: S,
+        edge_a: &[S::f64s],
+        delta: &[S::f64s],
+        b: &mut [S::f64s],
+    ) {
         for i in (0..self.n_var).rev() {
             let w_i = b[i] / delta[i];
             b[i] = w_i;
@@ -1108,7 +1312,8 @@ impl FisherResiduals {
     }
 
     /// Solves `J z = b` in place (forward substitution, parents first).
-    fn solve(&self, edge_a: &[f64], delta: &[f64], b: &mut [f64]) {
+    #[simd]
+    fn solve<S: Simd>(&self, _: S, edge_a: &[S::f64s], delta: &[S::f64s], b: &mut [S::f64s]) {
         for i in 0..self.n_var {
             let mut acc = b[i];
             for e in self.edges(i) {
@@ -1118,161 +1323,203 @@ impl FisherResiduals {
         }
     }
 
-    fn primal_draw(
+    /// The primal of one tile: its residuals into `out` and its tape.
+    #[simd]
+    fn primal_tile<S: Simd>(
         &self,
+        simd: S,
         theta: &[f64],
-        draw: usize,
-        tape: DrawTapeMut,
+        tile: usize,
+        tape: TileTapeMut<'_>,
         out: &mut [f64],
-        s: &mut DrawScratch,
+        s: &mut TileScratch<S>,
     ) {
         let n_var = self.n_var;
-        let y = &self.y[draw * n_var..(draw + 1) * n_var];
-        let g = &self.g[draw * n_var..(draw + 1) * n_var];
-        let [grad_log_det, ..] = &mut s.by_var;
-        grad_log_det.fill(0.0);
+        load(simd, self.tile(&self.y, n_var, tile), &mut s.y);
+        load(simd, self.tile(&self.g, n_var, tile), &mut s.g);
+        let TileScratch {
+            local,
+            y,
+            g,
+            edge_a,
+            edge_l,
+            delta,
+            x,
+            w,
+            by_var,
+            residual,
+            ..
+        } = s;
+        let [grad_log_det, _] = by_var;
+        grad_log_det.fill(S::f64s::splat(simd, 0.0));
 
         for i in 0..n_var {
-            self.gather_parents(i, y, &mut s.local.y_parents);
+            self.gather_parents(i, y, &mut local.y_parents);
             let edges = self.edges(i);
-            let (units, record) = (self.units_len(), self.record_len());
-            let (x, delta, mu) = self.local_primal(
-                i,
+            let (x_i, delta_i, mu_i) = self.local_primal(
+                simd,
+                self.shape(i),
                 &theta[self.params(i)],
                 y[i],
-                &mut tape.units[i * units..(i + 1) * units],
-                &mut tape.record[i * record..(i + 1) * record],
-                &mut tape.edge_a[edges.clone()],
-                &mut tape.edge_l[edges.clone()],
-                &mut s.local,
+                &mut edge_a[edges.clone()],
+                &mut edge_l[edges.clone()],
+                local,
             );
-            tape.x[i] = x;
-            tape.delta[i] = delta;
-            grad_log_det[i] += mu;
+            x[i] = x_i;
+            delta[i] = delta_i;
+            grad_log_det[i] += mu_i;
             for e in edges {
-                grad_log_det[self.parent_index[e]] += tape.edge_l[e];
+                grad_log_det[self.parent_index[e]] += edge_l[e];
             }
         }
 
         for i in 0..n_var {
-            tape.w[i] = g[i] - grad_log_det[i];
+            w[i] = g[i] - grad_log_det[i];
         }
-        self.solve_transpose(tape.edge_a, tape.delta, tape.w);
+        self.solve_transpose(simd, edge_a, delta, w);
 
         let scale = self.scale();
         for i in 0..n_var {
-            out[i] = scale * (tape.x[i] + tape.w[i]);
+            residual[i] = (x[i] + w[i]) * scale;
         }
         if let Some(reg) = self.regularization {
             for i in 0..n_var {
                 for e in self.edges(i) {
-                    out[n_var + e] = scale * reg * (tape.edge_l[e] - tape.x[i] * tape.edge_a[e]);
+                    residual[n_var + e] = (edge_l[e] - x[i] * edge_a[e]) * (scale * reg);
                 }
             }
         }
+
+        store(simd, edge_a, tape.edge_a);
+        store(simd, delta, tape.delta);
+        store(simd, x, tape.x);
+        store(simd, w, tape.w);
+        store(simd, residual, out);
     }
 
-    fn pushforward_draw(
-        &self,
-        theta: &[f64],
-        v: &[f64],
-        draw: usize,
-        tape: &DrawTape,
-        out: &mut [f64],
-        s: &mut DrawScratch,
-    ) {
+    /// `J v` for one tile, already loaded into `s`, into `s.residual`.
+    #[simd]
+    fn pushforward_tile<S: Simd>(&self, simd: S, theta: &[f64], v: &[f64], s: &mut TileScratch<S>) {
         let n_var = self.n_var;
-        let y = &self.y[draw * n_var..(draw + 1) * n_var];
-        let [x_dot, rhs, ..] = &mut s.by_var;
-        let [a_dot, l_dot] = &mut s.by_edge;
-        rhs.fill(0.0);
+        let TileScratch {
+            local,
+            y,
+            edge_a,
+            delta,
+            x,
+            w,
+            by_var,
+            by_edge,
+            residual,
+            ..
+        } = s;
+        let [x_dot, rhs] = by_var;
+        let [a_dot, l_dot] = by_edge;
+        rhs.fill(S::f64s::splat(simd, 0.0));
 
         for i in 0..n_var {
-            self.gather_parents(i, y, &mut s.local.y_parents);
+            self.gather_parents(i, y, &mut local.y_parents);
             let edges = self.edges(i);
             let params = self.params(i);
             let (xd, delta_dot, mu_dot) = self.local_pushforward(
+                simd,
                 self.shape(i),
                 &theta[params.clone()],
                 &v[params],
-                self.local(tape, i),
+                y[i],
                 &mut a_dot[edges.clone()],
                 &mut l_dot[edges.clone()],
-                &mut s.local,
+                local,
             );
             x_dot[i] = xd;
             // J^T w_dot = -(grad_y log_det)_dot - J_dot^T w
-            rhs[i] -= mu_dot + delta_dot * tape.w[i];
+            rhs[i] -= mu_dot + delta_dot * w[i];
             for e in edges {
-                rhs[self.parent_index[e]] -= l_dot[e] + a_dot[e] * tape.w[i];
+                rhs[self.parent_index[e]] -= l_dot[e] + a_dot[e] * w[i];
             }
         }
-        self.solve_transpose(tape.edge_a, tape.delta, rhs);
+        self.solve_transpose(simd, edge_a, delta, rhs);
 
         let scale = self.scale();
         for i in 0..n_var {
-            out[i] = scale * (x_dot[i] + rhs[i]);
+            residual[i] = (x_dot[i] + rhs[i]) * scale;
         }
         if let Some(reg) = self.regularization {
             for i in 0..n_var {
                 for e in self.edges(i) {
-                    out[n_var + e] =
-                        scale * reg * (l_dot[e] - x_dot[i] * tape.edge_a[e] - tape.x[i] * a_dot[e]);
+                    residual[n_var + e] =
+                        (l_dot[e] - x_dot[i] * edge_a[e] - x[i] * a_dot[e]) * (scale * reg);
                 }
             }
         }
     }
 
-    /// Accumulates this draw's `J^T r_bar` into `grad`.
-    fn pullback_draw(
+    /// Accumulates `J^T r_bar` for one tile, already loaded into `s` with
+    /// `r_bar` in `s.residual`, into `grad`.
+    #[simd]
+    fn pullback_tile<S: Simd>(
         &self,
+        simd: S,
         theta: &[f64],
-        r_bar: &[f64],
-        draw: usize,
-        tape: &DrawTape,
-        grad: &mut [f64],
-        s: &mut DrawScratch,
+        s: &mut TileScratch<S>,
+        grad: &mut [S::f64s],
     ) {
         let n_var = self.n_var;
-        let y = &self.y[draw * n_var..(draw + 1) * n_var];
         let scale = self.scale();
-        let [z, ..] = &mut s.by_var;
-        let [cot_a, cot_l] = &mut s.by_edge;
+        let TileScratch {
+            local,
+            y,
+            edge_a,
+            delta,
+            x,
+            w,
+            by_var,
+            by_edge,
+            residual,
+            ..
+        } = s;
+        let r_bar = &*residual;
+        let [z, _] = by_var;
+        let [cot_a, cot_l] = by_edge;
 
         for i in 0..n_var {
-            z[i] = scale * r_bar[i];
+            z[i] = r_bar[i] * scale;
         }
-        self.solve(tape.edge_a, tape.delta, z);
+        self.solve(simd, edge_a, delta, z);
 
         for i in 0..n_var {
-            self.gather_parents(i, y, &mut s.local.y_parents);
+            self.gather_parents(i, y, &mut local.y_parents);
             let edges = self.edges(i);
-            let mut x_bar = scale * r_bar[i];
+            let mut x_bar = r_bar[i] * scale;
             for e in edges.clone() {
                 let z_p = z[self.parent_index[e]];
-                cot_a[e] = -tape.w[i] * z_p;
+                cot_a[e] = -(w[i] * z_p);
                 cot_l[e] = -z_p;
                 if let Some(reg) = self.regularization {
-                    let o = scale * reg * r_bar[n_var + e];
-                    x_bar -= o * tape.edge_a[e];
-                    cot_a[e] -= tape.x[i] * o;
+                    let o = r_bar[n_var + e] * (scale * reg);
+                    x_bar -= o * edge_a[e];
+                    cot_a[e] -= x[i] * o;
                     cot_l[e] += o;
                 }
             }
             let cot = Cotangent {
                 x: x_bar,
-                delta: -tape.w[i] * z[i],
+                delta: -(w[i] * z[i]),
                 mu: -z[i],
                 edge_a: &cot_a[edges.clone()],
                 edge_l: &cot_l[edges],
             };
+            let shape = self.shape(i);
             let params = self.params(i);
+            let theta_i = &theta[params.clone()];
+            self.conditioner(simd, shape, theta_i, local);
             self.local_pullback(
-                self.shape(i),
-                &theta[params.clone()],
-                self.local(tape, i),
+                simd,
+                shape,
+                theta_i,
                 &cot,
-                &mut s.local,
+                &CurvatureSource::Recompute { y: y[i] },
+                local,
                 &mut grad[params],
             );
         }
@@ -1298,69 +1545,68 @@ impl FisherResiduals {
         if self.n_draw == 0 {
             bail!("no data: call `set_data` first");
         }
-        let (n_draw, n_var, n_edge) = (self.n_draw, self.n_var, self.n_edge());
-        let (units, record) = (n_var * self.units_len(), n_var * self.record_len());
+        Ok(dispatch!(self.level, simd => self.residuals_with(simd, theta)))
+    }
+
+    fn residuals_with<S: Simd>(&self, simd: S, theta: &[f64]) -> (Vec<f64>, Tape) {
+        let (n_draw, n_tile, width) = (self.n_draw, self.n_tile, self.width);
+        let (n_var, n_edge, n_res) = (self.n_var, self.n_edge(), self.n_residuals());
         let mut tape = Tape {
             theta: theta.to_vec(),
-            units: vec![0.0; n_draw * units],
-            record: vec![0.0; n_draw * record],
             edge_a: vec![0.0; n_draw * n_edge],
-            edge_l: vec![0.0; n_draw * n_edge],
             delta: vec![0.0; n_draw * n_var],
             x: vec![0.0; n_draw * n_var],
             w: vec![0.0; n_draw * n_var],
         };
-        let n_res = self.n_residuals();
         let mut out = vec![0.0; n_draw * n_res];
         {
-            let views: Vec<_> = chunks(&mut tape.units, units, n_draw)
+            let views: Vec<_> = chunks(&mut tape.edge_a, width * n_edge, n_tile)
                 .into_iter()
-                .zip(chunks(&mut tape.record, record, n_draw))
-                .zip(chunks(&mut tape.edge_a, n_edge, n_draw))
-                .zip(chunks(&mut tape.edge_l, n_edge, n_draw))
-                .zip(chunks(&mut tape.delta, n_var, n_draw))
-                .zip(chunks(&mut tape.x, n_var, n_draw))
-                .zip(chunks(&mut tape.w, n_var, n_draw))
-                .zip(chunks(&mut out, n_res, n_draw))
+                .zip(chunks(&mut tape.delta, width * n_var, n_tile))
+                .zip(chunks(&mut tape.x, width * n_var, n_tile))
+                .zip(chunks(&mut tape.w, width * n_var, n_tile))
+                .zip(chunks(&mut out, width * n_res, n_tile))
                 .enumerate()
-                .map(
-                    |(draw, (((((((units, record), edge_a), edge_l), delta), x), w), out))| {
-                        (
-                            draw,
-                            DrawTapeMut {
-                                units,
-                                record,
-                                edge_a,
-                                edge_l,
-                                delta,
-                                x,
-                                w,
-                            },
-                            out,
-                        )
-                    },
-                )
+                .map(|(tile, ((((edge_a, delta), x), w), out))| {
+                    (
+                        tile,
+                        TileTapeMut {
+                            edge_a,
+                            delta,
+                            x,
+                            w,
+                        },
+                        out,
+                    )
+                })
                 .collect();
             views.into_par_iter().for_each_init(
-                || DrawScratch::new(self),
-                |s, (draw, tape, out)| self.primal_draw(theta, draw, tape, out, s),
+                || TileScratch::new(simd, self),
+                |s, (tile, tape, out)| self.primal_tile(simd, theta, tile, tape, out, s),
             );
         }
-        Ok((out, tape))
+        (self.from_tiles(&out, n_res), tape)
     }
 
     pub(crate) fn pushforward(&self, tape: &Tape, v: &[f64]) -> Result<Vec<f64>> {
         self.check_params(v, "v")?;
+        Ok(dispatch!(self.level, simd => self.pushforward_with(simd, tape, v)))
+    }
+
+    fn pushforward_with<S: Simd>(&self, simd: S, tape: &Tape, v: &[f64]) -> Vec<f64> {
         let n_res = self.n_residuals();
         let mut out = vec![0.0; self.n_draw * n_res];
-        out.par_chunks_mut(n_res.max(1)).enumerate().for_each_init(
-            || DrawScratch::new(self),
-            |s, (draw, out)| {
-                let draw_tape = self.draw_tape(tape, draw);
-                self.pushforward_draw(&tape.theta, v, draw, &draw_tape, out, s)
-            },
-        );
-        Ok(out)
+        out.par_chunks_mut(self.width * n_res)
+            .enumerate()
+            .for_each_init(
+                || TileScratch::new(simd, self),
+                |s, (tile, out)| {
+                    self.load_tile(simd, tile, tape, s);
+                    self.pushforward_tile(simd, &tape.theta, v, s);
+                    store(simd, &s.residual, out);
+                },
+            );
+        self.from_tiles(&out, n_res)
     }
 
     pub(crate) fn pullback(&self, tape: &Tape, r_bar: &[f64]) -> Result<Vec<f64>> {
@@ -1368,37 +1614,52 @@ impl FisherResiduals {
         if r_bar.len() != self.n_draw * n_res {
             bail!("r_bar must have shape ({}, {n_res})", self.n_draw);
         }
-        Ok(self.sum_over_draws(|draw, grad, s| {
-            let draw_tape = self.draw_tape(tape, draw);
-            let r_bar = &r_bar[draw * n_res..(draw + 1) * n_res];
-            self.pullback_draw(&tape.theta, r_bar, draw, &draw_tape, grad, s);
-        }))
+        Ok(dispatch!(self.level, simd => self.pullback_with(simd, tape, r_bar)))
     }
 
-    /// `J^T J v`, one draw at a time, without forming `J v` for all draws.
+    fn pullback_with<S: Simd>(&self, simd: S, tape: &Tape, r_bar: &[f64]) -> Vec<f64> {
+        let n_res = self.n_residuals();
+        let r_bar = self.to_tiles(r_bar, n_res);
+        self.sum_over_tiles(simd, |tile, grad, s| {
+            self.load_tile(simd, tile, tape, s);
+            load(simd, self.tile(&r_bar, n_res, tile), &mut s.residual);
+            self.pullback_tile(simd, &tape.theta, s, grad);
+        })
+    }
+
+    /// `J^T J v`, one tile at a time, without forming `J v` for all draws.
     pub(crate) fn gauss_newton_product(&self, tape: &Tape, v: &[f64]) -> Result<Vec<f64>> {
         self.check_params(v, "v")?;
-        Ok(self.sum_over_draws(|draw, grad, s| {
-            let draw_tape = self.draw_tape(tape, draw);
-            let mut residual = std::mem::take(&mut s.residual);
-            self.pushforward_draw(&tape.theta, v, draw, &draw_tape, &mut residual, s);
-            self.pullback_draw(&tape.theta, &residual, draw, &draw_tape, grad, s);
-            s.residual = residual;
-        }))
+        Ok(dispatch!(self.level, simd => self.gauss_newton_product_with(simd, tape, v)))
     }
 
-    fn sum_over_draws(&self, f: impl Fn(usize, &mut [f64], &mut DrawScratch) + Sync) -> Vec<f64> {
+    fn gauss_newton_product_with<S: Simd>(&self, simd: S, tape: &Tape, v: &[f64]) -> Vec<f64> {
+        self.sum_over_tiles(simd, |tile, grad, s| {
+            self.load_tile(simd, tile, tape, s);
+            self.pushforward_tile(simd, &tape.theta, v, s);
+            self.pullback_tile(simd, &tape.theta, s, grad);
+        })
+    }
+
+    /// `sum_tiles f(tile)`, each `f` accumulating its tile's lanes into a
+    /// per-thread gradient.
+    fn sum_over_tiles<S: Simd>(
+        &self,
+        simd: S,
+        f: impl Fn(usize, &mut [S::f64s], &mut TileScratch<S>) + Sync,
+    ) -> Vec<f64> {
         let n_params = self.n_params();
-        (0..self.n_draw)
+        let zero = S::f64s::splat(simd, 0.0);
+        (0..self.n_tile)
             .into_par_iter()
             .fold(
-                || (vec![0.0; n_params], DrawScratch::new(self)),
-                |(mut grad, mut s), draw| {
-                    f(draw, &mut grad, &mut s);
+                || (vec![zero; n_params], TileScratch::new(simd, self)),
+                |(mut grad, mut s), tile| {
+                    f(tile, &mut grad, &mut s);
                     (grad, s)
                 },
             )
-            .map(|(grad, _)| grad)
+            .map(|(grad, _)| grad.iter().map(|g| g.reduce_sum()).collect::<Vec<f64>>())
             .reduce(
                 || vec![0.0; n_params],
                 |mut a, b| {
@@ -1415,26 +1676,36 @@ impl FisherResiduals {
     /// `Sigma = (J^T J)^{-1}` on the diagonal and the filled pattern, by
     /// Takahashi's recurrence: the diagonal, then one slot per entry of
     /// `filled_index`.
-    fn selected_inverse(&self, edge_a: &[f64], delta: &[f64], store: &mut [f64]) {
+    #[simd]
+    fn selected_inverse<S: Simd>(
+        &self,
+        simd: S,
+        edge_a: &[S::f64s],
+        delta: &[S::f64s],
+        store: &mut [S::f64s],
+    ) {
+        let zero = S::f64s::splat(simd, 0.0);
+        let one = S::f64s::splat(simd, 1.0);
         for i in 0..self.n_var {
             let filled = self.filled_indptr[i]..self.filled_indptr[i + 1];
             for slot in filled {
                 let j = self.filled_index[slot];
-                let mut acc = 0.0;
+                let mut acc = zero;
                 for e in self.edges(i) {
                     acc += edge_a[e] * self.sigma(store, self.parent_index[e], j);
                 }
                 store[self.n_var + slot] = -acc / delta[i];
             }
-            let mut acc = 0.0;
+            let mut acc = zero;
             for e in self.edges(i) {
                 acc += edge_a[e] * self.sigma(store, i, self.parent_index[e]);
             }
-            store[i] = (1.0 / delta[i] - acc) / delta[i];
+            store[i] = (one / delta[i] - acc) / delta[i];
         }
     }
 
-    fn sigma(&self, store: &[f64], a: usize, b: usize) -> f64 {
+    #[inline(always)]
+    fn sigma<V: Copy>(&self, store: &[V], a: usize, b: usize) -> V {
         if a == b {
             return store[a];
         }
@@ -1459,47 +1730,183 @@ impl FisherResiduals {
         if max_block_size == 0 {
             bail!("max_block_size must be positive");
         }
-        let n_store = self.n_var + self.filled_index.len();
-        let mut stores = vec![0.0; self.n_draw * n_store];
-        stores
-            .par_chunks_mut(n_store)
-            .enumerate()
-            .for_each(|(draw, store)| {
-                let draw_tape = self.draw_tape(tape, draw);
-                self.selected_inverse(draw_tape.edge_a, draw_tape.delta, store);
-            });
-
-        let per_var: Vec<Vec<GnBlock>> = (0..self.n_var)
-            .into_par_iter()
-            .map_init(
-                || self.scratch(),
-                |s, i| self.variable_blocks(tape, &stores, n_store, i, max_block_size, s),
-            )
-            .collect();
-        Ok(per_var.into_iter().flatten().collect())
+        Ok(dispatch!(self.level, simd => self.gauss_newton_blocks_with(simd, tape, max_block_size)))
     }
 
-    fn variable_blocks(
+    fn gauss_newton_blocks_with<S: Simd>(
         &self,
+        simd: S,
         tape: &Tape,
-        stores: &[f64],
+        max_block_size: usize,
+    ) -> Vec<GnBlock> {
+        let (n_var, n_edge) = (self.n_var, self.n_edge());
+        let zero = S::f64s::splat(simd, 0.0);
+        let n_store = n_var + self.filled_index.len();
+        let mut stores = vec![zero; self.n_tile * n_store];
+        stores.par_chunks_mut(n_store).enumerate().for_each_init(
+            || (vec![zero; n_edge], vec![zero; n_var]),
+            |(edge_a, delta), (tile, store)| {
+                load(simd, self.tile(&tape.edge_a, n_edge, tile), edge_a);
+                load(simd, self.tile(&tape.delta, n_var, tile), delta);
+                self.selected_inverse(simd, edge_a, delta, store);
+            },
+        );
+
+        let n_z = 1 + self.n_par;
+        let per_var: Vec<Vec<GnBlock>> = (0..n_var)
+            .into_par_iter()
+            .map_init(
+                || BlockScratch {
+                    local: self.scratch(simd),
+                    rows: Vec::new(),
+                    edge_a: Vec::with_capacity(self.max_parent),
+                    cot_a: Vec::with_capacity(self.max_parent),
+                    cot_l: Vec::with_capacity(self.max_parent),
+                    hess_t: vec![zero; packed_len(n_z)],
+                    hess_l: vec![zero; packed_len(n_z)],
+                },
+                |b, i| self.variable_blocks(simd, tape, &stores, n_store, i, max_block_size, b),
+            )
+            .collect();
+        per_var.into_iter().flatten().collect()
+    }
+
+    /// Variable `i`'s Jacobian rows for one tile, as columns of `b.rows`
+    /// (`n_theta` each): `a = dx_i/dtheta_i`, then `B' = B + alpha a` (see
+    /// `variable_blocks`), then the scores scaled by `sqrt(rho)`.
+    #[simd]
+    fn block_rows<S: Simd>(
+        &self,
+        simd: S,
+        i: usize,
+        theta: &[f64],
+        tile: usize,
+        tape: &Tape,
+        b: &mut BlockScratch<S>,
+    ) {
+        let shape = self.shape(i);
+        let n_theta = shape.size();
+        let (n_var, n_edge) = (self.n_var, self.n_edge());
+        let (n_p, n_s) = (shape.n_parent, shape.n_parent + 1);
+        let n_score = if self.regularization.is_some() {
+            n_p
+        } else {
+            0
+        };
+        let zero = S::f64s::splat(simd, 0.0);
+        let one = S::f64s::splat(simd, 1.0);
+        let edges = self.edges(i);
+
+        let BlockScratch {
+            local: s,
+            rows,
+            edge_a,
+            cot_a,
+            cot_l,
+            hess_t,
+            hess_l,
+        } = b;
+        s.y_parents.clear();
+        edge_a.clear();
+        for e in edges.clone() {
+            let p = self.parent_index[e];
+            s.y_parents
+                .push(self.tile_value(simd, &self.y, n_var, tile, p));
+            edge_a.push(self.tile_value(simd, &tape.edge_a, n_edge, tile, e));
+        }
+        let y_own = self.tile_value(simd, &self.y, n_var, tile, i);
+        let w_i = self.tile_value(simd, &tape.w, n_var, tile, i);
+        let x_i = self.tile_value(simd, &tape.x, n_var, tile, i);
+        let delta_i = self.tile_value(simd, &tape.delta, n_var, tile, i);
+
+        self.conditioner(simd, shape, theta, s);
+        let (grad_t, grad_l) = self.dense_curvature(simd, y_own, &s.pi, hess_t, hess_l);
+        let source = CurvatureSource::Dense {
+            grad_t: &grad_t,
+            grad_l: &grad_l,
+            hess_t,
+            hess_l,
+        };
+
+        // Each Jacobian row is a local pullback of one seed.
+        let n_col = 1 + n_s + n_score;
+        rows.clear();
+        rows.resize(n_col * n_theta, zero);
+        for col in 0..n_col {
+            cot_a.clear();
+            cot_a.resize(n_p, zero);
+            cot_l.clear();
+            cot_l.resize(n_p, zero);
+            let (x, delta, mu) = if col == 0 {
+                // a = dx_i / dtheta_i
+                (one, zero, zero)
+            } else if col == 1 {
+                // q_own = -mu_i - delta_i w_i
+                (zero, -w_i, -one)
+            } else if col < 1 + n_s {
+                // q_j = -L[i,j] - A[i,j] w_i
+                let j = col - 2;
+                cot_a[j] = -w_i;
+                cot_l[j] = -one;
+                (zero, zero, zero)
+            } else {
+                // score_j = L[i,j] - x_i A[i,j]
+                let j = col - 1 - n_s;
+                cot_a[j] = -x_i;
+                cot_l[j] = one;
+                (-edge_a[j], zero, zero)
+            };
+            let cot = Cotangent {
+                x,
+                delta,
+                mu,
+                edge_a: cot_a,
+                edge_l: cot_l,
+            };
+            let out = &mut rows[col * n_theta..(col + 1) * n_theta];
+            self.local_pullback(simd, shape, theta, &cot, &source, s, out);
+        }
+
+        // Row `i` of `J` is `alpha = (delta_i, A[i, P(i)])` on `S_i`, so
+        // `e_i = J^{-T} E_i alpha` and the direct part folds into the
+        // solve: `dr/dtheta_i = J^{-T} E_i B'` with `B' = B + alpha a`.
+        let (a, rest) = rows.split_at_mut(n_theta);
+        axpy_lanes(simd, delta_i, a, &mut rest[..n_theta]);
+        for j in 0..n_p {
+            axpy_lanes(
+                simd,
+                edge_a[j],
+                a,
+                &mut rest[(1 + j) * n_theta..(2 + j) * n_theta],
+            );
+        }
+        let reg = self.regularization.unwrap_or(0.0);
+        for value in &mut rest[n_s * n_theta..] {
+            *value *= reg;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn variable_blocks<S: Simd>(
+        &self,
+        simd: S,
+        tape: &Tape,
+        stores: &[S::f64s],
         n_store: usize,
         i: usize,
         max_block_size: usize,
-        s: &mut Scratch,
+        b: &mut BlockScratch<S>,
     ) -> Vec<GnBlock> {
         let shape = self.shape(i);
         let n_theta = shape.size();
         let n_p = shape.n_parent;
         let n_s = n_p + 1;
         let theta = &tape.theta[self.params(i)];
-        let parents = &self.parent_index[self.edges(i)];
         let n_score = if self.regularization.is_some() {
             n_p
         } else {
             0
         };
-        let reg = self.regularization.unwrap_or(0.0);
 
         let mut blocks: Vec<GnBlock> = (0..n_theta)
             .step_by(max_block_size)
@@ -1512,17 +1919,10 @@ impl FisherResiduals {
             })
             .collect();
 
-        // Columns of `rows` are the Jacobian rows `a`, `B` (then `B'`) and the
-        // scores, so that each local pullback writes a contiguous column.
-        let mut rows = Mat::<f64>::zeros(n_theta, 1 + n_s + n_score);
-        let mut a_row = vec![0.0; n_theta];
         let mut k_mat = Mat::<f64>::zeros(n_s, n_s);
-        let mut k_b = Mat::<f64>::zeros(n_theta, n_s);
-        let mut cot_a = vec![0.0; n_p];
-        let mut cot_l = vec![0.0; n_p];
         let mut index = Vec::with_capacity(n_s);
         index.push(i);
-        index.extend_from_slice(parents);
+        index.extend_from_slice(&self.parent_index[self.edges(i)]);
 
         // `G += P Q^T` over batches of draws, with the columns of `P` each
         // draw's `B'` and scaled score rows, and those of `Q` the matching
@@ -1534,126 +1934,62 @@ impl FisherResiduals {
         let mut q_mat = Mat::<f64>::zeros(n_theta, batch * per_draw);
         let mut in_batch = 0;
 
-        for draw in 0..self.n_draw {
-            let draw_tape = self.draw_tape(tape, draw);
-            let y = &self.y[draw * self.n_var..(draw + 1) * self.n_var];
-            self.gather_parents(i, y, &mut s.y_parents);
-            let local = self.local(&draw_tape, i);
+        for tile in 0..self.n_tile {
+            self.block_rows(simd, i, theta, tile, tape, b);
+            let store = &stores[tile * n_store..(tile + 1) * n_store];
+            for lane in 0..self.width {
+                let draw = tile * self.width + lane;
 
-            let w_i = draw_tape.w[i];
-            let x_i = draw_tape.x[i];
-            let edge_a = &draw_tape.edge_a[self.edges(i)];
-
-            // Each Jacobian row is a local pullback of one seed.
-            rows.fill(0.0);
-            let mut seed = |row: usize,
-                            x: f64,
-                            delta: f64,
-                            mu: f64,
-                            parent: Option<(usize, f64, f64)>,
-                            s: &mut Scratch| {
-                cot_a.fill(0.0);
-                cot_l.fill(0.0);
-                if let Some((j, value_a, value_l)) = parent {
-                    cot_a[j] = value_a;
-                    cot_l[j] = value_l;
+                // `B'` and the scores of this draw, skipping `a`.
+                let first = in_batch * per_draw;
+                for c in 0..per_draw {
+                    let rows = &b.rows[(1 + c) * n_theta..(2 + c) * n_theta];
+                    for (out, row) in p_mat.col_as_slice_mut(first + c).iter_mut().zip(rows) {
+                        *out = row[lane];
+                    }
                 }
-                let cot = Cotangent {
-                    x,
-                    delta,
-                    mu,
-                    edge_a: &cot_a,
-                    edge_l: &cot_l,
-                };
-                let out = rows.col_as_slice_mut(row);
-                self.local_pullback(shape, theta, local, &cot, s, out);
-            };
-            // a = dx_i / dtheta_i
-            seed(0, 1.0, 0.0, 0.0, None, s);
-            // q_own = -mu_i - delta_i w_i
-            seed(1, 0.0, -w_i, -1.0, None, s);
-            // q_j = -L[i,j] - A[i,j] w_i
-            for j in 0..n_p {
-                seed(2 + j, 0.0, 0.0, 0.0, Some((j, -w_i, -1.0)), s);
-            }
-            // score_j = L[i,j] - x_i A[i,j]
-            for j in 0..n_score {
-                seed(1 + n_s + j, -edge_a[j], 0.0, 0.0, Some((j, -x_i, 1.0)), s);
-            }
 
-            // Row `i` of `J` is `alpha = (delta_i, A[i, P(i)])` on `S_i`, so
-            // `e_i = J^{-T} E_i alpha` and the direct part folds into the
-            // solve: `dr/dtheta_i = J^{-T} E_i B'` with `B' = B + alpha a`.
-            // Then `G_i = sum B'^T K B'`, with no factor of `K` and nothing
-            // that cancels between terms.
-            a_row.copy_from_slice(rows.col_as_slice(0));
-            axpy(draw_tape.delta[i], &a_row, rows.col_as_slice_mut(1));
-            for j in 0..n_p {
-                axpy(edge_a[j], &a_row, rows.col_as_slice_mut(2 + j));
-            }
-            let b_prime = rows.as_ref().subcols(1, n_s);
+                // K = Sigma on {i} + P(i), and K B' (as columns, B' K).
+                for r in 0..n_s {
+                    for c in 0..n_s {
+                        k_mat[(r, c)] = self.sigma(store, index[r], index[c])[lane];
+                    }
+                }
+                matmul(
+                    q_mat.as_mut().subcols_mut(first, n_s),
+                    Accum::Replace,
+                    p_mat.as_ref().subcols(first, n_s),
+                    k_mat.as_ref(),
+                    1.0,
+                    Par::Seq,
+                );
+                q_mat
+                    .as_mut()
+                    .subcols_mut(first + n_s, n_score)
+                    .copy_from(p_mat.as_ref().subcols(first + n_s, n_score));
+                in_batch += 1;
 
-            // K = Sigma on {i} + P(i), and K B' (as columns, B' K).
-            let store = &stores[draw * n_store..(draw + 1) * n_store];
-            for r in 0..n_s {
-                for c in 0..n_s {
-                    k_mat[(r, c)] = self.sigma(store, index[r], index[c]);
+                if in_batch == batch || draw + 1 == self.n_draw {
+                    let n_cols = in_batch * per_draw;
+                    let local_start = self.param_offset[i];
+                    for block in &mut blocks {
+                        let start = block.start - local_start;
+                        let size = block.matrix.nrows();
+                        matmul(
+                            block.matrix.as_mut(),
+                            Accum::Add,
+                            p_mat.as_ref().subrows(start, size).subcols(0, n_cols),
+                            q_mat
+                                .as_ref()
+                                .subrows(start, size)
+                                .subcols(0, n_cols)
+                                .transpose(),
+                            1.0,
+                            Par::Seq,
+                        );
+                    }
+                    in_batch = 0;
                 }
-            }
-            matmul(
-                k_b.as_mut(),
-                Accum::Replace,
-                b_prime,
-                k_mat.as_ref(),
-                1.0,
-                Par::Seq,
-            );
-
-            let first = in_batch * per_draw;
-            p_mat.as_mut().subcols_mut(first, n_s).copy_from(b_prime);
-            q_mat
-                .as_mut()
-                .subcols_mut(first, n_s)
-                .copy_from(k_b.as_ref());
-            for j in 0..n_score {
-                let score = rows.col_as_slice(1 + n_s + j);
-                for (out, &value) in p_mat
-                    .col_as_slice_mut(first + n_s + j)
-                    .iter_mut()
-                    .zip(score)
-                {
-                    *out = reg * value;
-                }
-                for (out, &value) in q_mat
-                    .col_as_slice_mut(first + n_s + j)
-                    .iter_mut()
-                    .zip(score)
-                {
-                    *out = reg * value;
-                }
-            }
-            in_batch += 1;
-
-            if in_batch == batch || draw + 1 == self.n_draw {
-                let n_cols = in_batch * per_draw;
-                let local_start = self.param_offset[i];
-                for block in &mut blocks {
-                    let start = block.start - local_start;
-                    let size = block.matrix.nrows();
-                    matmul(
-                        block.matrix.as_mut(),
-                        Accum::Add,
-                        p_mat.as_ref().subrows(start, size).subcols(0, n_cols),
-                        q_mat
-                            .as_ref()
-                            .subrows(start, size)
-                            .subcols(0, n_cols)
-                            .transpose(),
-                        1.0,
-                        Par::Seq,
-                    );
-                }
-                in_batch = 0;
             }
         }
 
