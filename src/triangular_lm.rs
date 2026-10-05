@@ -810,40 +810,9 @@ impl<S: Simd> Scratch<S> {
     }
 }
 
-/// Where a local pullback gets the transformer's derivatives from.
-enum CurvatureSource<'a, S: Simd> {
-    /// A jet pass of the transformer at the variable's own `y`.
-    Recompute { y: S::f64s },
-    /// Gradients and packed Hessians from [`FisherResiduals::dense_curvature`],
-    /// for the many seeds of the exact blocks.
-    Dense {
-        grad_t: &'a [S::f64s],
-        grad_l: &'a [S::f64s],
-        hess_t: &'a [S::f64s],
-        hess_l: &'a [S::f64s],
-    },
-}
-
 /// Length of a packed lower triangle of an `n x n` matrix.
 fn packed_len(n: usize) -> usize {
     n * (n + 1) / 2
-}
-
-/// `out = H d` for a symmetric `H` stored as a packed lower triangle.
-#[inline(always)]
-fn packed_product<S: Simd>(simd: S, packed: &[S::f64s], d: &[S::f64s], out: &mut [S::f64s]) {
-    out.fill(S::f64s::splat(simd, 0.0));
-    let mut index = 0;
-    for r in 0..d.len() {
-        for c in 0..r {
-            let value = packed[index];
-            out[r] += value * d[c];
-            out[c] += value * d[r];
-            index += 1;
-        }
-        out[r] += packed[index] * d[r];
-        index += 1;
-    }
 }
 
 /// One exact Gauss-Newton sub-block: parameters `start..start + n` of the
@@ -923,14 +892,26 @@ impl<S: Simd> TileScratch<S> {
     }
 }
 
-/// Per-thread scratch for [`FisherResiduals::variable_blocks`].
+/// Per-thread scratch for [`FisherResiduals::variable_blocks`]. The matrices
+/// are column-major.
 struct BlockScratch<S: Simd> {
     local: Scratch<S>,
     /// The Jacobian rows of one tile, `n_theta` per column.
     rows: Vec<S::f64s>,
     edge_a: Vec<S::f64s>,
-    cot_a: Vec<S::f64s>,
-    cot_l: Vec<S::f64s>,
+    /// `M = dpi/dy_parents`, `(n_par, n_parent)`.
+    pi_jac: Vec<S::f64s>,
+    /// `H_T[pi, pi] M` and `H_Lambda[pi, pi] M`, `(n_par, n_parent)`.
+    hess_t_jac: Vec<S::f64s>,
+    hess_l_jac: Vec<S::f64s>,
+    /// Every seed's `pi_bar`, `(n_par, n_col)`, and `W2^T pi_bar`,
+    /// `(n_unit, n_col)`.
+    pi_bar: Vec<S::f64s>,
+    unit_bar: Vec<S::f64s>,
+    /// `w2_u . t` and `w2_u . l` per unit, and one seed's `alpha t + beta l`.
+    unit_t: Vec<S::f64s>,
+    unit_l: Vec<S::f64s>,
+    edge_dir: Vec<S::f64s>,
     grad_t: Vec<S::f64s>,
     grad_l: Vec<S::f64s>,
     hess_t: Vec<S::f64s>,
@@ -1327,37 +1308,22 @@ impl FisherResiduals {
     /// Hessian products along the directions in `s.dirs` -- of `T` along the
     /// first, of `Lambda` along the second -- into `s.prod_t` and `s.prod_l`.
     #[inline(always)]
-    fn curvature<S: Simd>(&self, simd: S, source: &CurvatureSource<S>, s: &mut Scratch<S>) {
+    fn curvature<S: Simd>(&self, simd: S, y: S::f64s, s: &mut Scratch<S>) {
         let n_z = 1 + self.n_par;
-        match source {
-            CurvatureSource::Recompute { y } => {
-                let (x, log_det) = transformer(
-                    simd,
-                    &self.layers,
-                    *y,
-                    &s.pi,
-                    &s.dirs[..2 * n_z],
-                    2,
-                    &mut s.jets,
-                );
-                let ws = &s.jets;
-                s.grad_t.copy_from_slice(ws.grad(&x));
-                s.grad_l.copy_from_slice(ws.grad(&log_det));
-                s.prod_t.copy_from_slice(ws.hess_dir(&x, 0));
-                s.prod_l.copy_from_slice(ws.hess_dir(&log_det, 1));
-            }
-            CurvatureSource::Dense {
-                grad_t,
-                grad_l,
-                hess_t,
-                hess_l,
-            } => {
-                s.grad_t.copy_from_slice(grad_t);
-                s.grad_l.copy_from_slice(grad_l);
-                packed_product(simd, hess_t, &s.dirs[..n_z], &mut s.prod_t);
-                packed_product(simd, hess_l, &s.dirs[n_z..2 * n_z], &mut s.prod_l);
-            }
-        }
+        let (x, log_det) = transformer(
+            simd,
+            &self.layers,
+            y,
+            &s.pi,
+            &s.dirs[..2 * n_z],
+            2,
+            &mut s.jets,
+        );
+        let ws = &s.jets;
+        s.grad_t.copy_from_slice(ws.grad(&x));
+        s.grad_l.copy_from_slice(ws.grad(&log_det));
+        s.prod_t.copy_from_slice(ws.hess_dir(&x, 0));
+        s.prod_l.copy_from_slice(ws.hess_dir(&log_det, 1));
     }
 
     /// Variable `i`'s local pullback of `cot`, accumulated into `grad`, its
@@ -1370,7 +1336,7 @@ impl FisherResiduals {
         shape: Shape,
         theta: &[f64],
         cot: &Cotangent<S>,
-        source: &CurvatureSource<S>,
+        y_own: S::f64s,
         s: &mut Scratch<S>,
         grad: &mut [S::f64s],
     ) {
@@ -1402,7 +1368,7 @@ impl FisherResiduals {
         s.dirs[1..n_z].copy_from_slice(&s.t_bar);
         s.dirs[n_z] = cot.mu;
         s.dirs[n_z + 1..2 * n_z].copy_from_slice(&s.l_bar);
-        self.curvature(simd, source, s);
+        self.curvature(simd, y_own, s);
         let (t, l) = (&s.grad_t[1..], &s.grad_l[1..]);
         for m in 0..self.n_par {
             s.pi_bar[m] = cot.x * t[m] + s.prod_t[1 + m] + s.prod_l[1 + m];
@@ -1710,15 +1676,7 @@ impl FisherResiduals {
             let params = self.params(i);
             let theta_i = &theta[params.clone()];
             self.conditioner(simd, shape, theta_i, local);
-            self.local_pullback(
-                simd,
-                shape,
-                theta_i,
-                &cot,
-                &CurvatureSource::Recompute { y: y[i] },
-                local,
-                &mut grad[params],
-            );
+            self.local_pullback(simd, shape, theta_i, &cot, y[i], local, &mut grad[params]);
         }
     }
 
@@ -1957,8 +1915,14 @@ impl FisherResiduals {
                     local: self.scratch(simd),
                     rows: Vec::new(),
                     edge_a: Vec::with_capacity(self.max_parent),
-                    cot_a: Vec::with_capacity(self.max_parent),
-                    cot_l: Vec::with_capacity(self.max_parent),
+                    pi_jac: Vec::new(),
+                    hess_t_jac: Vec::new(),
+                    hess_l_jac: Vec::new(),
+                    pi_bar: Vec::new(),
+                    unit_bar: Vec::new(),
+                    unit_t: vec![zero; self.n_unit],
+                    unit_l: vec![zero; self.n_unit],
+                    edge_dir: vec![zero; self.n_par],
                     grad_t: vec![zero; n_z],
                     grad_l: vec![zero; n_z],
                     hess_t: vec![zero; packed_len(n_z)],
@@ -2000,8 +1964,14 @@ impl FisherResiduals {
             local: s,
             rows,
             edge_a,
-            cot_a,
-            cot_l,
+            pi_jac,
+            hess_t_jac,
+            hess_l_jac,
+            pi_bar,
+            unit_bar,
+            unit_t,
+            unit_l,
+            edge_dir,
             grad_t,
             grad_l,
             hess_t,
@@ -2022,50 +1992,140 @@ impl FisherResiduals {
 
         self.conditioner(simd, shape, theta, s);
         self.dense_curvature(simd, y_own, s, grad_t, grad_l, hess_t, hess_l);
-        let source = CurvatureSource::Dense {
-            grad_t,
-            grad_l,
-            hess_t,
-            hess_l,
-        };
+        let (n_unit, n_par, loc) = (shape.n_unit, shape.n_par, self.location);
+        let (t, l) = (&grad_t[1..], &grad_l[1..]);
 
-        // Each Jacobian row is a local pullback of one seed.
-        let n_col = 1 + n_s + n_score;
-        rows.clear();
-        rows.resize(n_col * n_theta, zero);
-        for col in 0..n_col {
-            cot_a.clear();
-            cot_a.resize(n_p, zero);
-            cot_l.clear();
-            cot_l.resize(n_p, zero);
-            let (x, delta, mu) = if col == 0 {
+        // Each Jacobian row is the local pullback (see `local_pullback`) of
+        // one seed `(x_bar, delta_bar, mu_bar)` plus, for an edge `j`, the
+        // one-hot cotangents `alpha e_j` on `A[i, :]` and `beta e_j` on
+        // `L[i, :]`. Through the units these collapse onto the columns of
+        // `M = dpi/dy_parents = W2 diag(h') W1 + e_loc skip^T`: `t_bar =
+        // alpha M e_j` and `l_bar = beta M e_j`. So all seeds together need
+        // the products `M`, `H[pi, pi] M` and `W2^T pi_bar`.
+        let seed = |col: usize| {
+            if col == 0 {
                 // a = dx_i / dtheta_i
-                (one, zero, zero)
+                (one, zero, zero, None)
             } else if col == 1 {
                 // q_own = -mu_i - delta_i w_i
-                (zero, -w_i, -one)
+                (zero, -w_i, -one, None)
             } else if col < 1 + n_s {
                 // q_j = -L[i,j] - A[i,j] w_i
-                let j = col - 2;
-                cot_a[j] = -w_i;
-                cot_l[j] = -one;
-                (zero, zero, zero)
+                (zero, zero, zero, Some((col - 2, -w_i, -one)))
             } else {
                 // score_j = L[i,j] - x_i A[i,j]
                 let j = col - 1 - n_s;
-                cot_a[j] = -x_i;
-                cot_l[j] = one;
-                (-edge_a[j], zero, zero)
-            };
-            let cot = Cotangent {
-                x,
-                delta,
-                mu,
-                edge_a: cot_a,
-                edge_l: cot_l,
-            };
-            let out = &mut rows[col * n_theta..(col + 1) * n_theta];
-            self.local_pullback(simd, shape, theta, &cot, &source, s, out);
+                (-edge_a[j], zero, zero, Some((j, -x_i, one)))
+            }
+        };
+
+        pi_jac.clear();
+        pi_jac.resize(n_par * n_p, zero);
+        for u in 0..n_unit {
+            let (w1, w2) = (&theta[shape.w1(u)], &theta[shape.w2(u)]);
+            for (column, &w1) in pi_jac.chunks_exact_mut(n_par).zip(w1) {
+                axpy(simd, s.h1[u] * w1, w2, column);
+            }
+        }
+        for (column, &skip) in pi_jac.chunks_exact_mut(n_par).zip(&theta[shape.skip()]) {
+            column[loc] += skip;
+        }
+
+        // `H[pi, pi] M`, from the packed lower triangles.
+        for jac in [&mut *hess_t_jac, &mut *hess_l_jac] {
+            jac.clear();
+            jac.resize(n_par * n_p, zero);
+        }
+        for r in 0..n_par {
+            let row = packed_len(1 + r) + 1;
+            for c in 0..=r {
+                let (h_t, h_l) = (hess_t[row + c], hess_l[row + c]);
+                for j in 0..n_p {
+                    let (rj, cj) = (j * n_par + r, j * n_par + c);
+                    hess_t_jac[rj] += h_t * pi_jac[cj];
+                    hess_l_jac[rj] += h_l * pi_jac[cj];
+                    if c < r {
+                        hess_t_jac[cj] += h_t * pi_jac[rj];
+                        hess_l_jac[cj] += h_l * pi_jac[rj];
+                    }
+                }
+            }
+        }
+
+        // pi_bar = x_bar t + H[pi, z] (delta_bar, t_bar) + H_Lambda[pi, z]
+        // (mu_bar, l_bar)
+        let n_col = 1 + n_s + n_score;
+        pi_bar.clear();
+        pi_bar.resize(n_col * n_par, zero);
+        for (col, pi) in pi_bar.chunks_exact_mut(n_par).enumerate() {
+            let (x_bar, delta_bar, mu_bar, edge) = seed(col);
+            for (m, value) in pi.iter_mut().enumerate() {
+                let r = packed_len(1 + m);
+                *value = x_bar * t[m] + delta_bar * hess_t[r] + mu_bar * hess_l[r];
+            }
+            if let Some((j, alpha, beta)) = edge {
+                let column = j * n_par..(j + 1) * n_par;
+                axpy_lanes(simd, alpha, &hess_t_jac[column.clone()], pi);
+                axpy_lanes(simd, beta, &hess_l_jac[column], pi);
+            }
+        }
+
+        unit_bar.clear();
+        unit_bar.resize(n_col * n_unit, zero);
+        for u in 0..n_unit {
+            let w2 = &theta[shape.w2(u)];
+            unit_t[u] = dot(simd, w2, t);
+            unit_l[u] = dot(simd, w2, l);
+            for (col, pi) in pi_bar.chunks_exact(n_par).enumerate() {
+                unit_bar[col * n_unit + u] = dot(simd, w2, pi);
+            }
+        }
+
+        rows.clear();
+        rows.resize(n_col * n_theta, zero);
+        let columns = rows
+            .chunks_exact_mut(n_theta)
+            .zip(pi_bar.chunks_exact(n_par));
+        for (col, (out, pi)) in columns.enumerate() {
+            let edge = seed(col).3;
+            if let Some((_, alpha, beta)) = edge {
+                for ((dir, &t), &l) in edge_dir.iter_mut().zip(t).zip(l) {
+                    *dir = alpha * t + beta * l;
+                }
+            }
+            for u in 0..n_unit {
+                let (h, h1) = (s.h[u], s.h1[u]);
+                let mut a_bar = h1 * unit_bar[col * n_unit + u];
+                let out_w2 = &mut out[shape.w2(u)];
+                for (out, &pi) in out_w2.iter_mut().zip(pi) {
+                    *out = h * pi;
+                }
+                // The edge cotangents' paths through `W1[u, j]`.
+                let mut w1_direct = None;
+                if let Some((j, alpha, beta)) = edge {
+                    let w1 = theta[shape.w1(u).start + j];
+                    let p = alpha * unit_t[u] + beta * unit_l[u];
+                    a_bar += s.h2[u] * p * w1;
+                    axpy_lanes(simd, h1 * w1, &edge_dir[..], out_w2);
+                    w1_direct = Some((j, h1 * p));
+                }
+                let out_w1 = &mut out[shape.w1(u)];
+                for (out, &y) in out_w1.iter_mut().zip(&s.y_parents) {
+                    *out = a_bar * y;
+                }
+                if let Some((j, value)) = w1_direct {
+                    out_w1[j] += value;
+                }
+                out[shape.b1(u)] = a_bar;
+            }
+            out[shape.b2()].copy_from_slice(pi);
+            let out_skip = &mut out[shape.skip()];
+            for (out, &y) in out_skip.iter_mut().zip(&s.y_parents) {
+                *out = pi[loc] * y;
+            }
+            if let Some((j, alpha, beta)) = edge {
+                out_skip[j] += alpha * t[loc] + beta * l[loc];
+            }
         }
 
         // Row `i` of `J` is `alpha = (delta_i, A[i, P(i)])` on `S_i`, so
