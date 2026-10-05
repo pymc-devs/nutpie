@@ -165,6 +165,18 @@ fn progress_to_value(
                 Value::Integer(chain.total_num_steps as i64),
             );
             values.insert(
+                "latest_num_gradients".into(),
+                Value::Integer(chain.latest_num_gradients as i64),
+            );
+            values.insert(
+                "total_num_gradients".into(),
+                Value::Integer(chain.total_num_gradients as i64),
+            );
+            values.insert(
+                "log_fisher_distance".into(),
+                Value::String(format_log_fisher(chain.fisher_distance)),
+            );
+            values.insert(
                 "step_size".into(),
                 Value::String(format!("{:.2}", chain.step_size)),
             );
@@ -252,6 +264,14 @@ fn progress_to_value(
     );
 
     Value::Map(map)
+}
+
+fn format_log_fisher(fisher_distance: f64) -> String {
+    if fisher_distance.is_nan() {
+        "-".into()
+    } else {
+        format!("{:.2}", fisher_distance.ln())
+    }
 }
 
 fn estimate_remaining_time(
@@ -360,8 +380,11 @@ impl TerminalBar {
         if delta > 0 && !self.is_finished() {
             self.pb.set_position(position);
             self.pb.set_message(format!(
-                "{:<12} {:<11.2} {:<12}",
-                chain.divergences, chain.step_size, chain.latest_num_steps
+                "{:<12} {:<11.2} {:<12} {:<11}",
+                chain.divergences,
+                chain.step_size,
+                chain.latest_num_gradients,
+                format_log_fisher(chain.fisher_distance),
             ));
             self.last_position = position;
         }
@@ -390,8 +413,15 @@ impl IndicatifHandler {
                 .unwrap(),
         );
         header.set_message(format!(
-            "  {:<35}   {:<10} {:<12} {:<11} {:<12} {:<10} {:<10}",
-            "Progress", "Draws", "Divergences", "Step size", "Grad evals", "Elapsed", "Remaining"
+            "  {:<35}   {:<10} {:<12} {:<11} {:<12} {:<11} {:<10} {:<10}",
+            "Progress",
+            "Draws",
+            "Divergences",
+            "Step size",
+            "Grad evals",
+            "Log Fisher",
+            "Elapsed",
+            "Remaining"
         ));
 
         header.tick();
@@ -400,7 +430,7 @@ impl IndicatifHandler {
             .add(ProgressBar::new(0))
             .with_finish(ProgressFinish::Abandon);
         separator.set_style(ProgressStyle::default_bar().template("{msg}").unwrap());
-        separator.set_message(format!(" {}", "─".repeat(109)));
+        separator.set_message(format!(" {}", "─".repeat(121)));
         separator.tick();
 
         let callback = move |_time_sampling, progress: Box<[ChainProgress]>| {
