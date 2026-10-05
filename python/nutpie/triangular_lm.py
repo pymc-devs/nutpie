@@ -28,6 +28,7 @@ import numpy as np
 
 __all__ = [
     "check_supported",
+    "fisher_divergence",
     "fit",
     "make_residuals",
     "map_data",
@@ -210,9 +211,19 @@ def _describe_step(i, info):
         f"|g|={info['grad_norm']:.2e}  "
         f"|p|={info['full_step_norm']:.2e}  "
         f"a={info['step_length']:.2f}"
+        + ("" if info.get("val_F") is None else f"  val={np.log(info['val_F']):+.2f}")
         + fallbacks
         + ("" if info["accept"] else "   REJECT")
     )
+
+
+def fisher_divergence(problem, theta):
+    """The Fisher divergence of `problem`'s draws at `theta`: the squared norm
+    of its residuals without the `fisher_regularization` ones."""
+    n_var = len(problem.param_offsets) - 1
+    r = problem.residuals(np.asarray(theta, np.float64), linearize=False)
+    r = r.reshape(problem.n_draw, problem.n_residuals)[:, :n_var]
+    return float(np.vdot(r, r))
 
 
 def fit(
@@ -226,6 +237,8 @@ def fit(
     patience=5,
     verbose=True,
     should_stop=None,
+    val_problem=None,
+    early_stopping=True,
     **settings,
 ):
     """Levenberg-Marquardt fit of `problem` (a `FisherResiduals` with data)
@@ -238,21 +251,45 @@ def fit(
     `settings` go to `LmOptimizer` (``cg_max``, ``forcing``,
     ``max_block_size``, ...).
 
+    With `val_problem` (held-out draws, same map), every step also records
+    their `fisher_divergence` as ``info["val_F"]``. With `early_stopping` it
+    also stops when `patience` steps lowered ``val_F`` by less than a
+    fraction `rtol`, the same rule as for the training loss, and returns the
+    parameters of the lowest ``val_F`` instead of the last.
+
     Returns ``(theta, lam, hist)``: the fitted parameters, the final damping
-    and one info dict per step.
+    and one info dict per step (all of them, also after `early_stopping`
+    went back to an earlier `theta`).
     """
     from nutpie._lib import LmOptimizer
 
-    optimizer = LmOptimizer(
-        problem, np.asarray(theta, np.float64), lam=lam0, **settings
-    )
+    theta = np.asarray(theta, np.float64)
+    optimizer = LmOptimizer(problem, theta, lam=lam0, **settings)
     best_loss, stalled = optimizer.loss, 0
+    val_F = None if val_problem is None else fisher_divergence(val_problem, theta)
+    best_val, best_theta, best_step = val_F, theta, -1
+    val_ref, val_stalled = val_F, 0
     hist = []
     for i in range(n_steps):
         info = optimizer.step()
         hist.append(info)
         if should_stop is not None and should_stop():
             break
+        if val_problem is not None:
+            # A rejected step leaves `theta`, and so `val_F`, as it was.
+            if info["accept"]:
+                val_F = fisher_divergence(val_problem, optimizer.theta)
+            info["val_F"] = val_F
+            if val_F < best_val:
+                best_val = val_F
+                best_theta, best_step = np.asarray(optimizer.theta), i
+            # Patience, like the training loss's, only resets on a real
+            # improvement: otherwise a plateau that still creeps down keeps
+            # the fit going while it only overfits.
+            if val_F < val_ref * (1.0 - (rtol or 0.0)):
+                val_ref, val_stalled = val_F, 0
+            else:
+                val_stalled += 1
         if verbose:
             print(_describe_step(i, info))
 
@@ -269,4 +306,17 @@ def fit(
                     f"{patience} steps; stopping"
                 )
             break
+        if early_stopping and val_problem is not None and val_stalled >= patience:
+            if verbose:
+                print(
+                    f"validation loss improved by less than {rtol or 0:g} "
+                    f"(relative) in the last {patience} steps; stopping"
+                )
+            break
+
+    if early_stopping and val_problem is not None and best_step < len(hist) - 1:
+        if verbose:
+            step = "the start" if best_step < 0 else f"step {best_step}"
+            print(f"back to the best validation loss, at {step}")
+        return best_theta, optimizer.lam, hist
     return np.asarray(optimizer.theta), optimizer.lam, hist
