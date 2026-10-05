@@ -101,6 +101,8 @@ def fit_to_data(
     lm_print_blocks: bool = False,
     lm_diagnose: bool = False,
     should_stop: Callable[[], bool] | None = None,
+    val_x=None,
+    early_stopping: bool = True,
 ):
     r"""Train a distribution (e.g. a flow) to samples from the target distribution.
 
@@ -227,6 +229,16 @@ def fit_to_data(
             individual direction's misfit regardless of model size, and a
             larger model therefore has to work harder to reach it. Only used
             when ``method`` is ``"lm"``.
+        val_x: Held-out data, like ``x``, for the validation loss. Only used
+            when ``method`` is ``"lm-rust"``; ``"adam"`` splits off its own
+            (``val_prop``) and the others ignore it. ``losses["val"]`` is then
+            its Fisher divergence and ``losses["train_fisher"]`` that of
+            ``x``, both without the ``fisher_regularization`` term that
+            ``losses["train"]`` includes.
+        early_stopping: With ``val_x``, stop the LM fit once ``lm_patience``
+            steps lowered the validation loss by less than a fraction
+            ``solver_rtol``, and return the parameters with the lowest one.
+            ``False`` only records the validation loss.
 
     Returns:
         A tuple containing the trained distribution and the losses.
@@ -235,6 +247,11 @@ def fit_to_data(
         x = (x,)
     data = x if condition is None else (*x, condition)
     data = tuple(jnp.asarray(a) for a in data)
+    val_data = None
+    if val_x is not None:
+        if not isinstance(val_x, tuple):
+            val_x = (val_x,)
+        val_data = tuple(jnp.asarray(a) for a in val_x)
 
     if loss_fn is None:
         loss_fn = MaximumLikelihoodLoss()
@@ -246,7 +263,7 @@ def fit_to_data(
     )
 
     if method == "lm-rust":
-        params, loss_val, lam, n_steps, n_accepted = _fit_lm_rust(
+        params, lm_losses, lam, n_steps, n_accepted = _fit_lm_rust(
             params,
             static,
             data,
@@ -263,10 +280,14 @@ def fit_to_data(
             lmp_tol=lm_lmp_tol,
             verbose=verbose,
             should_stop=should_stop,
+            val_data=val_data,
+            early_stopping=early_stopping,
         )
+        objective = lm_losses["objective"]
         losses = {
-            "train": [float(loss_val)],
-            "val": [float(loss_val)],
+            "train": [objective],
+            "train_fisher": [lm_losses["train"]],
+            "val": [objective if lm_losses["val"] is None else lm_losses["val"]],
             "lm_lam": lam,
             "lm_steps": n_steps,
             "lm_accepted": n_accepted,
@@ -538,12 +559,22 @@ def _fit_lm_rust(
     lmp_tol,
     verbose,
     should_stop,
+    val_data=None,
+    early_stopping=True,
 ):
     """`_fit_lm` with exact blocks and the line search, in Rust (see
     `nutpie.triangular_lm.fit`). Fits the conditioners of the flow's
-    `SparseTriangularMap`; everything else stays as it is."""
+    `SparseTriangularMap`; everything else stays as it is.
+
+    `val_data` are held-out draws for `fit`'s validation loss and, with
+    `early_stopping`, its early stopping. Returns ``(params, losses, lam,
+    n_steps, n_accepted)``, with the losses at the fitted parameters:
+    ``"objective"`` (what LM minimised, with the regularization),
+    ``"train"`` and ``"val"`` (Fisher divergences, ``val`` `None` without
+    `val_data`)."""
     from nutpie.lmopt import _conditioners
     from nutpie.triangular_lm import (
+        fisher_divergence,
         fit,
         make_residuals,
         map_data,
@@ -553,11 +584,17 @@ def _fit_lm_rust(
 
     if not isinstance(loss_fn, FisherLoss) or loss_fn.gamma is not None:
         raise ValueError("method='lm-rust' needs a FisherLoss with gamma=None.")
+    flow = eqx.combine(params, static)
     draws, grads, *_ = data
-    tmap, y, g = map_data(eqx.combine(params, static), draws, grads)
+    tmap, y, g = map_data(flow, draws, grads)
     problem = make_residuals(
         tmap, y, g, fisher_regularization=loss_fn.fisher_regularization
     )
+    val_problem = None
+    if val_data is not None:
+        val_draws, val_grads, *_ = val_data
+        _, val_y, val_g = map_data(flow, val_draws, val_grads)
+        val_problem = make_residuals(tmap, val_y, val_g)
     theta, lam, hist = fit(
         problem,
         pack_params(tmap),
@@ -573,6 +610,8 @@ def _fit_lm_rust(
         max_block_size=max_exact_block_size,
         lmp_size=lmp_size,
         lmp_tol=lmp_tol,
+        val_problem=val_problem,
+        early_stopping=early_stopping,
     )
 
     fitted = eqx.filter(
@@ -583,17 +622,21 @@ def _fit_lm_rust(
     params = eqx.tree_at(_conditioners, params, fitted)
 
     accepted = [info for info in hist if info["accept"]]
-    if hist:
-        loss = hist[-1]["F_out"]
-    else:
-        r = problem.residuals(theta, linearize=False)
-        loss = float(r @ r)
+    # Evaluated afresh: early stopping may have returned an earlier `theta`
+    # than the last step's.
+    r = problem.residuals(theta, linearize=False)
+    r_fisher = r.reshape(problem.n_draw, problem.n_residuals)[:, : tmap.shape[0]]
+    losses = {
+        "objective": float(r @ r),
+        "train": float(np.vdot(r_fisher, r_fisher)),
+        "val": None if val_problem is None else fisher_divergence(val_problem, theta),
+    }
     # The damping to carry over is the one after the last accepted step:
     # each rejection in a final streak (typical of a patience stop) only
     # multiplied `lam` by a growing `nu`.
     if accepted:
         lam = accepted[-1]["lam_out"]
-    return params, loss, float(lam), len(hist), len(accepted)
+    return params, losses, float(lam), len(hist), len(accepted)
 
 
 @eqx.filter_jit
@@ -1031,7 +1074,40 @@ def _format_log_f(value):
     return f"{value:+.2f}" if np.isfinite(value) else "  nan"
 
 
-def fit_flow(key, bijection, loss_fn, draws, grads, logps, **kwargs):
+def _select_draws(
+    n_draws, start, *, max_draws, val_fraction, block_size, multiple, rng
+):
+    """``(train, val)`` indices into draws ``start:n_draws`` for a flow fit.
+
+    At most `max_draws` draws, evenly thinned when there are more: thinning
+    lowers the autocorrelation, and keeps the selection deterministic. A
+    random fraction `val_fraction` of blocks of `block_size` consecutive
+    draws is held out for validation; contiguous blocks keep NUTS repeats and
+    strongly correlated neighbours on one side of the split. Both parts are
+    cut to a multiple of `multiple` (the Rust LM's SIMD width) by dropping
+    their oldest draws, and are in chronological order.
+    """
+    available = n_draws - start
+    if available > max_draws:
+        idx = start + (np.arange(max_draws) * available) // max_draws
+    else:
+        idx = np.arange(start, n_draws)
+
+    n_blocks = -(-len(idx) // block_size)
+    n_val_blocks = round(val_fraction * n_blocks)
+    if val_fraction > 0 and n_blocks > 1:
+        n_val_blocks = min(max(n_val_blocks, 1), n_blocks - 1)
+    is_val_block = np.zeros(n_blocks, dtype=bool)
+    is_val_block[rng.choice(n_blocks, size=n_val_blocks, replace=False)] = True
+    is_val = np.repeat(is_val_block, block_size)[: len(idx)]
+
+    train, val = idx[~is_val], idx[is_val]
+    return train[len(train) % multiple :], val[len(val) % multiple :]
+
+
+def fit_flow(key, bijection, loss_fn, draws, grads, logps, val=None, **kwargs):
+    """Fit `bijection` to the draws; `val` are held-out ``(draws, grads,
+    logps)``, see `fit_to_data`'s ``val_x``."""
     flow = flowjax.flows.Transformed(
         flowjax.distributions.StandardNormal(bijection.shape), bijection
     )
@@ -1042,6 +1118,7 @@ def fit_flow(key, bijection, loss_fn, draws, grads, logps, **kwargs):
         key=train_key,
         dist=flow,
         x=(draws, grads, logps),
+        val_x=val,
         loss_fn=loss_fn,
         return_best=True,
         stop_value=_LOG_STOP_VALUE,
@@ -1182,7 +1259,13 @@ class TransformAdapter:
         lm_lmp_tol,
         native_flow,
         stop_event,
+        forget_fraction,
+        val_fraction,
+        val_block_size,
+        early_stopping,
     ):
+        from nutpie._lib import FisherResiduals
+
         self._logp_fn = logp_fn
         self._make_flow_fn = make_flow_fn
         self._chain = chain
@@ -1191,6 +1274,12 @@ class TransformAdapter:
         self._printed_lm_blocks = False
         self._window_size = window_size
         self._initial_skip = initial_skip
+        self._forget_fraction = forget_fraction
+        self._val_fraction = val_fraction
+        self._val_block_size = val_block_size
+        self._early_stopping = early_stopping
+        # The Rust LM fit needs a multiple of its SIMD width of draws.
+        self._draw_multiple = FisherResiduals.simd_width()
         self._num_layers = num_layers
         if make_optimizer is None:
             self._make_optimizer = lambda: optax.apply_if_finite(
@@ -1385,77 +1474,55 @@ class TransformAdapter:
 
                 return
 
-            hist_positions = positions[self._initial_skip :]
-            hist_gradients = gradients[self._initial_skip :]
-            hist_logps = logps[self._initial_skip :]
-
-            total_hist_len = len(hist_positions)
-            if total_hist_len < 10:
+            # Early draws come from a chain that may not have converged yet:
+            # skip a fixed number, and forget the oldest `forget_fraction`.
+            start = max(self._initial_skip, int(self._forget_fraction * n_draws))
+            train_idx, val_idx = _select_draws(
+                n_draws,
+                start,
+                max_draws=self._window_size,
+                val_fraction=self._val_fraction,
+                block_size=self._val_block_size,
+                multiple=self._draw_multiple,
+                rng=np.random.default_rng(seed),
+            )
+            if len(train_idx) < 10:
                 self._report(
                     n_draws,
-                    f"keep flow, waiting for draws after the first {self._initial_skip}",
+                    f"keep flow, only {len(train_idx)} draws to train on "
+                    f"(skipping the first {start})",
                 )
                 return
 
-            # Number of draws that arrived since the previous update() call.
-            # (The cadence itself is controlled on the Rust side via
-            # transform_update_freq, not by window_size.)
-            if len(self._count_trace) >= 2:
-                stride = self._count_trace[-1] - self._count_trace[-2]
-            else:
-                stride = self._count_trace[-1]
-            new_part_size = min(max(stride, 1), total_hist_len)
+            # Only the draws used, the full history can be long.
+            used = np.concatenate([train_idx, val_idx])
+            used_positions = np.asarray([positions[i] for i in used])
+            used_gradients = np.asarray([gradients[i] for i in used])
+            used_logps = np.asarray([logps[i] for i in used])
+            n_train = len(train_idx)
+            positions = used_positions[:n_train]
+            gradients = used_gradients[:n_train]
+            logps = used_logps[:n_train]
+            val = None
+            if len(val_idx):
+                val = (
+                    used_positions[n_train:],
+                    used_gradients[n_train:],
+                    used_logps[n_train:],
+                )
+            # The draws to compare flows on: held out, if there are any.
+            eval_data = (positions, gradients, logps) if val is None else val
+            draw_counts = f"{n_train} train, {len(val_idx)} val draws"
+            log_f = "log F" if val is None else "log F val"
 
-            window = self._window_size
-            tail_len = min(total_hist_len, new_part_size + 3 * window)
-            tail_positions = np.array(hist_positions[-tail_len:])
-            tail_gradients = np.array(hist_gradients[-tail_len:])
-            tail_logps = np.array(hist_logps[-tail_len:])
+            if self._verbose >= 2 and not np.isfinite(used_gradients).all():
+                print(used_gradients)
+                print(used_gradients.shape)
+                print((~np.isfinite(used_gradients)).nonzero())
 
-            new_positions = tail_positions[-new_part_size:]
-            new_gradients = tail_gradients[-new_part_size:]
-            new_logps = tail_logps[-new_part_size:]
-
-            history_positions = tail_positions[:-new_part_size]
-            history_gradients = tail_gradients[:-new_part_size]
-            history_logps = tail_logps[:-new_part_size]
-            history_len = len(history_positions)
-
-            rng = np.random.default_rng(seed)
-
-            if history_len == 0:
-                pool_positions = new_positions
-                pool_gradients = new_gradients
-                pool_logps = new_logps
-            else:
-                # A random subset of the last three windows, equally sized
-                # to the new draws.
-                replace = history_len < new_part_size
-                idx = rng.choice(history_len, size=new_part_size, replace=replace)
-                pool_positions = np.concatenate([new_positions, history_positions[idx]])
-                pool_gradients = np.concatenate([new_gradients, history_gradients[idx]])
-                pool_logps = np.concatenate([new_logps, history_logps[idx]])
-
-            # Final subsample (with replacement if the pool is smaller than
-            # the window) down to the configured window size.
-            pool_len = len(pool_positions)
-            replace = pool_len < window
-            final_idx = rng.choice(pool_len, size=window, replace=replace)
-            positions = pool_positions[final_idx]
-            gradients = pool_gradients[final_idx]
-            logps = pool_logps[final_idx]
-
-            if len(positions) < 10:
-                return
-
-            if self._verbose >= 2 and not np.isfinite(gradients).all():
-                print(gradients)
-                print(gradients.shape)
-                print((~np.isfinite(gradients)).nonzero())
-
-            assert np.isfinite(positions).all()
-            assert np.isfinite(gradients).all()
-            assert np.isfinite(logps).all()
+            assert np.isfinite(used_positions).all()
+            assert np.isfinite(used_gradients).all()
+            assert np.isfinite(used_logps).all()
 
             # TODO don't reuse seed
             key = jax.random.PRNGKey(seed % (2**63))
@@ -1475,15 +1542,9 @@ class TransformAdapter:
                 params, static = eqx.partition(flow, eqx.is_inexact_array)
                 self._report(n_draws, f"new flow: {_describe_flow(base)}")
                 if self._verbose >= 2:
-                    fresh_loss = self._loss_fn(
-                        params,
-                        static,
-                        positions[-128:],
-                        gradients[-128:],
-                        logps[-128:],
-                    )
+                    fresh_loss = self._loss_fn(params, static, *eval_data)
                     self._report(
-                        n_draws, f"log F  fresh flow {_format_log_f(fresh_loss)}"
+                        n_draws, f"{log_f}  fresh flow {_format_log_f(fresh_loss)}"
                     )
             else:
                 base = self._bijection
@@ -1527,16 +1588,14 @@ class TransformAdapter:
             params, static = eqx.partition(flow, eqx.is_inexact_array)
 
             self._sync_loss_target_norm()
-            old_loss = self._loss_fn(
-                params, static, positions[-128:], gradients[-128:], logps[-128:]
-            )
+            old_loss = self._loss_fn(params, static, *eval_data)
             self._record_fisher_divergence(old_loss)
 
             skip_training = old_loss < _LOG_SKIP_TRAINING_VALUE and self.index > 10
             if np.isfinite(old_loss) and skip_training:
                 self._report(
                     n_draws,
-                    f"log F  current {_format_log_f(old_loss)}  -> keep flow, "
+                    f"{log_f}  current {_format_log_f(old_loss)}  -> keep flow, "
                     f"already below {_format_log_f(_LOG_SKIP_TRAINING_VALUE)}",
                 )
                 return
@@ -1545,7 +1604,9 @@ class TransformAdapter:
             # its own.
             if self._verbose >= 2 and base is self._bijection:
                 self._report(
-                    n_draws, f"log F  current {_format_log_f(old_loss)}  -> refit"
+                    n_draws,
+                    f"{log_f}  current {_format_log_f(old_loss)}  -> refit  "
+                    f"({draw_counts})",
                 )
 
             fit, fit_losses, opt_state = fit_flow(
@@ -1555,6 +1616,8 @@ class TransformAdapter:
                 positions,
                 gradients,
                 logps,
+                val=val,
+                early_stopping=self._early_stopping,
                 show_progress=self._show_progress,
                 verbose=self._verbose >= 2,
                 lm_print_blocks=self._verbose >= 2 and not self._printed_lm_blocks,
@@ -1603,16 +1666,21 @@ class TransformAdapter:
             )
             params, static = eqx.partition(flow, eqx.is_inexact_array)
 
-            new_loss = self._loss_fn(
-                params, static, positions[-128:], gradients[-128:], logps[-128:]
-            )
+            new_loss = self._loss_fn(params, static, *eval_data)
 
             def report(decision):
                 steps = fit_losses.get("lm_steps")
+                train = fit_losses.get("train_fisher")
                 self._report(
                     n_draws,
-                    f"log F  current {_format_log_f(old_loss)}  "
-                    f"refit {_format_log_f(new_loss)}  -> {decision}"
+                    f"{log_f}  current {_format_log_f(old_loss)}  "
+                    f"refit {_format_log_f(new_loss)}"
+                    + (
+                        ""
+                        if train is None or val is None
+                        else f"  (train {_format_log_f(np.log(train[0]))})"
+                    )
+                    + f"  -> {decision}"
                     + (
                         ""
                         if steps is None
@@ -1626,32 +1694,14 @@ class TransformAdapter:
                     self._bijection,
                 )
                 params, static = eqx.partition(flow, eqx.is_inexact_array)
-                print(
-                    self._loss_fn(
-                        params,
-                        static,
-                        positions[-128:],
-                        gradients[-128:],
-                        logps[-128:],
-                        return_all_costs=True,
-                    )
-                )
+                print(self._loss_fn(params, static, *eval_data, return_all_costs=True))
 
             if self._verbose >= 2 and not np.isfinite(new_loss):
                 flow = flowjax.flows.Transformed(
                     flowjax.distributions.StandardNormal(fit.shape), fit
                 )
                 params, static = eqx.partition(flow, eqx.is_inexact_array)
-                print(
-                    self._loss_fn(
-                        params,
-                        static,
-                        positions[-128:],
-                        gradients[-128:],
-                        logps[-128:],
-                        return_all_costs=True,
-                    )
-                )
+                print(self._loss_fn(params, static, *eval_data, return_all_costs=True))
 
             if self._debug_save_bijection:
                 _BIJECTION_TRACE.append(
@@ -1796,7 +1846,7 @@ def make_transform_adapter(
     window_size=512,
     show_progress=False,
     nn_depth=None,
-    nn_width=8,
+    nn_width=16,
     num_layers=8,
     num_diag_windows=9,
     learning_rate=5e-4,
@@ -1824,11 +1874,11 @@ def make_transform_adapter(
     num_householder=8,
     twin_layers=False,
     activation=None,
-    max_epochs=30,
+    max_epochs=40,
     affine_transformer=False,
-    contract_transformer=1,
+    contract_transformer=0,
     asymmetric_transformer=False,
-    tangent_sas_transformer=0,
+    tangent_sas_transformer=1,
     tangent_sas_fix_b=False,
     reuse_embed=True,
     order=None,
@@ -1838,7 +1888,7 @@ def make_transform_adapter(
     method="lm-rust",
     solver_rtol=5e-2,
     solver_atol=1e-6,
-    lm_linear_steps=150,
+    lm_linear_steps=80,
     lm_min_loss=math.exp(-3),
     lm_probe_batch=32,
     lm_probes=1024,
@@ -1857,7 +1907,24 @@ def make_transform_adapter(
     lm_lmp_tol=1e-8,
     native_flow=True,
     stop_event=None,
+    forget_fraction=0.5,
+    val_fraction=0.2,
+    val_block_size=16,
+    early_stopping=True,
 ):
+    """The adapter for `nutpie.sample`'s ``transform_adapt``.
+
+    Draw selection for each flow fit: draws before ``initial_skip`` and the
+    oldest ``forget_fraction`` of all draws are ignored, the rest is evenly
+    thinned to at most ``window_size`` (never upsampled), and a random
+    ``val_fraction`` of blocks of ``val_block_size`` consecutive draws is
+    held out. The held-out draws decide whether a refit replaces the flow
+    and, with ``early_stopping`` and ``method="lm-rust"``, when the LM fit
+    stops (it then returns the step with the best validation loss).
+    ``early_stopping=False`` still reports the validation loss but lets the
+    fit run to its training-loss stopping rule. ``val_fraction=0`` trains on
+    everything and compares flows on the training draws.
+    """
     if extension_windows is None:
         extension_windows = []
     if activation is None and coupling_type == "triangular":
@@ -1934,4 +2001,8 @@ def make_transform_adapter(
         lm_lmp_tol=lm_lmp_tol,
         native_flow=native_flow,
         stop_event=stop_event,
+        forget_fraction=forget_fraction,
+        val_fraction=val_fraction,
+        val_block_size=val_block_size,
+        early_stopping=early_stopping,
     )

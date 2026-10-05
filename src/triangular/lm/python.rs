@@ -60,6 +60,13 @@ impl PyFisherResiduals {
         })
     }
 
+    /// Lanes of this machine's native ``f64`` vector: `set_data` needs a
+    /// multiple of this many draws.
+    #[staticmethod]
+    fn simd_width() -> usize {
+        FisherResiduals::native_width()
+    }
+
     #[getter]
     fn n_params(&self) -> usize {
         self.inner.n_params()

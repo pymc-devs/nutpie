@@ -126,10 +126,9 @@ impl FisherResiduals {
             (0..graph.n_var()).map(|i| conditioner.shape(graph.n_parent(i)).size()),
         );
         let inverse = SelectedInverseLayout::new(&graph)?;
-        let level = Level::new();
         Ok(Self {
-            level,
-            width: dispatch!(level, simd => f64_width(simd)),
+            level: Level::new(),
+            width: Self::native_width(),
             graph,
             param_offset,
             conditioner,
@@ -137,6 +136,13 @@ impl FisherResiduals {
             inverse,
             data: None,
         })
+    }
+
+    /// Lanes of this machine's native `f64` vector; [`Self::set_data`] needs
+    /// a multiple of this many draws.
+    pub(crate) fn native_width() -> usize {
+        let level = Level::new();
+        dispatch!(level, simd => f64_width(simd))
     }
 
     pub(crate) fn n_var(&self) -> usize {

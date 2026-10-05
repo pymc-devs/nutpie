@@ -322,3 +322,99 @@ def test_lm_rust_method_updates_the_flow():
     assert losses["lm_steps"] == 5
     assert losses["train"][0] < initial
     np.testing.assert_allclose(float(jnp.sum(r**2)), losses["train"][0], rtol=1e-10)
+
+
+def test_lm_rust_validation_loss():
+    """`fit_to_data(method="lm-rust", val_x=...)` reports the Fisher
+    divergences of the train and held-out draws at the returned flow, without
+    the regularization."""
+    from nutpie.transform_adapter import fit_to_data
+
+    params, static, data, loss_fn = _flow_problem(n_draw=96, rho=0.1)
+    train = tuple(a[:64] for a in data)
+    val = tuple(a[64:] for a in data)
+    for early_stopping in [True, False]:
+        flow, losses, _ = fit_to_data(
+            jax.random.key(0),
+            eqx.combine(params, static),
+            train,
+            val_x=val,
+            early_stopping=early_stopping,
+            loss_fn=loss_fn,
+            method="lm-rust",
+            max_epochs=8,
+            lm_min_loss=0.0,
+        )
+        fitted, _ = eqx.partition(flow, eqx.is_inexact_array)
+        # `FisherLoss.__call__` is the log of the plain Fisher divergence.
+        np.testing.assert_allclose(
+            np.log(losses["val"][0]), loss_fn(fitted, static, *val), rtol=1e-8
+        )
+        np.testing.assert_allclose(
+            np.log(losses["train_fisher"][0]),
+            loss_fn(fitted, static, *train),
+            rtol=1e-8,
+        )
+        assert losses["train_fisher"][0] < losses["train"][0]
+
+
+@pytest.mark.parametrize("early_stopping", [True, False])
+def test_rust_lm_early_stopping(early_stopping):
+    """With early stopping, `fit` returns the parameters of the best
+    validation loss seen (the start included); without, the last ones."""
+    from nutpie.triangular_lm import fisher_divergence, fit, map_data
+
+    params, static, data, _ = _flow_problem(n_draw=48, rho=None)
+    flow = eqx.combine(params, static)
+    tmap, y, g = map_data(flow, data[0][:16], data[1][:16])
+    _, val_y, val_g = map_data(flow, data[0][16:], data[1][16:])
+    problem = make_residuals(tmap, y, g)
+    val_problem = make_residuals(tmap, val_y, val_g)
+    theta0 = pack_params(tmap)
+
+    theta, _, hist = fit(
+        problem,
+        theta0,
+        n_steps=15,
+        verbose=False,
+        val_problem=val_problem,
+        early_stopping=early_stopping,
+        patience=3,
+    )
+    val_F = fisher_divergence(val_problem, theta)
+    if early_stopping:
+        best = min(
+            [fisher_divergence(val_problem, theta0)] + [h["val_F"] for h in hist]
+        )
+        np.testing.assert_allclose(val_F, best, rtol=1e-12)
+    else:
+        np.testing.assert_allclose(val_F, hist[-1]["val_F"], rtol=1e-12)
+
+
+def test_select_draws():
+    """Disjoint, in range, chronological, multiples of the SIMD width,
+    never upsampled, and the validation draws come in contiguous blocks."""
+    from nutpie.transform_adapter import _select_draws
+
+    settings = {"max_draws": 512, "val_fraction": 0.2, "block_size": 16, "multiple": 8}
+    for n_draws, start in [(257, 128), (2000, 1000), (140, 120)]:
+        train, val = _select_draws(
+            n_draws, start, rng=np.random.default_rng(0), **settings
+        )
+        both = np.concatenate([train, val])
+        assert len(np.unique(both)) == len(both)
+        assert both.min() >= start and both.max() < n_draws
+        assert len(both) <= min(n_draws - start, 512)
+        assert len(train) % 8 == 0 and len(val) % 8 == 0
+        if n_draws - start >= 100:
+            assert len(val) > 0
+        assert (np.diff(train) > 0).all() and (np.diff(val) > 0).all()
+        again = _select_draws(n_draws, start, rng=np.random.default_rng(0), **settings)
+        assert all((a == b).all() for a, b in zip((train, val), again))
+
+    # Without thinning, each held-out block is a run of consecutive draws.
+    _, val = _select_draws(
+        400, 0, rng=np.random.default_rng(1), **{**settings, "multiple": 1}
+    )
+    runs = np.split(val, np.flatnonzero(np.diff(val) != 1) + 1)
+    assert all(len(run) % 16 == 0 for run in runs)
