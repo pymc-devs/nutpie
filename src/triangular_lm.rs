@@ -47,246 +47,342 @@ use faer::{Accum, Mat, Par};
 use crate::simd_math;
 use crate::triangular::{Contract2Spec, LayerSpec, Param, PositiveAffineSpec, TangentSasSpec};
 
-/// Capacity of a [`Jet`]: the transformer input `y` and up to 15 transformer
-/// parameters (three `Contract2` layers, or three `TangentSAS` layers and
-/// their `PositiveAffine`).
-const N: usize = 16;
 /// Draws per matrix product when accumulating the exact blocks.
 const BLOCK_DRAW_BATCH: usize = 32;
 
-/// `K` directions in `z = (y, pi)`, one vector per entry.
-type Dirs<S, const K: usize> = [[<S as Simd>::f64s; N]; K];
-
-/// A scalar function of `z = (y, pi)`, one lane per draw, with its gradient
-/// and the products of its Hessian with `K` fixed directions:
-/// `e[k] = g . d_k`, `h[k] = H d_k`.
+/// A jet in a [`JetArena`]: a scalar function of `z = (y, pi)`, one lane per
+/// draw, with its gradient and the products of its Hessian with the arena's
+/// `k` fixed directions: `e[d] = g . dir_d`, `h[d] = H dir_d`.
 ///
 /// Forward-over-forward, but sharing the value and gradient across the
-/// directions, so every operation is O(N) instead of the O(N^2) a full
+/// directions, so every operation is O(n_z) instead of the O(n_z^2) a full
 /// Hessian would cost.
-#[derive(Clone, Copy)]
-struct Jet<S: Simd, const K: usize> {
+///
+/// Not `Copy`: an operation that takes a jet by value writes its result into
+/// that jet's slot, so a value needed twice is copied explicitly with
+/// [`JetArena::copy`].
+#[must_use]
+struct Jet(u32);
+
+/// Jet slots of one size, `[v, g[n_z], e[k], h[k][n_z]]` each. [`Self::reset`]
+/// sets the size for one transformer evaluation and hands every slot back;
+/// the storage only grows, so after the first evaluation nothing allocates.
+struct JetArena<S: Simd> {
     simd: S,
-    v: S::f64s,
-    g: [S::f64s; N],
-    e: [S::f64s; K],
-    h: [[S::f64s; N]; K],
+    data: Vec<S::f64s>,
+    n_z: usize,
+    k: usize,
+    slot_len: usize,
+    n_slots: usize,
+    /// Slots handed back by consuming binary operations.
+    free: Vec<u32>,
 }
 
-impl<S: Simd, const K: usize> Jet<S, K> {
-    #[inline(always)]
-    fn constant(simd: S, v: S::f64s) -> Self {
-        let zero = S::f64s::splat(simd, 0.0);
+impl<S: Simd> JetArena<S> {
+    fn new(simd: S) -> Self {
         Self {
             simd,
-            v,
-            g: [zero; N],
-            e: [zero; K],
-            h: [[zero; N]; K],
+            data: Vec::new(),
+            n_z: 0,
+            k: 0,
+            slot_len: 0,
+            n_slots: 0,
+            free: Vec::new(),
         }
     }
 
+    /// Starts an evaluation with `n_z` inputs and `k` directions.
     #[inline(always)]
-    fn variable(simd: S, v: S::f64s, index: usize, dirs: &Dirs<S, K>) -> Self {
-        let mut out = Self::constant(simd, v);
-        out.g[index] = S::f64s::splat(simd, 1.0);
-        for k in 0..K {
-            out.e[k] = dirs[k][index];
+    fn reset(&mut self, n_z: usize, k: usize) {
+        self.n_z = n_z;
+        self.k = k;
+        self.slot_len = 1 + n_z * (k + 1) + k;
+        self.n_slots = 0;
+        self.free.clear();
+    }
+
+    #[inline(always)]
+    fn splat(&self, value: f64) -> S::f64s {
+        S::f64s::splat(self.simd, value)
+    }
+
+    #[inline(always)]
+    fn range(&self, j: &Jet) -> std::ops::Range<usize> {
+        let start = j.0 as usize * self.slot_len;
+        start..start + self.slot_len
+    }
+
+    #[inline(always)]
+    fn alloc(&mut self) -> Jet {
+        if let Some(index) = self.free.pop() {
+            return Jet(index);
         }
+        let index = self.n_slots;
+        self.n_slots += 1;
+        let end = self.n_slots * self.slot_len;
+        if self.data.len() < end {
+            let zero = self.splat(0.0);
+            self.data.resize(end, zero);
+        }
+        Jet(index as u32)
+    }
+
+    #[inline(always)]
+    fn release(&mut self, j: Jet) {
+        self.free.push(j.0);
+    }
+
+    #[inline(always)]
+    fn value(&self, j: &Jet) -> S::f64s {
+        self.data[self.range(j).start]
+    }
+
+    /// The gradient in `z`.
+    #[inline(always)]
+    fn grad(&self, j: &Jet) -> &[S::f64s] {
+        let start = self.range(j).start + 1;
+        &self.data[start..start + self.n_z]
+    }
+
+    /// The Hessian's product with direction `d`.
+    #[inline(always)]
+    fn hess_dir(&self, j: &Jet, d: usize) -> &[S::f64s] {
+        let start = self.range(j).start + 1 + self.n_z + self.k + d * self.n_z;
+        &self.data[start..start + self.n_z]
+    }
+
+    #[inline(always)]
+    fn constant(&mut self, v: S::f64s) -> Jet {
+        let j = self.alloc();
+        let zero = self.splat(0.0);
+        let range = self.range(&j);
+        let slot = &mut self.data[range];
+        slot.fill(zero);
+        slot[0] = v;
+        j
+    }
+
+    /// Input `index` of `z` at `v`, with `dirs` the `k` directions, `n_z`
+    /// entries each.
+    #[inline(always)]
+    fn variable(&mut self, v: S::f64s, index: usize, dirs: &[S::f64s]) -> Jet {
+        let j = self.constant(v);
+        let (n_z, k) = (self.n_z, self.k);
+        let one = self.splat(1.0);
+        let range = self.range(&j);
+        let slot = &mut self.data[range];
+        slot[1 + index] = one;
+        for d in 0..k {
+            slot[1 + n_z + d] = dirs[d * n_z + index];
+        }
+        j
+    }
+
+    #[inline(always)]
+    fn copy(&mut self, j: &Jet) -> Jet {
+        let out = self.alloc();
+        let (source, start) = (self.range(j), self.range(&out).start);
+        self.data.copy_within(source, start);
         out
     }
 
+    /// The slots of a binary operation: `a`'s to write, `b`'s to read.
     #[inline(always)]
-    fn one(&self) -> S::f64s {
-        S::f64s::splat(self.simd, 1.0)
+    fn pair(&mut self, a: &Jet, b: &Jet) -> (&mut [S::f64s], &[S::f64s]) {
+        let (range_a, range_b) = (self.range(a), self.range(b));
+        let [a, b] = self
+            .data
+            .get_disjoint_mut([range_a, range_b])
+            .expect("jets have distinct slots");
+        (a, b)
     }
 
-    /// `f(self)`, given `f`, `f'` and `f''` at `self.v`.
+    /// `f(j)`, given `f`, `f'` and `f''` at its value.
     #[inline(always)]
-    fn chain(self, f0: S::f64s, f1: S::f64s, f2: S::f64s) -> Self {
-        let mut out = Self::constant(self.simd, f0);
-        for n in 0..N {
-            out.g[n] = f1 * self.g[n];
+    fn chain(&mut self, j: Jet, f0: S::f64s, f1: S::f64s, f2: S::f64s) -> Jet {
+        let (n_z, k) = (self.n_z, self.k);
+        let range = self.range(&j);
+        let (head, h) = self.data[range].split_at_mut(1 + n_z + k);
+        let (v, rest) = head.split_at_mut(1);
+        let (g, e) = rest.split_at_mut(n_z);
+        // `h` reads the old `g` and `e`, so it goes first.
+        for (e, h) in e.iter_mut().zip(h.chunks_exact_mut(n_z)) {
+            let curvature = f2 * *e;
+            for (h, &g) in h.iter_mut().zip(&*g) {
+                *h = f1 * *h + curvature * g;
+            }
+            *e = f1 * *e;
         }
-        for k in 0..K {
-            out.e[k] = f1 * self.e[k];
-            let curvature = f2 * self.e[k];
-            for n in 0..N {
-                out.h[k][n] = f1 * self.h[k][n] + curvature * self.g[n];
+        for g in g.iter_mut() {
+            *g = f1 * *g;
+        }
+        v[0] = f0;
+        j
+    }
+
+    #[inline(always)]
+    fn add(&mut self, a: Jet, b: Jet) -> Jet {
+        let (a_slot, b_slot) = self.pair(&a, &b);
+        for (a, &b) in a_slot.iter_mut().zip(b_slot) {
+            *a += b;
+        }
+        self.release(b);
+        a
+    }
+
+    #[inline(always)]
+    fn sub(&mut self, a: Jet, b: Jet) -> Jet {
+        let (a_slot, b_slot) = self.pair(&a, &b);
+        for (a, &b) in a_slot.iter_mut().zip(b_slot) {
+            *a -= b;
+        }
+        self.release(b);
+        a
+    }
+
+    #[inline(always)]
+    fn mul(&mut self, a: Jet, b: Jet) -> Jet {
+        let (n_z, k) = (self.n_z, self.k);
+        let (a_slot, b_slot) = self.pair(&a, &b);
+        let (a_head, a_h) = a_slot.split_at_mut(1 + n_z + k);
+        let (b_head, b_h) = b_slot.split_at(1 + n_z + k);
+        let (a_v, a_rest) = a_head.split_at_mut(1);
+        let (a_g, a_e) = a_rest.split_at_mut(n_z);
+        let (b_g, b_e) = b_head[1..].split_at(n_z);
+        let (av, bv) = (a_v[0], b_head[0]);
+        // `h` reads the old `g` and `e` of both, so it goes first.
+        for ((&ae, &be), (a_h, b_h)) in a_e
+            .iter()
+            .zip(b_e)
+            .zip(a_h.chunks_exact_mut(n_z).zip(b_h.chunks_exact(n_z)))
+        {
+            for ((ah, &bh), (&ag, &bg)) in a_h.iter_mut().zip(b_h).zip(a_g.iter().zip(b_g)) {
+                *ah = av * bh + bv * *ah + ae * bg + be * ag;
             }
         }
-        out
+        for (ae, &be) in a_e.iter_mut().zip(b_e) {
+            *ae = av * be + bv * *ae;
+        }
+        for (ag, &bg) in a_g.iter_mut().zip(b_g) {
+            *ag = av * bg + bv * *ag;
+        }
+        a_v[0] = av * bv;
+        self.release(b);
+        a
     }
 
     #[inline(always)]
-    fn asinh(self) -> Self {
-        let a = self.v;
+    fn scale(&mut self, j: Jet, c: f64) -> Jet {
+        let range = self.range(&j);
+        for value in &mut self.data[range] {
+            *value *= c;
+        }
+        j
+    }
+
+    #[inline(always)]
+    fn neg(&mut self, j: Jet) -> Jet {
+        self.scale(j, -1.0)
+    }
+
+    #[inline(always)]
+    fn add_const(&mut self, j: Jet, c: f64) -> Jet {
+        let start = self.range(&j).start;
+        self.data[start] += c;
+        j
+    }
+
+    #[inline(always)]
+    fn asinh(&mut self, j: Jet) -> Jet {
+        let a = self.value(&j);
         let root = simd_math::hypot_one(self.simd, a);
         let value = simd_math::asinh(self.simd, a);
-        self.chain(value, self.one() / root, -a / (root * root * root))
+        let f1 = self.splat(1.0) / root;
+        self.chain(j, value, f1, -a / (root * root * root))
     }
 
     #[inline(always)]
-    fn sinh(self) -> Self {
-        let (s, c) = simd_math::sinh_cosh(self.simd, self.v);
-        self.chain(s, c, s)
+    fn sinh(&mut self, j: Jet) -> Jet {
+        let (s, c) = simd_math::sinh_cosh(self.simd, self.value(&j));
+        self.chain(j, s, c, s)
     }
 
     #[inline(always)]
-    fn cosh(self) -> Self {
-        let (s, c) = simd_math::sinh_cosh(self.simd, self.v);
-        self.chain(c, s, c)
+    fn cosh(&mut self, j: Jet) -> Jet {
+        let (s, c) = simd_math::sinh_cosh(self.simd, self.value(&j));
+        self.chain(j, c, s, c)
     }
 
     /// `v + sqrt(1 + v*v)`, in `exp_asinh`'s cancellation-free form.
     #[inline(always)]
-    fn positive(self) -> Self {
-        let a = self.v;
-        let one = self.one();
+    fn positive(&mut self, j: Jet) -> Jet {
+        let a = self.value(&j);
+        let one = self.splat(1.0);
         let root = simd_math::hypot_one(self.simd, a);
         let value = a.simd_ge(0.0).select(a + root, one / (root - a));
         // d/da (value / root) = (value (root - a)) / root^3 = 1 / root^3.
-        self.chain(value, value / root, one / (root * root * root))
+        self.chain(j, value, value / root, one / (root * root * root))
     }
 
     #[inline(always)]
-    fn exp(self) -> Self {
-        let e = simd_math::exp(self.simd, self.v);
-        self.chain(e, e, e)
+    fn exp(&mut self, j: Jet) -> Jet {
+        let e = simd_math::exp(self.simd, self.value(&j));
+        self.chain(j, e, e, e)
     }
 
     #[inline(always)]
-    fn ln_1p(self) -> Self {
-        let inv = self.one() / (self.v + 1.0);
-        let value = simd_math::ln_1p(self.simd, self.v);
-        self.chain(value, inv, -inv * inv)
+    fn ln_1p(&mut self, j: Jet) -> Jet {
+        let v = self.value(&j);
+        let inv = self.splat(1.0) / (v + 1.0);
+        let value = simd_math::ln_1p(self.simd, v);
+        self.chain(j, value, inv, -inv * inv)
     }
 
     /// `log(cosh(v))`, in `_log_cosh`'s stable form.
     #[inline(always)]
-    fn log_cosh(self) -> Self {
-        let (value, t) = simd_math::log_cosh_tanh(self.simd, self.v);
-        self.chain(value, t, self.one() - t * t)
+    fn log_cosh(&mut self, j: Jet) -> Jet {
+        let (value, t) = simd_math::log_cosh_tanh(self.simd, self.value(&j));
+        let f2 = self.splat(1.0) - t * t;
+        self.chain(j, value, t, f2)
     }
 
     #[inline(always)]
-    fn sigmoid(self) -> Self {
-        let one = self.one();
-        let s = one / (simd_math::exp(self.simd, -self.v) + 1.0);
+    fn sigmoid(&mut self, j: Jet) -> Jet {
+        let one = self.splat(1.0);
+        let s = one / (simd_math::exp(self.simd, -self.value(&j)) + 1.0);
         let ds = s * (one - s);
-        self.chain(s, ds, ds * (one - s * 2.0))
+        self.chain(j, s, ds, ds * (one - s * 2.0))
     }
 
     #[inline(always)]
-    fn square(self) -> Self {
-        self * self
-    }
-}
-
-impl<S: Simd, const K: usize> std::ops::Add for Jet<S, K> {
-    type Output = Self;
-    #[inline(always)]
-    fn add(mut self, other: Self) -> Self {
-        self.v += other.v;
-        for n in 0..N {
-            self.g[n] += other.g[n];
-        }
-        for k in 0..K {
-            self.e[k] += other.e[k];
-            for n in 0..N {
-                self.h[k][n] += other.h[k][n];
-            }
-        }
-        self
-    }
-}
-
-impl<S: Simd, const K: usize> std::ops::Neg for Jet<S, K> {
-    type Output = Self;
-    #[inline(always)]
-    fn neg(self) -> Self {
-        self * -1.0
-    }
-}
-
-impl<S: Simd, const K: usize> std::ops::Sub for Jet<S, K> {
-    type Output = Self;
-    #[inline(always)]
-    fn sub(self, other: Self) -> Self {
-        self + (-other)
-    }
-}
-
-impl<S: Simd, const K: usize> std::ops::Mul for Jet<S, K> {
-    type Output = Self;
-    #[inline(always)]
-    fn mul(self, other: Self) -> Self {
-        let (a, b) = (self, other);
-        let mut out = Self::constant(a.simd, a.v * b.v);
-        for n in 0..N {
-            out.g[n] = a.v * b.g[n] + b.v * a.g[n];
-        }
-        for k in 0..K {
-            out.e[k] = a.v * b.e[k] + b.v * a.e[k];
-            for n in 0..N {
-                out.h[k][n] = a.v * b.h[k][n] + b.v * a.h[k][n] + a.e[k] * b.g[n] + b.e[k] * a.g[n];
-            }
-        }
-        out
-    }
-}
-
-impl<S: Simd, const K: usize> std::ops::Mul<f64> for Jet<S, K> {
-    type Output = Self;
-    #[inline(always)]
-    fn mul(mut self, c: f64) -> Self {
-        self.v *= c;
-        for n in 0..N {
-            self.g[n] *= c;
-        }
-        for k in 0..K {
-            self.e[k] *= c;
-            for n in 0..N {
-                self.h[k][n] *= c;
-            }
-        }
-        self
-    }
-}
-
-impl<S: Simd, const K: usize> std::ops::Add<f64> for Jet<S, K> {
-    type Output = Self;
-    #[inline(always)]
-    fn add(mut self, c: f64) -> Self {
-        self.v += c;
-        self
+    fn square(&mut self, j: Jet) -> Jet {
+        let v = self.value(&j);
+        let two = self.splat(2.0);
+        self.chain(j, v * v, v * 2.0, two)
     }
 }
 
 /// The transformer parameters `pi` of one variable as jet inputs.
-struct Fields<'a, S: Simd, const K: usize> {
-    simd: S,
+struct Fields<'a, S: Simd> {
     pi: &'a [S::f64s],
-    dirs: &'a Dirs<S, K>,
+    dirs: &'a [S::f64s],
 }
 
-impl<S: Simd, const K: usize> Fields<'_, S, K> {
+impl<S: Simd> Fields<'_, S> {
     #[inline(always)]
-    fn get(&self, param: Option<Param>) -> Option<Jet<S, K>> {
-        param.map(|p| {
-            Jet::variable(
-                self.simd,
-                self.pi[p.index] + p.offset,
-                1 + p.index,
-                self.dirs,
-            )
-        })
+    fn get(&self, ws: &mut JetArena<S>, param: Option<Param>) -> Option<Jet> {
+        param.map(|p| ws.variable(self.pi[p.index] + p.offset, 1 + p.index, self.dirs))
     }
 
     #[inline(always)]
-    fn get_or_zero(&self, param: Option<Param>) -> Jet<S, K> {
-        self.get(param)
-            .unwrap_or_else(|| Jet::constant(self.simd, S::f64s::splat(self.simd, 0.0)))
+    fn get_or_zero(&self, ws: &mut JetArena<S>, param: Option<Param>) -> Jet {
+        match self.get(ws, param) {
+            Some(jet) => jet,
+            None => {
+                let zero = ws.splat(0.0);
+                ws.constant(zero)
+            }
+        }
     }
 }
 
@@ -339,52 +435,79 @@ impl Contract2Layer {
 
     /// `Contract2.inverse_and_log_det`.
     #[inline(always)]
-    fn inverse<S: Simd, const K: usize>(
-        &self,
-        fields: &Fields<S, K>,
-        x: Jet<S, K>,
-    ) -> (Jet<S, K>, Jet<S, K>) {
-        let log_gamma = fields.get(self.alpha).map(|alpha| {
-            let log_gamma = alpha.asinh();
+    fn inverse<S: Simd>(&self, ws: &mut JetArena<S>, fields: &Fields<S>, x: Jet) -> (Jet, Jet) {
+        let log_gamma = fields.get(ws, self.alpha).map(|alpha| {
+            let log_gamma = ws.asinh(alpha);
             match self.bound {
                 None => log_gamma,
-                Some(b) => (log_gamma * b.slope + b.offset).sigmoid() * b.width + b.low,
+                Some(b) => {
+                    let t = ws.scale(log_gamma, b.slope);
+                    let t = ws.add_const(t, b.offset);
+                    let t = ws.sigmoid(t);
+                    let t = ws.scale(t, b.width);
+                    ws.add_const(t, b.low)
+                }
             }
         });
-        let log_delta = fields.get(self.beta).map(Jet::asinh);
-        let log_sigma = fields.get(self.sigma).map(Jet::asinh);
+        let log_delta = fields.get(ws, self.beta).map(|beta| ws.asinh(beta));
+        let log_sigma = fields.get(ws, self.sigma).map(|sigma| ws.asinh(sigma));
 
-        let centred = match fields.get(self.mu) {
-            Some(mu) => x - mu,
+        let centred = match fields.get(ws, self.mu) {
+            Some(mu) => ws.sub(x, mu),
             None => x,
         };
-        let log_scale = match (log_gamma, log_sigma) {
-            (Some(g), Some(s)) => Some(g - s),
-            (Some(g), None) => Some(g),
-            (None, Some(s)) => Some(-s),
+        // `log_gamma` and `log_sigma` are used again below.
+        let log_scale = match (&log_gamma, &log_sigma) {
+            (Some(g), Some(s)) => {
+                let (g, s) = (ws.copy(g), ws.copy(s));
+                Some(ws.sub(g, s))
+            }
+            (Some(g), None) => Some(ws.copy(g)),
+            (None, Some(s)) => {
+                let s = ws.copy(s);
+                Some(ws.neg(s))
+            }
             (None, None) => None,
         };
         let half_a = match log_scale {
-            Some(scale) => scale.exp() * centred * 0.5,
-            None => centred * 0.5,
+            Some(scale) => {
+                let scale = ws.exp(scale);
+                let scaled = ws.mul(scale, centred);
+                ws.scale(scaled, 0.5)
+            }
+            None => ws.scale(centred, 0.5),
         };
-        let arg = half_a.asinh();
+        let arg = ws.copy(&half_a);
+        let arg = ws.asinh(arg);
         let shifted = match log_delta {
-            Some(delta) => arg - delta * 2.0,
+            Some(delta) => {
+                let delta = ws.scale(delta, 2.0);
+                ws.sub(arg, delta)
+            }
             None => arg,
         };
         let u = match log_gamma {
-            Some(g) => shifted * (-g).exp(),
+            Some(g) => {
+                let g = ws.neg(g);
+                let factor = ws.exp(g);
+                ws.mul(shifted, factor)
+            }
             None => shifted,
         };
 
-        let mut out = u.sinh() * 2.0;
-        if let Some(nu) = fields.get(self.nu) {
-            out = out + nu;
+        let sinh_u = ws.copy(&u);
+        let sinh_u = ws.sinh(sinh_u);
+        let mut out = ws.scale(sinh_u, 2.0);
+        if let Some(nu) = fields.get(ws, self.nu) {
+            out = ws.add(out, nu);
         }
-        let mut ld = u.log_cosh() - half_a.square().ln_1p() * 0.5;
+        let log_cosh_u = ws.log_cosh(u);
+        let correction = ws.square(half_a);
+        let correction = ws.ln_1p(correction);
+        let correction = ws.scale(correction, 0.5);
+        let mut ld = ws.sub(log_cosh_u, correction);
         if let Some(s) = log_sigma {
-            ld = ld - s;
+            ld = ws.sub(ld, s);
         }
         (out, ld)
     }
@@ -396,38 +519,85 @@ impl Contract2Layer {
 /// 0.5 log1p(q^2)`. `1 / b = 1 + exp(-b_raw)` and
 /// `1 / r = positive(-r_raw)`.
 #[inline(always)]
-fn tangent_sas_inverse<S: Simd, const K: usize>(
+fn tangent_sas_inverse<S: Simd>(
     layer: &TangentSasSpec,
-    fields: &Fields<S, K>,
-    x: Jet<S, K>,
-) -> (Jet<S, K>, Jet<S, K>) {
-    let nu = fields.get_or_zero(layer.nu);
-    let eps = fields.get_or_zero(layer.eps);
-    let b_raw = fields.get_or_zero(layer.b);
-    let r_raw = fields.get_or_zero(layer.r);
+    ws: &mut JetArena<S>,
+    fields: &Fields<S>,
+    x: Jet,
+) -> (Jet, Jet) {
+    let nu = fields.get_or_zero(ws, layer.nu);
+    let eps = fields.get_or_zero(ws, layer.eps);
+    let b_raw = fields.get_or_zero(ws, layer.b);
+    let r_raw = fields.get_or_zero(ws, layer.r);
 
-    let q = (x - nu) * b_raw.sigmoid() * r_raw.positive() * eps.cosh() + eps.sinh();
-    let a = (q.asinh() - eps) * (-r_raw).positive();
-    let out = a.sinh() * ((-b_raw).exp() + 1.0) + nu;
-    let ld = a.log_cosh() + eps.log_cosh() - q.square().ln_1p() * 0.5;
+    // q = (y - nu) * sigmoid(b_raw) * positive(r_raw) * cosh(eps) + sinh(eps)
+    let centred = ws.copy(&nu);
+    let q = ws.sub(x, centred);
+    let factor = ws.copy(&b_raw);
+    let factor = ws.sigmoid(factor);
+    let q = ws.mul(q, factor);
+    let factor = ws.copy(&r_raw);
+    let factor = ws.positive(factor);
+    let q = ws.mul(q, factor);
+    let factor = ws.copy(&eps);
+    let factor = ws.cosh(factor);
+    let q = ws.mul(q, factor);
+    let shift = ws.copy(&eps);
+    let shift = ws.sinh(shift);
+    let q = ws.add(q, shift);
+
+    // a = (asinh(q) - eps) * positive(-r_raw)
+    let a = ws.copy(&q);
+    let a = ws.asinh(a);
+    let shift = ws.copy(&eps);
+    let a = ws.sub(a, shift);
+    let r = ws.neg(r_raw);
+    let r = ws.positive(r);
+    let a = ws.mul(a, r);
+
+    // out = sinh(a) * (exp(-b_raw) + 1) + nu
+    let out = ws.copy(&a);
+    let out = ws.sinh(out);
+    let b = ws.neg(b_raw);
+    let b = ws.exp(b);
+    let b = ws.add_const(b, 1.0);
+    let out = ws.mul(out, b);
+    let out = ws.add(out, nu);
+
+    // ld = log_cosh(a) + log_cosh(eps) - 0.5 log1p(q^2)
+    let ld = ws.log_cosh(a);
+    let eps = ws.log_cosh(eps);
+    let ld = ws.add(ld, eps);
+    let q = ws.square(q);
+    let q = ws.ln_1p(q);
+    let q = ws.scale(q, 0.5);
+    let ld = ws.sub(ld, q);
     (out, ld)
 }
 
 /// `PositiveAffine.inverse_and_log_det`: `x = (y - loc) / scale_mod`, and
 /// `1 / scale_mod = positive(-scale)`.
 #[inline(always)]
-fn positive_affine_inverse<S: Simd, const K: usize>(
+fn positive_affine_inverse<S: Simd>(
     layer: &PositiveAffineSpec,
-    fields: &Fields<S, K>,
-    x: Jet<S, K>,
-) -> (Jet<S, K>, Jet<S, K>) {
-    let centred = match fields.get(layer.loc) {
-        Some(loc) => x - loc,
+    ws: &mut JetArena<S>,
+    fields: &Fields<S>,
+    x: Jet,
+) -> (Jet, Jet) {
+    let centred = match fields.get(ws, layer.loc) {
+        Some(loc) => ws.sub(x, loc),
         None => x,
     };
-    match fields.get(layer.scale) {
-        Some(scale) => (centred * (-scale).positive(), -scale.asinh()),
-        None => (centred, fields.get_or_zero(None)),
+    match fields.get(ws, layer.scale) {
+        Some(scale) => {
+            let factor = ws.copy(&scale);
+            let factor = ws.neg(factor);
+            let factor = ws.positive(factor);
+            let out = ws.mul(centred, factor);
+            let ld = ws.asinh(scale);
+            (out, ws.neg(ld))
+        }
+        None => (centred, fields.get_or_zero(ws, None)),
     }
 }
 
@@ -450,26 +620,30 @@ impl Layer {
 
 /// `T(y; pi)` and `Lambda(y; pi) = log |dT/dy|` of the inverted transformer
 /// chain (each layer's `inverse_and_log_det`, last layer first), as jets in
-/// `z = (y, pi)` along the directions `dirs`.
+/// `z = (y, pi)` along the `k` directions `dirs`, `1 + pi.len()` entries each.
+/// Resets `ws`, so earlier jets in it are invalid afterwards.
 #[simd]
-fn transformer<S: Simd, const K: usize>(
+fn transformer<S: Simd>(
     simd: S,
     layers: &[Layer],
     y: S::f64s,
     pi: &[S::f64s],
-    dirs: &Dirs<S, K>,
-) -> (Jet<S, K>, Jet<S, K>) {
-    let fields = Fields { simd, pi, dirs };
-    let mut x = Jet::variable(simd, y, 0, dirs);
-    let mut log_det = fields.get_or_zero(None);
+    dirs: &[S::f64s],
+    k: usize,
+    ws: &mut JetArena<S>,
+) -> (Jet, Jet) {
+    ws.reset(1 + pi.len(), k);
+    let fields = Fields { pi, dirs };
+    let mut x = ws.variable(y, 0, dirs);
+    let mut log_det = ws.constant(S::f64s::splat(simd, 0.0));
     for layer in layers.iter().rev() {
         let (out, ld) = match layer {
-            Layer::Contract2(layer) => layer.inverse(&fields, x),
-            Layer::TangentSas(layer) => tangent_sas_inverse(layer, &fields, x),
-            Layer::PositiveAffine(layer) => positive_affine_inverse(layer, &fields, x),
+            Layer::Contract2(layer) => layer.inverse(ws, &fields, x),
+            Layer::TangentSas(layer) => tangent_sas_inverse(layer, ws, &fields, x),
+            Layer::PositiveAffine(layer) => positive_affine_inverse(layer, ws, &fields, x),
         };
         x = out;
-        log_det = log_det + ld;
+        log_det = ws.add(log_det, ld);
     }
     (x, log_det)
 }
@@ -599,11 +773,21 @@ struct Scratch<S: Simd> {
     t_bar: Vec<S::f64s>,
     l_bar: Vec<S::f64s>,
     pi_bar: Vec<S::f64s>,
+    jets: JetArena<S>,
+    /// Up to two jet directions, `n_z` entries each.
+    dirs: Vec<S::f64s>,
+    /// The transformer's gradients in `z`, and a pullback's Hessian products
+    /// (see [`FisherResiduals::curvature`]).
+    grad_t: Vec<S::f64s>,
+    grad_l: Vec<S::f64s>,
+    prod_t: Vec<S::f64s>,
+    prod_l: Vec<S::f64s>,
 }
 
 impl<S: Simd> Scratch<S> {
     fn new(simd: S, n_unit: usize, n_par: usize, max_parent: usize) -> Self {
         let zero = S::f64s::splat(simd, 0.0);
+        let n_z = 1 + n_par;
         Self {
             y_parents: Vec::with_capacity(max_parent),
             h: vec![zero; n_unit],
@@ -616,28 +800,25 @@ impl<S: Simd> Scratch<S> {
             t_bar: vec![zero; n_par],
             l_bar: vec![zero; n_par],
             pi_bar: vec![zero; n_par],
+            jets: JetArena::new(simd),
+            dirs: vec![zero; 2 * n_z],
+            grad_t: vec![zero; n_z],
+            grad_l: vec![zero; n_z],
+            prod_t: vec![zero; n_z],
+            prod_l: vec![zero; n_z],
         }
     }
 }
 
-/// Gradients of `T` and `Lambda` in `z = (y, pi)`, and their Hessians'
-/// products with the directions `dir_t` and `dir_l` of a pullback.
-struct Curvature<S: Simd> {
-    grad_t: [S::f64s; N],
-    grad_l: [S::f64s; N],
-    hess_t: [S::f64s; N],
-    hess_l: [S::f64s; N],
-}
-
-/// Where a local pullback gets its [`Curvature`] from.
+/// Where a local pullback gets the transformer's derivatives from.
 enum CurvatureSource<'a, S: Simd> {
     /// A jet pass of the transformer at the variable's own `y`.
     Recompute { y: S::f64s },
     /// Gradients and packed Hessians from [`FisherResiduals::dense_curvature`],
     /// for the many seeds of the exact blocks.
     Dense {
-        grad_t: &'a [S::f64s; N],
-        grad_l: &'a [S::f64s; N],
+        grad_t: &'a [S::f64s],
+        grad_l: &'a [S::f64s],
         hess_t: &'a [S::f64s],
         hess_l: &'a [S::f64s],
     },
@@ -750,6 +931,8 @@ struct BlockScratch<S: Simd> {
     edge_a: Vec<S::f64s>,
     cot_a: Vec<S::f64s>,
     cot_l: Vec<S::f64s>,
+    grad_t: Vec<S::f64s>,
+    grad_l: Vec<S::f64s>,
     hess_t: Vec<S::f64s>,
     hess_l: Vec<S::f64s>,
 }
@@ -807,12 +990,6 @@ impl FisherResiduals {
                     bail!("variable {i} has parent {p}, which does not precede it");
                 }
             }
-        }
-        if n_par + 1 > N {
-            bail!(
-                "the transformer has {n_par} parameters; at most {} are supported",
-                N - 1
-            );
         }
         if location >= n_par {
             bail!("location index {location} out of range for {n_par} parameters");
@@ -1054,11 +1231,11 @@ impl FisherResiduals {
         edge_l: &mut [S::f64s],
         s: &mut Scratch<S>,
     ) -> (S::f64s, S::f64s, S::f64s) {
-        let n_z = 1 + self.n_par;
         let loc = self.location;
         self.conditioner(simd, shape, theta, s);
-        let (x, log_det) = transformer::<S, 0>(simd, &self.layers, y_own, &s.pi, &[]);
-        let (t, l) = (&x.g[1..n_z], &log_det.g[1..n_z]);
+        let (x, log_det) = transformer(simd, &self.layers, y_own, &s.pi, &[], 0, &mut s.jets);
+        let ws = &s.jets;
+        let (t, l) = (&ws.grad(&x)[1..], &ws.grad(&log_det)[1..]);
 
         let skip = &theta[shape.skip()];
         for j in 0..shape.n_parent {
@@ -1071,7 +1248,7 @@ impl FisherResiduals {
             axpy(simd, dot(simd, w2, t) * s.h1[u], w1, edge_a);
             axpy(simd, dot(simd, w2, l) * s.h1[u], w1, edge_l);
         }
-        (x.v, x.g[0], log_det.g[0])
+        (ws.value(&x), ws.grad(&x)[0], ws.grad(&log_det)[0])
     }
 
     /// Variable `i`'s tangents along `v` (its slice). Writes `A`'s and `L`'s
@@ -1103,11 +1280,20 @@ impl FisherResiduals {
         }
         s.pi_dot[loc] += dot(simd, &v[shape.skip()], &s.y_parents);
 
-        let mut dir = [S::f64s::splat(simd, 0.0); N];
-        dir[1..n_z].copy_from_slice(&s.pi_dot);
-        let (x, log_det) = transformer::<S, 1>(simd, &self.layers, y_own, &s.pi, &[dir]);
-        let (t, l) = (&x.g[1..n_z], &log_det.g[1..n_z]);
-        let (t_dot, l_dot) = (&x.h[0][1..n_z], &log_det.h[0][1..n_z]);
+        s.dirs[0] = S::f64s::splat(simd, 0.0);
+        s.dirs[1..n_z].copy_from_slice(&s.pi_dot);
+        let (x, log_det) = transformer(
+            simd,
+            &self.layers,
+            y_own,
+            &s.pi,
+            &s.dirs[..n_z],
+            1,
+            &mut s.jets,
+        );
+        let ws = &s.jets;
+        let (t, l) = (&ws.grad(&x)[1..], &ws.grad(&log_det)[1..]);
+        let (t_dot, l_dot) = (&ws.hess_dir(&x, 0)[1..], &ws.hess_dir(&log_det, 0)[1..]);
 
         let skip = &theta[shape.skip()];
         let skip_dot = &v[shape.skip()];
@@ -1130,30 +1316,35 @@ impl FisherResiduals {
             axpy(simd, alpha_l, w1, edge_l);
             axpy(simd, p_l * h1, w1_dot, edge_l);
         }
-        (dot_lanes(simd, t, &s.pi_dot), x.h[0][0], log_det.h[0][0])
+        (
+            dot_lanes(simd, t, &s.pi_dot),
+            ws.hess_dir(&x, 0)[0],
+            ws.hess_dir(&log_det, 0)[0],
+        )
     }
 
-    /// The transformer's gradients, and Hessian products along `dir_t` (of
-    /// `T`) and `dir_l` (of `Lambda`).
+    /// The transformer's gradients into `s.grad_t` and `s.grad_l`, and its
+    /// Hessian products along the directions in `s.dirs` -- of `T` along the
+    /// first, of `Lambda` along the second -- into `s.prod_t` and `s.prod_l`.
     #[inline(always)]
-    fn curvature<S: Simd>(
-        &self,
-        simd: S,
-        source: &CurvatureSource<S>,
-        pi: &[S::f64s],
-        dir_t: &[S::f64s; N],
-        dir_l: &[S::f64s; N],
-    ) -> Curvature<S> {
+    fn curvature<S: Simd>(&self, simd: S, source: &CurvatureSource<S>, s: &mut Scratch<S>) {
+        let n_z = 1 + self.n_par;
         match source {
             CurvatureSource::Recompute { y } => {
-                let (x, log_det) =
-                    transformer::<S, 2>(simd, &self.layers, *y, pi, &[*dir_t, *dir_l]);
-                Curvature {
-                    grad_t: x.g,
-                    grad_l: log_det.g,
-                    hess_t: x.h[0],
-                    hess_l: log_det.h[1],
-                }
+                let (x, log_det) = transformer(
+                    simd,
+                    &self.layers,
+                    *y,
+                    &s.pi,
+                    &s.dirs[..2 * n_z],
+                    2,
+                    &mut s.jets,
+                );
+                let ws = &s.jets;
+                s.grad_t.copy_from_slice(ws.grad(&x));
+                s.grad_l.copy_from_slice(ws.grad(&log_det));
+                s.prod_t.copy_from_slice(ws.hess_dir(&x, 0));
+                s.prod_l.copy_from_slice(ws.hess_dir(&log_det, 1));
             }
             CurvatureSource::Dense {
                 grad_t,
@@ -1161,17 +1352,10 @@ impl FisherResiduals {
                 hess_t,
                 hess_l,
             } => {
-                let n_z = 1 + self.n_par;
-                let zero = S::f64s::splat(simd, 0.0);
-                let mut out = Curvature {
-                    grad_t: **grad_t,
-                    grad_l: **grad_l,
-                    hess_t: [zero; N],
-                    hess_l: [zero; N],
-                };
-                packed_product(simd, hess_t, &dir_t[..n_z], &mut out.hess_t[..n_z]);
-                packed_product(simd, hess_l, &dir_l[..n_z], &mut out.hess_l[..n_z]);
-                out
+                s.grad_t.copy_from_slice(grad_t);
+                s.grad_l.copy_from_slice(grad_l);
+                packed_product(simd, hess_t, &s.dirs[..n_z], &mut s.prod_t);
+                packed_product(simd, hess_l, &s.dirs[n_z..2 * n_z], &mut s.prod_l);
             }
         }
     }
@@ -1214,15 +1398,14 @@ impl FisherResiduals {
 
         // `T` along `(delta_bar, t_bar)` and `Lambda` along `(mu_bar,
         // l_bar)`: every second-order path into `pi` at once.
-        let (mut dir_t, mut dir_l) = ([zero; N], [zero; N]);
-        dir_t[0] = cot.delta;
-        dir_t[1..n_z].copy_from_slice(&s.t_bar);
-        dir_l[0] = cot.mu;
-        dir_l[1..n_z].copy_from_slice(&s.l_bar);
-        let curvature = self.curvature(simd, source, &s.pi, &dir_t, &dir_l);
-        let (t, l) = (&curvature.grad_t[1..n_z], &curvature.grad_l[1..n_z]);
+        s.dirs[0] = cot.delta;
+        s.dirs[1..n_z].copy_from_slice(&s.t_bar);
+        s.dirs[n_z] = cot.mu;
+        s.dirs[n_z + 1..2 * n_z].copy_from_slice(&s.l_bar);
+        self.curvature(simd, source, s);
+        let (t, l) = (&s.grad_t[1..], &s.grad_l[1..]);
         for m in 0..self.n_par {
-            s.pi_bar[m] = cot.x * t[m] + curvature.hess_t[1 + m] + curvature.hess_l[1 + m];
+            s.pi_bar[m] = cot.x * t[m] + s.prod_t[1 + m] + s.prod_l[1 + m];
         }
 
         for u in 0..shape.n_unit {
@@ -1252,43 +1435,57 @@ impl FisherResiduals {
         axpy_lanes(simd, s.pi_bar[loc], &s.y_parents, g_skip);
     }
 
-    /// The transformer's gradients in `z = (y, pi)`, and its full Hessians as
-    /// packed lower triangles, from `ceil((1 + n_par) / 2)` jet passes.
+    /// The transformer's gradients in `z = (y, pi)`, at `y` and `s.pi`, and its
+    /// full Hessians as packed lower triangles, from `ceil((1 + n_par) / 2)`
+    /// jet passes.
     #[simd]
+    #[allow(clippy::too_many_arguments)]
     fn dense_curvature<S: Simd>(
         &self,
         simd: S,
         y: S::f64s,
-        pi: &[S::f64s],
+        s: &mut Scratch<S>,
+        grad_t: &mut [S::f64s],
+        grad_l: &mut [S::f64s],
         hess_t: &mut [S::f64s],
         hess_l: &mut [S::f64s],
-    ) -> ([S::f64s; N], [S::f64s; N]) {
+    ) {
         let n_z = 1 + self.n_par;
         let zero = S::f64s::splat(simd, 0.0);
-        let mut grads = ([zero; N], [zero; N]);
         for first in (0..n_z).step_by(2) {
-            let mut dirs = [[zero; N]; 2];
-            for (k, dir) in dirs.iter_mut().enumerate() {
-                if first + k < n_z {
-                    dir[first + k] = S::f64s::splat(simd, 1.0);
+            let dirs = &mut s.dirs[..2 * n_z];
+            dirs.fill(zero);
+            for d in 0..2 {
+                if first + d < n_z {
+                    dirs[d * n_z + first + d] = S::f64s::splat(simd, 1.0);
                 }
             }
-            let (x, log_det) = transformer::<S, 2>(simd, &self.layers, y, pi, &dirs);
-            for k in 0..2 {
-                let column = first + k;
+            let (x, log_det) = transformer(
+                simd,
+                &self.layers,
+                y,
+                &s.pi,
+                &s.dirs[..2 * n_z],
+                2,
+                &mut s.jets,
+            );
+            let ws = &s.jets;
+            for d in 0..2 {
+                let column = first + d;
                 if column >= n_z {
                     continue;
                 }
+                let (h_t, h_l) = (ws.hess_dir(&x, d), ws.hess_dir(&log_det, d));
                 // Row `r >= column` of the lower triangle.
                 for r in column..n_z {
                     let index = packed_len(r) + column;
-                    hess_t[index] = x.h[k][r];
-                    hess_l[index] = log_det.h[k][r];
+                    hess_t[index] = h_t[r];
+                    hess_l[index] = h_l[r];
                 }
             }
-            grads = (x.g, log_det.g);
+            grad_t.copy_from_slice(ws.grad(&x));
+            grad_l.copy_from_slice(ws.grad(&log_det));
         }
-        grads
     }
 
     // ------------------------------------------------------------ global sweeps
@@ -1762,6 +1959,8 @@ impl FisherResiduals {
                     edge_a: Vec::with_capacity(self.max_parent),
                     cot_a: Vec::with_capacity(self.max_parent),
                     cot_l: Vec::with_capacity(self.max_parent),
+                    grad_t: vec![zero; n_z],
+                    grad_l: vec![zero; n_z],
                     hess_t: vec![zero; packed_len(n_z)],
                     hess_l: vec![zero; packed_len(n_z)],
                 },
@@ -1803,6 +2002,8 @@ impl FisherResiduals {
             edge_a,
             cot_a,
             cot_l,
+            grad_t,
+            grad_l,
             hess_t,
             hess_l,
         } = b;
@@ -1820,10 +2021,10 @@ impl FisherResiduals {
         let delta_i = self.tile_value(simd, &tape.delta, n_var, tile, i);
 
         self.conditioner(simd, shape, theta, s);
-        let (grad_t, grad_l) = self.dense_curvature(simd, y_own, &s.pi, hess_t, hess_l);
+        self.dense_curvature(simd, y_own, s, grad_t, grad_l, hess_t, hess_l);
         let source = CurvatureSource::Dense {
-            grad_t: &grad_t,
-            grad_l: &grad_l,
+            grad_t,
+            grad_l,
             hess_t,
             hess_l,
         };
