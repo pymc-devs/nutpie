@@ -1658,6 +1658,7 @@ def make_transformer(
     asymmetric_transformer=True,
     log_gamma_bounds=None,
     tangent_sas_transformer=0,
+    tangent_sas_fix_b=False,
 ):
     """Elementwise transformer as a chain of the requested layers.
 
@@ -1705,6 +1706,8 @@ def make_transformer(
             ``high`` reach ``n * high`` overall.
         tangent_sas_transformer: Number of `TangentSAS` layers. If nonzero,
             they are followed by a `PositiveAffine`, which holds the location.
+        tangent_sas_fix_b: Fix every `TangentSAS` layer's ``b`` at 1/2
+            instead of fitting it.
 
     Returns:
         An `ElementwiseTransformer`, whose location is the last layer's output
@@ -1782,7 +1785,7 @@ def make_transformer(
                 TangentSAS(
                     nu=jnp.zeros(()),
                     eps=jnp.zeros(()),
-                    b=jnp.zeros(()),
+                    b=None if tangent_sas_fix_b else jnp.zeros(()),
                     r=jnp.zeros(()),
                 )
             )
@@ -2200,6 +2203,7 @@ def make_sparse_triangular_map(
     contract_transformer=False,
     asymmetric_transformer=False,
     tangent_sas_transformer=0,
+    tangent_sas_fix_b=False,
     feature_degree=None,
 ):
     """Build a `SparseTriangularMap` bijection for the given ordering.
@@ -2236,10 +2240,10 @@ def make_sparse_triangular_map(
         location_skip: Linear map from each variable's parents straight to
             its transformer location, see `SparseTriangularMap`.
         affine_transformer, contract_transformer, asymmetric_transformer,
-        tangent_sas_transformer:
-            Layer counts of the elementwise transformer, see
-            `make_transformer`. If all are zero, `SparseTriangularMap`'s own
-            default transformer is used.
+        tangent_sas_transformer, tangent_sas_fix_b:
+            The elementwise transformer, see `make_transformer`. If all
+            counts are zero, `SparseTriangularMap`'s own default transformer
+            is used.
         feature_degree: Degree of the `HermiteFeatures` the conditioners see
             instead of the raw parents, see `SparseTriangularMap`. None for
             the raw parents.
@@ -2281,6 +2285,7 @@ def make_sparse_triangular_map(
             contract_transformer=contract_transformer,
             asymmetric_transformer=asymmetric_transformer,
             tangent_sas_transformer=tangent_sas_transformer,
+            tangent_sas_fix_b=tangent_sas_fix_b,
         )
 
     layer = SparseTriangularMap(
@@ -2506,6 +2511,7 @@ def make_flow(
     contract_transformer=False,
     asymmetric_transformer=False,
     tangent_sas_transformer=0,
+    tangent_sas_fix_b=False,
     sandwich_householder=False,
     activation=None,
     reuse_embed=False,
@@ -2667,6 +2673,7 @@ def make_flow(
             contract_transformer=contract_transformer,
             asymmetric_transformer=asymmetric_transformer,
             tangent_sas_transformer=tangent_sas_transformer,
+            tangent_sas_fix_b=tangent_sas_fix_b,
             feature_degree=feature_degree,
             n_buckets=n_buckets,
         )

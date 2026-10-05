@@ -244,6 +244,7 @@ def test_location_skip_can_be_disabled():
         (32, 1, {}),
         (4, None, dict(tangent_sas_transformer=2)),
         (4, None, dict(contract_transformer=1, tangent_sas_transformer=1)),
+        (4, None, dict(tangent_sas_transformer=2, tangent_sas_fix_b=True)),
     ],
 )
 def test_native_flow_transform_matches_jax(
