@@ -33,6 +33,7 @@ def _setup(
     blanket="banded",
     bounds=None,
     tangent_sas=0,
+    fix_b=False,
     dim=7,
     n_draw=5,
     seed=0,
@@ -44,6 +45,7 @@ def _setup(
         asymmetric_transformer=False,
         log_gamma_bounds=bounds,
         tangent_sas_transformer=tangent_sas,
+        tangent_sas_fix_b=fix_b,
     )
     tmap = SparseTriangularMap(
         jax.random.key(seed),
@@ -110,6 +112,7 @@ CASES = [
     {"bounds": (-1.0, 1.0)},
     {"tangent_sas": 2},
     {"tangent_sas": 3, "blanket": "random"},
+    {"tangent_sas": 2, "fix_b": True},
 ]
 
 
