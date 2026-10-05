@@ -8,7 +8,22 @@ if find_spec("flowjax") is None:
 import jax
 import numpy as np
 
-from nutpie.normalizing_flow import SparseTriangularMap
+from nutpie.normalizing_flow import make_sparse_triangular_map
+
+
+def _triangular_map(key, order, blanket, nn_width):
+    """A sparse triangular map in `order`, with random conditioners so that
+    every allowed dependency is actually there."""
+    return make_sparse_triangular_map(
+        key,
+        len(order),
+        order=order,
+        sparsity=blanket,
+        zero_init=False,
+        nn_width=nn_width,
+        nn_depth=1,
+        activation=jax.nn.gelu,
+    )
 
 
 def _allowed_pairs(order, blanket):
@@ -33,9 +48,7 @@ def test_sparse_triangular_round_trip_and_log_det():
     blanket = rng.random((dim, dim)) < 0.3
     np.fill_diagonal(blanket, False)
 
-    bij = SparseTriangularMap(
-        jax.random.key(0), order=order, blanket=blanket, nn_width=8, nn_depth=1
-    )
+    bij = _triangular_map(jax.random.key(0), order, blanket, nn_width=8)
 
     x = jax.random.normal(jax.random.key(1), (dim,))
 
@@ -55,9 +68,7 @@ def test_sparse_triangular_respects_sparsity_pattern():
     blanket = rng.random((dim, dim)) < 0.3
     np.fill_diagonal(blanket, False)
 
-    bij = SparseTriangularMap(
-        jax.random.key(2), order=order, blanket=blanket, nn_width=8, nn_depth=1
-    )
+    bij = _triangular_map(jax.random.key(2), order, blanket, nn_width=8)
 
     x = jax.random.normal(jax.random.key(3), (dim,))
 
@@ -79,9 +90,7 @@ def test_sparse_triangular_empty_blanket_is_elementwise():
     order = np.arange(dim)
     blanket = np.zeros((dim, dim), dtype=bool)
 
-    bij = SparseTriangularMap(
-        jax.random.key(4), order=order, blanket=blanket, nn_width=4, nn_depth=1
-    )
+    bij = _triangular_map(jax.random.key(4), order, blanket, nn_width=4)
 
     x = jax.random.normal(jax.random.key(5), (dim,))
     jac = np.asarray(jax.jacfwd(lambda x: bij.transform_and_log_det(x)[0])(x))
