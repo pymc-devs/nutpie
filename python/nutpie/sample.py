@@ -520,11 +520,12 @@ def _add_arrow_data(data_dict, max_length, batch, chain, n_chains, dims, skip_va
 _progress_style = """
 <style>
     :root {
-        --column-width-1: 40%; /* Progress column width */
-        --column-width-2: 15%; /* Chain column width */
-        --column-width-3: 15%; /* Divergences column width */
-        --column-width-4: 15%; /* Step Size column width */
-        --column-width-5: 15%; /* Gradients/Draw column width */
+        --column-width-1: 35%; /* Progress column width */
+        --column-width-2: 13%; /* Chain column width */
+        --column-width-3: 13%; /* Divergences column width */
+        --column-width-4: 13%; /* Step Size column width */
+        --column-width-5: 13%; /* Gradients/Draw column width */
+        --column-width-6: 13%; /* Log Fisher column width */
     }
 
     .nutpie {
@@ -556,6 +557,7 @@ _progress_style = """
     .nutpie th:nth-child(3) { width: var(--column-width-3); }
     .nutpie th:nth-child(4) { width: var(--column-width-4); }
     .nutpie th:nth-child(5) { width: var(--column-width-5); }
+    .nutpie th:nth-child(6) { width: var(--column-width-6); }
 
     .nutpie progress {
         width: 100%;
@@ -635,6 +637,7 @@ _progress_template = """
                 <th>Divergences</th>
                 <th>Step Size</th>
                 <th>Gradients/Draw</th>
+                <th>Log Fisher</th>
             </tr>
         </thead>
         <tbody id="chain-details">
@@ -649,7 +652,8 @@ _progress_template = """
                     <td>{{ chain.finished_draws }}</td>
                     <td>{{ chain.divergences }}</td>
                     <td>{{ chain.step_size }}</td>
-                    <td>{{ chain.latest_num_steps }}</td>
+                    <td>{{ chain.latest_num_gradients }}</td>
+                    <td>{{ chain.log_fisher_distance }}</td>
                 </tr>
             {% endfor %}
             </tr>
@@ -1289,6 +1293,11 @@ def sample(
         - ``started`` – whether the chain has started
         - ``latest_num_steps`` – leapfrog steps in the last trajectory
         - ``total_num_steps`` – cumulative leapfrog steps
+        - ``latest_num_gradients`` – gradient evaluations in the last
+          trajectory (differs from the steps with WALNUTS)
+        - ``total_num_gradients`` – cumulative gradient evaluations
+        - ``fisher_distance`` – ``‖z + ∇z‖²`` of the last draw in the
+          transformed space, a single-draw Fisher divergence estimate
         - ``step_size`` – current step size
         - ``runtime_ms`` – wall-clock time spent sampling (milliseconds)
         - ``divergent_draws`` – list of draw indices that diverged

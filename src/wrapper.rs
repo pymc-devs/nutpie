@@ -101,6 +101,21 @@ impl PyChainProgress {
     }
 
     #[getter]
+    fn latest_num_gradients(&self) -> usize {
+        self.0.latest_num_gradients
+    }
+
+    #[getter]
+    fn total_num_gradients(&self) -> usize {
+        self.0.total_num_gradients
+    }
+
+    #[getter]
+    fn fisher_distance(&self) -> f64 {
+        self.0.fisher_distance
+    }
+
+    #[getter]
     fn step_size(&self) -> f64 {
         self.0.step_size
     }
