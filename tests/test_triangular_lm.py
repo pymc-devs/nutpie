@@ -28,11 +28,22 @@ def _blanket(dim, kind, rng):
     return blanket
 
 
-def _setup(nn_width=3, blanket="banded", bounds=None, dim=7, n_draw=5, seed=0):
+def _setup(
+    nn_width=3,
+    blanket="banded",
+    bounds=None,
+    tangent_sas=0,
+    dim=7,
+    n_draw=5,
+    seed=0,
+):
     jax.config.update("jax_enable_x64", True)
     rng = np.random.default_rng(seed)
     transformer = make_transformer(
-        contract_transformer=2, asymmetric_transformer=False, log_gamma_bounds=bounds
+        contract_transformer=0 if tangent_sas else 2,
+        asymmetric_transformer=False,
+        log_gamma_bounds=bounds,
+        tangent_sas_transformer=tangent_sas,
     )
     tmap = SparseTriangularMap(
         jax.random.key(seed),
@@ -97,6 +108,8 @@ CASES = [
     {"nn_width": 0},
     {"blanket": "random"},
     {"bounds": (-1.0, 1.0)},
+    {"tangent_sas": 2},
+    {"tangent_sas": 3, "blanket": "random"},
 ]
 
 

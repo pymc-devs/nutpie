@@ -7,23 +7,37 @@ Plain float64 numpy.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
+from typing import ClassVar
 
 import numpy as np
 
-__all__ = ["Contract2Spec", "TriangularLayout", "extract_layout"]
+__all__ = [
+    "Contract2Spec",
+    "PositiveAffineSpec",
+    "TangentSASSpec",
+    "TriangularLayout",
+    "extract_layout",
+    "transformer_dicts",
+]
 
 
-_FIELDS = ("alpha", "beta", "sigma", "mu", "nu")
-
-# Rough cost of one `Contract2` layer, in multiply-adds, for scheduling.
+# Rough cost of one transformer layer, in multiply-adds, for scheduling.
 _TRANSFORMER_WORK_PER_LAYER = 100
+
+
+# Each spec field is `None` or ``(index, offset)``, meaning
+# ``field = conditioner_output[index] + offset``. `kind` is the tag the Rust
+# side dispatches on, and `FIELDS` lists the probed fields.
 
 
 @dataclass(frozen=True)
 class Contract2Spec:
-    """One `Contract2` layer. Each field is `None` or ``(index, offset)``,
-    meaning ``field = conditioner_output[index] + offset``."""
+    """One `Contract2` layer."""
+
+    kind: ClassVar[str] = "contract2"
+    FIELDS: ClassVar[tuple[str, ...]] = ("alpha", "beta", "sigma", "mu", "nu")
 
     alpha: tuple[int, float] | None
     beta: tuple[int, float] | None
@@ -31,6 +45,51 @@ class Contract2Spec:
     mu: tuple[int, float] | None
     nu: tuple[int, float] | None
     log_gamma_bounds: tuple[float, float] | None
+
+
+@dataclass(frozen=True)
+class TangentSASSpec:
+    """One `TangentSAS` layer."""
+
+    kind: ClassVar[str] = "tangent_sas"
+    FIELDS: ClassVar[tuple[str, ...]] = ("nu", "eps", "b", "r")
+
+    nu: tuple[int, float] | None
+    eps: tuple[int, float] | None
+    b: tuple[int, float] | None
+    r: tuple[int, float] | None
+
+
+@dataclass(frozen=True)
+class PositiveAffineSpec:
+    """One `PositiveAffine` layer."""
+
+    kind: ClassVar[str] = "positive_affine"
+    FIELDS: ClassVar[tuple[str, ...]] = ("loc", "scale")
+
+    loc: tuple[int, float] | None
+    scale: tuple[int, float] | None
+
+
+def transformer_dicts(specs) -> list[dict]:
+    """`specs` as the dicts the Rust constructors deserialize."""
+    out = []
+    for spec in specs:
+        layer = {"kind": spec.kind}
+        for field in dataclasses.fields(spec):
+            value = getattr(spec, field.name)
+            if field.name in spec.FIELDS:
+                # Rust's `Param` is a struct, so pass (index, offset) as a map.
+                value = (
+                    None
+                    if value is None
+                    else {"index": int(value[0]), "offset": float(value[1])}
+                )
+            elif isinstance(value, tuple):
+                value = list(value)
+            layer[field.name] = value
+        out.append(layer)
+    return out
 
 
 @dataclass(frozen=True)
@@ -69,7 +128,7 @@ class TriangularLayout:
     feature_degree: int
     feature_params: np.ndarray
     activation: str
-    transformer: tuple[Contract2Spec, ...]
+    transformer: tuple[Contract2Spec | TangentSASSpec | PositiveAffineSpec, ...]
     level_ptr: np.ndarray
     level_vars: np.ndarray
     level_work: np.ndarray
@@ -119,10 +178,16 @@ def _is_identity(fn) -> bool:
 
 
 def _chain_layers(transformer):
-    """The `Contract2` layers of a transformer, as a list of field dicts."""
+    """The layers of a transformer, as ``(spec class, field values, extra
+    spec arguments)``."""
     from flowjax import bijections
 
-    from nutpie.normalizing_flow import Contract2, ElementwiseTransformer
+    from nutpie.normalizing_flow import (
+        Contract2,
+        ElementwiseTransformer,
+        PositiveAffine,
+        TangentSAS,
+    )
 
     if isinstance(transformer, ElementwiseTransformer):
         transformer = transformer.chain
@@ -133,21 +198,28 @@ def _chain_layers(transformer):
 
     out = []
     for layer in layers:
-        if not isinstance(layer, Contract2):
+        if isinstance(layer, Contract2):
+            spec, extra = Contract2Spec, {"log_gamma_bounds": layer.log_gamma_bounds}
+        elif isinstance(layer, TangentSAS):
+            spec, extra = TangentSASSpec, {}
+        elif isinstance(layer, PositiveAffine):
+            spec, extra = PositiveAffineSpec, {}
+        else:
             raise NotImplementedError(
                 "The compiled transforms only support transformers built from "
-                f"`Contract2` layers, got {type(layer).__name__}."
+                "`Contract2`, `TangentSAS` and `PositiveAffine` layers, got "
+                f"{type(layer).__name__}."
             )
         values = {}
-        for field in _FIELDS:
+        for field in spec.FIELDS:
             value = getattr(layer, field)
             values[field] = None if value is None else float(np.asarray(value))
-        out.append((values, layer.log_gamma_bounds))
+        out.append((spec, values, extra))
     return out
 
 
 def _probe_transformer(constructor, num_params):
-    """Recover which flat conditioner output feeds which `Contract2` field.
+    """Recover which flat conditioner output feeds which transformer field.
 
     `get_ravelled_pytree_constructor` gives a closure ``p -> unravel(p + init)``;
     the mapping from flat index to field is an implementation detail of the
@@ -163,12 +235,14 @@ def _probe_transformer(constructor, num_params):
 
     index_map = [
         {field: (None, value) for field, value in values.items() if value is not None}
-        for values, _bounds in base
+        for _spec, values, _extra in base
     ]
 
     for k in range(num_params):
         probed = _chain_layers(constructor(zeros.at[k].set(1.0)))
-        for layer, ((values, _), (base_values, _)) in enumerate(zip(probed, base)):
+        for layer, ((_, values, _), (_, base_values, _)) in enumerate(
+            zip(probed, base)
+        ):
             for field, value in values.items():
                 if value is None:
                     continue
@@ -189,18 +263,18 @@ def _probe_transformer(constructor, num_params):
                 index_map[layer][field] = (k, base_values[field])
 
     specs = []
-    for layer, (fields, (_values, bounds)) in enumerate(zip(index_map, base)):
+    for layer, (fields, (spec, _values, extra)) in enumerate(zip(index_map, base)):
         for field, (index, _offset) in fields.items():
             if index is None:
                 raise NotImplementedError(
                     f"Transformer field {field!r} of layer {layer} is not "
                     "driven by any conditioner output."
                 )
+        bounds = extra.get("log_gamma_bounds")
+        if bounds is not None:
+            extra = {**extra, "log_gamma_bounds": tuple(map(float, bounds))}
         specs.append(
-            Contract2Spec(
-                **{field: fields.get(field) for field in _FIELDS},
-                log_gamma_bounds=None if bounds is None else tuple(map(float, bounds)),
-            )
+            spec(**{field: fields.get(field) for field in spec.FIELDS}, **extra)
         )
     return tuple(specs)
 

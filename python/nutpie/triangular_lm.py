@@ -40,7 +40,8 @@ __all__ = [
 def check_supported(tmap):
     """Raise `NotImplementedError` unless the Rust residuals support `tmap`:
     depth-1 softplus conditioners with the location skip, no parent features,
-    and a `Contract2` transformer."""
+    and a transformer of `Contract2`, `TangentSAS` and `PositiveAffine`
+    layers."""
     import jax
 
     from nutpie.triangular import LocationSkipMlp
@@ -152,28 +153,11 @@ def map_data(flow, draws, grads):
     return tmap, np.asarray(y, dtype=np.float64), np.asarray(g, dtype=np.float64)
 
 
-def _transformer_dicts(specs):
-    out = []
-    for contract in specs:
-        layer = {}
-        for field in ("alpha", "beta", "sigma", "mu", "nu"):
-            entry = getattr(contract, field)
-            layer[field] = (
-                None
-                if entry is None
-                else {"index": int(entry[0]), "offset": float(entry[1])}
-            )
-        bounds = contract.log_gamma_bounds
-        layer["log_gamma_bounds"] = None if bounds is None else list(bounds)
-        out.append(layer)
-    return out
-
-
 def make_residuals(tmap, y=None, g=None, *, fisher_regularization=None):
     """A `FisherResiduals` for `tmap` (unwrapped), with data `y`, `g` if
     given (see `map_data`)."""
     from nutpie._lib import FisherResiduals
-    from nutpie.triangular_layout import _probe_transformer
+    from nutpie.triangular_layout import _probe_transformer, transformer_dicts
 
     check_supported(tmap)
     (dim,) = tmap.shape
@@ -195,7 +179,7 @@ def make_residuals(tmap, y=None, g=None, *, fisher_regularization=None):
         n_unit=n_unit,
         n_par=n_par,
         location_index=int(tmap.conditioners[0].location_index),
-        transformer=_transformer_dicts(specs),
+        transformer=transformer_dicts(specs),
         fisher_regularization=fisher_regularization,
     )
     if y is not None:
