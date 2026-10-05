@@ -1043,6 +1043,14 @@ pub(crate) struct FisherResiduals {
     /// inverse is stored. Equal to the parents for a chordal pattern.
     filled_indptr: Vec<usize>,
     filled_index: Vec<usize>,
+    /// Where the selected inverse's reads sit in its store, so the per-tile
+    /// loops need no searches. For Takahashi's recurrence, per variable `i`:
+    /// `Sigma[p, j]` for each filled `j` and parent `p`, then `Sigma[i, p]`
+    /// for each parent `p`.
+    takahashi_offset: Vec<u32>,
+    /// Per variable `i`, `K = Sigma` on `{i} + P(i)`, row-major.
+    k_offset_indptr: Vec<usize>,
+    k_offset: Vec<u32>,
     pub(crate) n_draw: usize,
     n_tile: usize,
     /// `(n_tile, n_var, width)`, see [`Tape`].
@@ -1133,6 +1141,39 @@ impl FisherResiduals {
             filled_indptr[i + 1] = filled_index.len();
         }
 
+        // A store holds the diagonal, then one slot per entry of
+        // `filled_index`.
+        if u32::try_from(n_var + filled_index.len()).is_err() {
+            bail!("the selected inverse has too many entries");
+        }
+        let store_offset = |a: usize, b: usize| -> u32 {
+            if a == b {
+                return a as u32;
+            }
+            let (row, col) = (a.max(b), a.min(b));
+            let start = filled_indptr[row];
+            let k = filled_index[start..filled_indptr[row + 1]]
+                .binary_search(&col)
+                .expect("selected inverse entry outside the filled pattern");
+            (n_var + start + k) as u32
+        };
+        let mut takahashi_offset = Vec::new();
+        let mut k_offset_indptr = vec![0usize; n_var + 1];
+        let mut k_offset = Vec::new();
+        for i in 0..n_var {
+            let parents = &parent_index[parent_indptr[i]..parent_indptr[i + 1]];
+            for &j in &filled_index[filled_indptr[i]..filled_indptr[i + 1]] {
+                takahashi_offset.extend(parents.iter().map(|&p| store_offset(p, j)));
+            }
+            takahashi_offset.extend(parents.iter().map(|&p| store_offset(i, p)));
+
+            let index = || std::iter::once(i).chain(parents.iter().copied());
+            for r in index() {
+                k_offset.extend(index().map(|c| store_offset(r, c)));
+            }
+            k_offset_indptr[i + 1] = k_offset.len();
+        }
+
         let level = Level::new();
         Ok(Self {
             level,
@@ -1149,6 +1190,9 @@ impl FisherResiduals {
             regularization: fisher_regularization.map(f64::sqrt),
             filled_indptr,
             filled_index,
+            takahashi_offset,
+            k_offset_indptr,
+            k_offset,
             n_draw: 0,
             n_tile: 0,
             y: Vec::new(),
@@ -1915,36 +1959,24 @@ impl FisherResiduals {
     ) {
         let zero = S::f64s::splat(simd, 0.0);
         let one = S::f64s::splat(simd, 1.0);
+        let mut offsets = self.takahashi_offset.as_slice();
+        let mut combine = |edges: std::ops::Range<usize>, store: &[S::f64s]| {
+            let (head, rest) = offsets.split_at(edges.len());
+            offsets = rest;
+            let mut acc = zero;
+            for (e, &offset) in edges.zip(head) {
+                acc += edge_a[e] * store[offset as usize];
+            }
+            acc
+        };
         for i in 0..self.n_var {
-            let filled = self.filled_indptr[i]..self.filled_indptr[i + 1];
-            for slot in filled {
-                let j = self.filled_index[slot];
-                let mut acc = zero;
-                for e in self.edges(i) {
-                    acc += edge_a[e] * self.sigma(store, self.parent_index[e], j);
-                }
+            for slot in self.filled_indptr[i]..self.filled_indptr[i + 1] {
+                let acc = combine(self.edges(i), store);
                 store[self.n_var + slot] = -acc / delta[i];
             }
-            let mut acc = zero;
-            for e in self.edges(i) {
-                acc += edge_a[e] * self.sigma(store, i, self.parent_index[e]);
-            }
+            let acc = combine(self.edges(i), store);
             store[i] = (one / delta[i] - acc) / delta[i];
         }
-    }
-
-    #[inline(always)]
-    fn sigma<V: Copy>(&self, store: &[V], a: usize, b: usize) -> V {
-        if a == b {
-            return store[a];
-        }
-        let (row, col) = if a > b { (a, b) } else { (b, a) };
-        let start = self.filled_indptr[row];
-        let filled = &self.filled_index[start..self.filled_indptr[row + 1]];
-        let k = filled
-            .binary_search(&col)
-            .expect("selected inverse entry outside the filled pattern");
-        store[self.n_var + start + k]
     }
 
     /// Exact Gauss-Newton blocks, `sum_draws (dr/dtheta_i)^T (dr/dtheta_i) /
@@ -2255,9 +2287,7 @@ impl FisherResiduals {
             .collect();
 
         let mut k_mat = Mat::<f64>::zeros(n_s, n_s);
-        let mut index = Vec::with_capacity(n_s);
-        index.push(i);
-        index.extend_from_slice(&self.parent_index[self.edges(i)]);
+        let k_offset = &self.k_offset[self.k_offset_indptr[i]..self.k_offset_indptr[i + 1]];
 
         // `G += P Q^T` over batches of draws, with the columns of `P` each
         // draw's `B'` and scaled score rows, and those of `Q` the matching
@@ -2287,7 +2317,7 @@ impl FisherResiduals {
                 // K = Sigma on {i} + P(i), and K B' (as columns, B' K).
                 for r in 0..n_s {
                     for c in 0..n_s {
-                        k_mat[(r, c)] = self.sigma(store, index[r], index[c])[lane];
+                        k_mat[(r, c)] = store[k_offset[r * n_s + c] as usize][lane];
                     }
                 }
                 matmul(
