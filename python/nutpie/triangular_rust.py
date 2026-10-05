@@ -32,11 +32,13 @@ To pull the model gradient back, record the sparse Jacobian on the way::
 
 from __future__ import annotations
 
-import dataclasses
-
 import numpy as np
 
-from nutpie.triangular_layout import TriangularLayout, extract_layout
+from nutpie.triangular_layout import (
+    TriangularLayout,
+    extract_layout,
+    transformer_dicts,
+)
 
 __all__ = [
     "DEFAULT_MIN_PARALLEL_WORK",
@@ -142,22 +144,7 @@ def _transform_kwargs(layout, schedule, min_parallel_work):
     if schedule not in SCHEDULES:
         raise ValueError(f"schedule must be one of {SCHEDULES}, got {schedule!r}.")
 
-    transformer = [
-        {
-            field.name: list(value) if isinstance(value, tuple) else value
-            for field, value in (
-                (field, getattr(contract, field.name))
-                for field in dataclasses.fields(contract)
-            )
-        }
-        for contract in layout.transformer
-    ]
-    # Rust's `Param` is a struct, so pass (index, offset) as a map.
-    for layer in transformer:
-        for field in ("alpha", "beta", "sigma", "mu", "nu"):
-            entry = layer[field]
-            if entry is not None:
-                layer[field] = {"index": int(entry[0]), "offset": float(entry[1])}
+    transformer = transformer_dicts(layout.transformer)
 
     return {
         "parent_indptr": np.asarray(layout.parent_indptr, dtype=np.int64),

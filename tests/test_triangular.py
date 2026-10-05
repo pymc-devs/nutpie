@@ -25,6 +25,10 @@ def _banded(dim):
         None,
         # Affine only, located at its `loc`.
         dict(affine_transformer=1, contract_transformer=0, asymmetric_transformer=0),
+        # Tangent SAS, located at the trailing `PositiveAffine`'s `loc`.
+        dict(
+            contract_transformer=0, asymmetric_transformer=0, tangent_sas_transformer=2
+        ),
     ],
 )
 def test_location_skip_is_the_conditional_mean(transformer_kwargs):
@@ -229,18 +233,22 @@ def test_location_skip_can_be_disabled():
 
 
 @pytest.mark.parametrize(
-    ("nn_width", "feature_degree"),
+    ("nn_width", "feature_degree", "transformer_kwargs"),
     [
-        (4, None),
-        (0, None),
+        (4, None, {}),
+        (0, None, {}),
         # More than one SIMD block of hidden units: exercised the forward
         # kernel's blocked loop on the parentless first variable.
-        (32, None),
-        (4, 3),
-        (32, 1),
+        (32, None, {}),
+        (4, 3, {}),
+        (32, 1, {}),
+        (4, None, dict(tangent_sas_transformer=2)),
+        (4, None, dict(contract_transformer=1, tangent_sas_transformer=1)),
     ],
 )
-def test_native_flow_transform_matches_jax(nn_width, feature_degree):
+def test_native_flow_transform_matches_jax(
+    nn_width, feature_degree, transformer_kwargs
+):
     """The sampler's native leapfrog transform against the JAX bijection: the
     whole `make_flow(kind="triangular")` flow -- permutation, map and affine --
     forward, log det, and the gradient pulled back with a unit log det
@@ -271,6 +279,7 @@ def test_native_flow_transform_matches_jax(nn_width, feature_degree):
         zero_init=False,
         feature_degree=feature_degree,
         n_buckets=2,
+        **transformer_kwargs,
     )
     # Off the initialization, so every parameter matters.
     params, static = eqx.partition(bijection, eqx.is_inexact_array)
@@ -323,3 +332,29 @@ def test_native_flow_transform_diagonal_flow():
     np.testing.assert_allclose(
         native.pullback(grad_y), np.asarray(grad_z_ref), rtol=1e-12
     )
+
+
+def test_tangent_sas():
+    """Identity at zero, ``S(0) = 0`` and ``S'(0) = 1`` at any parameters,
+    the inverse, and both log dets against autodiff."""
+    from nutpie.normalizing_flow import TangentSAS
+
+    jax.config.update("jax_enable_x64", True)
+    zero = TangentSAS(0.0, 0.0, 0.0, 0.0)
+    x = jnp.linspace(-30.0, 30.0, 13)
+    y, log_det = jax.vmap(zero.transform_and_log_det)(x)
+    np.testing.assert_allclose(y, x, rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(log_det, 0.0, atol=1e-12)
+
+    layer = TangentSAS(0.7, -0.4, 1.3, -0.6)
+    centre, slope = jax.value_and_grad(layer.transform)(jnp.asarray(0.7))
+    np.testing.assert_allclose(centre, 0.7, rtol=1e-12)
+    np.testing.assert_allclose(slope, 1.0, rtol=1e-12)
+
+    y, log_det = jax.vmap(layer.transform_and_log_det)(x)
+    np.testing.assert_allclose(
+        log_det, jnp.log(jax.vmap(jax.grad(layer.transform))(x)), rtol=1e-10
+    )
+    x_back, inverse_log_det = jax.vmap(layer.inverse_and_log_det)(y)
+    np.testing.assert_allclose(x_back, x, rtol=1e-10, atol=1e-10)
+    np.testing.assert_allclose(inverse_log_det, -log_det, rtol=1e-10, atol=1e-12)

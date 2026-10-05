@@ -1419,6 +1419,106 @@ class Contract2(bijections.AbstractBijection):
         return x, log_det
 
 
+def _optional(value):
+    return None if value is None else jnp.array(value)
+
+
+def _positive(x):
+    """``x + sqrt(1 + x**2)``: positive, and 1 at zero."""
+    return x + jnp.sqrt(1 + x**2)
+
+
+class TangentSAS(bijections.AbstractBijection):
+    """Tangent sinh-arcsinh: one sinh-arcsinh layer pinned to the identity to
+    first order at its centre ``nu``,
+
+        S(u) = [sinh(c asinh(b u) / b + eps) - sinh(eps)] / (c cosh(eps)),
+        y    = nu + S(x - nu),
+
+    so ``S(0) = 0`` and ``S'(0) = 1``. ``b`` sets where the tails start,
+    ``r = c / b`` is the tail exponent (``S(u) ~ u**r``), and ``eps`` the
+    skew. With ``c = r b`` the argument is ``r asinh(b u) + eps``.
+
+    The fields are unconstrained: ``b = sigmoid(b_raw)`` in ``(0, 1)`` and
+    ``r = r_raw + sqrt(1 + r_raw**2)`` positive. A field that is `None` stays
+    at its value for zero, and all zeros give the identity.
+    """
+
+    shape: tuple[int, ...]
+    nu: Array | None
+    eps: Array | None
+    b: Array | None
+    r: Array | None
+    cond_shape: tuple[int, ...] | None = None
+
+    def __init__(self, nu, eps, b, r):
+        self.nu = _optional(nu)
+        self.eps = _optional(eps)
+        self.b = _optional(b)
+        self.r = _optional(r)
+        self.shape = ()
+
+    def _params(self):
+        """nu, eps, b, r."""
+        zero = jnp.zeros(())
+        nu = zero if self.nu is None else self.nu
+        eps = zero if self.eps is None else self.eps
+        b = jax.nn.sigmoid(zero if self.b is None else self.b)
+        r = jnp.ones(()) if self.r is None else _positive(self.r)
+        return nu, eps, b, r
+
+    def transform_and_log_det(
+        self, x: ArrayLike, condition: ArrayLike | None = None
+    ) -> tuple[Array, Array]:
+        """``log S'(u) = logcosh(arg) - logcosh(eps) - 0.5 log1p((b u)**2)``."""
+        nu, eps, b, r = self._params()
+        w = b * (x - nu)
+        arg = r * jnp.arcsinh(w) + eps
+        y = nu + (jnp.sinh(arg) - jnp.sinh(eps)) / (r * b * jnp.cosh(eps))
+        log_det = _log_cosh(arg) - _log_cosh(eps) - 0.5 * jnp.log1p(w * w)
+        return y, log_det
+
+    def inverse_and_log_det(
+        self, y: ArrayLike, condition: ArrayLike | None = None
+    ) -> tuple[Array, Array]:
+        """With ``q = sinh(arg) = r b cosh(eps) (y - nu) + sinh(eps)``:
+        ``a = asinh(b u) = (asinh(q) - eps) / r`` and ``x = nu + sinh(a) / b``.
+        In the log det, ``logcosh(asinh(q)) = 0.5 log1p(q**2)`` and
+        ``0.5 log1p((b u)**2) = logcosh(a)``."""
+        nu, eps, b, r = self._params()
+        q = r * b * jnp.cosh(eps) * (y - nu) + jnp.sinh(eps)
+        a = (jnp.arcsinh(q) - eps) / r
+        x = nu + jnp.sinh(a) / b
+        log_det = _log_cosh(a) + _log_cosh(eps) - 0.5 * jnp.log1p(q * q)
+        return x, log_det
+
+
+class PositiveAffine(bijections.AbstractBijection):
+    """``y = loc + scale_mod * x`` with ``scale_mod = scale + sqrt(1 +
+    scale**2)``, so ``scale`` is unconstrained and zero is the identity."""
+
+    shape: tuple[int, ...]
+    loc: Array
+    scale: Array
+    cond_shape: tuple[int, ...] | None = None
+
+    def __init__(self, loc, scale):
+        self.loc = jnp.array(loc)
+        self.scale = jnp.array(scale)
+        self.shape = ()
+
+    def transform_and_log_det(
+        self, x: ArrayLike, condition: ArrayLike | None = None
+    ) -> tuple[Array, Array]:
+        # log(scale_mod) == asinh(scale)
+        return self.loc + _positive(self.scale) * x, jnp.arcsinh(self.scale)
+
+    def inverse_and_log_det(
+        self, y: ArrayLike, condition: ArrayLike | None = None
+    ) -> tuple[Array, Array]:
+        return (y - self.loc) / _positive(self.scale), -jnp.arcsinh(self.scale)
+
+
 class DipBij(bijections.AbstractBijection):
     b: jnp.ndarray  # raw parameter (scalar)
     shape: tuple[int, ...]
@@ -1557,11 +1657,13 @@ def make_transformer(
     contract_transformer=True,
     asymmetric_transformer=True,
     log_gamma_bounds=None,
+    tangent_sas_transformer=0,
 ):
     """Elementwise transformer as a chain of the requested layers.
 
     Each argument is a *count*; ``True``/``False`` still work as 1/0. Layers
-    are chained in the order affine -> asymmetric -> contract.
+    are chained in the order affine -> asymmetric -> contract -> tangent SAS,
+    and tangent SAS layers are followed by one `PositiveAffine`.
 
     Parameters the chain makes redundant are disabled here rather than left
     for the optimizer to find. Two additive shifts applied back to back
@@ -1601,20 +1703,23 @@ def make_transformer(
             layer's ``log gamma``, see that class. Note the bound is per
             layer and log gamma adds along a chain, so ``n`` layers bounded at
             ``high`` reach ``n * high`` overall.
+        tangent_sas_transformer: Number of `TangentSAS` layers. If nonzero,
+            they are followed by a `PositiveAffine`, which holds the location.
 
     Returns:
         An `ElementwiseTransformer`, whose location is the last layer's output
-        shift: the last `Contract2`'s ``mu``, or the `Affine`'s ``loc`` when
-        that is the only layer kind. None if the chain ends in an inverted
-        `AsymmetricAffine`.
+        shift: the trailing `PositiveAffine`'s ``loc``, the last `Contract2`'s
+        ``mu``, or the `Affine`'s ``loc`` when that is the only layer kind.
+        None if the chain ends in an inverted `AsymmetricAffine`.
     """
     n_affine = int(affine_transformer)
     n_contract = int(contract_transformer)
     n_asymmetric = int(asymmetric_transformer)
+    n_tangent_sas = int(tangent_sas_transformer)
 
-    if min(n_affine, n_contract, n_asymmetric) < 0:
+    if min(n_affine, n_contract, n_asymmetric, n_tangent_sas) < 0:
         raise ValueError("transformer counts must be non-negative.")
-    if n_affine + n_contract + n_asymmetric == 0:
+    if n_affine + n_contract + n_asymmetric + n_tangent_sas == 0:
         raise ValueError("make_transformer needs at least one layer.")
 
     elemwises = []
@@ -1671,12 +1776,26 @@ def make_transformer(
             )
         )
 
+    if n_tangent_sas:
+        for _ in range(n_tangent_sas):
+            elemwises.append(
+                TangentSAS(
+                    nu=jnp.zeros(()),
+                    eps=jnp.zeros(()),
+                    b=jnp.zeros(()),
+                    r=jnp.zeros(()),
+                )
+            )
+        elemwises.append(PositiveAffine(jnp.zeros(()), jnp.zeros(())))
+
     # The location is the last layer's output shift, which nothing after it
-    # undoes. `Contract2` ends in ``+ mu`` and `Affine` in ``+ loc``; the
+    # undoes. `Contract2` ends in ``+ mu`` and the affines in ``+ loc``; the
     # inverted `AsymmetricAffine` has only an *input* shift, so a chain ending
     # in one has no location.
     last = elemwises[-1]
-    if isinstance(last, Contract2):
+    if isinstance(last, PositiveAffine):
+        location_field = (len(elemwises) - 1, "loc")
+    elif isinstance(last, Contract2):
         location_field = (len(elemwises) - 1, "mu")
     elif isinstance(last, bijections.Affine):
         location_field = (len(elemwises) - 1, "loc")
@@ -2080,6 +2199,7 @@ def make_sparse_triangular_map(
     affine_transformer=False,
     contract_transformer=False,
     asymmetric_transformer=False,
+    tangent_sas_transformer=0,
     feature_degree=None,
 ):
     """Build a `SparseTriangularMap` bijection for the given ordering.
@@ -2115,7 +2235,8 @@ def make_sparse_triangular_map(
             ``i`` in ``order``.
         location_skip: Linear map from each variable's parents straight to
             its transformer location, see `SparseTriangularMap`.
-        affine_transformer, contract_transformer, asymmetric_transformer:
+        affine_transformer, contract_transformer, asymmetric_transformer,
+        tangent_sas_transformer:
             Layer counts of the elementwise transformer, see
             `make_transformer`. If all are zero, `SparseTriangularMap`'s own
             default transformer is used.
@@ -2149,11 +2270,17 @@ def make_sparse_triangular_map(
     sparsity_sorted = sparsity[np.ix_(order, order)]
 
     transformer = None
-    if affine_transformer or contract_transformer or asymmetric_transformer:
+    if (
+        affine_transformer
+        or contract_transformer
+        or asymmetric_transformer
+        or tangent_sas_transformer
+    ):
         transformer = make_transformer(
             affine_transformer=affine_transformer,
             contract_transformer=contract_transformer,
             asymmetric_transformer=asymmetric_transformer,
+            tangent_sas_transformer=tangent_sas_transformer,
         )
 
     layer = SparseTriangularMap(
@@ -2378,6 +2505,7 @@ def make_flow(
     affine_transformer=False,
     contract_transformer=False,
     asymmetric_transformer=False,
+    tangent_sas_transformer=0,
     sandwich_householder=False,
     activation=None,
     reuse_embed=False,
@@ -2538,6 +2666,7 @@ def make_flow(
             affine_transformer=affine_transformer,
             contract_transformer=contract_transformer,
             asymmetric_transformer=asymmetric_transformer,
+            tangent_sas_transformer=tangent_sas_transformer,
             feature_degree=feature_degree,
             n_buckets=n_buckets,
         )
