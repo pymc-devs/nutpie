@@ -14,7 +14,7 @@ use crate::triangular::pattern::{Pattern, Ragged};
 
 const N_DRAW: usize = 16;
 
-fn normal(rng: &mut ChaCha8Rng, n: usize, scale: f64) -> Vec<f64> {
+pub(super) fn normal(rng: &mut ChaCha8Rng, n: usize, scale: f64) -> Vec<f64> {
     (0..n)
         .map(|_| {
             let z: f64 = StandardNormal.sample(&mut *rng);
@@ -37,6 +37,10 @@ fn param(index: usize, offset: f64) -> Option<Param> {
 /// `Contract2` (bounded), `TangentSAS` and `PositiveAffine`, eleven
 /// parameters, the location in `Contract2`'s `mu`.
 fn problem(regularization: Option<f64>) -> FisherResiduals {
+    problem_with(regularization, N_DRAW)
+}
+
+pub(super) fn problem_with(regularization: Option<f64>, n_draw: usize) -> FisherResiduals {
     let specs = vec![
         LayerSpec::Contract2(Contract2Spec {
             alpha: param(0, 0.1),
@@ -61,10 +65,10 @@ fn problem(regularization: Option<f64>) -> FisherResiduals {
     let mut problem = FisherResiduals::new(graph(), conditioner, regularization).unwrap();
     let mut rng = ChaCha8Rng::seed_from_u64(0);
     let n_var = problem.n_var();
-    let y = normal(&mut rng, N_DRAW * n_var, 1.0);
+    let y = normal(&mut rng, n_draw * n_var, 1.0);
     let g: Vec<f64> = y
         .iter()
-        .zip(normal(&mut rng, N_DRAW * n_var, 0.3))
+        .zip(normal(&mut rng, n_draw * n_var, 0.3))
         .map(|(y, noise)| -y + noise)
         .collect();
     problem.set_data(y, g).unwrap();
@@ -168,6 +172,33 @@ fn blocks_match_the_dense_gram() {
                     .collect();
                 assert_close(&actual, &expected, 1e-10);
             }
+        }
+    }
+}
+
+#[test]
+fn reductions_do_not_depend_on_the_threads() {
+    // Many tiles, so that the work is split between threads.
+    let problem = problem_with(Some(0.3), 512);
+    let mut rng = ChaCha8Rng::seed_from_u64(4);
+    let theta = normal(&mut rng, problem.n_params(), 0.3);
+    let v = normal(&mut rng, problem.n_params(), 1.0);
+    let run = |threads: usize| {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let (r, lin) = problem.residuals(&theta).unwrap();
+            let grad = problem.pullback(&lin, &r).unwrap();
+            let gn = problem.gauss_newton_product(&lin, &v).unwrap();
+            (grad, gn)
+        })
+    };
+    let reference = run(1);
+    for threads in [2, 3, 8] {
+        for _ in 0..5 {
+            assert!(run(threads) == reference, "{threads} threads");
         }
     }
 }

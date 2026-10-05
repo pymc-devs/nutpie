@@ -825,7 +825,63 @@ impl PyLmOptimizer {
 
 #[cfg(test)]
 mod tests {
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha8Rng;
+
     use super::*;
+    use crate::triangular::lm::tests::{normal, problem_with};
+
+    /// The defaults of `PyLmOptimizer`, with small blocks and the
+    /// limited-memory preconditioner on, so that every part of a step runs.
+    fn settings() -> Settings {
+        Settings {
+            cg_max: 300,
+            cg_tol: 1e-2,
+            cg_model_tol: 0.5,
+            cg_model_cost: 15.0,
+            cg_eta_max: 0.5,
+            cg_gamma: 0.9,
+            cg_alpha: 1.618,
+            accept_rho: 0.1,
+            nu0: 2.0,
+            lam_min: 1e-6,
+            lam_max: 1e10,
+            lam_lo_decay: 3f64.sqrt(),
+            lam_lo_reset: 0.25,
+            ls_min_fraction: 0.1,
+            forcing: Forcing::Residual,
+            max_block_size: 8,
+            rebuild_every: 1,
+            lmp_size: 4,
+            lmp_tol: 1e-8,
+        }
+    }
+
+    /// Bit for bit the same fit on any number of threads.
+    #[test]
+    fn steps_do_not_depend_on_the_threads() {
+        let problem = problem_with(Some(0.3), 512);
+        let mut rng = ChaCha8Rng::seed_from_u64(5);
+        let theta = normal(&mut rng, problem.n_params(), 0.3);
+        let run = |threads: usize| {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                let mut lm =
+                    LmOptimizer::new(problem.clone(), theta.clone(), 0.1, settings()).unwrap();
+                for _ in 0..5 {
+                    lm.step().unwrap();
+                }
+                (lm.theta, lm.lam)
+            })
+        };
+        let reference = run(1);
+        for threads in [2, 3, 8] {
+            assert!(run(threads) == reference, "{threads} threads");
+        }
+    }
 
     /// `P A s = s` for every stored direction, whatever `M`, also when one
     /// direction depends on the others.
