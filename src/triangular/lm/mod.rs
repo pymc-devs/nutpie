@@ -92,6 +92,9 @@ use sweeps::TileScratch;
 pub(crate) use tiles::Linearization;
 use tiles::{Data, Tiled};
 
+/// Tiles [`FisherResiduals::sum_over_tiles`] sums in one task, in order.
+const TILES_PER_TASK: usize = 4;
+
 #[derive(Clone)]
 pub(crate) struct FisherResiduals {
     level: Level,
@@ -307,33 +310,41 @@ impl FisherResiduals {
     }
 
     /// `sum_tiles f(tile)`, each `f` accumulating its tile's lanes into a
-    /// per-thread gradient.
+    /// gradient.
+    ///
+    /// Deterministic: the tiles are halved at fixed points down to runs of at
+    /// most [`TILES_PER_TASK`], each run is summed in order, and the two halves
+    /// are added left plus right. So the order of every addition depends only
+    /// on the number of tiles, not on the threads or how they were scheduled.
     fn sum_over_tiles<S: Simd>(
         &self,
         simd: S,
         lin: &Linearization,
         f: impl Fn(usize, &mut [S::f64s], &mut TileScratch<S>) + Sync,
     ) -> Vec<f64> {
-        let n_params = self.n_params();
-        let zero = S::f64s::splat(simd, 0.0);
-        (0..lin.data.n_tile())
-            .into_par_iter()
-            .fold(
-                || (vec![zero; n_params], TileScratch::new(simd, self)),
-                |(mut grad, mut s), tile| {
-                    f(tile, &mut grad, &mut s);
-                    (grad, s)
-                },
-            )
-            .map(|(grad, _)| grad.iter().map(|g| g.reduce_sum()).collect::<Vec<f64>>())
-            .reduce(
-                || vec![0.0; n_params],
-                |mut a, b| {
-                    for (a, b) in a.iter_mut().zip(&b) {
-                        *a += b;
-                    }
-                    a
-                },
-            )
+        self.sum_tiles(simd, 0..lin.data.n_tile(), &f)
+    }
+
+    fn sum_tiles<S: Simd, F>(&self, simd: S, tiles: std::ops::Range<usize>, f: &F) -> Vec<f64>
+    where
+        F: Fn(usize, &mut [S::f64s], &mut TileScratch<S>) + Sync,
+    {
+        if tiles.len() <= TILES_PER_TASK {
+            let mut grad = vec![S::f64s::splat(simd, 0.0); self.n_params()];
+            let mut s = TileScratch::new(simd, self);
+            for tile in tiles {
+                f(tile, &mut grad, &mut s);
+            }
+            return grad.iter().map(|g| g.reduce_sum()).collect();
+        }
+        let mid = tiles.start + tiles.len() / 2;
+        let (mut left, right) = rayon::join(
+            || self.sum_tiles(simd, tiles.start..mid, f),
+            || self.sum_tiles(simd, mid..tiles.end, f),
+        );
+        for (left, right) in left.iter_mut().zip(&right) {
+            *left += right;
+        }
+        left
     }
 }
