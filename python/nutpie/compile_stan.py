@@ -8,7 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from importlib.util import find_spec
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import scipy.sparse as sp
@@ -31,6 +31,9 @@ class CompiledStanModel(CompiledModel):
     _transform_adapt_args: dict | None = None
     # User init function `fn(model, rng, chain_id)`, see `with_init_point_fn`
     _init_point_fn: Callable | None = None
+    # With the stanli backend the library is the generic stanli runtime, and
+    # the model itself is passed in the data under the key "__stanli".
+    _stanli_manifest: dict[str, str] | None = None
 
     def with_data(self, *, seed=None, **updates):
         if self.data is None:
@@ -41,6 +44,10 @@ class CompiledStanModel(CompiledModel):
         data.update(updates)
 
         data_json = _dump_stan_json(data)
+        if self._stanli_manifest is not None:
+            payload = json.loads(data_json)
+            payload["__stanli"] = self._stanli_manifest
+            data_json = json.dumps(payload)
 
         coords = self._coords
         if coords is None:
@@ -429,6 +436,46 @@ def _compile_stan_model(
     return so_path
 
 
+def _compile_stanli_model(
+    model_name: str,
+    code: str,
+    filename: str | None,
+    dims: dict[str, tuple[str, ...]],
+    coords: dict[str, Any],
+) -> CompiledStanModel:
+    """Translate *code* to stanli's MIR and bind it to the stanli runtime library.
+
+    stanli implements the BridgeStan C ABI in a single precompiled library,
+    so no C++ compiler is needed.
+    """
+    if find_spec("stanli") is None:
+        raise ImportError(
+            "stanli is not installed in the current environment. "
+            "Please install it with something like 'pip install stanli'."
+        )
+
+    import stanli
+
+    include_paths = None if filename is None else [Path(filename).parent]
+    manifest = {
+        "build_id": stanli.build_id(),
+        "mir": stanli.stan_to_mir(code, include_paths=include_paths),
+        "name": model_name,
+    }
+    library = _lib.StanLibrary(str(stanli._runtime_lib_path()))
+
+    return CompiledStanModel(
+        code=code,
+        library=library,
+        dims=dims,
+        _coords=coords,
+        model_name=model_name,
+        model=None,
+        data=None,
+        _stanli_manifest=manifest,
+    )
+
+
 def compile_stan_model(
     *,
     code: str | None = None,
@@ -442,6 +489,7 @@ def compile_stan_model(
     cache: bool = False,
     prune_cache: bool = True,
     ad_hessian: bool = False,
+    backend: Literal["bridgestan", "stanli"] = "bridgestan",
 ) -> CompiledStanModel:
     """Compile a Stan model and return a :class:`CompiledStanModel`.
 
@@ -486,15 +534,16 @@ def compile_stan_model(
         :meth:`CompiledStanModel.with_hessian_sparsity` and
         :meth:`CompiledStanModel.hessian_vector_product`, but makes
         compilation slower. Defaults to ``False``.
+    backend:
+        ``"bridgestan"`` (the default) compiles the model to C++ with
+        BridgeStan. ``"stanli"`` uses `stanli <https://github.com/seantalts/stanli>`_,
+        which interprets the model with precompiled Stan math kernels and
+        needs no C++ compiler. stanli does not support ``ad_hessian``,
+        ``extra_compile_args``, ``extra_stanc_args`` or
+        :meth:`CompiledStanModel.unconstrain`, and ignores ``cache``.
     """
-    if find_spec("bridgestan") is None:
-        raise ImportError(
-            "BridgeStan is not installed in the current environment. "
-            "Please install it with something like "
-            "'pip install bridgestan' or 'pip install nutpie[stan]'."
-        )
-
-    import bridgestan
+    if backend not in ("bridgestan", "stanli"):
+        raise ValueError(f"Unknown Stan backend {backend!r}")
 
     if dims is None:
         dims = {}
@@ -512,6 +561,28 @@ def compile_stan_model(
 
     if model_name is None:
         model_name = "model"
+
+    if backend == "stanli":
+        unsupported = {
+            "ad_hessian": ad_hessian,
+            "extra_compile_args": extra_compile_args,
+            "extra_stanc_args": extra_stanc_args,
+        }
+        unsupported = [name for name, value in unsupported.items() if value]
+        if unsupported:
+            raise ValueError(
+                f"The stanli backend does not support {', '.join(unsupported)}"
+            )
+        return _compile_stanli_model(model_name, code, filename, dims, coords)
+
+    if find_spec("bridgestan") is None:
+        raise ImportError(
+            "BridgeStan is not installed in the current environment. "
+            "Please install it with something like "
+            "'pip install bridgestan' or 'pip install nutpie[stan]'."
+        )
+
+    import bridgestan
 
     make_args = ["STAN_THREADS=true"]
     if ad_hessian:

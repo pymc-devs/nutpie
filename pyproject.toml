@@ -33,6 +33,7 @@ Repository = "https://github.com/pymc-devs/nutpie"
 
 [project.optional-dependencies]
 stan = ["bridgestan >= 2.7.0", "stanio >= 0.5.1"]
+stanli = ["stanli", "stanio >= 0.5.1"]
 pymc = ["pymc >= 5.20.1", "numba >= 0.60.0"]
 pymc-jax = ["pymc >= 5.20.1", "jax >= 0.4.27"]
 nnflow = ["flowjax >= 17.1.0", "equinox >= 0.11.12", "optimistix >= 0.1.0"]
