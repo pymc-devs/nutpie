@@ -26,7 +26,7 @@ use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 use serde::Serialize;
 
-use crate::triangular_lm::{FisherResiduals, GnBlock, PyFisherResiduals, Tape};
+use super::{FisherResiduals, GnBlock, Linearization, PyFisherResiduals};
 
 /// Marquardt floor, as a fraction of each conditioner's largest curvature.
 const MARQUARDT_FLOOR: f64 = 1e-4;
@@ -229,7 +229,7 @@ pub struct LmOptimizer {
     problem: FisherResiduals,
     settings: Settings,
     theta: Vec<f64>,
-    tape: Tape,
+    lin: Linearization,
     r: Vec<f64>,
     lam: f64,
     nu: f64,
@@ -273,18 +273,18 @@ impl LmOptimizer {
                 problem.n_params()
             );
         }
-        if problem.n_draw == 0 {
+        if problem.n_draw() == 0 {
             bail!("the residuals have no data");
         }
         if settings.max_block_size == 0 || settings.rebuild_every == 0 {
             bail!("max_block_size and rebuild_every must be positive");
         }
-        let (r, tape) = problem.residuals(&theta)?;
+        let (r, lin) = problem.residuals(&theta)?;
         let n_params = theta.len();
         Ok(Self {
             problem,
             theta,
-            tape,
+            lin,
             r,
             lam,
             nu: settings.nu0,
@@ -302,7 +302,7 @@ impl LmOptimizer {
     fn build_blocks(&self) -> Result<Blocks> {
         let mut blocks = self
             .problem
-            .gauss_newton_blocks(&self.tape, self.settings.max_block_size)?;
+            .gauss_newton_blocks(&self.lin, self.settings.max_block_size)?;
 
         // Non-finite sub-blocks fall back to their finite diagonal; one would
         // otherwise spread through the global floor into every damping.
@@ -328,11 +328,9 @@ impl LmOptimizer {
         }
 
         // Marquardt floors per variable (conditioner).
-        let param_offset = &self.problem.param_offset;
-        let var_of = |start: usize| param_offset.partition_point(|&o| o <= start) - 1;
-        let mut local = vec![f64::NEG_INFINITY; self.problem.n_var];
+        let mut local = vec![f64::NEG_INFINITY; self.problem.n_var()];
         for block in &blocks {
-            let var = var_of(block.start);
+            let var = self.problem.param_offset.row_of(block.start);
             for k in 0..block.matrix.nrows() {
                 local[var] = local[var].max(block.matrix[(k, k)]);
             }
@@ -350,7 +348,7 @@ impl LmOptimizer {
         let mut floor = Vec::with_capacity(blocks.len());
         let mut diagonal = vec![0.0; self.theta.len()];
         for block in &blocks {
-            let var_floor = floor_of_var[var_of(block.start)];
+            let var_floor = floor_of_var[self.problem.param_offset.row_of(block.start)];
             floor.push(var_floor);
             for k in 0..block.matrix.nrows() {
                 diagonal[block.start + k] = block.matrix[(k, k)].max(var_floor);
@@ -420,7 +418,7 @@ impl LmOptimizer {
 
     /// `(J^T J + lam D) v`.
     fn damped_product(&self, diagonal: &[f64], lam: f64, v: &[f64]) -> Result<Vec<f64>> {
-        let mut out = self.problem.gauss_newton_product(&self.tape, v)?;
+        let mut out = self.problem.gauss_newton_product(&self.lin, v)?;
         for ((o, d), v) in out.iter_mut().zip(diagonal).zip(v) {
             *o += lam * d * v;
         }
@@ -533,7 +531,7 @@ impl LmOptimizer {
         let lmp = Lmp::new(&self.lmp_pairs, &blocks.diagonal, lam, s.lmp_tol);
         let lmp_rank = lmp.as_ref().map_or(0, Lmp::rank);
 
-        let g = self.problem.pullback(&self.tape, &self.r)?;
+        let g = self.problem.pullback(&self.lin, &self.r)?;
         let rhs: Vec<f64> = g.iter().map(|v| -v).collect();
         let eta = match s.forcing {
             Forcing::Model => s.cg_tol,
@@ -557,8 +555,8 @@ impl LmOptimizer {
 
         let step_to =
             |p: &[f64]| -> Vec<f64> { self.theta.iter().zip(p).map(|(t, p)| t + p).collect() };
-        let (mut r_new, mut tape_new) = self.problem.residuals(&step_to(&p))?;
-        let mut jp = self.problem.pushforward(&self.tape, &p)?;
+        let (mut r_new, mut lin_new) = self.problem.residuals(&step_to(&p))?;
+        let mut jp = self.problem.pushforward(&self.lin, &p)?;
 
         let f = dot(&self.r, &self.r);
         let mut f_new = dot(&r_new, &r_new);
@@ -577,13 +575,13 @@ impl LmOptimizer {
             .clamp(s.ls_min_fraction, 1.0);
         if f_new.is_finite() && curvature > 0.0 && fraction < 0.95 {
             let p_short: Vec<f64> = p.iter().map(|v| fraction * v).collect();
-            let (r_short, tape_short) = self.problem.residuals(&step_to(&p_short))?;
+            let (r_short, lin_short) = self.problem.residuals(&step_to(&p_short))?;
             let f_short = dot(&r_short, &r_short);
             // Kept only if it actually beats the full step; NaN compares false.
             if f_short < f_new {
                 p = p_short;
                 r_new = r_short;
-                tape_new = tape_short;
+                lin_new = lin_short;
                 // `J` is linear, so the shortened step's `Jp` is just rescaled.
                 for v in jp.iter_mut() {
                     *v *= fraction;
@@ -685,7 +683,7 @@ impl LmOptimizer {
         if accept {
             self.theta = step_to(&p);
             self.r = r_new;
-            self.tape = tape_new;
+            self.lin = lin_new;
             self.p_prev = p;
             self.accepted_since_build += 1;
         } else {
