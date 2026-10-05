@@ -35,7 +35,7 @@ def _setup(
     tangent_sas=0,
     fix_b=False,
     dim=7,
-    n_draw=5,
+    n_draw=8,
     seed=0,
 ):
     jax.config.update("jax_enable_x64", True)
@@ -172,8 +172,9 @@ def test_gauss_newton_blocks_match_dense_gram(case, max_block_size, rho):
         expected = gram[start : start + size, start : start + size]
         # The blocks read `Sigma = (J^T J)^-1` from Takahashi's recurrence,
         # whose error grows like `cond(J)^2 eps`. The random blanket gives
-        # some draws `cond(K) ~ 1e11`; everything else is exact to rounding.
-        tol = 1e-5 if case.get("blanket") == "random" else 1e-10
+        # some draws `cond(K) ~ 1e11`; with the banded one the worst draw has
+        # `cond(J) ~ 1e5`, which costs a few `1e-10`.
+        tol = 1e-5 if case.get("blanket") == "random" else 1e-9
         np.testing.assert_allclose(
             block, expected, rtol=0, atol=tol * np.abs(expected).max()
         )
