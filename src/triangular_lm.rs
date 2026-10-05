@@ -56,7 +56,7 @@ const BLOCK_DRAW_BATCH: usize = 32;
 ///
 /// Forward-over-forward, but sharing the value and gradient across the
 /// directions, so every operation is O(n_z) instead of the O(n_z^2) a full
-/// Hessian would cost.
+/// Hessian would cost. For the full Hessian, see [`JetArena::reset_hessian`].
 ///
 /// Not `Copy`: an operation that takes a jet by value writes its result into
 /// that jet's slot, so a value needed twice is copied explicitly with
@@ -64,14 +64,18 @@ const BLOCK_DRAW_BATCH: usize = 32;
 #[must_use]
 struct Jet(u32);
 
-/// Jet slots of one size, `[v, g[n_z], e[k], h[k][n_z]]` each. [`Self::reset`]
-/// sets the size for one transformer evaluation and hands every slot back;
-/// the storage only grows, so after the first evaluation nothing allocates.
+/// Jet slots of one size, `[v, g[n_z], e[k], h[k][n_z]]` each, or `[v,
+/// g[n_z], H]` with `H` the full Hessian as a packed lower triangle.
+/// [`Self::reset`] and [`Self::reset_hessian`] set the size for one
+/// transformer evaluation and hand every slot back; the storage only grows,
+/// so after the first evaluation nothing allocates.
 struct JetArena<S: Simd> {
     simd: S,
     data: Vec<S::f64s>,
     n_z: usize,
     k: usize,
+    /// Whether the slots hold full Hessians instead of directions.
+    hessian: bool,
     slot_len: usize,
     n_slots: usize,
     /// Slots handed back by consuming binary operations.
@@ -85,6 +89,7 @@ impl<S: Simd> JetArena<S> {
             data: Vec::new(),
             n_z: 0,
             k: 0,
+            hessian: false,
             slot_len: 0,
             n_slots: 0,
             free: Vec::new(),
@@ -96,9 +101,20 @@ impl<S: Simd> JetArena<S> {
     fn reset(&mut self, n_z: usize, k: usize) {
         self.n_z = n_z;
         self.k = k;
+        self.hessian = false;
         self.slot_len = 1 + n_z * (k + 1) + k;
         self.n_slots = 0;
         self.free.clear();
+    }
+
+    /// Starts an evaluation with `n_z` inputs and full Hessians. Each row of
+    /// a Hessian update reads only the same row of the operands' Hessians and
+    /// their gradients, so the lower triangle is all that is computed.
+    #[inline(always)]
+    fn reset_hessian(&mut self, n_z: usize) {
+        self.reset(n_z, 0);
+        self.hessian = true;
+        self.slot_len = 1 + n_z + packed_len(n_z);
     }
 
     #[inline(always)]
@@ -151,6 +167,13 @@ impl<S: Simd> JetArena<S> {
         &self.data[start..start + self.n_z]
     }
 
+    /// The full Hessian as a packed lower triangle, after [`Self::reset_hessian`].
+    #[inline(always)]
+    fn hessian(&self, j: &Jet) -> &[S::f64s] {
+        let range = self.range(j);
+        &self.data[range.start + 1 + self.n_z..range.end]
+    }
+
     #[inline(always)]
     fn constant(&mut self, v: S::f64s) -> Jet {
         let j = self.alloc();
@@ -200,6 +223,9 @@ impl<S: Simd> JetArena<S> {
     /// `f(j)`, given `f`, `f'` and `f''` at its value.
     #[inline(always)]
     fn chain(&mut self, j: Jet, f0: S::f64s, f1: S::f64s, f2: S::f64s) -> Jet {
+        if self.hessian {
+            return self.chain_hessian(j, f0, f1, f2);
+        }
         let (n_z, k) = (self.n_z, self.k);
         let range = self.range(&j);
         let (head, h) = self.data[range].split_at_mut(1 + n_z + k);
@@ -212,6 +238,29 @@ impl<S: Simd> JetArena<S> {
                 *h = f1 * *h + curvature * g;
             }
             *e = f1 * *e;
+        }
+        for g in g.iter_mut() {
+            *g = f1 * *g;
+        }
+        v[0] = f0;
+        j
+    }
+
+    /// [`Self::chain`] on full Hessians: `H' = f' H + f'' g g^T`.
+    #[inline(always)]
+    fn chain_hessian(&mut self, j: Jet, f0: S::f64s, f1: S::f64s, f2: S::f64s) -> Jet {
+        let n_z = self.n_z;
+        let range = self.range(&j);
+        let (head, h) = self.data[range].split_at_mut(1 + n_z);
+        let (v, g) = head.split_at_mut(1);
+        let mut rows = h;
+        for r in 0..n_z {
+            let (row, rest) = rows.split_at_mut(r + 1);
+            let curvature = f2 * g[r];
+            for (h, &g) in row.iter_mut().zip(&*g) {
+                *h = f1 * *h + curvature * g;
+            }
+            rows = rest;
         }
         for g in g.iter_mut() {
             *g = f1 * *g;
@@ -242,6 +291,9 @@ impl<S: Simd> JetArena<S> {
 
     #[inline(always)]
     fn mul(&mut self, a: Jet, b: Jet) -> Jet {
+        if self.hessian {
+            return self.mul_hessian(a, b);
+        }
         let (n_z, k) = (self.n_z, self.k);
         let (a_slot, b_slot) = self.pair(&a, &b);
         let (a_head, a_h) = a_slot.split_at_mut(1 + n_z + k);
@@ -262,6 +314,34 @@ impl<S: Simd> JetArena<S> {
         }
         for (ae, &be) in a_e.iter_mut().zip(b_e) {
             *ae = av * be + bv * *ae;
+        }
+        for (ag, &bg) in a_g.iter_mut().zip(b_g) {
+            *ag = av * bg + bv * *ag;
+        }
+        a_v[0] = av * bv;
+        self.release(b);
+        a
+    }
+
+    /// [`Self::mul`] on full Hessians: `H = a H_b + b H_a + g_a g_b^T + g_b
+    /// g_a^T`.
+    #[inline(always)]
+    fn mul_hessian(&mut self, a: Jet, b: Jet) -> Jet {
+        let n_z = self.n_z;
+        let (a_slot, b_slot) = self.pair(&a, &b);
+        let (a_head, a_h) = a_slot.split_at_mut(1 + n_z);
+        let (b_head, b_h) = b_slot.split_at(1 + n_z);
+        let (a_v, a_g) = a_head.split_at_mut(1);
+        let b_g = &b_head[1..];
+        let (av, bv) = (a_v[0], b_head[0]);
+        let mut index = 0;
+        for r in 0..n_z {
+            let (ag_r, bg_r) = (a_g[r], b_g[r]);
+            let (a_row, b_row) = (&mut a_h[index..=index + r], &b_h[index..=index + r]);
+            for ((ah, &bh), (&ag, &bg)) in a_row.iter_mut().zip(b_row).zip(a_g.iter().zip(b_g)) {
+                *ah = av * bh + bv * *ah + ag_r * bg + bg_r * ag;
+            }
+            index += r + 1;
         }
         for (ag, &bg) in a_g.iter_mut().zip(b_g) {
             *ag = av * bg + bv * *ag;
@@ -633,6 +713,31 @@ fn transformer<S: Simd>(
     ws: &mut JetArena<S>,
 ) -> (Jet, Jet) {
     ws.reset(1 + pi.len(), k);
+    evaluate_transformer(simd, layers, y, pi, dirs, ws)
+}
+
+/// [`transformer`] with full Hessians, see [`JetArena::reset_hessian`].
+#[simd]
+fn transformer_hessian<S: Simd>(
+    simd: S,
+    layers: &[Layer],
+    y: S::f64s,
+    pi: &[S::f64s],
+    ws: &mut JetArena<S>,
+) -> (Jet, Jet) {
+    ws.reset_hessian(1 + pi.len());
+    evaluate_transformer(simd, layers, y, pi, &[], ws)
+}
+
+#[inline(always)]
+fn evaluate_transformer<S: Simd>(
+    simd: S,
+    layers: &[Layer],
+    y: S::f64s,
+    pi: &[S::f64s],
+    dirs: &[S::f64s],
+    ws: &mut JetArena<S>,
+) -> (Jet, Jet) {
     let fields = Fields { pi, dirs };
     let mut x = ws.variable(y, 0, dirs);
     let mut log_det = ws.constant(S::f64s::splat(simd, 0.0));
@@ -1402,8 +1507,7 @@ impl FisherResiduals {
     }
 
     /// The transformer's gradients in `z = (y, pi)`, at `y` and `s.pi`, and its
-    /// full Hessians as packed lower triangles, from `ceil((1 + n_par) / 2)`
-    /// jet passes.
+    /// full Hessians as packed lower triangles, from one jet pass.
     #[simd]
     #[allow(clippy::too_many_arguments)]
     fn dense_curvature<S: Simd>(
@@ -1416,42 +1520,12 @@ impl FisherResiduals {
         hess_t: &mut [S::f64s],
         hess_l: &mut [S::f64s],
     ) {
-        let n_z = 1 + self.n_par;
-        let zero = S::f64s::splat(simd, 0.0);
-        for first in (0..n_z).step_by(2) {
-            let dirs = &mut s.dirs[..2 * n_z];
-            dirs.fill(zero);
-            for d in 0..2 {
-                if first + d < n_z {
-                    dirs[d * n_z + first + d] = S::f64s::splat(simd, 1.0);
-                }
-            }
-            let (x, log_det) = transformer(
-                simd,
-                &self.layers,
-                y,
-                &s.pi,
-                &s.dirs[..2 * n_z],
-                2,
-                &mut s.jets,
-            );
-            let ws = &s.jets;
-            for d in 0..2 {
-                let column = first + d;
-                if column >= n_z {
-                    continue;
-                }
-                let (h_t, h_l) = (ws.hess_dir(&x, d), ws.hess_dir(&log_det, d));
-                // Row `r >= column` of the lower triangle.
-                for r in column..n_z {
-                    let index = packed_len(r) + column;
-                    hess_t[index] = h_t[r];
-                    hess_l[index] = h_l[r];
-                }
-            }
-            grad_t.copy_from_slice(ws.grad(&x));
-            grad_l.copy_from_slice(ws.grad(&log_det));
-        }
+        let (x, log_det) = transformer_hessian(simd, &self.layers, y, &s.pi, &mut s.jets);
+        let ws = &s.jets;
+        grad_t.copy_from_slice(ws.grad(&x));
+        grad_l.copy_from_slice(ws.grad(&log_det));
+        hess_t.copy_from_slice(ws.hessian(&x));
+        hess_l.copy_from_slice(ws.hessian(&log_det));
     }
 
     // ------------------------------------------------------------ global sweeps
