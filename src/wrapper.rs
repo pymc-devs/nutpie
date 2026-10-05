@@ -11,7 +11,7 @@ use crate::{
     pyfunc::PyModel,
     pymc::{ExpandFunc, LogpFunc, PyMcModel},
     stan::{StanLibrary, StanModel},
-    triangular::FlowTransform,
+    triangular::transform::FlowTransform,
 };
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -1887,16 +1887,16 @@ pub fn _lib(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyVariable>()?;
     m.add_class::<PyStorage>()?;
     m.add_class::<PyTrace>()?;
-    m.add_class::<crate::triangular::PySparseTriangularTransform>()?;
-    m.add_class::<crate::triangular::PyFlowTransform>()?;
-    m.add_class::<crate::triangular_lm::PyFisherResiduals>()?;
-    m.add_class::<crate::lm_optimizer::PyLmOptimizer>()?;
+    m.add_class::<crate::triangular::transform::PySparseTriangularTransform>()?;
+    m.add_class::<crate::triangular::transform::PyFlowTransform>()?;
+    m.add_class::<crate::triangular::lm::PyFisherResiduals>()?;
+    m.add_class::<crate::triangular::lm::optimizer::PyLmOptimizer>()?;
     m.add_function(wrap_pyfunction!(
-        crate::triangular::activation_for_testing,
+        crate::triangular::transform::activation_for_testing,
         m
     )?)?;
-    m.add_function(wrap_pyfunction!(crate::symbolic::py_amd_order, m)?)?;
-    m.add_function(wrap_pyfunction!(crate::symbolic::py_symbolic_fill, m)?)?;
+    m.add_function(wrap_pyfunction!(crate::triangular::symbolic::py_amd_order, m)?)?;
+    m.add_function(wrap_pyfunction!(crate::triangular::symbolic::py_symbolic_fill, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     #[cfg(feature = "zarr")]
     {
