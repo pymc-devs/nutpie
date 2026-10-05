@@ -78,9 +78,9 @@ features = ["extension-module", "anyhow"]
 criterion = "0.8.0"
 
 [profile.release]
-lto = "fat"
+lto = "thin"
 opt-level = 3
 
 [profile.bench]
 debug = true
-lto = "fat"
+lto = "thin"
