@@ -1,4 +1,4 @@
-"""Rust backend (`src/triangular.rs`) for
+"""Rust backend (`src/triangular/transform.rs`) for
 `SparseTriangularMap.transform_and_log_det`, on a `TriangularLayout`.
 
 Schedules:
@@ -27,7 +27,7 @@ To pull the model gradient back, record the sparse Jacobian on the way::
     grad_x = fn.pullback(grad_y)            # J^T grad_y + grad of log_det
 
 ``J = (I - A)^-1 D`` is never formed; `pullback` is one reverse sweep (see
-`Tape` in `src/triangular.rs`).
+`Tape` in `src/triangular/transform.rs`).
 """
 
 from __future__ import annotations

@@ -570,7 +570,7 @@ def _fit_lm_rust(
     if hist:
         loss = hist[-1]["F_out"]
     else:
-        r = problem.residuals(theta, record=False)
+        r = problem.residuals(theta, linearize=False)
         loss = float(r @ r)
     # The damping to carry over is the one after the last accepted step:
     # each rejection in a final streak (typical of a patience stop) only

@@ -1,5 +1,5 @@
 """Rust residuals of the LM fit of a `SparseTriangularMap`
-(`src/triangular_lm.rs`, derivation in `notes/lm_derivatives.md`).
+(`src/triangular/lm/`, derivation in `notes/lm_derivatives.md`).
 
 `FisherResiduals` evaluates the residuals of `FisherLoss.residuals` for the
 map's conditioners, with the flow's affine and permutation frozen, plus the
@@ -15,11 +15,11 @@ Usage::
     tmap, y, g = map_data(flow, draws, grads)
     problem = make_residuals(tmap, y, g)
     theta = pack_params(tmap)
-    r = problem.residuals(theta)            # (n_draw, n_residuals), records
+    r = problem.residuals(theta)            # (n_draw, n_residuals), linearizes
     Jv = problem.pushforward(v)
     g = problem.pullback(r)
 
-    theta, lam, hist = fit(problem, theta)  # LM, `src/lm_optimizer.rs`
+    theta, lam, hist = fit(problem, theta)  # LM, `src/triangular/lm/optimizer.rs`
 """
 
 from __future__ import annotations
@@ -229,7 +229,7 @@ def fit(
     **settings,
 ):
     """Levenberg-Marquardt fit of `problem` (a `FisherResiduals` with data)
-    from `theta`, in Rust (`src/lm_optimizer.rs`).
+    from `theta`, in Rust (`src/triangular/lm/optimizer.rs`).
 
     The step is `lmopt.step` with exact blocks, Marquardt damping and the line
     search; this loop is `lmopt.fit`'s. Stops after `n_steps`, below

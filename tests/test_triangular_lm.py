@@ -1,5 +1,6 @@
 import numpy as np
 import pytest
+import scipy.sparse as sp
 
 jax = pytest.importorskip("jax")
 
@@ -7,6 +8,7 @@ import equinox as eqx
 import jax.numpy as jnp
 
 from nutpie.normalizing_flow import make_transformer
+from nutpie.sparsity import _fill
 from nutpie.triangular import SparseTriangularMap
 from nutpie.triangular_lm import (
     make_residuals,
@@ -22,10 +24,18 @@ def _blanket(dim, kind, rng):
         for i in range(1, dim):
             blanket[i, max(0, i - 2) : i] = True
         return blanket
-    # A cycle without chords needs fill in the selected inverse.
+    # A cycle without chords, which needs fill.
     blanket = rng.random((dim, dim)) < 0.4
     blanket[0, dim - 1] = blanket[1, 0] = True
-    return blanket
+    return _filled(blanket, np.arange(dim))
+
+
+def _filled(blanket, order):
+    """`blanket` closed under elimination in the flow order `order`, as a
+    symbolic factorization fills it: the residuals require that."""
+    blanket = blanket | blanket.T
+    np.fill_diagonal(blanket, False)
+    return _fill(sp.csr_array(blanket), order).toarray()
 
 
 def _setup(
@@ -203,14 +213,15 @@ def _flow_problem(dim=7, n_draw=64, rho=None, seed=0):
     g = -(x - 0.5) / np.exp(2 * rng.normal(size=dim)) + 0.3 * rng.normal(
         size=(n_draw, dim)
     )
+    order = rng.permutation(dim)
     bijection = make_flow(
         seed,
         x,
         g,
         n_layers=1,
         kind="triangular",
-        sparsity=_blanket(dim, "banded", rng),
-        order=rng.permutation(dim),
+        sparsity=_filled(_blanket(dim, "banded", rng), order),
+        order=order,
         nn_width=4,
         nn_depth=1,
         activation=jax.nn.softplus,
@@ -279,7 +290,7 @@ def test_rust_lm_with_limited_memory_preconditioner():
     params, static, data, loss_fn = _flow_problem(rho=0.1)
     tmap, y, g = map_data(eqx.combine(params, static), data[0], data[1])
     problem = make_residuals(tmap, y, g, fisher_regularization=0.1)
-    settings = dict(n_steps=15, max_block_size=8, cg_tol=1e-6, verbose=False)
+    settings = dict(n_steps=30, max_block_size=8, cg_tol=1e-6, verbose=False)
 
     _, _, base = fit(problem, pack_params(tmap), **settings)
     _, _, hist = fit(problem, pack_params(tmap), lmp_size=8, **settings)

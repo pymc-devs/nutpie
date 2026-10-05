@@ -32,6 +32,10 @@ use rayon::prelude::*;
 use serde::Deserialize;
 use smallvec::SmallVec;
 
+use super::layers::scalar::{transform_element, transform_element_with_grads};
+use super::layers::{Layer, LayerSpec};
+use super::pattern::{Children, Offsets, Pattern, Ragged};
+
 /// Scratch space for one conditioner evaluation. Sized for the common case
 /// (parent counts and hidden widths in the tens); wider maps spill to the heap.
 type Scratch = SmallVec<[f64; 64]>;
@@ -351,247 +355,6 @@ mod softplus {
     }
 }
 
-/// `field = conditioner_output[index] + offset`.
-#[derive(Debug, Clone, Copy, Deserialize)]
-pub(crate) struct Param {
-    pub(crate) index: usize,
-    pub(crate) offset: f64,
-}
-
-impl Param {
-    #[inline(always)]
-    fn get(self, params: &[f64]) -> f64 {
-        params[self.index] + self.offset
-    }
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-pub(crate) struct Contract2Spec {
-    pub(crate) alpha: Option<Param>,
-    pub(crate) beta: Option<Param>,
-    pub(crate) sigma: Option<Param>,
-    pub(crate) mu: Option<Param>,
-    pub(crate) nu: Option<Param>,
-    pub(crate) log_gamma_bounds: Option<(f64, f64)>,
-}
-
-/// `nutpie.normalizing_flow.TangentSAS`, with its raw (unconstrained) fields.
-#[derive(Debug, Clone, Copy, Deserialize)]
-pub(crate) struct TangentSasSpec {
-    pub(crate) nu: Option<Param>,
-    pub(crate) eps: Option<Param>,
-    pub(crate) b: Option<Param>,
-    pub(crate) r: Option<Param>,
-}
-
-/// `nutpie.normalizing_flow.PositiveAffine`, with its raw fields.
-#[derive(Debug, Clone, Copy, Deserialize)]
-pub(crate) struct PositiveAffineSpec {
-    pub(crate) loc: Option<Param>,
-    pub(crate) scale: Option<Param>,
-}
-
-/// One transformer layer, tagged by `kind` (see
-/// `nutpie.triangular_layout.transformer_dicts`).
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub(crate) enum LayerSpec {
-    Contract2(Contract2Spec),
-    TangentSas(TangentSasSpec),
-    PositiveAffine(PositiveAffineSpec),
-}
-
-impl LayerSpec {
-    /// The parameters the layer reads.
-    pub(crate) fn params(&self) -> impl Iterator<Item = Param> {
-        let fields = match *self {
-            LayerSpec::Contract2(c) => [c.alpha, c.beta, c.sigma, c.mu, c.nu],
-            LayerSpec::TangentSas(t) => [t.nu, t.eps, t.b, t.r, None],
-            LayerSpec::PositiveAffine(a) => [a.loc, a.scale, None, None, None],
-        };
-        fields.into_iter().flatten()
-    }
-}
-
-/// `_bounded_log_gamma` from `nutpie/normalizing_flow.py`, with the constants
-/// derived from the bounds once instead of per call.
-#[derive(Debug, Clone, Copy)]
-struct LogGammaBound {
-    low: f64,
-    width: f64,
-    slope: f64,
-    offset: f64,
-}
-
-impl LogGammaBound {
-    fn new(low: f64, high: f64) -> Result<Self> {
-        if !(low < 0.0 && 0.0 < high) {
-            bail!("log_gamma_bounds must satisfy low < 0 < high, got ({low}, {high})");
-        }
-        let width = high - low;
-        let at_zero = -low / width;
-        Ok(Self {
-            low,
-            width,
-            slope: width / (-low * high),
-            offset: (at_zero / (1.0 - at_zero)).ln(),
-        })
-    }
-
-    #[inline(always)]
-    fn apply(&self, unbounded: f64) -> f64 {
-        self.low + self.width / (1.0 + (-(self.slope * unbounded + self.offset)).exp())
-    }
-
-    /// The same value together with `d/d unbounded`.
-    #[inline(always)]
-    fn apply_with_derivative(&self, unbounded: f64) -> (f64, f64) {
-        let sigmoid = 1.0 / (1.0 + (-(self.slope * unbounded + self.offset)).exp());
-        (
-            self.low + self.width * sigmoid,
-            self.width * self.slope * sigmoid * (1.0 - sigmoid),
-        )
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct Contract2 {
-    alpha: Option<Param>,
-    beta: Option<Param>,
-    sigma: Option<Param>,
-    mu: Option<Param>,
-    nu: Option<Param>,
-    bound: Option<LogGammaBound>,
-}
-
-impl Contract2 {
-    fn new(spec: Contract2Spec) -> Result<Self> {
-        let bound = match spec.log_gamma_bounds {
-            None => None,
-            Some((low, high)) => Some(LogGammaBound::new(low, high)?),
-        };
-        Ok(Self {
-            alpha: spec.alpha,
-            beta: spec.beta,
-            sigma: spec.sigma,
-            mu: spec.mu,
-            nu: spec.nu,
-            bound,
-        })
-    }
-}
-
-#[inline(always)]
-fn param_or(param: Option<Param>, params: &[f64], default: f64) -> f64 {
-    param.map_or(default, |p| p.get(params))
-}
-
-#[inline(always)]
-fn sigmoid(v: f64) -> f64 {
-    1.0 / (1.0 + (-v).exp())
-}
-
-/// A transformer layer, ready to evaluate.
-#[derive(Debug, Clone, Copy)]
-enum Layer {
-    Contract2(Contract2),
-    TangentSas(TangentSasSpec),
-    PositiveAffine(PositiveAffineSpec),
-}
-
-impl Layer {
-    fn new(spec: LayerSpec) -> Result<Self> {
-        Ok(match spec {
-            LayerSpec::Contract2(spec) => Layer::Contract2(Contract2::new(spec)?),
-            LayerSpec::TangentSas(spec) => Layer::TangentSas(spec),
-            LayerSpec::PositiveAffine(spec) => Layer::PositiveAffine(spec),
-        })
-    }
-
-    #[inline(always)]
-    fn transform(&self, params: &[f64], y: f64) -> (f64, f64) {
-        match self {
-            Layer::Contract2(layer) => layer.transform(params, y),
-            Layer::TangentSas(layer) => layer.transform(params, y),
-            Layer::PositiveAffine(layer) => layer.transform(params, y),
-        }
-    }
-
-    #[inline(always)]
-    fn transform_with_tape(&self, params: &[f64], y: f64) -> (f64, f64, LayerTape) {
-        match self {
-            Layer::Contract2(layer) => layer.transform_with_tape(params, y),
-            Layer::TangentSas(layer) => layer.transform_with_tape(params, y),
-            Layer::PositiveAffine(layer) => layer.transform_with_tape(params, y),
-        }
-    }
-}
-
-/// `exp(asinh(a))`, which is algebraically `a + sqrt(1 + a*a)`.
-///
-/// `Contract2` writes this as an `asinh` followed by an `exp` because the
-/// direct form cancels catastrophically for `a << 0`. Taking the conjugate,
-/// `a + sqrt(1 + a*a) == 1 / (sqrt(1 + a*a) - a)`, which is well conditioned
-/// exactly where the direct form is not -- so picking the branch by sign gives
-/// the same accuracy with no transcendental at all. That removes two libm
-/// calls per `Contract2` layer for `gamma`, and another for `sigma_mod`.
-#[inline(always)]
-fn exp_asinh(a: f64) -> f64 {
-    // `1 + a*a` overflows above ~1e154, where the result is `2|a|` or
-    // `1/(2|a|)` to full precision anyway.
-    let root = if a.abs() > 1e150 {
-        a.abs()
-    } else {
-        (1.0 + a * a).sqrt()
-    };
-    if a >= 0.0 {
-        a + root
-    } else {
-        1.0 / (root - a)
-    }
-}
-
-/// `exp(asinh(a))` and its derivative, which is `exp(asinh(a)) / sqrt(1 + a*a)`.
-#[inline(always)]
-fn exp_asinh_with_derivative(a: f64) -> (f64, f64) {
-    let root = if a.abs() > 1e150 {
-        a.abs()
-    } else {
-        (1.0 + a * a).sqrt()
-    };
-    let value = if a >= 0.0 { a + root } else { 1.0 / (root - a) };
-    (value, value / root)
-}
-
-/// `log(cosh(asinh(s)))`, which is `0.5 * log1p(s*s)` since
-/// `cosh(asinh(s)) == sqrt(1 + s*s)`.
-///
-/// The transformer only ever needs `log cosh` of an `asinh`, so this replaces
-/// the general stable form -- an `exp` and a `log1p` -- with one `log1p`.
-#[inline(always)]
-fn log_cosh_asinh(s: f64) -> f64 {
-    if s.abs() > 1e150 {
-        s.abs().ln()
-    } else {
-        0.5 * (s * s).ln_1p()
-    }
-}
-
-/// `log(cosh(v))` given `sinh(v)`, from `cosh^2 == 1 + sinh^2`.
-///
-/// Reusing the `sinh` the transform already computed removes the `exp` the
-/// general form needs. Above `|v| ~ 300` the `log1p` term is exactly zero in
-/// f64 -- which is also where `sinh(v)^2` would overflow -- so both branches
-/// are exact.
-#[inline(always)]
-fn log_cosh_from_sinh(sinh_v: f64, v: f64) -> f64 {
-    if v.abs() < 300.0 {
-        0.5 * (sinh_v * sinh_v).ln_1p()
-    } else {
-        v.abs() - std::f64::consts::LN_2
-    }
-}
-
 /// The fixed marginal map of a parent feature, `u = g(y)` and `g'(y)`, with
 /// `params = (log gamma, eps, log sigma, mu, nu)`; the inverse of one
 /// sinh-arcsinh layer, as `nutpie.triangular.marginal_to_normal`.
@@ -603,379 +366,6 @@ fn marginal_to_normal(params: &[f64; 5], y: f64) -> (f64, f64) {
     let u = 2.0 * w.sinh() + nu;
     let du = (-log_sigma).exp() * w.cosh() / (1.0 + half * half).sqrt();
     (u, du)
-}
-
-/// The elementwise transformer chain, mirroring the JAX layers'
-/// `transform_and_log_det`.
-#[inline]
-fn transform_element(layers: &[Layer], params: &[f64], x: f64) -> (f64, f64) {
-    let mut y = x;
-    let mut log_det = 0.0;
-    for layer in layers {
-        let (out, ld) = layer.transform(params, y);
-        y = out;
-        log_det += ld;
-    }
-    (y, log_det)
-}
-
-/// Per-layer partials of one transformer layer, kept for the reverse pass
-/// over the chain. `p_*_in` are with respect to the layer's input; `params`
-/// holds, for each parameter the layer actually has, its flat index and the
-/// layer's two partials with respect to it.
-#[derive(Clone, Copy)]
-struct LayerTape {
-    /// `d y_out / d y_in`, which is also `exp(log_det)` for this layer.
-    p_y_in: f64,
-    /// `d log_det / d y_in`.
-    p_l_in: f64,
-    n_params: usize,
-    params: [(usize, f64, f64); 5],
-}
-
-impl LayerTape {
-    #[inline(always)]
-    fn new(p_y_in: f64, p_l_in: f64) -> Self {
-        Self {
-            p_y_in,
-            p_l_in,
-            n_params: 0,
-            params: [(0, 0.0, 0.0); 5],
-        }
-    }
-
-    #[inline(always)]
-    fn push(&mut self, param: Option<Param>, dy: f64, dld: f64) {
-        if let Some(param) = param {
-            self.params[self.n_params] = (param.index, dy, dld);
-            self.n_params += 1;
-        }
-    }
-}
-
-/// `transform_element`, plus every derivative the pullback needs.
-///
-/// Returns `(y, log_det, dy/dx, dlog_det/dx)` and fills `dy_dtheta` and
-/// `dld_dtheta` with the derivatives against the conditioner's outputs.
-///
-/// `d y_out / d y_in` of each layer is `exp(log_det)` of that layer, so
-/// accumulating it along the chain gives the Jacobian diagonal for free, and
-/// more accurately than exponentiating a sum of logs.
-fn transform_element_with_grads(
-    layers: &[Layer],
-    params: &[f64],
-    x: f64,
-    dy_dtheta: &mut [f64],
-    dld_dtheta: &mut [f64],
-) -> (f64, f64, f64, f64) {
-    let mut tapes: SmallVec<[LayerTape; 4]> = SmallVec::new();
-    let mut y = x;
-    let mut log_det = 0.0;
-
-    for layer in layers {
-        let (out, ld, tape) = layer.transform_with_tape(params, y);
-        tapes.push(tape);
-        y = out;
-        log_det += ld;
-    }
-
-    // Reverse over the chain. `ay` is `d y_final / d y_k` and `al` is
-    // `d (sum of later log dets) / d y_k`, both at the input of the layer about
-    // to be processed.
-    dy_dtheta.fill(0.0);
-    dld_dtheta.fill(0.0);
-    let mut ay = 1.0;
-    let mut al = 0.0;
-    for tape in tapes.iter().rev() {
-        for &(index, p_y, p_l) in &tape.params[..tape.n_params] {
-            dy_dtheta[index] = ay * p_y;
-            dld_dtheta[index] = p_l + al * p_y;
-        }
-        al = tape.p_l_in + al * tape.p_y_in;
-        ay *= tape.p_y_in;
-    }
-
-    (y, log_det, ay, al)
-}
-
-/// `tanh(v)` given `sinh(v)` and `cosh(v)`. `cosh` overflows past |v| ~ 355,
-/// the same place `sinh` does; the ratio is 1 long before that.
-#[inline(always)]
-fn tanh_from(sinh_v: f64, cosh_v: f64, v: f64) -> f64 {
-    if v.abs() < 300.0 {
-        sinh_v / cosh_v
-    } else {
-        v.signum()
-    }
-}
-
-impl Contract2 {
-    /// One layer of `Contract2::transform_and_log_det`.
-    ///
-    /// Algebraically identical to the Python version, but arranged so that
-    /// each layer costs 6 libm calls instead of 11: `log gamma` is never
-    /// needed on its own (the `exp(log_sigma - log_gamma)` factor is just
-    /// `sigma_mod / gamma`), and both `exp(asinh(.))` and the two `log cosh`es
-    /// have closed forms here. See `exp_asinh`, `log_cosh_asinh` and
-    /// `log_cosh_from_sinh`.
-    #[inline(always)]
-    fn transform(&self, params: &[f64], y: f64) -> (f64, f64) {
-        let gamma = match (self.alpha, &self.bound) {
-            (None, _) => 1.0,
-            (Some(alpha), None) => exp_asinh(alpha.get(params)),
-            // Bounded `log gamma` is squashed through a sigmoid, so it has to
-            // be formed explicitly and exponentiated the long way.
-            (Some(alpha), Some(bound)) => bound.apply(alpha.get(params).asinh()).exp(),
-        };
-        let log_delta = self.beta.map_or(0.0, |p| p.get(params).asinh());
-        let (sigma_mod, log_sigma) = match self.sigma {
-            None => (1.0, 0.0),
-            Some(sigma) => {
-                let sigma_mod = exp_asinh(sigma.get(params));
-                (sigma_mod, sigma_mod.ln())
-            }
-        };
-
-        let centred = match self.nu {
-            None => y,
-            Some(nu) => y - nu.get(params),
-        };
-        let half = 0.5 * centred;
-        let u = half.asinh();
-        let arg = gamma * u + 2.0 * log_delta;
-        let sinh_arg = arg.sinh();
-
-        let mut out = 2.0 * (sigma_mod / gamma) * sinh_arg;
-        if let Some(mu) = self.mu {
-            out += mu.get(params);
-        }
-        (
-            out,
-            log_sigma + log_cosh_from_sinh(sinh_arg, arg) - log_cosh_asinh(half),
-        )
-    }
-
-    /// `transform` and its partials.
-    ///
-    /// `d y_out / d y_in` is `sigma_mod * cosh(arg) / cosh(u)`, and every
-    /// partial is rational in quantities the forward pass already formed:
-    /// `cosh(u)` is `sqrt(1 + half^2)` and `cosh(arg)` is
-    /// `sqrt(1 + sinh(arg)^2)`, so the derivative costs two square roots and
-    /// **no new transcendental calls**.
-    #[inline(always)]
-    fn transform_with_tape(&self, params: &[f64], y: f64) -> (f64, f64, LayerTape) {
-        // gamma, and d gamma / d alpha.
-        let (gamma, dgamma) = match (self.alpha, &self.bound) {
-            (None, _) => (1.0, 0.0),
-            (Some(alpha), None) => exp_asinh_with_derivative(alpha.get(params)),
-            (Some(alpha), Some(bound)) => {
-                let a = alpha.get(params);
-                let (log_gamma, dlog_gamma) = bound.apply_with_derivative(a.asinh());
-                let gamma = log_gamma.exp();
-                (gamma, gamma * dlog_gamma / (1.0 + a * a).sqrt())
-            }
-        };
-        let (log_delta, dlog_delta) = match self.beta {
-            None => (0.0, 0.0),
-            Some(beta) => {
-                let b = beta.get(params);
-                (b.asinh(), 1.0 / (1.0 + b * b).sqrt())
-            }
-        };
-        let (sigma_mod, dsigma_mod, log_sigma) = match self.sigma {
-            None => (1.0, 0.0, 0.0),
-            Some(sigma) => {
-                let (m, dm) = exp_asinh_with_derivative(sigma.get(params));
-                (m, dm, m.ln())
-            }
-        };
-
-        let centred = match self.nu {
-            None => y,
-            Some(nu) => y - nu.get(params),
-        };
-        let half = 0.5 * centred;
-        let cosh_u = (1.0 + half * half).sqrt();
-        let u = half.asinh();
-        let tanh_u = half / cosh_u;
-
-        let arg = gamma * u + 2.0 * log_delta;
-        let sinh_arg = arg.sinh();
-        let cosh_arg = (1.0 + sinh_arg * sinh_arg).sqrt();
-        let tanh_arg = tanh_from(sinh_arg, cosh_arg, arg);
-
-        let scale = 2.0 * sigma_mod / gamma;
-        let y_out = scale * sinh_arg + self.mu.map_or(0.0, |mu| mu.get(params));
-        let ld = log_sigma + log_cosh_from_sinh(sinh_arg, arg) - log_cosh_asinh(half);
-
-        let du_dy = 0.5 / cosh_u;
-        let mut tape = LayerTape::new(
-            sigma_mod * cosh_arg / cosh_u,
-            (gamma * tanh_arg - tanh_u) * du_dy,
-        );
-
-        // alpha enters only through gamma, which scales `u` inside `arg` and
-        // divides the outer amplitude.
-        tape.push(
-            self.alpha,
-            scale * (cosh_arg * u - sinh_arg / gamma) * dgamma,
-            tanh_arg * u * dgamma,
-        );
-        // beta shifts `arg` by `2 log delta`.
-        tape.push(
-            self.beta,
-            scale * cosh_arg * 2.0 * dlog_delta,
-            tanh_arg * 2.0 * dlog_delta,
-        );
-        // sigma is a pure amplitude, so its log det partial is just
-        // `d log sigma_mod / d sigma`.
-        tape.push(
-            self.sigma,
-            (2.0 * sinh_arg / gamma) * dsigma_mod,
-            dsigma_mod / sigma_mod,
-        );
-        tape.push(self.mu, 1.0, 0.0);
-        // nu shifts the input, so its partials are the input ones negated.
-        tape.push(self.nu, -tape.p_y_in, -tape.p_l_in);
-
-        (y_out, ld, tape)
-    }
-}
-
-impl TangentSasSpec {
-    /// One layer of `TangentSAS.transform_and_log_det`: with `w = b (y - nu)`
-    /// and `arg = r asinh(w) + eps`,
-    ///
-    /// ```text
-    /// y_out = nu + (sinh(arg) - sinh(eps)) / (r b cosh(eps)),
-    /// ld    = logcosh(arg) - logcosh(eps) - 0.5 log1p(w^2).
-    /// ```
-    #[inline(always)]
-    fn transform(&self, params: &[f64], y: f64) -> (f64, f64) {
-        let nu = param_or(self.nu, params, 0.0);
-        let b = sigmoid(param_or(self.b, params, 0.0));
-        let r = self.r.map_or(1.0, |p| exp_asinh(p.get(params)));
-        let (eps, sinh_eps, cosh_eps) = match self.eps {
-            None => (0.0, 0.0, 1.0),
-            Some(p) => {
-                let eps = p.get(params);
-                (eps, eps.sinh(), eps.cosh())
-            }
-        };
-
-        let w = b * (y - nu);
-        let arg = r * w.asinh() + eps;
-        let sinh_arg = arg.sinh();
-        let out = nu + (sinh_arg - sinh_eps) / (r * b * cosh_eps);
-        let ld = log_cosh_from_sinh(sinh_arg, arg)
-            - log_cosh_from_sinh(sinh_eps, eps)
-            - log_cosh_asinh(w);
-        (out, ld)
-    }
-
-    /// `transform` and its partials. With `u = y - nu`, `R = sqrt(1 + w^2)`,
-    /// `a = asinh(w)`, `D = r b cosh(eps)` and `S = y_out - nu`:
-    ///
-    /// ```text
-    /// dS/du  = cosh(arg) / (cosh(eps) R),       dld/du  = b (r tanh(arg) - w/R) / R,
-    /// dS/deps = (cosh(arg) - cosh(eps)) / D - S tanh(eps),   dld/deps = tanh(arg) - tanh(eps),
-    /// dS/db  = (u dS/du - S) / b,               dld/db  = u (dld/du) / b,
-    /// dS/dr  = cosh(arg) a / D - S / r,         dld/dr  = tanh(arg) a,
-    /// ```
-    ///
-    /// and `db/db_raw = b (1 - b)` cancels the `1 / b`.
-    #[inline(always)]
-    fn transform_with_tape(&self, params: &[f64], y: f64) -> (f64, f64, LayerTape) {
-        let nu = param_or(self.nu, params, 0.0);
-        let b = sigmoid(param_or(self.b, params, 0.0));
-        let (r, dr) = self
-            .r
-            .map_or((1.0, 0.0), |p| exp_asinh_with_derivative(p.get(params)));
-        let (eps, sinh_eps, cosh_eps) = match self.eps {
-            None => (0.0, 0.0, 1.0),
-            Some(p) => {
-                let eps = p.get(params);
-                (eps, eps.sinh(), eps.cosh())
-            }
-        };
-        let tanh_eps = sinh_eps / cosh_eps;
-
-        let u = y - nu;
-        let w = b * u;
-        let root = if w.abs() > 1e150 {
-            w.abs()
-        } else {
-            (1.0 + w * w).sqrt()
-        };
-        let a = w.asinh();
-        let arg = r * a + eps;
-        let sinh_arg = arg.sinh();
-        let cosh_arg = (1.0 + sinh_arg * sinh_arg).sqrt();
-        let tanh_arg = tanh_from(sinh_arg, cosh_arg, arg);
-
-        let denominator = r * b * cosh_eps;
-        let shape = (sinh_arg - sinh_eps) / denominator;
-        let ld = log_cosh_from_sinh(sinh_arg, arg)
-            - log_cosh_from_sinh(sinh_eps, eps)
-            - log_cosh_asinh(w);
-
-        let p_y_in = cosh_arg / (cosh_eps * root);
-        let p_l_in = b * (r * tanh_arg - w / root) / root;
-        let mut tape = LayerTape::new(p_y_in, p_l_in);
-
-        // nu shifts both the input and the output.
-        tape.push(self.nu, 1.0 - p_y_in, -p_l_in);
-        tape.push(
-            self.eps,
-            (cosh_arg - cosh_eps) / denominator - shape * tanh_eps,
-            tanh_arg - tanh_eps,
-        );
-        tape.push(
-            self.b,
-            (1.0 - b) * (u * p_y_in - shape),
-            (1.0 - b) * u * p_l_in,
-        );
-        tape.push(
-            self.r,
-            (cosh_arg * a / denominator - shape / r) * dr,
-            tanh_arg * a * dr,
-        );
-
-        (nu + shape, ld, tape)
-    }
-}
-
-impl PositiveAffineSpec {
-    /// `y_out = loc + scale_mod * y`, `scale_mod = scale + sqrt(1 + scale^2)`.
-    #[inline(always)]
-    fn transform(&self, params: &[f64], y: f64) -> (f64, f64) {
-        let loc = param_or(self.loc, params, 0.0);
-        match self.scale {
-            None => (loc + y, 0.0),
-            Some(p) => {
-                let scale = p.get(params);
-                (loc + exp_asinh(scale) * y, scale.asinh())
-            }
-        }
-    }
-
-    #[inline(always)]
-    fn transform_with_tape(&self, params: &[f64], y: f64) -> (f64, f64, LayerTape) {
-        let loc = param_or(self.loc, params, 0.0);
-        let (scale, (scale_mod, dscale_mod)) = match self.scale {
-            None => (0.0, (1.0, 0.0)),
-            Some(p) => {
-                let scale = p.get(params);
-                (scale, exp_asinh_with_derivative(scale))
-            }
-        };
-        let mut tape = LayerTape::new(scale_mod, 0.0);
-        tape.push(self.loc, 1.0, 0.0);
-        // `log scale_mod = asinh(scale)`, whose derivative is
-        // `dscale_mod / scale_mod`.
-        tape.push(self.scale, y * dscale_mod, dscale_mod / scale_mod);
-        (loc + scale_mod * y, scale.asinh(), tape)
-    }
 }
 
 /// One conditioner MLP, vectorized across the output width.
@@ -1460,7 +850,7 @@ struct Dataflow<'a> {
 /// Everything here is sized once from the layout and overwritten in place, so a
 /// steady-state leapfrog step allocates nothing.
 struct Tape {
-    /// Per edge, in `parent_index` order and interleaved:
+    /// Per edge, by edge id and interleaved:
     /// `d y_child / d y_parent` then `d ld_child / d y_parent`.
     edges: Vec<Cell>,
     /// `d y_i / d x_i`, the diagonal of `J`'s numerator.
@@ -1535,21 +925,16 @@ impl Scratchpad {
 /// the arrays are the same ones, taken by value.
 pub struct TriangularTransform {
     n_variables: usize,
-    parent_indptr: Vec<usize>,
-    parent_index: Vec<u32>,
-    /// The reverse of the parent lists, built here: the dataflow sweep pushes
-    /// work forwards along edges, so it needs each variable's children.
-    child_indptr: Vec<usize>,
-    child_index: Vec<u32>,
-    /// For each reversed edge, its index in the forward `parent_index` order,
-    /// which is where the tape keeps that edge's Jacobian entries.
-    child_edge: Vec<u32>,
-    blob: Vec<f64>,
-    blob_offset: Vec<usize>,
+    parents: Pattern<u32>,
+    /// The transpose of `parents`, built here: the dataflow sweep pushes work
+    /// forwards along edges, so it needs each variable's children, and the
+    /// edge ids say where the tape keeps each edge's Jacobian entries.
+    children: Children<u32>,
+    /// Each variable's slice of the weight blob.
+    weights: Ragged<f64>,
     layer_out: Vec<usize>,
     /// Linear skip from the parents to conditioner output `skip_index`, one
-    /// weight per edge in `parent_index` order. All zeros when the
-    /// conditioners have none.
+    /// weight per edge. All zeros when the conditioners have none.
     skip_weight: Vec<f64>,
     skip_index: usize,
     /// Parent features: with `feature_degree = K > 0` the MLPs see, for each
@@ -1564,8 +949,8 @@ pub struct TriangularTransform {
     feature_derivs: Vec<Cell>,
     activation: Activation,
     layers: Vec<Layer>,
-    level_ptr: Vec<usize>,
-    level_vars: Vec<u32>,
+    /// The variables of each level; concatenated, an evaluation order.
+    levels: Ragged<u32>,
     /// For [`Schedule::Levels`]: whether each level is worth handing to the
     /// thread pool. Levels are tiny far more often than not -- a banded blanket
     /// puts exactly one variable in each -- and rayon's per-call overhead would
@@ -1605,12 +990,11 @@ impl TriangularTransform {
         x: f64,
         pad: &mut Scratchpad,
     ) -> (f64, f64) {
-        let start = self.parent_indptr[variable];
-        let stop = self.parent_indptr[variable + 1];
-        let n_in = stop - start;
-        let parents = &self.parent_index[start..stop];
+        let edges = self.parents.edges(variable);
+        let (start, n_in) = (edges.start, edges.len());
+        let parents = self.parents.parents(variable);
         // Taken before the MLP runs, which reuses `inputs` as a layer buffer.
-        let skip: f64 = self.skip_weight[start..stop]
+        let skip: f64 = self.skip_weight[edges.clone()]
             .iter()
             .zip(parents)
             .map(|(weight, &parent)| weight * y[parent as usize].get())
@@ -1631,7 +1015,7 @@ impl TriangularTransform {
             n_in * degree
         };
 
-        let weights = &self.blob[self.blob_offset[variable]..self.blob_offset[variable + 1]];
+        let weights = self.weights.row(variable);
 
         // One dispatch per variable, covering every layer: the whole MLP runs
         // inside a single `#[target_feature]` body rather than paying for the
@@ -1703,7 +1087,7 @@ impl TriangularTransform {
             }
             let skip_dy = pad.dy_dtheta[self.skip_index];
             let skip_dld = pad.dld_dtheta[self.skip_index];
-            for (k, &weight) in self.skip_weight[start..stop].iter().enumerate() {
+            for (k, &weight) in self.skip_weight[edges].iter().enumerate() {
                 pad.edge_y[k] += skip_dy * weight;
                 pad.edge_l[k] += skip_dld * weight;
             }
@@ -1796,17 +1180,11 @@ impl TriangularTransform {
         let mut w = vec![0.0; self.n_variables];
         let mut grad_x = vec![0.0; self.n_variables];
 
-        for &variable in self.level_vars.iter().rev() {
+        for &variable in self.levels.values().iter().rev() {
             let variable = variable as usize;
             let mut total = grad_y[variable];
-            let start = self.child_indptr[variable];
-            let stop = self.child_indptr[variable + 1];
-            for (&child, &edge) in self.child_index[start..stop]
-                .iter()
-                .zip(&self.child_edge[start..stop])
-            {
-                let edge = edge as usize;
-                total += self.tape.edges[2 * edge].get() * w[child as usize]
+            for (child, edge) in self.children.entries(variable) {
+                total += self.tape.edges[2 * edge].get() * w[child]
                     + ld_bar * self.tape.edges[2 * edge + 1].get();
             }
             w[variable] = total;
@@ -1839,7 +1217,7 @@ impl TriangularTransform {
     fn run_serial<const TAPE: bool>(&self, x: &[f64], y: &[Cell]) -> f64 {
         let mut pad = Scratchpad::new(self);
         let mut log_det = 0.0;
-        for &variable in &self.level_vars {
+        for &variable in self.levels.values() {
             let variable = variable as usize;
             let (value, element) = self.eval_variable::<TAPE>(variable, y, x[variable], &mut pad);
             y[variable].set(value);
@@ -1853,8 +1231,8 @@ impl TriangularTransform {
         let mut collected: Vec<(f64, f64)> = Vec::new();
         let mut log_det = 0.0;
 
-        for level in 0..self.level_ptr.len() - 1 {
-            let members = &self.level_vars[self.level_ptr[level]..self.level_ptr[level + 1]];
+        for level in 0..self.levels.n_rows() {
+            let members = self.levels.row(level);
             if self.level_parallel[level] {
                 members
                     .par_iter()
@@ -1886,11 +1264,11 @@ impl TriangularTransform {
     fn run_dataflow_top<const TAPE: bool>(&self, x: &[f64], y: &[Cell]) -> f64 {
         let log_det = Cell::zeros(self.n_variables);
         let pending: Vec<AtomicU32> = (0..self.n_variables)
-            .map(|i| AtomicU32::new((self.parent_indptr[i + 1] - self.parent_indptr[i]) as u32))
+            .map(|i| AtomicU32::new(self.parents.n_parent(i) as u32))
             .collect();
 
         let roots: ReadyList = (0..self.n_variables as u32)
-            .filter(|&i| self.parent_indptr[i as usize + 1] == self.parent_indptr[i as usize])
+            .filter(|&i| self.parents.n_parent(i as usize) == 0)
             .collect();
 
         self.run_dataflow::<TAPE>(
@@ -1949,9 +1327,7 @@ impl TriangularTransform {
             ctx.y[variable].set(value);
             ctx.log_det[variable].set(element);
 
-            let start = self.child_indptr[variable];
-            let stop = self.child_indptr[variable + 1];
-            for &child in &self.child_index[start..stop] {
+            for &child in self.children.children(variable) {
                 // AcqRel is what makes the gather in `eval_variable` legal: the
                 // release half publishes the write of `y[variable]` just made,
                 // and whichever thread sees the count reach zero acquires the
@@ -2006,51 +1382,40 @@ fn build_transform(
         .map(Layer::new)
         .collect::<Result<Vec<_>>>()?;
 
-    let parent_indptr: Vec<usize> = as_usize(parent_indptr)?;
-    let parent_index: Vec<u32> = as_u32(parent_index)?;
-    let blob_offset: Vec<usize> = as_usize(blob_offset)?;
+    let parents: Pattern<u32> = Pattern::from_i64(parent_indptr, parent_index)?;
+    let weights = Ragged::new(Offsets::from_i64(blob_offset)?, blob.to_vec())?;
     let layer_out: Vec<usize> = as_usize(layer_out)?;
-    let level_ptr: Vec<usize> = as_usize(level_ptr)?;
-    let level_vars: Vec<u32> = as_u32(level_vars)?;
-    let blob = blob.to_vec();
+    let levels = Ragged::new(Offsets::from_i64(level_ptr)?, as_u32(level_vars)?)?;
     let skip_weight = skip_weight.to_vec();
 
-    let n_variables = parent_indptr.len().saturating_sub(1);
-    if blob_offset.len() != n_variables + 1 {
+    let n_variables = parents.n_var();
+    if weights.n_rows() != n_variables {
         bail!("blob_offset must have one more entry than there are variables");
     }
-    if level_vars.len() != n_variables {
+    if levels.values().len() != n_variables {
         bail!("level_vars must list every variable exactly once");
     }
-    if level_ptr.len() != level_work.len() + 1 {
+    if levels.n_rows() != level_work.len() {
         bail!("level_ptr must have one more entry than level_work");
     }
     if layer_out.is_empty() {
         bail!("conditioners must have at least one layer");
     }
-    if parent_index.iter().any(|&p| p as usize >= n_variables) {
-        bail!("parent_index contains an out of range variable");
-    }
-    if level_vars.iter().any(|&v| v as usize >= n_variables) {
+    if levels.values().iter().any(|&v| v as usize >= n_variables) {
         bail!("level_vars contains an out of range variable");
     }
 
-    let (child_indptr, child_index, child_edge) =
-        invert_edges(n_variables, &parent_indptr, &parent_index);
+    let children = parents.children();
 
     let num_params = *layer_out.last().expect("checked non-empty");
-    if skip_weight.len() != parent_index.len() {
+    if skip_weight.len() != parents.n_edge() {
         bail!("skip_weight must have one entry per parent_index entry");
     }
     let skip_index = usize::try_from(skip_index)
         .ok()
         .filter(|&index| index < num_params)
         .ok_or_else(|| anyhow::anyhow!("skip_index {skip_index} is out of range"))?;
-    let max_parents = parent_indptr
-        .windows(2)
-        .map(|w| w[1] - w[0])
-        .max()
-        .unwrap_or(0);
+    let max_parents = parents.max_parent();
     let act_deriv_len: usize = layer_out[..layer_out.len() - 1].iter().sum();
 
     let feature_degree = usize::try_from(feature_degree)
@@ -2078,22 +1443,15 @@ fn build_transform(
     let level_parallel = level_work
         .iter()
         .enumerate()
-        .map(|(level, &work)| {
-            let size = level_ptr[level + 1] - level_ptr[level];
-            size > 1 && work >= min_parallel_work
-        })
+        .map(|(level, &work)| levels.row(level).len() > 1 && work >= min_parallel_work)
         .collect();
 
-    let n_edges = parent_index.len();
+    let n_edges = parents.n_edge();
     Ok(TriangularTransform {
         n_variables,
-        parent_indptr,
-        parent_index,
-        child_indptr,
-        child_index,
-        child_edge,
-        blob,
-        blob_offset,
+        parents,
+        children,
+        weights,
         layer_out,
         skip_weight,
         skip_index,
@@ -2103,8 +1461,7 @@ fn build_transform(
         feature_derivs: Cell::zeros(n_variables * feature_degree),
         activation,
         layers,
-        level_ptr,
-        level_vars,
+        levels,
         level_parallel,
         schedule,
         buffer_size,
@@ -2474,39 +1831,6 @@ impl<'a> WithSimd for ApplyActivation<'a> {
     fn with_simd<S: pulp::Simd>(self, simd: S) -> Self::Output {
         apply_activation(simd, self.activation, self.src, self.dst)
     }
-}
-
-/// Reverse a CSR edge list: parents-of -> children-of.
-///
-/// Also returns, for each reversed edge, the position of the same edge in the
-/// forward list -- which is where the tape stores that edge's Jacobian entries,
-/// so the reverse sweep can find them.
-fn invert_edges(
-    n_variables: usize,
-    parent_indptr: &[usize],
-    parent_index: &[u32],
-) -> (Vec<usize>, Vec<u32>, Vec<u32>) {
-    let mut counts = vec![0usize; n_variables + 1];
-    for &parent in parent_index {
-        counts[parent as usize + 1] += 1;
-    }
-    for i in 0..n_variables {
-        counts[i + 1] += counts[i];
-    }
-    let child_indptr = counts.clone();
-
-    let mut child_index = vec![0u32; parent_index.len()];
-    let mut child_edge = vec![0u32; parent_index.len()];
-    let mut cursor = counts;
-    for child in 0..n_variables {
-        for edge in parent_indptr[child]..parent_indptr[child + 1] {
-            let slot = &mut cursor[parent_index[edge] as usize];
-            child_index[*slot] = child as u32;
-            child_edge[*slot] = edge as u32;
-            *slot += 1;
-        }
-    }
-    (child_indptr, child_index, child_edge)
 }
 
 fn from_tag<T: for<'de> Deserialize<'de>>(tag: &str) -> Result<T, serde_json::Error> {
