@@ -32,7 +32,15 @@ from flowjax.train.train_utils import (
 from jaxtyping import ArrayLike, PyTree
 from paramax import NonTrainable, unwrap
 
-from nutpie.normalizing_flow import Coupling, Householder, Scan, extend_flow, make_flow
+from nutpie.normalizing_flow import (
+    Coupling,
+    Householder,
+    Scan,
+    diag_from_gradients,
+    extend_flow,
+    make_diag_flow,
+    make_flow,
+)
 
 _BIJECTION_TRACE = []
 
@@ -41,6 +49,14 @@ _LOG_SKIP_TRAINING_VALUE = -4
 # Fewest distinct draws a diagonal fit needs; with fewer, it matches them
 # exactly and its scales are arbitrary.
 _MIN_DIAG_DRAWS = 5
+
+
+def _diag_flow_from_gradients(positions, gradients):
+    """A diagonal flow from the gradients alone, see `diag_from_gradients`."""
+    return bijections.Chain(
+        [make_diag_flow(*diag_from_gradients(positions, gradients))]
+    )
+
 
 # Remat toggle for the per-draw residual, see `FisherLoss.residuals`.
 CHECKPOINT_RESIDUAL = False
@@ -1122,50 +1138,50 @@ class TransformAdapter:
         *,
         logp_fn,
         make_flow_fn,
-        verbose=False,
-        window_size=2000,
-        show_progress=False,
-        num_diag_windows=10,
-        learning_rate=1e-3,
-        zero_init=True,
-        untransformed_dim=None,
-        batch_size=128,
-        reuse_opt_state=True,
-        max_patience=5,
-        gamma=None,
-        log_inside_batch=False,
-        fisher_ema_alpha=0.1,
-        initial_skip=500,
-        extension_windows=None,
-        extend_dct=False,
-        extension_var_count=6,
-        extension_var_trafo_count=4,
-        debug_save_bijection=False,
-        make_optimizer=None,
-        num_layers=9,
-        max_epochs=200,
-        method="adam",
-        solver_rtol=1e-3,
-        solver_atol=1e-6,
-        lm_linear_steps=300,
-        lm_min_loss=math.exp(-3),
-        lm_probe_batch=32,
-        lm_probes=64,
-        lm_residual_batch=256,
-        lm_cholesky_jitter=None,
-        lm_fisher_regularization=None,
-        lm_probe_groups=None,
-        lm_probe_rounds=1,
-        lm_fit_affine=True,
-        lm_patience=5,
-        lm_line_search=False,
-        lm_forcing="residual",
-        lm_exact_blocks=False,
-        lm_max_exact_block_size=256,
-        lm_lmp_size=0,
-        lm_lmp_tol=1e-8,
-        native_flow=True,
-        stop_event=None,
+        verbose,
+        window_size,
+        show_progress,
+        num_diag_windows,
+        learning_rate,
+        zero_init,
+        untransformed_dim,
+        batch_size,
+        reuse_opt_state,
+        max_patience,
+        gamma,
+        log_inside_batch,
+        fisher_ema_alpha,
+        initial_skip,
+        extension_windows,
+        extend_dct,
+        extension_var_count,
+        extension_var_trafo_count,
+        debug_save_bijection,
+        make_optimizer,
+        num_layers,
+        max_epochs,
+        method,
+        solver_rtol,
+        solver_atol,
+        lm_linear_steps,
+        lm_min_loss,
+        lm_probe_batch,
+        lm_probes,
+        lm_residual_batch,
+        lm_cholesky_jitter,
+        lm_fisher_regularization,
+        lm_probe_groups,
+        lm_probe_rounds,
+        lm_fit_affine,
+        lm_patience,
+        lm_line_search,
+        lm_forcing,
+        lm_exact_blocks,
+        lm_max_exact_block_size,
+        lm_lmp_size,
+        lm_lmp_tol,
+        native_flow,
+        stop_event,
     ):
         self._logp_fn = logp_fn
         self._make_flow_fn = make_flow_fn
@@ -1328,9 +1344,17 @@ class TransformAdapter:
                 n_repeats = size - start - len(keep)
                 repeats = f", {n_repeats} repeats skipped" if n_repeats else ""
                 if len(keep) < _MIN_DIAG_DRAWS:
+                    # Too few draws for variances: scale by the gradient
+                    # instead, so that a bad scale from earlier does not keep
+                    # the chain stuck.
+                    self._bijection = _diag_flow_from_gradients(
+                        positions[keep], gradients[keep]
+                    )
+                    self._opt_state = None
                     self._report(
                         n_draws,
-                        f"keep diag, only {len(keep)} distinct draws{repeats}",
+                        f"diag from the gradient, only {len(keep)} distinct "
+                        f"draws{repeats}",
                     )
                     return
 
@@ -1516,6 +1540,13 @@ class TransformAdapter:
                     f"already below {_format_log_f(_LOG_SKIP_TRAINING_VALUE)}",
                 )
                 return
+
+            # Header for the LM steps printed below; a fresh flow already has
+            # its own.
+            if self._verbose >= 2 and base is self._bijection:
+                self._report(
+                    n_draws, f"log F  current {_format_log_f(old_loss)}  -> refit"
+                )
 
             fit, fit_losses, opt_state = fit_flow(
                 key,
@@ -1829,6 +1860,9 @@ def make_transform_adapter(
 ):
     if extension_windows is None:
         extension_windows = []
+    if activation is None and coupling_type == "triangular":
+        # The Rust LM fit (`method="lm-rust"`) only supports softplus.
+        activation = jax.nn.softplus
 
     return partial(
         TransformAdapter,

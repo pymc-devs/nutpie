@@ -1424,8 +1424,15 @@ def _optional(value):
 
 
 def _positive(x):
-    """``x + sqrt(1 + x**2)``: positive, and 1 at zero."""
-    return x + jnp.sqrt(1 + x**2)
+    """``x + sqrt(1 + x**2)``: positive, and 1 at zero.
+
+    For ``x < 0`` the sum cancels, losing all precision below ``1e-8``, so
+    that branch is evaluated as ``1 / (sqrt(1 + x**2) - x)``. Both branches go
+    through ``sqrt(1 + x**2) + |x| >= 1``, so neither divides by zero, which
+    `jnp.where` would turn into a NaN gradient.
+    """
+    s = jnp.sqrt(1 + x**2) + jnp.abs(x)
+    return jnp.where(x >= 0, s, 1 / s)
 
 
 class TangentSAS(bijections.AbstractBijection):
@@ -2489,6 +2496,34 @@ def reverse_cholesky(matrix):
     return sp.csc_matrix(factor).T[rev][:, rev]
 
 
+def diag_from_gradients(positions, gradients):
+    """``(mean, scale)`` of a diagonal normal from the gradients alone, as
+    nuts-rs initializes its diagonal mass matrix.
+
+    The variance is ``1 / mean(|g|)``, clipped, and the mean is where a normal
+    with that variance has the observed score, ``x + var g``, averaged over the
+    draws. At a single draw, the score of that normal matches the gradient
+    exactly, so an exact-normal trajectory starts with no residual force.
+    """
+    with np.errstate(divide="ignore"):
+        diag = 1 / np.sqrt(np.abs(gradients).mean(0))
+    diag = np.clip(np.where(np.isnan(diag), 1.0, diag), 1e-10, 1e10)
+    mean = (positions + diag**2 * gradients).mean(0)
+    return mean, diag
+
+
+def make_diag_flow(mean, diag):
+    """The diagonal affine ``x = mean + diag * z`` every flow of `make_flow`
+    starts with, with ``diag`` parameterized to stay positive."""
+    diag_param = Parameterize(_positive, (diag**2 - 1) / (2 * diag))
+    diag_affine = bijections.Affine(mean, diag)
+    return eqx.tree_at(
+        where=lambda aff: aff.scale,
+        pytree=diag_affine,
+        replace=diag_param,
+    )
+
+
 def make_flow(
     seed,
     positions,
@@ -2546,10 +2581,7 @@ def make_flow(
     if n_draws == 0:
         raise ValueError("No draws")
     elif n_draws == 1:
-        assert np.all(gradients != 0)
-        diag = np.clip(1 / jnp.sqrt(jnp.abs(gradients[0])), 1e-8, 1e8)
-        assert np.isfinite(diag).all()
-        mean = jnp.zeros_like(diag)
+        mean, diag = diag_from_gradients(positions, gradients)
     else:
         pos_std = np.clip(positions.std(0), 1e-8, 1e8)
         grad_std = np.clip(gradients.std(0), 1e-8, 1e8)
@@ -2558,19 +2590,8 @@ def make_flow(
 
     key = jax.random.key(seed % (2**63), impl="threefry2x32")
 
-    diag_param = Parameterize(
-        lambda x: x + jnp.sqrt(1 + x**2),
-        (diag**2 - 1) / (2 * diag),
-    )
-    diag_affine = bijections.Affine(mean, diag)
-    diag_affine = eqx.tree_at(
-        where=lambda aff: aff.scale,
-        pytree=diag_affine,
-        replace=diag_param,
-    )
-
     flows = [
-        diag_affine,
+        make_diag_flow(mean, diag),
     ]
 
     if n_layers == 0:
