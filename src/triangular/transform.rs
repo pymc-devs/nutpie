@@ -943,6 +943,9 @@ pub struct TriangularTransform {
     /// `feature_params[parent]`). Zero: the raw parents.
     feature_degree: usize,
     feature_params: Vec<[f64; 5]>,
+    /// With `Some(c)` (and no features), the MLPs see `c asinh(y / c)` of
+    /// each parent instead of `y`; the skip stays linear in `y`.
+    input_squash: Option<f64>,
     /// Each variable's `K` features and their derivatives in its value,
     /// written when the variable is evaluated and read by its children.
     features: Vec<Cell>,
@@ -1002,7 +1005,11 @@ impl TriangularTransform {
         let degree = self.feature_degree;
         let n_mlp_in = if degree == 0 {
             for (slot, &parent) in pad.inputs[..n_in].iter_mut().zip(parents) {
-                *slot = y[parent as usize].get();
+                let value = y[parent as usize].get();
+                *slot = match self.input_squash {
+                    None => value,
+                    Some(c) => c * (value / c).asinh(),
+                };
             }
             n_in
         } else {
@@ -1083,6 +1090,14 @@ impl TriangularTransform {
                     }
                     pad.edge_y[j] = sum_y;
                     pad.edge_l[j] = sum_l;
+                }
+            } else if let Some(c) = self.input_squash {
+                // `d/dy c asinh(y / c) = 1 / sqrt(1 + (y / c)^2)`.
+                for (j, &parent) in parents.iter().enumerate() {
+                    let v = y[parent as usize].get() / c;
+                    let dz = 1.0 / v.hypot(1.0);
+                    pad.edge_y[j] *= dz;
+                    pad.edge_l[j] *= dz;
                 }
             }
             let skip_dy = pad.dy_dtheta[self.skip_index];
@@ -1363,6 +1378,7 @@ fn build_transform(
     skip_index: i64,
     feature_degree: i64,
     feature_params: &[f64],
+    input_squash: Option<f64>,
     activation: &str,
     transformer: &Bound<'_, PyAny>,
     level_ptr: &[i64],
@@ -1371,6 +1387,14 @@ fn build_transform(
     min_parallel_work: i64,
     schedule: &str,
 ) -> Result<TriangularTransform> {
+    if let Some(c) = input_squash {
+        if !(c.is_finite() && c > 0.0) {
+            bail!("input_squash must be positive and finite, got {c}");
+        }
+        if feature_degree != 0 {
+            bail!("input_squash and parent features are mutually exclusive");
+        }
+    }
     let activation: Activation =
         from_tag(activation).map_err(|_| anyhow::anyhow!("unknown activation {activation:?}"))?;
     let schedule: Schedule =
@@ -1457,6 +1481,7 @@ fn build_transform(
         skip_index,
         feature_degree,
         feature_params,
+        input_squash,
         features: Cell::zeros(n_variables * feature_degree),
         feature_derivs: Cell::zeros(n_variables * feature_degree),
         activation,
@@ -1534,6 +1559,10 @@ impl FlowTransform {
                     item(layout, "skip_index")?.extract()?,
                     item(layout, "feature_degree")?.extract()?,
                     &floats(layout, "feature_params")?,
+                    match layout.get_item("input_squash")? {
+                        Some(value) => value.extract()?,
+                        None => None,
+                    },
                     &item(layout, "activation")?.extract::<String>()?,
                     &item(layout, "transformer")?,
                     &ints(layout, "level_ptr")?,
@@ -1655,6 +1684,7 @@ impl PySparseTriangularTransform {
         level_work,
         min_parallel_work,
         schedule,
+        input_squash = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -1674,6 +1704,7 @@ impl PySparseTriangularTransform {
         level_work: PyReadonlyArray1<'_, i64>,
         min_parallel_work: i64,
         schedule: &str,
+        input_squash: Option<f64>,
     ) -> Result<Self> {
         Ok(Self {
             inner: build_transform(
@@ -1686,6 +1717,7 @@ impl PySparseTriangularTransform {
                 skip_index,
                 feature_degree,
                 feature_params.as_slice()?,
+                input_squash,
                 activation,
                 transformer,
                 level_ptr.as_slice()?,

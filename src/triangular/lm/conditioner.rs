@@ -16,12 +16,17 @@ use crate::triangular::layers::{Layer, LayerSpec};
 /// hidden layer of `n_unit` softplus units, `n_par` transformer parameters
 /// with the location skip into parameter `location` (`loc`), and the
 /// transformer layers.
+///
+/// With `squash = Some(c)`, the units see `z = c asinh(y / c)` of each parent
+/// instead of `y`, while the skip stays linear in `y`. The units' part of
+/// every edge derivative then carries `z'(y_j)` (`dz`).
 #[derive(Debug, Clone)]
 pub(super) struct Conditioner {
     pub(super) n_unit: usize,
     pub(super) n_par: usize,
     pub(super) location: usize,
     pub(super) layers: Vec<Layer>,
+    pub(super) squash: Option<f64>,
 }
 
 /// Where one variable's conditioner parameters sit in its slice.
@@ -193,6 +198,10 @@ pub(super) struct Cotangent<'a, S: Simd> {
 pub(super) struct UnitState<S: Simd> {
     /// The parents' values, filled before [`Conditioner::evaluate`].
     pub(super) y_parents: Vec<S::f64s>,
+    /// What the units see of them, `z`, and `dz = z'(y)`; `y` and one
+    /// without a squash.
+    pub(super) z_parents: Vec<S::f64s>,
+    pub(super) dz: Vec<S::f64s>,
     /// Softplus and its first two derivatives at the hidden units.
     pub(super) h: Vec<S::f64s>,
     pub(super) h1: Vec<S::f64s>,
@@ -203,10 +212,14 @@ pub(super) struct UnitState<S: Simd> {
 
 /// Per-thread work space of the local kernels.
 pub(super) struct Scratch<S: Simd> {
-    /// Per unit: `a_dot` in the pushforward; `zeta_a = W1[u, :] . A_bar[i, :]`
-    /// and `zeta_l = W1[u, :] . L_bar[i, :]` in the pullback.
+    /// Per unit: `a_dot` in the pushforward; `zeta_a = W1[u, :] . A_bar_z`
+    /// and `zeta_l = W1[u, :] . L_bar_z` in the pullback.
     unit_a: Vec<S::f64s>,
     unit_b: Vec<S::f64s>,
+    /// Per parent, in the pullback: `A_bar_z = dz * A_bar[i, :]` and
+    /// `L_bar_z = dz * L_bar[i, :]`, the edge cotangents the units see.
+    edge_za: Vec<S::f64s>,
+    edge_zl: Vec<S::f64s>,
     pi_dot: Vec<S::f64s>,
     /// The cotangents of `t` and `l` from the edges' `A_bar` and `L_bar`.
     t_bar: Vec<S::f64s>,
@@ -229,9 +242,15 @@ impl Conditioner {
         n_par: usize,
         location: usize,
         specs: Vec<LayerSpec>,
+        squash: Option<f64>,
     ) -> Result<Self> {
         if location >= n_par {
             bail!("location index {location} out of range for {n_par} parameters");
+        }
+        if let Some(c) = squash {
+            if !(c.is_finite() && c > 0.0) {
+                bail!("input_squash must be positive and finite, got {c}");
+            }
         }
         for param in specs.iter().flat_map(LayerSpec::params) {
             if param.index >= n_par {
@@ -247,6 +266,7 @@ impl Conditioner {
             n_par,
             location,
             layers,
+            squash,
         })
     }
 
@@ -264,6 +284,8 @@ impl Conditioner {
         let zero = S::f64s::splat(simd, 0.0);
         UnitState {
             y_parents: Vec::with_capacity(max_parent),
+            z_parents: Vec::with_capacity(max_parent),
+            dz: Vec::with_capacity(max_parent),
             h: vec![zero; self.n_unit],
             h1: vec![zero; self.n_unit],
             h2: vec![zero; self.n_unit],
@@ -277,6 +299,8 @@ impl Conditioner {
         Scratch {
             unit_a: vec![zero; n_unit],
             unit_b: vec![zero; n_unit],
+            edge_za: Vec::new(),
+            edge_zl: Vec::new(),
             pi_dot: vec![zero; n_par],
             t_bar: vec![zero; n_par],
             l_bar: vec![zero; n_par],
@@ -291,15 +315,34 @@ impl Conditioner {
     }
 
     /// One variable's conditioner at its parents, already in
-    /// `units.y_parents`: the hidden units `h, h', h''` and the transformer
-    /// parameters `pi`. Every local kernel reads its result.
+    /// `units.y_parents`: the units' inputs `z` and `dz`, the hidden units
+    /// `h, h', h''` and the transformer parameters `pi`. Every local kernel
+    /// reads its result.
     #[simd]
     pub(super) fn evaluate<S: Simd>(&self, simd: S, theta: Params<f64>, units: &mut UnitState<S>) {
+        units.z_parents.clear();
+        units.dz.clear();
+        match self.squash {
+            None => {
+                units.z_parents.extend_from_slice(&units.y_parents);
+                units
+                    .dz
+                    .resize(units.y_parents.len(), S::f64s::splat(simd, 1.0));
+            }
+            Some(c) => {
+                let one = S::f64s::splat(simd, 1.0);
+                for &y in &units.y_parents {
+                    let v = y * (1.0 / c);
+                    units.z_parents.push(simd_math::asinh(simd, v) * c);
+                    units.dz.push(one / simd_math::hypot_one(simd, v));
+                }
+            }
+        }
         for (pi, &b) in units.pi.iter_mut().zip(theta.b2()) {
             *pi = S::f64s::splat(simd, b);
         }
         for u in 0..self.n_unit {
-            let a = dot(simd, theta.w1(u), &units.y_parents) + theta.b1(u);
+            let a = dot(simd, theta.w1(u), &units.z_parents) + theta.b1(u);
             let (h, h1, h2) = simd_math::softplus(simd, a);
             units.h[u] = h;
             units.h1[u] = h1;
@@ -328,14 +371,18 @@ impl Conditioner {
         let ws = &s.jets;
         let (t, l) = (&ws.grad(&x)[1..], &ws.grad(&log_det)[1..]);
 
-        for ((a, l_out), &skip) in edge_a.iter_mut().zip(edge_l.iter_mut()).zip(theta.skip()) {
-            *a = t[loc] * skip;
-            *l_out = l[loc] * skip;
-        }
+        let zero = S::f64s::splat(simd, 0.0);
+        edge_a.fill(zero);
+        edge_l.fill(zero);
         for u in 0..self.n_unit {
             let (w1, w2) = (theta.w1(u), theta.w2(u));
             axpy(simd, dot(simd, w2, t) * units.h1[u], w1, edge_a);
             axpy(simd, dot(simd, w2, l) * units.h1[u], w1, edge_l);
+        }
+        let edges = edge_a.iter_mut().zip(edge_l.iter_mut());
+        for (((a, l_out), &skip), &dz) in edges.zip(theta.skip()).zip(&units.dz) {
+            *a = *a * dz + t[loc] * skip;
+            *l_out = *l_out * dz + l[loc] * skip;
         }
         (ws.value(&x), ws.grad(&x)[0], ws.grad(&log_det)[0])
     }
@@ -368,7 +415,7 @@ impl Conditioner {
             *pi_dot = S::f64s::splat(simd, b);
         }
         for u in 0..self.n_unit {
-            let a_dot = dot(simd, v.w1(u), &units.y_parents) + v.b1(u);
+            let a_dot = dot(simd, v.w1(u), &units.z_parents) + v.b1(u);
             s.unit_a[u] = a_dot;
             axpy(simd, units.h[u], v.w2(u), &mut s.pi_dot);
             axpy(simd, units.h1[u] * a_dot, theta.w2(u), &mut s.pi_dot);
@@ -390,11 +437,9 @@ impl Conditioner {
         let (t, l) = (&ws.grad(&x)[1..], &ws.grad(&log_det)[1..]);
         let (t_dot, l_dot) = (&ws.hess_dir(&x, 0)[1..], &ws.hess_dir(&log_det, 0)[1..]);
 
-        let (skip, skip_dot) = (theta.skip(), v.skip());
-        for j in 0..edge_a.len() {
-            edge_a[j] = t_dot[loc] * skip[j] + t[loc] * skip_dot[j];
-            edge_l[j] = l_dot[loc] * skip[j] + l[loc] * skip_dot[j];
-        }
+        let zero = S::f64s::splat(simd, 0.0);
+        edge_a.fill(zero);
+        edge_l.fill(zero);
         for u in 0..self.n_unit {
             let (w2, w2_dot) = (theta.w2(u), v.w2(u));
             let (p_t, p_l) = (dot(simd, w2, t), dot(simd, w2, l));
@@ -407,6 +452,12 @@ impl Conditioner {
             axpy(simd, p_t * h1, w1_dot, edge_a);
             axpy(simd, alpha_l, w1, edge_l);
             axpy(simd, p_l * h1, w1_dot, edge_l);
+        }
+        let (skip, skip_dot) = (theta.skip(), v.skip());
+        for j in 0..edge_a.len() {
+            let dz = units.dz[j];
+            edge_a[j] = edge_a[j] * dz + t_dot[loc] * skip[j] + t[loc] * skip_dot[j];
+            edge_l[j] = edge_l[j] * dz + l_dot[loc] * skip[j] + l[loc] * skip_dot[j];
         }
         (
             dot_lanes(simd, t, &s.pi_dot),
@@ -461,14 +512,22 @@ impl Conditioner {
         let loc = self.location;
         let zero = S::f64s::splat(simd, 0.0);
 
+        // The units see the edge cotangents through `dz`.
+        s.edge_za.clear();
+        s.edge_zl.clear();
+        for ((&a, &l), &dz) in cot.edge_a.iter().zip(cot.edge_l).zip(&units.dz) {
+            s.edge_za.push(a * dz);
+            s.edge_zl.push(l * dz);
+        }
+
         // The cotangents of `t` and `l`, from the edge cotangents, keeping
         // `zeta` for `A` and `L` in `unit_a` and `unit_b`.
         s.t_bar.fill(zero);
         s.l_bar.fill(zero);
         for u in 0..self.n_unit {
             let (w1, w2) = (theta.w1(u), theta.w2(u));
-            let zeta_a = dot(simd, w1, cot.edge_a);
-            let zeta_l = dot(simd, w1, cot.edge_l);
+            let zeta_a = dot(simd, w1, &s.edge_za);
+            let zeta_l = dot(simd, w1, &s.edge_zl);
             s.unit_a[u] = zeta_a;
             s.unit_b[u] = zeta_l;
             axpy(simd, units.h1[u] * zeta_a, w2, &mut s.t_bar);
@@ -502,9 +561,9 @@ impl Conditioner {
             axpy_lanes(simd, h, &s.pi_bar, g_w2);
 
             let g_w1 = grad.w1(u);
-            axpy_lanes(simd, h1 * p_t, cot.edge_a, g_w1);
-            axpy_lanes(simd, h1 * p_l, cot.edge_l, g_w1);
-            axpy_lanes(simd, a_bar, &units.y_parents, g_w1);
+            axpy_lanes(simd, h1 * p_t, &s.edge_za, g_w1);
+            axpy_lanes(simd, h1 * p_l, &s.edge_zl, g_w1);
+            axpy_lanes(simd, a_bar, &units.z_parents, g_w1);
             *grad.b1(u) += a_bar;
         }
         for (g, &p) in grad.b2().iter_mut().zip(&s.pi_bar) {

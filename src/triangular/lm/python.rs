@@ -38,6 +38,7 @@ impl PyFisherResiduals {
         location_index,
         transformer,
         fisher_regularization = None,
+        input_squash = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -48,12 +49,13 @@ impl PyFisherResiduals {
         location_index: usize,
         transformer: &Bound<'_, PyAny>,
         fisher_regularization: Option<f64>,
+        input_squash: Option<f64>,
     ) -> Result<Self> {
         let specs: Vec<LayerSpec> = pythonize::depythonize(transformer)?;
         Ok(Self {
             inner: FisherResiduals::new(
                 Pattern::from_i64(parent_indptr.as_slice()?, parent_index.as_slice()?)?,
-                Conditioner::new(n_unit, n_par, location_index, specs)?,
+                Conditioner::new(n_unit, n_par, location_index, specs, input_squash)?,
                 fisher_regularization,
             )?,
             lin: None,
