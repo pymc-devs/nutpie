@@ -84,6 +84,13 @@ impl PyFisherResiduals {
         self.inner.n_draw()
     }
 
+    /// Per parameter, whether it is a hidden-unit weight (`W1` or `W2`), the
+    /// parameters `LmOptimizer`'s ``mlp_ridge`` penalizes.
+    #[getter]
+    fn unit_weight_mask<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<bool>> {
+        PyArray1::from_vec(py, self.inner.unit_weight_mask())
+    }
+
     /// Start of each variable's parameter slice, plus the total.
     #[getter]
     fn param_offsets<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<i64>> {

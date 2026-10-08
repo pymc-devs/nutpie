@@ -48,7 +48,7 @@ impl Shape {
     }
 
     #[inline(always)]
-    fn w1(&self, u: usize) -> std::ops::Range<usize> {
+    pub(super) fn w1(&self, u: usize) -> std::ops::Range<usize> {
         let start = u * self.stride();
         start..start + self.n_parent
     }
@@ -59,7 +59,7 @@ impl Shape {
     }
 
     #[inline(always)]
-    fn w2(&self, u: usize) -> std::ops::Range<usize> {
+    pub(super) fn w2(&self, u: usize) -> std::ops::Range<usize> {
         let start = u * self.stride() + self.n_parent + 1;
         start..start + self.n_par
     }
