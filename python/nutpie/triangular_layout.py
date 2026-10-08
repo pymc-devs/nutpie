@@ -112,6 +112,9 @@ class TriangularLayout:
             parent-major, of the parent through its `marginal_to_normal` map
             with parameters ``feature_params[parent]`` (``(n_variables, 5)``).
             Degree 0: the MLPs see the raw parents.
+        input_squash: With a scale ``c``, the MLPs see ``c * asinh(y / c)``
+            of each parent instead (see `SparseTriangularMap`); None for the
+            raw parents. The skip always sees the raw parents.
         level_ptr, level_vars: Elimination levels as CSR. Variables within a
             level are independent.
         level_work: Estimated cost of each level, in multiply-adds.
@@ -127,6 +130,7 @@ class TriangularLayout:
     skip_index: int
     feature_degree: int
     feature_params: np.ndarray
+    input_squash: float | None
     activation: str
     transformer: tuple[Contract2Spec | TangentSASSpec | PositiveAffineSpec, ...]
     level_ptr: np.ndarray
@@ -434,6 +438,7 @@ def extract_layout(flow_map) -> TriangularLayout:
         skip_index=skip_index,
         feature_degree=int(feature_degree),
         feature_params=feature_params,
+        input_squash=flow_map.input_squash,
         activation=activation,
         transformer=transformer,
         level_ptr=level_ptr,

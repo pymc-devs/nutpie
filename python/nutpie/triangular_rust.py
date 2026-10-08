@@ -156,6 +156,7 @@ def _transform_kwargs(layout, schedule, min_parallel_work):
         "skip_index": int(layout.skip_index),
         "feature_degree": int(layout.feature_degree),
         "feature_params": np.asarray(layout.feature_params, dtype=np.float64).ravel(),
+        "input_squash": layout.input_squash,
         "activation": layout.activation,
         "transformer": transformer,
         "level_ptr": np.asarray(layout.level_ptr, dtype=np.int64),

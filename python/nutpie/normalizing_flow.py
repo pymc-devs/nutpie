@@ -2213,6 +2213,7 @@ def make_sparse_triangular_map(
     tangent_sas_fix_b=False,
     log_gamma_bounds=None,
     feature_degree=None,
+    input_squash=None,
 ):
     """Build a `SparseTriangularMap` bijection for the given ordering.
 
@@ -2255,6 +2256,9 @@ def make_sparse_triangular_map(
         feature_degree: Degree of the `HermiteFeatures` the conditioners see
             instead of the raw parents, see `SparseTriangularMap`. None for
             the raw parents.
+        input_squash: Scale of the ``c * asinh(y / c)`` the conditioner MLPs
+            see of the parents, see `SparseTriangularMap`. None for the raw
+            parents.
     """
     if nn_width is None:
         nn_width = 16
@@ -2308,6 +2312,7 @@ def make_sparse_triangular_map(
         nn_activation=activation,
         location_skip=location_skip,
         feature_degree=feature_degree,
+        input_squash=input_squash,
     )
     if zero_init:
         layer = zero_init_conditioners(layer)
@@ -2557,6 +2562,7 @@ def make_flow(
     sparsity: ArrayLike | None = None,
     location_skip: bool = True,
     feature_degree: int | None = None,
+    input_squash: float | None = None,
     n_buckets: int = 8,
 ):
     if activation is None:
@@ -2700,6 +2706,7 @@ def make_flow(
             tangent_sas_fix_b=tangent_sas_fix_b,
             log_gamma_bounds=log_gamma_bounds,
             feature_degree=feature_degree,
+            input_squash=input_squash,
             n_buckets=n_buckets,
         )
         if feature_degree is not None:

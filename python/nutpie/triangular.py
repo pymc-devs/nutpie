@@ -641,6 +641,14 @@ class SparseTriangularMap(bijections.AbstractBijection):
             stays linear in the raw parents, so this needs `location_skip`.
             The marginal maps start at the identity; set them with
             `with_marginal_maps`.
+        input_squash: If given, a scale ``c``: the conditioner MLPs see
+            ``c * asinh(y / c)`` of each parent instead of ``y``, linear up to
+            about ``|y| = c`` and logarithmic beyond. The location skip stays
+            linear in the raw parents. Outside the draws the MLP outputs then
+            grow like ``log`` of the parents' distance rather than linearly,
+            which keeps transformer parameters that act as exponents (such as
+            `Contract2`'s) from blowing the map up there. Not together with
+            `feature_degree`.
     """
 
     shape: tuple[int, ...]
@@ -670,6 +678,7 @@ class SparseTriangularMap(bijections.AbstractBijection):
     # when the conditioners see the raw parents.
     feature_params: Array | None
     feature_degree: int | None = eqx.field(static=True)
+    input_squash: float | None = eqx.field(static=True)
     cond_shape = None
 
     def __init__(
@@ -685,7 +694,16 @@ class SparseTriangularMap(bijections.AbstractBijection):
         nn_activation: Callable = jax.nn.gelu,
         location_skip: bool = True,
         feature_degree: int | None = None,
+        input_squash: float | None = None,
     ):
+        if input_squash is not None:
+            input_squash = float(input_squash)
+            if not (np.isfinite(input_squash) and input_squash > 0):
+                raise ValueError(
+                    f"input_squash must be positive and finite, got {input_squash}."
+                )
+            if feature_degree is not None:
+                raise ValueError("input_squash and feature_degree exclude each other.")
         blanket = np.asarray(blanket, dtype=bool)
         if blanket.ndim != 2 or blanket.shape[0] != blanket.shape[1]:
             raise ValueError(
@@ -863,6 +881,7 @@ class SparseTriangularMap(bijections.AbstractBijection):
         self.n_levels = n_levels
         self.shape = (dim,)
         self.feature_degree = feature_degree
+        self.input_squash = input_squash
         self.feature_params = (
             None if feature_degree is None else NonTrainable(jnp.zeros((dim, 5)))
         )
@@ -909,9 +928,14 @@ class SparseTriangularMap(bijections.AbstractBijection):
         return eqx.tree_at(lambda m: m.feature_params, self, NonTrainable(params))
 
     def mlp_inputs(self, parents, parent_indices):
-        """What a conditioner's MLP sees: the parent features, or None if it
-        sees the raw `parents`. `parent_indices` are the parents' variables
-        (``dim`` for padded slots, which read zero)."""
+        """What a conditioner's MLP sees: the parent features, the squashed
+        parents (`input_squash`), or None if it sees the raw `parents`.
+        `parent_indices` are the parents' variables (``dim`` for padded
+        slots, which read zero)."""
+        if self.input_squash is not None:
+            # Padded slots read zero, which the squash keeps.
+            c = self.input_squash
+            return c * jnp.arcsinh(parents / c)
         if self.feature_degree is None:
             return None
         dim = self.shape[0]
@@ -927,7 +951,11 @@ class SparseTriangularMap(bijections.AbstractBijection):
     def _condition(self, net, parents, parent_indices):
         """Transformer parameters from one conditioner at its parents."""
         inputs = self.mlp_inputs(parents, parent_indices)
-        return net(parents) if inputs is None else net(parents, inputs)
+        if inputs is None:
+            return net(parents)
+        if isinstance(net, LocationSkipMlp):
+            return net(parents, inputs)
+        return net(inputs)
 
     def _flat_params_to_transformer(self, params: Array):
         """``(n, num_params)`` params -> vmapped transformer."""

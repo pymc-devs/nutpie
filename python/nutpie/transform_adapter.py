@@ -1912,6 +1912,7 @@ def make_transform_adapter(
     tangent_sas_transformer=1,
     tangent_sas_fix_b=False,
     log_gamma_bounds=(-1.0, 1.0),
+    input_squash=1.0,
     reuse_embed=True,
     order=None,
     sparsity=None,
@@ -1969,6 +1970,14 @@ def make_transform_adapter(
     training draws makes the map blow up polynomially with a growing power
     there; ``(-1, 1)`` allows tails at most ``e`` times heavier or lighter
     per layer. ``None`` leaves it unbounded.
+
+    ``input_squash`` makes the conditioner MLPs of a triangular flow see
+    ``c * asinh(y / c)`` of each parent, so that away from the draws their
+    outputs grow like ``log`` of the distance instead of linearly; the
+    location skip stays linear. `Contract2`'s ``beta`` and ``sigma`` act on
+    the map through a power ``1 / gamma``, so with raw parents their linear
+    growth away from the draws becomes a high-power blowup of the map.
+    ``None`` gives the MLPs the raw parents.
     """
     if extension_windows is None:
         extension_windows = []
@@ -1999,6 +2008,7 @@ def make_transform_adapter(
             tangent_sas_transformer=tangent_sas_transformer,
             tangent_sas_fix_b=tangent_sas_fix_b,
             log_gamma_bounds=log_gamma_bounds,
+            input_squash=input_squash,
             reuse_embed=reuse_embed,
             order=order,
             sparsity=sparsity,

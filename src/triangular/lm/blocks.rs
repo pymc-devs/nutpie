@@ -285,17 +285,18 @@ impl FisherResiduals {
         // one seed `(x_bar, delta_bar, mu_bar)` plus, for an edge `j`, the
         // one-hot cotangents `c_a e_j` on `A[i, :]` and `c_l e_j` on
         // `L[i, :]`. Through the units these collapse onto the columns of
-        // `C = dpi/dy_parents = W2 diag(h') W1 + e_loc s^T`: `t_bar = c_a C
-        // e_j` and `l_bar = c_l C e_j`. So all seeds together need the
-        // products `C`, `H[pi, pi] C` and `W2^T pi_bar`.
+        // `C = dpi/dy_parents = W2 diag(h') W1 diag(dz) + e_loc s^T`: `t_bar
+        // = c_a C e_j` and `l_bar = c_l C e_j`. So all seeds together need
+        // the products `C`, `H[pi, pi] C` and `W2^T pi_bar`.
         let seed = |col| Seed::of_column(col, n_p).cotangent(simd, w_i, x_i, edge_a);
 
         pi_jac.clear();
         pi_jac.resize(n_par * n_p, zero);
         for u in 0..n_unit {
             let (w1, w2) = (theta.w1(u), theta.w2(u));
-            for (column, &w1) in pi_jac.chunks_exact_mut(n_par).zip(w1) {
-                axpy(simd, units.h1[u] * w1, w2, column);
+            let columns = pi_jac.chunks_exact_mut(n_par).zip(w1).zip(&units.dz);
+            for ((column, &w1), &dz) in columns {
+                axpy(simd, units.h1[u] * dz * w1, w2, column);
             }
         }
         for (column, &skip) in pi_jac.chunks_exact_mut(n_par).zip(theta.skip()) {
@@ -372,18 +373,19 @@ impl FisherResiduals {
                 for (out, &pi) in out_w2.iter_mut().zip(pi) {
                     *out = h * pi;
                 }
-                // The edge cotangents' paths through `W1[u, j]`.
+                // The edge cotangents' paths through `W1[u, j]`, which reach
+                // `A[i, j]` and `L[i, j]` through `dz[j]`.
                 let mut w1_direct = None;
                 if let Some((j, c_a, c_l)) = edge {
-                    let w1 = theta.w1(u)[j];
+                    let w1_dz = units.dz[j] * theta.w1(u)[j];
                     let p = c_a * unit_t[u] + c_l * unit_l[u];
-                    a_bar += units.h2[u] * p * w1;
-                    axpy_lanes(simd, h1 * w1, &edge_dir[..], out_w2);
-                    w1_direct = Some((j, h1 * p));
+                    a_bar += units.h2[u] * p * w1_dz;
+                    axpy_lanes(simd, h1 * w1_dz, &edge_dir[..], out_w2);
+                    w1_direct = Some((j, h1 * p * units.dz[j]));
                 }
                 let out_w1 = out.w1(u);
-                for (out, &y) in out_w1.iter_mut().zip(&units.y_parents) {
-                    *out = a_bar * y;
+                for (out, &z) in out_w1.iter_mut().zip(&units.z_parents) {
+                    *out = a_bar * z;
                 }
                 if let Some((j, value)) = w1_direct {
                     out_w1[j] += value;
