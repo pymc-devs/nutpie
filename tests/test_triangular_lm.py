@@ -396,7 +396,13 @@ def test_select_draws():
     never upsampled, and the validation draws come in contiguous blocks."""
     from nutpie.transform_adapter import _select_draws
 
-    settings = {"max_draws": 512, "val_fraction": 0.2, "block_size": 16, "multiple": 8}
+    settings = {
+        "max_draws": 512,
+        "recency": 1.0,
+        "val_fraction": 0.2,
+        "block_size": 16,
+        "multiple": 8,
+    }
     for n_draws, start in [(257, 128), (2000, 1000), (140, 120)]:
         train, val = _select_draws(
             n_draws, start, rng=np.random.default_rng(0), **settings
@@ -418,3 +424,61 @@ def test_select_draws():
     )
     runs = np.split(val, np.flatnonzero(np.diff(val) != 1) + 1)
     assert all(len(run) % 16 == 0 for run in runs)
+
+
+@pytest.mark.parametrize("available", [600, 1000, 5000])
+@pytest.mark.parametrize("recency", [0.0, 1.0, 3.0])
+def test_thin(available, recency):
+    """`max_draws` distinct sorted draws; even for `recency=0`, else denser
+    towards the newest, with the newest all taken where the density caps."""
+    from nutpie.transform_adapter import _thin
+
+    idx = _thin(available, 512, recency)
+    assert len(idx) == 512
+    assert (np.diff(idx) > 0).all()
+    assert idx.min() >= 0 and idx.max() < available
+    gaps = np.diff(idx)
+    if recency == 0:
+        assert gaps.max() - gaps.min() <= 1
+    else:
+        older, newer = np.array_split(gaps, 2)
+        assert newer.mean() < older.mean()
+        if recency == 3.0 and available == 600:
+            # Capped: the newest stretch is taken whole.
+            assert (gaps[-50:] == 1).all()
+
+
+def test_make_flow_passes_log_gamma_bounds():
+    """`make_flow(kind="triangular", log_gamma_bounds=...)` reaches every
+    `Contract2` layer, and so the Rust residuals' transformer spec."""
+    import flowjax
+
+    from nutpie.normalizing_flow import make_flow
+    from nutpie.triangular_layout import _probe_transformer, transformer_dicts
+    from nutpie.triangular_lm import map_data
+
+    rng = np.random.default_rng(0)
+    dim = 5
+    x = rng.normal(size=(16, dim))
+    bijection = make_flow(
+        0,
+        x,
+        -x,
+        n_layers=1,
+        kind="triangular",
+        sparsity=_filled(_blanket(dim, "banded", rng), np.arange(dim)),
+        nn_width=4,
+        activation=jax.nn.softplus,
+        contract_transformer=2,
+        log_gamma_bounds=(-1.0, 1.0),
+    )
+    flow = flowjax.flows.Transformed(
+        flowjax.distributions.StandardNormal((dim,)), bijection
+    )
+    tmap, _, _ = map_data(flow, x, -x)
+    n_par = int(tmap.conditioners[0].mlp.layers[1].out_features)
+    layers = transformer_dicts(_probe_transformer(tmap.transformer_constructor, n_par))
+    bounds = [layer.get("log_gamma_bounds") for layer in layers]
+    bounds = [b for b in bounds if b is not None]
+    assert len(bounds) == 2
+    assert all(tuple(b) == (-1.0, 1.0) for b in bounds)
