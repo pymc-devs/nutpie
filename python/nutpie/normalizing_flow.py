@@ -2211,6 +2211,7 @@ def make_sparse_triangular_map(
     asymmetric_transformer=False,
     tangent_sas_transformer=0,
     tangent_sas_fix_b=False,
+    log_gamma_bounds=None,
     feature_degree=None,
 ):
     """Build a `SparseTriangularMap` bijection for the given ordering.
@@ -2247,7 +2248,7 @@ def make_sparse_triangular_map(
         location_skip: Linear map from each variable's parents straight to
             its transformer location, see `SparseTriangularMap`.
         affine_transformer, contract_transformer, asymmetric_transformer,
-        tangent_sas_transformer, tangent_sas_fix_b:
+        tangent_sas_transformer, tangent_sas_fix_b, log_gamma_bounds:
             The elementwise transformer, see `make_transformer`. If all
             counts are zero, `SparseTriangularMap`'s own default transformer
             is used.
@@ -2293,6 +2294,7 @@ def make_sparse_triangular_map(
             asymmetric_transformer=asymmetric_transformer,
             tangent_sas_transformer=tangent_sas_transformer,
             tangent_sas_fix_b=tangent_sas_fix_b,
+            log_gamma_bounds=log_gamma_bounds,
         )
 
     layer = SparseTriangularMap(
@@ -2547,6 +2549,7 @@ def make_flow(
     asymmetric_transformer=False,
     tangent_sas_transformer=0,
     tangent_sas_fix_b=False,
+    log_gamma_bounds=None,
     sandwich_householder=False,
     activation=None,
     reuse_embed=False,
@@ -2695,6 +2698,7 @@ def make_flow(
             asymmetric_transformer=asymmetric_transformer,
             tangent_sas_transformer=tangent_sas_transformer,
             tangent_sas_fix_b=tangent_sas_fix_b,
+            log_gamma_bounds=log_gamma_bounds,
             feature_degree=feature_degree,
             n_buckets=n_buckets,
         )

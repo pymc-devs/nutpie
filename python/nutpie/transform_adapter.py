@@ -1074,22 +1074,50 @@ def _format_log_f(value):
     return f"{value:+.2f}" if np.isfinite(value) else "  nan"
 
 
+def _thin(available, max_draws, recency):
+    """Sorted indices of `max_draws` distinct ones of `available` draws, at a
+    density growing like ``t**recency`` from the oldest (``t=0``) to the
+    newest draw (``t=1``); ``recency=0`` thins evenly.
+
+    The density is capped at one per draw, the newest draws are then all
+    taken and the rest goes to older ones. Systematic sampling: draw `i` is
+    taken where the cumulative density passes a half-integer, which keeps the
+    spacing as even as the density allows, and the selection deterministic.
+    """
+    t = (np.arange(available) + 0.5) / available
+    weight = t**recency
+    # The scale of the capped density that sums to `max_draws`. At `hi`
+    # every draw is capped, and the sum is `available > max_draws`.
+    lo, hi = 0.0, 1.0 / weight.min()
+    for _ in range(100):
+        mid = 0.5 * (lo + hi)
+        if np.minimum(1.0, mid * weight).sum() < max_draws:
+            lo = mid
+        else:
+            hi = mid
+    density = np.minimum(1.0, hi * weight)
+    cumulative = np.cumsum(density)
+    taken = np.floor(cumulative + 0.5) > np.floor(cumulative - density + 0.5)
+    return np.flatnonzero(taken)[-max_draws:]
+
+
 def _select_draws(
-    n_draws, start, *, max_draws, val_fraction, block_size, multiple, rng
+    n_draws, start, *, max_draws, recency, val_fraction, block_size, multiple, rng
 ):
     """``(train, val)`` indices into draws ``start:n_draws`` for a flow fit.
 
-    At most `max_draws` draws, evenly thinned when there are more: thinning
-    lowers the autocorrelation, and keeps the selection deterministic. A
-    random fraction `val_fraction` of blocks of `block_size` consecutive
-    draws is held out for validation; contiguous blocks keep NUTS repeats and
-    strongly correlated neighbours on one side of the split. Both parts are
-    cut to a multiple of `multiple` (the Rust LM's SIMD width) by dropping
-    their oldest draws, and are in chronological order.
+    At most `max_draws` draws; when there are more, they are thinned (see
+    `_thin`), denser towards the newest draws with a positive `recency`.
+    Thinning lowers the autocorrelation, and keeps the selection
+    deterministic. A random fraction `val_fraction` of blocks of `block_size`
+    consecutive draws is held out for validation; contiguous blocks keep
+    NUTS repeats and strongly correlated neighbours on one side of the split.
+    Both parts are cut to a multiple of `multiple` (the Rust LM's SIMD width)
+    by dropping their oldest draws, and are in chronological order.
     """
     available = n_draws - start
     if available > max_draws:
-        idx = start + (np.arange(max_draws) * available) // max_draws
+        idx = start + _thin(available, max_draws, recency)
     else:
         idx = np.arange(start, n_draws)
 
@@ -1260,6 +1288,7 @@ class TransformAdapter:
         native_flow,
         stop_event,
         forget_fraction,
+        recency,
         val_fraction,
         val_block_size,
         early_stopping,
@@ -1275,6 +1304,7 @@ class TransformAdapter:
         self._window_size = window_size
         self._initial_skip = initial_skip
         self._forget_fraction = forget_fraction
+        self._recency = recency
         self._val_fraction = val_fraction
         self._val_block_size = val_block_size
         self._early_stopping = early_stopping
@@ -1481,6 +1511,7 @@ class TransformAdapter:
                 n_draws,
                 start,
                 max_draws=self._window_size,
+                recency=self._recency,
                 val_fraction=self._val_fraction,
                 block_size=self._val_block_size,
                 multiple=self._draw_multiple,
@@ -1880,6 +1911,7 @@ def make_transform_adapter(
     asymmetric_transformer=False,
     tangent_sas_transformer=1,
     tangent_sas_fix_b=False,
+    log_gamma_bounds=(-1.0, 1.0),
     reuse_embed=True,
     order=None,
     sparsity=None,
@@ -1908,6 +1940,7 @@ def make_transform_adapter(
     native_flow=True,
     stop_event=None,
     forget_fraction=0.5,
+    recency=1.0,
     val_fraction=0.2,
     val_block_size=16,
     early_stopping=True,
@@ -1915,15 +1948,27 @@ def make_transform_adapter(
     """The adapter for `nutpie.sample`'s ``transform_adapt``.
 
     Draw selection for each flow fit: draws before ``initial_skip`` and the
-    oldest ``forget_fraction`` of all draws are ignored, the rest is evenly
-    thinned to at most ``window_size`` (never upsampled), and a random
+    oldest ``forget_fraction`` of all draws are ignored, the rest is thinned
+    to at most ``window_size`` (never upsampled), and a random
     ``val_fraction`` of blocks of ``val_block_size`` consecutive draws is
-    held out. The held-out draws decide whether a refit replaces the flow
-    and, with ``early_stopping`` and ``method="lm-rust"``, when the LM fit
-    stops (it then returns the step with the best validation loss).
+    held out. Thinning keeps a density of draws that grows like
+    ``t**recency`` over the remaining range, ``t`` from 0 at its oldest to 1
+    at its newest draw: ``recency=0`` thins evenly, the default ``1`` ramps
+    up linearly, since the draws usually get better as the flow does.
+
+    The held-out draws decide whether a refit replaces the flow and, with
+    ``early_stopping`` and ``method="lm-rust"``, when the LM fit stops (it
+    then returns the step with the best validation loss).
     ``early_stopping=False`` still reports the validation loss but lets the
     fit run to its training-loss stopping rule. ``val_fraction=0`` trains on
     everything and compares flows on the training draws.
+
+    ``log_gamma_bounds`` bounds each `Contract2` layer's tail exponent,
+    ``log gamma``. ``gamma`` is an exponent (``T(x) ~ |x|**gamma``), so
+    without a bound a conditioner whose output grows linearly away from the
+    training draws makes the map blow up polynomially with a growing power
+    there; ``(-1, 1)`` allows tails at most ``e`` times heavier or lighter
+    per layer. ``None`` leaves it unbounded.
     """
     if extension_windows is None:
         extension_windows = []
@@ -1953,6 +1998,7 @@ def make_transform_adapter(
             asymmetric_transformer=asymmetric_transformer,
             tangent_sas_transformer=tangent_sas_transformer,
             tangent_sas_fix_b=tangent_sas_fix_b,
+            log_gamma_bounds=log_gamma_bounds,
             reuse_embed=reuse_embed,
             order=order,
             sparsity=sparsity,
@@ -2002,6 +2048,7 @@ def make_transform_adapter(
         native_flow=native_flow,
         stop_event=stop_event,
         forget_fraction=forget_fraction,
+        recency=recency,
         val_fraction=val_fraction,
         val_block_size=val_block_size,
         early_stopping=early_stopping,
