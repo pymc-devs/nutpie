@@ -166,6 +166,22 @@ impl FisherResiduals {
             }
     }
 
+    /// Per parameter, whether it is a weight of the units, `W1` or `W2`:
+    /// what the optimizer's MLP ridge penalizes. With all of them zero, each
+    /// conditioner is its biases and the skip alone.
+    pub(crate) fn unit_weight_mask(&self) -> Vec<bool> {
+        let mut mask = vec![false; self.n_params()];
+        for i in 0..self.n_var() {
+            let (start, shape) = (self.params(i).start, self.shape(i));
+            for u in 0..shape.n_unit {
+                for k in shape.w1(u).chain(shape.w2(u)) {
+                    mask[start + k] = true;
+                }
+            }
+        }
+        mask
+    }
+
     /// The number of draws, zero before [`Self::set_data`].
     pub(crate) fn n_draw(&self) -> usize {
         self.data.as_ref().map_or(0, |data| data.n_draw)

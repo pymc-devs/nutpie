@@ -98,6 +98,7 @@ def fit_to_data(
     lm_max_exact_block_size: int = 256,
     lm_lmp_size: int = 0,
     lm_lmp_tol: float = 1e-8,
+    lm_mlp_ridge: float = 0.0,
     lm_print_blocks: bool = False,
     lm_diagnose: bool = False,
     should_stop: Callable[[], bool] | None = None,
@@ -223,6 +224,12 @@ def fit_to_data(
         lm_lmp_tol: Relative eigenvalue cutoff below which near-dependent
             stored directions are dropped. Only used when ``method`` is
             ``"lm-rust"``.
+        lm_mlp_ridge: Ridge ``lm_mlp_ridge * ||W||^2 / n_draws`` on the
+            conditioner MLPs' weights (both layers, not their biases or the
+            location skip), added to the mean Fisher divergence: a ridge of
+            ``lm_mlp_ridge`` on its sum over the draws. Its minimum is the
+            flow without the MLPs, so the MLPs are only used where the draws
+            support them. Only used when ``method`` is ``"lm-rust"``.
         lm_min_loss: Stop the LM fit once the Fisher divergence falls below
             this. Note that the divergence is a *sum* over dimensions, so this
             is an absolute, dimension-independent target: it bounds each
@@ -262,6 +269,9 @@ def fit_to_data(
         is_leaf=lambda leaf: isinstance(leaf, NonTrainable),
     )
 
+    if lm_mlp_ridge and method != "lm-rust":
+        raise ValueError("lm_mlp_ridge is only supported with method='lm-rust'.")
+
     if method == "lm-rust":
         params, lm_losses, lam, n_steps, n_accepted = _fit_lm_rust(
             params,
@@ -278,6 +288,7 @@ def fit_to_data(
             max_exact_block_size=lm_max_exact_block_size,
             lmp_size=lm_lmp_size,
             lmp_tol=lm_lmp_tol,
+            mlp_ridge=lm_mlp_ridge,
             verbose=verbose,
             should_stop=should_stop,
             val_data=val_data,
@@ -561,17 +572,18 @@ def _fit_lm_rust(
     should_stop,
     val_data=None,
     early_stopping=True,
+    mlp_ridge=0.0,
 ):
     """`_fit_lm` with exact blocks and the line search, in Rust (see
     `nutpie.triangular_lm.fit`). Fits the conditioners of the flow's
     `SparseTriangularMap`; everything else stays as it is.
 
     `val_data` are held-out draws for `fit`'s validation loss and, with
-    `early_stopping`, its early stopping. Returns ``(params, losses, lam,
-    n_steps, n_accepted)``, with the losses at the fitted parameters:
-    ``"objective"`` (what LM minimised, with the regularization),
-    ``"train"`` and ``"val"`` (Fisher divergences, ``val`` `None` without
-    `val_data`)."""
+    `early_stopping`, its early stopping. `mlp_ridge` is `fit_to_data`'s
+    ``lm_mlp_ridge``. Returns ``(params, losses, lam, n_steps,
+    n_accepted)``, with the losses at the fitted parameters: ``"objective"``
+    (what LM minimised, with the regularizations), ``"train"`` and ``"val"``
+    (Fisher divergences, ``val`` `None` without `val_data`)."""
     from nutpie.lmopt import _conditioners
     from nutpie.triangular_lm import (
         fisher_divergence,
@@ -610,6 +622,7 @@ def _fit_lm_rust(
         max_block_size=max_exact_block_size,
         lmp_size=lmp_size,
         lmp_tol=lmp_tol,
+        mlp_ridge=mlp_ridge,
         val_problem=val_problem,
         early_stopping=early_stopping,
     )
@@ -626,8 +639,10 @@ def _fit_lm_rust(
     # than the last step's.
     r = problem.residuals(theta, linearize=False)
     r_fisher = r.reshape(problem.n_draw, problem.n_residuals)[:, : tmap.shape[0]]
+    unit_weights = np.asarray(theta)[problem.unit_weight_mask]
+    ridge = mlp_ridge / problem.n_draw * float(unit_weights @ unit_weights)
     losses = {
-        "objective": float(r @ r),
+        "objective": float(r @ r) + ridge,
         "train": float(np.vdot(r_fisher, r_fisher)),
         "val": None if val_problem is None else fisher_divergence(val_problem, theta),
     }
@@ -1275,6 +1290,7 @@ class TransformAdapter:
         lm_residual_batch,
         lm_cholesky_jitter,
         lm_fisher_regularization,
+        lm_mlp_ridge,
         lm_probe_groups,
         lm_probe_rounds,
         lm_fit_affine,
@@ -1351,6 +1367,7 @@ class TransformAdapter:
         self._lm_min_loss = lm_min_loss
         self._lm_probe_batch = lm_probe_batch
         self._lm_probes = lm_probes
+        self._lm_mlp_ridge = lm_mlp_ridge
         self._lm_probe_groups = lm_probe_groups
         self._lm_probe_rounds = lm_probe_rounds
         self._lm_fit_affine = lm_fit_affine
@@ -1664,6 +1681,7 @@ class TransformAdapter:
                 lm_min_loss=self._lm_min_loss,
                 lm_probe_batch=self._lm_probe_batch,
                 lm_probes=self._lm_probes,
+                lm_mlp_ridge=self._lm_mlp_ridge,
                 lm_probe_groups=self._lm_probe_groups,
                 lm_probe_rounds=self._lm_probe_rounds,
                 lm_fit_affine=self._lm_fit_affine,
@@ -1928,6 +1946,7 @@ def make_transform_adapter(
     lm_residual_batch=128,
     lm_cholesky_jitter=None,
     lm_fisher_regularization=None,
+    lm_mlp_ridge=0.0,
     lm_probe_groups=None,
     lm_probe_rounds=1,
     lm_fit_affine=False,
@@ -1978,6 +1997,12 @@ def make_transform_adapter(
     the map through a power ``1 / gamma``, so with raw parents their linear
     growth away from the draws becomes a high-power blowup of the map.
     ``None`` gives the MLPs the raw parents.
+
+    ``lm_mlp_ridge`` penalizes the conditioner MLPs' weights (see
+    `fit_to_data`), with the flow without MLPs as its minimum. Unlike
+    ``lm_fisher_regularization``, which penalizes any dependence of a
+    conditional on its parents and so pulls towards independent coordinates,
+    it leaves the linear location skip free.
     """
     if extension_windows is None:
         extension_windows = []
@@ -2045,6 +2070,7 @@ def make_transform_adapter(
         lm_residual_batch=lm_residual_batch,
         lm_cholesky_jitter=lm_cholesky_jitter,
         lm_fisher_regularization=lm_fisher_regularization,
+        lm_mlp_ridge=lm_mlp_ridge,
         lm_probe_groups=lm_probe_groups,
         lm_probe_rounds=lm_probe_rounds,
         lm_fit_affine=lm_fit_affine,
