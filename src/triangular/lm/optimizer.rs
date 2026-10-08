@@ -16,6 +16,11 @@
 //!    if that is better, and accept or reject on the gain ratio.
 //! 5. Update `lam` (Nielsen) and the CG forcing term (Eisenstat-Walker),
 //!    unless CG stops on the quadratic model instead.
+//!
+//! The objective is `F = ||r||^2 + sum_k ridge_k theta_k^2`: an optional
+//! ridge on the hidden units' weights (see `PyLmOptimizer`'s `mlp_ridge`),
+//! which adds `diag(ridge)` to `H = J^T J`. Every quantity below, `F`, the
+//! gradient `g`, `H` and its blocks, includes it.
 
 use std::collections::VecDeque;
 
@@ -228,6 +233,9 @@ pub struct StepInfo {
 pub struct LmOptimizer {
     problem: FisherResiduals,
     settings: Settings,
+    /// Per parameter, the ridge weight in `F`: zero, or `mlp_ridge / n_draw`
+    /// on the hidden units' weights.
+    ridge: Vec<f64>,
     theta: Vec<f64>,
     lin: Linearization,
     r: Vec<f64>,
@@ -264,6 +272,7 @@ impl LmOptimizer {
         problem: FisherResiduals,
         theta: Vec<f64>,
         lam: f64,
+        mlp_ridge: f64,
         settings: Settings,
     ) -> Result<Self> {
         if theta.len() != problem.n_params() {
@@ -279,10 +288,22 @@ impl LmOptimizer {
         if settings.max_block_size == 0 || settings.rebuild_every == 0 {
             bail!("max_block_size and rebuild_every must be positive");
         }
+        if !(mlp_ridge.is_finite() && mlp_ridge >= 0.0) {
+            bail!("mlp_ridge must be finite and non-negative, got {mlp_ridge}");
+        }
+        // `||r||^2` is a mean over the draws, so this is a ridge of
+        // `mlp_ridge` on their sum: the more draws, the weaker it gets.
+        let weight = mlp_ridge / problem.n_draw() as f64;
+        let ridge = problem
+            .unit_weight_mask()
+            .into_iter()
+            .map(|unit_weight| if unit_weight { weight } else { 0.0 })
+            .collect();
         let (r, lin) = problem.residuals(&theta)?;
         let n_params = theta.len();
         Ok(Self {
             problem,
+            ridge,
             theta,
             lin,
             r,
@@ -325,6 +346,11 @@ impl LmOptimizer {
                 })
                 .collect();
             *m = Mat::from_fn(size, size, |r, c| if r == c { diagonal[r] } else { 0.0 });
+        }
+        for block in &mut blocks {
+            for k in 0..block.matrix.nrows() {
+                block.matrix[(k, k)] += self.ridge[block.start + k];
+            }
         }
 
         // Marquardt floors per variable (conditioner).
@@ -416,13 +442,29 @@ impl LmOptimizer {
         out
     }
 
-    /// `(J^T J + lam D) v`.
+    /// `(H + lam D) v`, with `H = J^T J + diag(ridge)`.
     fn damped_product(&self, diagonal: &[f64], lam: f64, v: &[f64]) -> Result<Vec<f64>> {
         let mut out = self.problem.gauss_newton_product(&self.lin, v)?;
-        for ((o, d), v) in out.iter_mut().zip(diagonal).zip(v) {
-            *o += lam * d * v;
+        for (((o, d), v), w) in out.iter_mut().zip(diagonal).zip(v).zip(&self.ridge) {
+            *o += (lam * d + w) * v;
         }
         Ok(out)
+    }
+
+    /// `sum_k ridge_k (theta_k + p_k)^2`, the ridge's part of `F` at
+    /// `theta + p`.
+    fn ridge_penalty(&self, p: &[f64]) -> f64 {
+        self.ridge
+            .iter()
+            .zip(&self.theta)
+            .zip(p)
+            .map(|((w, t), p)| w * (t + p) * (t + p))
+            .sum()
+    }
+
+    /// `||r||^2 + sum_k ridge_k theta_k^2`, at the current `theta`.
+    fn objective(&self) -> f64 {
+        dot(&self.r, &self.r) + self.ridge_penalty(&vec![0.0; self.theta.len()])
     }
 
     /// PCG as `lmopt.pcg`: warm start from the best multiple of `x0`, stop
@@ -531,7 +573,11 @@ impl LmOptimizer {
         let lmp = Lmp::new(&self.lmp_pairs, &blocks.diagonal, lam, s.lmp_tol);
         let lmp_rank = lmp.as_ref().map_or(0, Lmp::rank);
 
-        let g = self.problem.pullback(&self.lin, &self.r)?;
+        // Half the gradient of `F`: `J^T r + ridge theta`.
+        let mut g = self.problem.pullback(&self.lin, &self.r)?;
+        for ((g, w), t) in g.iter_mut().zip(&self.ridge).zip(&self.theta) {
+            *g += w * t;
+        }
         let rhs: Vec<f64> = g.iter().map(|v| -v).collect();
         let eta = match s.forcing {
             Forcing::Model => s.cg_tol,
@@ -557,10 +603,20 @@ impl LmOptimizer {
             |p: &[f64]| -> Vec<f64> { self.theta.iter().zip(p).map(|(t, p)| t + p).collect() };
         let (mut r_new, mut lin_new) = self.problem.residuals(&step_to(&p))?;
         let mut jp = self.problem.pushforward(&self.lin, &p)?;
+        // `p^T H p`, with `H` including the ridge.
+        let curvature_along = |jp: &[f64], p: &[f64]| -> f64 {
+            dot(jp, jp)
+                + self
+                    .ridge
+                    .iter()
+                    .zip(p)
+                    .map(|(w, p)| w * p * p)
+                    .sum::<f64>()
+        };
 
-        let f = dot(&self.r, &self.r);
-        let mut f_new = dot(&r_new, &r_new);
-        let pred_full = -dot(&p, &g) - 0.5 * dot(&jp, &jp);
+        let f = self.objective();
+        let mut f_new = dot(&r_new, &r_new) + self.ridge_penalty(&p);
+        let pred_full = -dot(&p, &g) - 0.5 * curvature_along(&jp, &p);
         let rho_full = safe_ratio(0.5 * (f - f_new), pred_full);
         let full_step_good =
             rho_full > s.accept_rho && pred_full > 0.0 && f_new.is_finite() && rho_full.is_finite();
@@ -576,7 +632,7 @@ impl LmOptimizer {
         if f_new.is_finite() && curvature > 0.0 && fraction < 0.95 {
             let p_short: Vec<f64> = p.iter().map(|v| fraction * v).collect();
             let (r_short, lin_short) = self.problem.residuals(&step_to(&p_short))?;
-            let f_short = dot(&r_short, &r_short);
+            let f_short = dot(&r_short, &r_short) + self.ridge_penalty(&p_short);
             // Kept only if it actually beats the full step; NaN compares false.
             if f_short < f_new {
                 p = p_short;
@@ -592,7 +648,7 @@ impl LmOptimizer {
         }
 
         let actual = 0.5 * (f - f_new);
-        let pred = -dot(&p, &g) - 0.5 * dot(&jp, &jp);
+        let pred = -dot(&p, &g) - 0.5 * curvature_along(&jp, &p);
         let rho = safe_ratio(actual, pred);
         let ok = f_new.is_finite() && rho.is_finite();
         let accept = rho > s.accept_rho && pred > 0.0 && ok;
@@ -634,13 +690,15 @@ impl LmOptimizer {
                 }
             }
             Forcing::Residual => {
-                let linear: f64 = self
+                // The linearized residual norm, the ridge being exactly linear.
+                let linear: f64 = (self
                     .r
                     .iter()
                     .zip(&jp)
                     .map(|(r, j)| (r + j) * (r + j))
                     .sum::<f64>()
-                    .sqrt();
+                    + self.ridge_penalty(&p))
+                .sqrt();
                 (f_new.sqrt() - linear).abs() / (if f > 0.0 { f } else { 1.0 }).sqrt()
             }
             Forcing::Model => s.cg_tol,
@@ -733,6 +791,7 @@ impl PyLmOptimizer {
         rebuild_every = 1,
         lmp_size = 0,
         lmp_tol = 1e-8,
+        mlp_ridge = 0.0,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -759,6 +818,7 @@ impl PyLmOptimizer {
         rebuild_every: usize,
         lmp_size: usize,
         lmp_tol: f64,
+        mlp_ridge: f64,
     ) -> Result<Self> {
         let forcing = match forcing {
             "residual" => Forcing::Residual,
@@ -789,7 +849,7 @@ impl PyLmOptimizer {
         };
         let theta = theta.as_slice()?.to_vec();
         let problem = problem.inner.clone();
-        let inner = py.detach(|| LmOptimizer::new(problem, theta, lam, settings))?;
+        let inner = py.detach(|| LmOptimizer::new(problem, theta, lam, mlp_ridge, settings))?;
         Ok(Self { inner })
     }
 
@@ -811,10 +871,10 @@ impl PyLmOptimizer {
         PyArray1::from_vec(py, self.inner.r.clone())
     }
 
-    /// The current loss, ``sum(r**2)``.
+    /// The current loss, ``sum(r**2)`` plus the ridge.
     #[getter]
     fn loss(&self) -> f64 {
-        dot(&self.inner.r, &self.inner.r)
+        self.inner.objective()
     }
 
     #[getter]
@@ -857,6 +917,27 @@ mod tests {
         }
     }
 
+    /// With the ridge, each step's model prediction `pred` is the decrease of
+    /// the quadratic model of the full objective: for a tiny step it matches
+    /// the actual decrease, so `rho -> 1`.
+    #[test]
+    fn ridge_enters_the_model_consistently() {
+        let problem = problem_with(None, 64);
+        let mut rng = ChaCha8Rng::seed_from_u64(6);
+        let theta = normal(&mut rng, problem.n_params(), 0.3);
+        // A huge damping makes the step tiny, so GN's model is exact to
+        // first order.
+        let mut lm = LmOptimizer::new(problem, theta.clone(), 1e6, 0.7, settings()).unwrap();
+        let penalized = lm.ridge.iter().filter(|&&w| w > 0.0).count();
+        assert!(penalized > 0 && penalized < theta.len());
+        let ridge: f64 = lm.ridge.iter().zip(&theta).map(|(w, t)| w * t * t).sum();
+        let expected = dot(&lm.r, &lm.r) + ridge;
+        let info = lm.step().unwrap();
+        assert!(ridge > 0.0 && (info.f - expected).abs() <= 1e-12 * expected);
+        assert!(info.accept, "{info:?}");
+        assert!((info.rho - 1.0).abs() < 1e-3, "{info:?}");
+    }
+
     /// Bit for bit the same fit on any number of threads.
     #[test]
     fn steps_do_not_depend_on_the_threads() {
@@ -870,7 +951,7 @@ mod tests {
                 .unwrap();
             pool.install(|| {
                 let mut lm =
-                    LmOptimizer::new(problem.clone(), theta.clone(), 0.1, settings()).unwrap();
+                    LmOptimizer::new(problem.clone(), theta.clone(), 0.1, 0.3, settings()).unwrap();
                 for _ in 0..5 {
                     lm.step().unwrap();
                 }
