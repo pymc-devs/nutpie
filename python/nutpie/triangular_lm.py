@@ -182,6 +182,7 @@ def make_residuals(tmap, y=None, g=None, *, fisher_regularization=None):
         location_index=int(tmap.conditioners[0].location_index),
         transformer=transformer_dicts(specs),
         fisher_regularization=fisher_regularization,
+        input_squash=tmap.input_squash,
     )
     if y is not None:
         problem.set_data(
