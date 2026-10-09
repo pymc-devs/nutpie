@@ -497,6 +497,27 @@ def test_normalizing_flow():
 
 
 @pytest.mark.pymc
+@pytest.mark.flow
+def test_normalizing_flow_rust():
+    """`test_normalizing_flow` with the triangular flow built in Rust."""
+    with pm.Model() as model:
+        pm.HalfNormal("x", shape=2)
+
+    compiled = nutpie.compile_pymc_model(
+        model, backend="jax", gradient_backend="jax"
+    ).with_transform_adapt(verbose=True, rust_flow=True)
+    trace = nutpie.sample(
+        compiled,
+        chains=1,
+        adaptation="flow",
+        window_switch_freq=128,
+        seed=1,
+        draws=500,
+    )
+    assert float(trace.sample_stats.fisher_distance.mean()) < 0.1
+
+
+@pytest.mark.pymc
 @pytest.mark.parametrize(
     ("backend", "gradient_backend"),
     [

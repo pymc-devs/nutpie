@@ -68,6 +68,7 @@
 
 mod blocks;
 mod conditioner;
+mod flow;
 pub(crate) mod optimizer;
 mod python;
 mod selected_inverse;
@@ -86,6 +87,7 @@ use rayon::prelude::*;
 use crate::triangular::pattern::{Offsets, Pattern};
 pub(crate) use blocks::GnBlock;
 use conditioner::{Conditioner, Params, ParamsMut, Shape, UnitState};
+pub(crate) use flow::PyTriangularFlow;
 pub(crate) use python::PyFisherResiduals;
 use selected_inverse::SelectedInverseLayout;
 use simd::{f64_width, store};

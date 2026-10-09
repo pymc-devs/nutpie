@@ -1387,6 +1387,50 @@ fn build_transform(
     min_parallel_work: i64,
     schedule: &str,
 ) -> Result<TriangularTransform> {
+    let specs: Vec<LayerSpec> = pythonize::depythonize(transformer)?;
+    build_transform_from_specs(
+        parent_indptr,
+        parent_index,
+        blob,
+        blob_offset,
+        layer_out,
+        skip_weight,
+        skip_index,
+        feature_degree,
+        feature_params,
+        input_squash,
+        activation,
+        specs,
+        level_ptr,
+        level_vars,
+        level_work,
+        min_parallel_work,
+        schedule,
+    )
+}
+
+/// [`build_transform`], with the transformer's layers already deserialized:
+/// for maps built in Rust (`nutpie.triangular_flow`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_transform_from_specs(
+    parent_indptr: &[i64],
+    parent_index: &[i64],
+    blob: &[f64],
+    blob_offset: &[i64],
+    layer_out: &[i64],
+    skip_weight: &[f64],
+    skip_index: i64,
+    feature_degree: i64,
+    feature_params: &[f64],
+    input_squash: Option<f64>,
+    activation: &str,
+    specs: Vec<LayerSpec>,
+    level_ptr: &[i64],
+    level_vars: &[i64],
+    level_work: &[i64],
+    min_parallel_work: i64,
+    schedule: &str,
+) -> Result<TriangularTransform> {
     if let Some(c) = input_squash {
         if !(c.is_finite() && c > 0.0) {
             bail!("input_squash must be positive and finite, got {c}");
@@ -1400,7 +1444,6 @@ fn build_transform(
     let schedule: Schedule =
         from_tag(schedule).map_err(|_| anyhow::anyhow!("unknown schedule {schedule:?}"))?;
 
-    let specs: Vec<LayerSpec> = pythonize::depythonize(transformer)?;
     let layers = specs
         .into_iter()
         .map(Layer::new)
@@ -1576,12 +1619,22 @@ impl FlowTransform {
 
         let loc = floats(layout, "loc")?;
         let scale = floats(layout, "scale")?;
-        let n = loc.len();
         let permutation = if has_map {
             as_usize(&ints(layout, "permutation")?)?
         } else {
-            (0..n).collect()
+            (0..loc.len()).collect()
         };
+        Self::new(map, permutation, loc, scale)
+    }
+
+    /// The flow from its parts; `map` `None` for the diagonal-only flow.
+    pub(crate) fn new(
+        map: Option<TriangularTransform>,
+        permutation: Vec<usize>,
+        loc: Vec<f64>,
+        scale: Vec<f64>,
+    ) -> Result<Self> {
+        let n = loc.len();
         if map.as_ref().is_some_and(|map| map.n_variables != n) {
             bail!("loc must have one entry per variable of the map");
         }
@@ -1791,6 +1844,12 @@ impl PySparseTriangularTransform {
 #[pyclass(name = "FlowTransform")]
 pub struct PyFlowTransform {
     inner: FlowTransform,
+}
+
+impl PyFlowTransform {
+    pub(crate) fn from_flow(inner: FlowTransform) -> Self {
+        Self { inner }
+    }
 }
 
 #[pymethods]

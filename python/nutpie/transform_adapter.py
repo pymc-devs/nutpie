@@ -41,14 +41,18 @@ from nutpie.normalizing_flow import (
     make_diag_flow,
     make_flow,
 )
+from nutpie.triangular_adapter import (
+    _LOG_SKIP_TRAINING_VALUE,
+    _LOG_STOP_VALUE,
+    _MIN_DIAG_DRAWS,
+    _format_log_f,
+    _recent_distinct,
+    _run_lm,
+    _select_draws,
+    _thin,  # noqa: F401 (tests import it from here)
+)
 
 _BIJECTION_TRACE = []
-
-_LOG_STOP_VALUE = -5
-_LOG_SKIP_TRAINING_VALUE = -4
-# Fewest distinct draws a diagonal fit needs; with fewer, it matches them
-# exactly and its scales are arbitrary.
-_MIN_DIAG_DRAWS = 5
 
 
 def _diag_flow_from_gradients(positions, gradients):
@@ -596,8 +600,6 @@ def _fit_lm_rust(
     (Fisher divergences, ``val`` `None` without `val_data`)."""
     from nutpie.lmopt import _conditioners
     from nutpie.triangular_lm import (
-        fisher_divergence,
-        fit,
         make_residuals,
         map_data,
         pack_params,
@@ -617,25 +619,25 @@ def _fit_lm_rust(
         val_draws, val_grads, *_ = val_data
         _, val_y, val_g = map_data(flow, val_draws, val_grads)
         val_problem = make_residuals(tmap, val_y, val_g)
-    theta, lam, hist = fit(
+    theta, losses, lam, n_steps, n_accepted = _run_lm(
         problem,
         pack_params(tmap),
-        n_steps=max_steps,
-        **({} if lam0 is None else {"lam0": lam0}),
-        min_loss=min_loss,
+        max_steps=max_steps,
         rtol=rtol,
+        linear_steps=linear_steps,
+        min_loss=min_loss,
         patience=patience,
-        verbose=verbose,
-        should_stop=should_stop,
-        cg_max=linear_steps,
         forcing=forcing,
-        max_block_size=max_exact_block_size,
+        lam0=lam0,
+        max_exact_block_size=max_exact_block_size,
         lmp_size=lmp_size,
         lmp_tol=lmp_tol,
-        mlp_ridge=mlp_ridge,
-        frozen=problem.unit_param_mask if freeze_units else None,
+        verbose=verbose,
+        should_stop=should_stop,
         val_problem=val_problem,
         early_stopping=early_stopping,
+        mlp_ridge=mlp_ridge,
+        freeze_units=freeze_units,
     )
 
     fitted = eqx.filter(
@@ -644,25 +646,7 @@ def _fit_lm_rust(
     if jax.tree.structure(fitted) != jax.tree.structure(_conditioners(params)):
         raise RuntimeError("The fitted conditioners do not match the flow's.")
     params = eqx.tree_at(_conditioners, params, fitted)
-
-    accepted = [info for info in hist if info["accept"]]
-    # Evaluated afresh: early stopping may have returned an earlier `theta`
-    # than the last step's.
-    r = problem.residuals(theta, linearize=False)
-    r_fisher = r.reshape(problem.n_draw, problem.n_residuals)[:, : tmap.shape[0]]
-    unit_weights = np.asarray(theta)[problem.unit_weight_mask]
-    ridge = mlp_ridge / problem.n_draw * float(unit_weights @ unit_weights)
-    losses = {
-        "objective": float(r @ r) + ridge,
-        "train": float(np.vdot(r_fisher, r_fisher)),
-        "val": None if val_problem is None else fisher_divergence(val_problem, theta),
-    }
-    # The damping to carry over is the one after the last accepted step:
-    # each rejection in a final streak (typical of a patience stop) only
-    # multiplied `lam` by a growing `nu`.
-    if accepted:
-        lam = accepted[-1]["lam_out"]
-    return params, losses, float(lam), len(hist), len(accepted)
+    return params, losses, lam, n_steps, n_accepted
 
 
 @eqx.filter_jit
@@ -1095,70 +1079,6 @@ def _describe_flow(bijection):
     return text
 
 
-def _format_log_f(value):
-    value = float(value)
-    return f"{value:+.2f}" if np.isfinite(value) else "  nan"
-
-
-def _thin(available, max_draws, recency):
-    """Sorted indices of `max_draws` distinct ones of `available` draws, at a
-    density growing like ``t**recency`` from the oldest (``t=0``) to the
-    newest draw (``t=1``); ``recency=0`` thins evenly.
-
-    The density is capped at one per draw, the newest draws are then all
-    taken and the rest goes to older ones. Systematic sampling: draw `i` is
-    taken where the cumulative density passes a half-integer, which keeps the
-    spacing as even as the density allows, and the selection deterministic.
-    """
-    t = (np.arange(available) + 0.5) / available
-    weight = t**recency
-    # The scale of the capped density that sums to `max_draws`. At `hi`
-    # every draw is capped, and the sum is `available > max_draws`.
-    lo, hi = 0.0, 1.0 / weight.min()
-    for _ in range(100):
-        mid = 0.5 * (lo + hi)
-        if np.minimum(1.0, mid * weight).sum() < max_draws:
-            lo = mid
-        else:
-            hi = mid
-    density = np.minimum(1.0, hi * weight)
-    cumulative = np.cumsum(density)
-    taken = np.floor(cumulative + 0.5) > np.floor(cumulative - density + 0.5)
-    return np.flatnonzero(taken)[-max_draws:]
-
-
-def _select_draws(
-    n_draws, start, *, max_draws, recency, val_fraction, block_size, multiple, rng
-):
-    """``(train, val)`` indices into draws ``start:n_draws`` for a flow fit.
-
-    At most `max_draws` draws; when there are more, they are thinned (see
-    `_thin`), denser towards the newest draws with a positive `recency`.
-    Thinning lowers the autocorrelation, and keeps the selection
-    deterministic. A random fraction `val_fraction` of blocks of `block_size`
-    consecutive draws is held out for validation; contiguous blocks keep
-    NUTS repeats and strongly correlated neighbours on one side of the split.
-    Both parts are cut to a multiple of `multiple` (the Rust LM's SIMD width)
-    by dropping their oldest draws, and are in chronological order.
-    """
-    available = n_draws - start
-    if available > max_draws:
-        idx = start + _thin(available, max_draws, recency)
-    else:
-        idx = np.arange(start, n_draws)
-
-    n_blocks = -(-len(idx) // block_size)
-    n_val_blocks = round(val_fraction * n_blocks)
-    if val_fraction > 0 and n_blocks > 1:
-        n_val_blocks = min(max(n_val_blocks, 1), n_blocks - 1)
-    is_val_block = np.zeros(n_blocks, dtype=bool)
-    is_val_block[rng.choice(n_blocks, size=n_val_blocks, replace=False)] = True
-    is_val = np.repeat(is_val_block, block_size)[: len(idx)]
-
-    train, val = idx[~is_val], idx[is_val]
-    return train[len(train) % multiple :], val[len(val) % multiple :]
-
-
 def fit_flow(key, bijection, loss_fn, draws, grads, logps, val=None, **kwargs):
     """Fit `bijection` to the draws; `val` are held-out ``(draws, grads,
     logps)``, see `fit_to_data`'s ``val_x``."""
@@ -1476,21 +1396,7 @@ class TransformAdapter:
                 gradients = np.asarray(gradients)
                 logps = np.asarray(logps)
 
-                # The newest `size // 5 + 3` distinct draws. Repeats (rejected
-                # transitions) say nothing new about the score, and a fit to
-                # a few distinct points matches them exactly.
-                size = len(positions)
-                target = max(size // 5 + 3, _MIN_DIAG_DRAWS)
-                seen, keep, start = set(), [], 0
-                for i in range(size - 1, -1, -1):
-                    key = positions[i].tobytes()
-                    if key not in seen:
-                        seen.add(key)
-                        keep.append(i)
-                        if len(keep) == target:
-                            start = i
-                            break
-                n_repeats = size - start - len(keep)
+                keep, n_repeats = _recent_distinct(positions)
                 repeats = f", {n_repeats} repeats skipped" if n_repeats else ""
                 if len(keep) < _MIN_DIAG_DRAWS:
                     # Too few draws for variances: scale by the gradient
@@ -1507,7 +1413,6 @@ class TransformAdapter:
                     )
                     return
 
-                keep = keep[::-1]
                 positions = positions[keep]
                 gradients = gradients[keep]
                 logps = logps[keep]
@@ -1989,8 +1894,15 @@ def make_transform_adapter(
     val_block_size=16,
     early_stopping=True,
     linear_first_fit=True,
+    rust_flow=True,
 ):
     """The adapter for `nutpie.sample`'s ``transform_adapt``.
+
+    With ``rust_flow``, the triangular flow is built, fitted and handed to the
+    sampler in Rust, without a JAX flow (see
+    `nutpie.triangular_adapter.TriangularFlowAdapter`). That needs
+    ``coupling_type="triangular"`` and ``method="lm-rust"``, and supports the
+    settings that apply to them; the others raise.
 
     Draw selection for each flow fit: draws before ``initial_skip`` and the
     oldest ``forget_fraction`` of all draws are ignored, the rest is thinned
@@ -2038,6 +1950,64 @@ def make_transform_adapter(
     conditional on its parents and so pulls towards independent coordinates,
     it leaves the linear location skip free.
     """
+    if rust_flow:
+        from nutpie.triangular_adapter import TriangularFlowAdapter
+
+        unsupported = {
+            "coupling_type": coupling_type != "triangular",
+            "method": method != "lm-rust",
+            "nn_depth": nn_depth not in (None, 1),
+            "location_skip": not location_skip,
+            "feature_degree": feature_degree is not None,
+            "affine_transformer": bool(affine_transformer),
+            "asymmetric_transformer": bool(asymmetric_transformer),
+            "extension_windows": bool(extension_windows),
+        }
+        unsupported = [name for name, bad in unsupported.items() if bad]
+        if unsupported:
+            raise ValueError(
+                "rust_flow=True needs coupling_type='triangular', "
+                "method='lm-rust', depth-1 conditioners with the location skip, "
+                "and no parent features, affine or asymmetric layers or "
+                f"extension windows; got {', '.join(unsupported)}."
+            )
+        return partial(
+            TriangularFlowAdapter,
+            sparsity=sparsity,
+            order=order,
+            verbose=verbose,
+            window_size=window_size,
+            num_diag_windows=num_diag_windows,
+            initial_skip=initial_skip,
+            forget_fraction=forget_fraction,
+            recency=recency,
+            val_fraction=val_fraction,
+            val_block_size=val_block_size,
+            early_stopping=early_stopping,
+            linear_first_fit=linear_first_fit,
+            debug_save_bijection=debug_save_bijection,
+            stop_event=stop_event,
+            nn_width=nn_width,
+            activation="softplus" if activation is None else activation,
+            zero_init=zero_init,
+            contract_transformer=contract_transformer,
+            tangent_sas_transformer=tangent_sas_transformer,
+            tangent_sas_fix_b=tangent_sas_fix_b,
+            log_gamma_bounds=log_gamma_bounds,
+            input_squash=input_squash,
+            max_epochs=max_epochs,
+            solver_rtol=solver_rtol,
+            lm_linear_steps=lm_linear_steps,
+            lm_min_loss=lm_min_loss,
+            lm_fisher_regularization=lm_fisher_regularization,
+            lm_mlp_ridge=lm_mlp_ridge,
+            lm_patience=lm_patience,
+            lm_forcing=lm_forcing,
+            lm_max_exact_block_size=lm_max_exact_block_size,
+            lm_lmp_size=lm_lmp_size,
+            lm_lmp_tol=lm_lmp_tol,
+        )
+
     if extension_windows is None:
         extension_windows = []
     if activation is None and coupling_type == "triangular":

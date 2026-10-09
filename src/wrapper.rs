@@ -11,6 +11,7 @@ use crate::{
     pyfunc::PyModel,
     pymc::{ExpandFunc, LogpFunc, PyMcModel},
     stan::{StanLibrary, StanModel},
+    triangular::lm::PyTriangularFlow,
     triangular::transform::FlowTransform,
 };
 
@@ -1850,10 +1851,16 @@ impl PyTransformAdapt {
                 .context("No attribute flow_transform_layout")?
                 .call0(py)
                 .context("Failed adapter.flow_transform_layout")?;
+            let layout = layout.bind(py);
+            // A flow built in Rust (`nutpie.triangular_flow`) hands over
+            // itself, with no layout to go through.
+            if let Ok(flow) = layout.extract::<PyRef<'_, PyTriangularFlow>>() {
+                return flow.native_transform().map(Some);
+            }
             let layout: Option<Bound<'_, PyDict>> = layout
-                .extract(py)
+                .extract()
                 .map_err(PyErr::from)
-                .context("flow_transform_layout must return a dict or None")?;
+                .context("flow_transform_layout must return a dict, a TriangularFlow or None")?;
             layout
                 .map(|layout| FlowTransform::from_layout(&layout))
                 .transpose()
@@ -1890,6 +1897,7 @@ pub fn _lib(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::triangular::transform::PySparseTriangularTransform>()?;
     m.add_class::<crate::triangular::transform::PyFlowTransform>()?;
     m.add_class::<crate::triangular::lm::PyFisherResiduals>()?;
+    m.add_class::<crate::triangular::lm::PyTriangularFlow>()?;
     m.add_class::<crate::triangular::lm::optimizer::PyLmOptimizer>()?;
     m.add_function(wrap_pyfunction!(
         crate::triangular::transform::activation_for_testing,
