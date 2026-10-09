@@ -246,6 +246,7 @@ def test_location_skip_can_be_disabled():
         (4, None, dict(contract_transformer=1, tangent_sas_transformer=1)),
         (4, None, dict(tangent_sas_transformer=2, tangent_sas_fix_b=True)),
         (4, None, dict(input_squash=0.7)),
+        (32, None, dict(activation=jax.nn.gelu, input_squash=0.7)),
         (
             32,
             None,
@@ -281,12 +282,11 @@ def test_native_flow_transform_matches_jax(
         kind="triangular",
         sparsity=blanket,
         order=rng.permutation(dim),
-        activation=jax.nn.softplus,
         nn_width=nn_width,
         zero_init=False,
         feature_degree=feature_degree,
         n_buckets=2,
-        **transformer_kwargs,
+        **{"activation": jax.nn.softplus, **transformer_kwargs},
     )
     # Off the initialization, so every parameter matters.
     params, static = eqx.partition(bijection, eqx.is_inexact_array)

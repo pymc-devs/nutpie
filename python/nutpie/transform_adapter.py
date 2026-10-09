@@ -2007,7 +2007,8 @@ def make_transform_adapter(
     if extension_windows is None:
         extension_windows = []
     if activation is None and coupling_type == "triangular":
-        # The Rust LM fit (`method="lm-rust"`) only supports softplus.
+        # The Rust LM fit (`method="lm-rust"`) supports softplus and GELU
+        # (`activation="gelu"`).
         activation = jax.nn.softplus
 
     return partial(

@@ -4,7 +4,7 @@ use anyhow::{bail, Result};
 use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use super::conditioner::Conditioner;
+use super::conditioner::{Activation, Conditioner};
 use super::{FisherResiduals, Linearization};
 use crate::triangular::layers::LayerSpec;
 use crate::triangular::pattern::Pattern;
@@ -39,6 +39,7 @@ impl PyFisherResiduals {
         transformer,
         fisher_regularization = None,
         input_squash = None,
+        activation = "softplus",
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -50,12 +51,20 @@ impl PyFisherResiduals {
         transformer: &Bound<'_, PyAny>,
         fisher_regularization: Option<f64>,
         input_squash: Option<f64>,
+        activation: &str,
     ) -> Result<Self> {
         let specs: Vec<LayerSpec> = pythonize::depythonize(transformer)?;
         Ok(Self {
             inner: FisherResiduals::new(
                 Pattern::from_i64(parent_indptr.as_slice()?, parent_index.as_slice()?)?,
-                Conditioner::new(n_unit, n_par, location_index, specs, input_squash)?,
+                Conditioner::new(
+                    n_unit,
+                    n_par,
+                    location_index,
+                    specs,
+                    input_squash,
+                    Activation::from_name(activation)?,
+                )?,
                 fisher_regularization,
             )?,
             lin: None,

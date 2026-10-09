@@ -45,6 +45,7 @@ def _setup(
     tangent_sas=0,
     fix_b=False,
     squash=None,
+    activation=jax.nn.softplus,
     dim=7,
     n_draw=8,
     seed=0,
@@ -64,7 +65,7 @@ def _setup(
         transformer=transformer,
         n_buckets=3,
         nn_width=nn_width,
-        nn_activation=jax.nn.softplus,
+        nn_activation=activation,
         input_squash=squash,
     )
     # Away from the zero init, so that every term is exercised.
@@ -128,6 +129,8 @@ CASES = [
     # The draws are standard normal, so 0.7 is well away from the identity.
     {"squash": 0.7},
     {"squash": 0.7, "blanket": "random", "bounds": (-1.0, 1.0)},
+    {"activation": jax.nn.gelu},
+    {"activation": jax.nn.gelu, "squash": 0.7, "tangent_sas": 2},
 ]
 
 

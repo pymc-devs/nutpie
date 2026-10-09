@@ -38,25 +38,39 @@ __all__ = [
 ]
 
 
+_ACTIVATIONS = ("softplus", "gelu_tanh")
+
+
+def _activation(tmap):
+    """The `nutpie.triangular_layout` name of the conditioners' activation."""
+    from nutpie.triangular_layout import _activation_name
+
+    return _activation_name(tmap.conditioners[0].mlp.activation)
+
+
 def check_supported(tmap):
     """Raise `NotImplementedError` unless the Rust residuals support `tmap`:
-    depth-1 softplus conditioners with the location skip, no parent features,
-    and a transformer of `Contract2`, `TangentSAS` and `PositiveAffine`
-    layers."""
-    import jax
-
+    depth-1 softplus or GELU (`jax.nn.gelu`, the tanh approximation)
+    conditioners with the location skip, no parent features, and a
+    transformer of `Contract2`, `TangentSAS` and `PositiveAffine` layers."""
     from nutpie.triangular import LocationSkipMlp
 
     if tmap.feature_degree is not None:
         raise NotImplementedError("Parent features (feature_degree) are not supported.")
+    activation = None
     for conditioner in tmap.conditioners:
         if not isinstance(conditioner, LocationSkipMlp):
             raise NotImplementedError("Conditioners need the location skip.")
         mlp = conditioner.mlp
         if len(mlp.layers) != 2:
             raise NotImplementedError("Only depth-1 conditioners are supported.")
-        if mlp.activation is not jax.nn.softplus:
-            raise NotImplementedError("Only softplus conditioners are supported.")
+        if activation is None:
+            activation = mlp.activation
+        if mlp.activation is not activation or _activation(tmap) not in _ACTIVATIONS:
+            raise NotImplementedError(
+                "Only softplus or jax.nn.gelu conditioners, the same in every "
+                "bucket, are supported."
+            )
         if any(layer.bias is None for layer in mlp.layers):
             raise NotImplementedError("Conditioners need biases.")
 
@@ -183,6 +197,7 @@ def make_residuals(tmap, y=None, g=None, *, fisher_regularization=None):
         transformer=transformer_dicts(specs),
         fisher_regularization=fisher_regularization,
         input_squash=tmap.input_squash,
+        activation=_activation(tmap),
     )
     if y is not None:
         problem.set_data(
