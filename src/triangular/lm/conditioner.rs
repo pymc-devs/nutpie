@@ -28,6 +28,13 @@ impl Activation {
             other => bail!("unsupported activation {other:?}, expected 'softplus' or 'gelu_tanh'"),
         }
     }
+
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Self::Softplus => "softplus",
+            Self::GeluTanh => "gelu_tanh",
+        }
+    }
 }
 
 /// The architecture every variable's conditioner and transformer share: one

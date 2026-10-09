@@ -18,6 +18,10 @@ pub struct PyFisherResiduals {
 }
 
 impl PyFisherResiduals {
+    pub(super) fn from_inner(inner: FisherResiduals) -> Self {
+        Self { inner, lin: None }
+    }
+
     fn linearization(&self) -> Result<&Linearization> {
         match &self.lin {
             Some(lin) => Ok(lin),
