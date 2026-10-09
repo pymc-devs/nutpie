@@ -171,12 +171,26 @@ impl FisherResiduals {
     /// what the optimizer's MLP ridge penalizes. With all of them zero, each
     /// conditioner is its biases and the skip alone.
     pub(crate) fn unit_weight_mask(&self) -> Vec<bool> {
+        self.unit_mask(false)
+    }
+
+    /// Per parameter, whether it belongs to the hidden units (`W1`, `b1` or
+    /// `W2`): with these frozen at `W2 = 0`, a fit only moves the linear
+    /// part of each conditioner, its biases `b2` and the skip.
+    pub(crate) fn unit_param_mask(&self) -> Vec<bool> {
+        self.unit_mask(true)
+    }
+
+    fn unit_mask(&self, with_bias: bool) -> Vec<bool> {
         let mut mask = vec![false; self.n_params()];
         for i in 0..self.n_var() {
             let (start, shape) = (self.params(i).start, self.shape(i));
             for u in 0..shape.n_unit {
                 for k in shape.w1(u).chain(shape.w2(u)) {
                     mask[start + k] = true;
+                }
+                if with_bias {
+                    mask[start + shape.b1(u)] = true;
                 }
             }
         }

@@ -99,6 +99,7 @@ def fit_to_data(
     lm_lmp_size: int = 0,
     lm_lmp_tol: float = 1e-8,
     lm_mlp_ridge: float = 0.0,
+    lm_freeze_units: bool = False,
     lm_print_blocks: bool = False,
     lm_diagnose: bool = False,
     should_stop: Callable[[], bool] | None = None,
@@ -230,6 +231,11 @@ def fit_to_data(
             ``lm_mlp_ridge`` on its sum over the draws. Its minimum is the
             flow without the MLPs, so the MLPs are only used where the draws
             support them. Only used when ``method`` is ``"lm-rust"``.
+        lm_freeze_units: Hold the conditioner MLPs' hidden units (both
+            weights and the hidden biases) fixed and fit only the rest. On
+            a zero-initialized flow, whose MLP outputs are zero, this fits
+            the flow without MLPs. Only used when ``method`` is
+            ``"lm-rust"``.
         lm_min_loss: Stop the LM fit once the Fisher divergence falls below
             this. Note that the divergence is a *sum* over dimensions, so this
             is an absolute, dimension-independent target: it bounds each
@@ -269,8 +275,10 @@ def fit_to_data(
         is_leaf=lambda leaf: isinstance(leaf, NonTrainable),
     )
 
-    if lm_mlp_ridge and method != "lm-rust":
-        raise ValueError("lm_mlp_ridge is only supported with method='lm-rust'.")
+    if (lm_mlp_ridge or lm_freeze_units) and method != "lm-rust":
+        raise ValueError(
+            "lm_mlp_ridge and lm_freeze_units are only supported with method='lm-rust'."
+        )
 
     if method == "lm-rust":
         params, lm_losses, lam, n_steps, n_accepted = _fit_lm_rust(
@@ -289,6 +297,7 @@ def fit_to_data(
             lmp_size=lm_lmp_size,
             lmp_tol=lm_lmp_tol,
             mlp_ridge=lm_mlp_ridge,
+            freeze_units=lm_freeze_units,
             verbose=verbose,
             should_stop=should_stop,
             val_data=val_data,
@@ -573,14 +582,15 @@ def _fit_lm_rust(
     val_data=None,
     early_stopping=True,
     mlp_ridge=0.0,
+    freeze_units=False,
 ):
     """`_fit_lm` with exact blocks and the line search, in Rust (see
     `nutpie.triangular_lm.fit`). Fits the conditioners of the flow's
     `SparseTriangularMap`; everything else stays as it is.
 
     `val_data` are held-out draws for `fit`'s validation loss and, with
-    `early_stopping`, its early stopping. `mlp_ridge` is `fit_to_data`'s
-    ``lm_mlp_ridge``. Returns ``(params, losses, lam, n_steps,
+    `early_stopping`, its early stopping. `mlp_ridge` and `freeze_units` are
+    `fit_to_data`'s ``lm_mlp_ridge`` and ``lm_freeze_units``. Returns ``(params, losses, lam, n_steps,
     n_accepted)``, with the losses at the fitted parameters: ``"objective"``
     (what LM minimised, with the regularizations), ``"train"`` and ``"val"``
     (Fisher divergences, ``val`` `None` without `val_data`)."""
@@ -623,6 +633,7 @@ def _fit_lm_rust(
         lmp_size=lmp_size,
         lmp_tol=lmp_tol,
         mlp_ridge=mlp_ridge,
+        frozen=problem.unit_param_mask if freeze_units else None,
         val_problem=val_problem,
         early_stopping=early_stopping,
     )
@@ -1308,6 +1319,7 @@ class TransformAdapter:
         val_fraction,
         val_block_size,
         early_stopping,
+        linear_first_fit,
     ):
         from nutpie._lib import FisherResiduals
 
@@ -1324,6 +1336,7 @@ class TransformAdapter:
         self._val_fraction = val_fraction
         self._val_block_size = val_block_size
         self._early_stopping = early_stopping
+        self._linear_first_fit = linear_first_fit
         # The Rust LM fit needs a multiple of its SIMD width of draws.
         self._draw_multiple = FisherResiduals.simd_width()
         self._num_layers = num_layers
@@ -1575,7 +1588,13 @@ class TransformAdapter:
             # TODO don't reuse seed
             key = jax.random.PRNGKey(seed % (2**63))
 
-            if len(self._bijection.bijections) == 1:
+            fresh = len(self._bijection.bijections) == 1
+            # A fresh flow's first fit only moves the linear part of its
+            # conditioners, see `make_transform_adapter`.
+            freeze_units = (
+                fresh and self._linear_first_fit and self._method == "lm-rust"
+            )
+            if fresh:
                 base = self._make_flow_fn(
                     seed,
                     positions,
@@ -1588,7 +1607,11 @@ class TransformAdapter:
                     flowjax.distributions.StandardNormal(base.shape), base
                 )
                 params, static = eqx.partition(flow, eqx.is_inexact_array)
-                self._report(n_draws, f"new flow: {_describe_flow(base)}")
+                self._report(
+                    n_draws,
+                    f"new flow: {_describe_flow(base)}"
+                    + (", first fit without the MLPs" if freeze_units else ""),
+                )
                 if self._verbose >= 2:
                     fresh_loss = self._loss_fn(params, static, *eval_data)
                     self._report(
@@ -1682,6 +1705,7 @@ class TransformAdapter:
                 lm_probe_batch=self._lm_probe_batch,
                 lm_probes=self._lm_probes,
                 lm_mlp_ridge=self._lm_mlp_ridge,
+                lm_freeze_units=freeze_units,
                 lm_probe_groups=self._lm_probe_groups,
                 lm_probe_rounds=self._lm_probe_rounds,
                 lm_fit_affine=self._lm_fit_affine,
@@ -1964,6 +1988,7 @@ def make_transform_adapter(
     val_fraction=0.2,
     val_block_size=16,
     early_stopping=True,
+    linear_first_fit=True,
 ):
     """The adapter for `nutpie.sample`'s ``transform_adapt``.
 
@@ -1997,6 +2022,15 @@ def make_transform_adapter(
     the map through a power ``1 / gamma``, so with raw parents their linear
     growth away from the draws becomes a high-power blowup of the map.
     ``None`` gives the MLPs the raw parents.
+
+    With ``linear_first_fit`` (and ``method="lm-rust"``), the first fit of
+    a new flow holds the conditioner MLPs' hidden units fixed (see
+    `fit_to_data`'s ``lm_freeze_units``). Their outputs start at zero
+    (``zero_init``), so that fit is the flow without MLPs, which converges
+    quickly; later fits start from it and use the MLPs where the draws
+    support them. A refit only replaces the flow if it does better on the
+    held-out draws, so the MLPs cannot make it worse there than this linear
+    start, up to the noise of those draws.
 
     ``lm_mlp_ridge`` penalizes the conditioner MLPs' weights (see
     `fit_to_data`), with the flow without MLPs as its minimum. Unlike
@@ -2089,4 +2123,5 @@ def make_transform_adapter(
         val_fraction=val_fraction,
         val_block_size=val_block_size,
         early_stopping=early_stopping,
+        linear_first_fit=linear_first_fit,
     )
