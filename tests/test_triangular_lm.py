@@ -527,3 +527,32 @@ def test_lm_rust_mlp_ridge():
         rtol=1e-10,
     )
     assert weights @ weights < 0.1 * theta_free[mask] @ theta_free[mask]
+
+
+def test_lm_rust_freeze_units():
+    """`lm_freeze_units` fits only the linear part of the conditioners: the
+    hidden units' weights and biases come back unchanged, the rest moves."""
+    from nutpie.transform_adapter import fit_to_data
+    from nutpie.triangular_lm import make_residuals, map_data, pack_params
+
+    params, static, data, loss_fn = _flow_problem(n_draw=64, rho=0.1)
+    flow0 = eqx.combine(params, static)
+    tmap0, y, g = map_data(flow0, data[0], data[1])
+    mask = make_residuals(tmap0, y, g).unit_param_mask
+    theta0 = pack_params(tmap0)
+
+    flow, losses, _ = fit_to_data(
+        jax.random.key(0),
+        flow0,
+        data,
+        loss_fn=loss_fn,
+        method="lm-rust",
+        max_epochs=5,
+        lm_min_loss=0.0,
+        lm_freeze_units=True,
+    )
+    tmap, _, _ = map_data(flow, data[0], data[1])
+    theta = pack_params(tmap)
+    np.testing.assert_array_equal(theta[mask], theta0[mask])
+    assert not np.allclose(theta[~mask], theta0[~mask])
+    assert losses["lm_accepted"] > 0

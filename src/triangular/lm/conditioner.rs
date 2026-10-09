@@ -73,7 +73,7 @@ impl Shape {
     }
 
     #[inline(always)]
-    fn b1(&self, u: usize) -> usize {
+    pub(super) fn b1(&self, u: usize) -> usize {
         u * self.stride() + self.n_parent
     }
 

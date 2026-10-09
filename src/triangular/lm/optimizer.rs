@@ -21,6 +21,10 @@
 //! ridge on the hidden units' weights (see `PyLmOptimizer`'s `mlp_ridge`),
 //! which adds `diag(ridge)` to `H = J^T J`. Every quantity below, `F`, the
 //! gradient `g`, `H` and its blocks, includes it.
+//!
+//! Optionally, some parameters are `frozen`: the step is restricted to the
+//! others, by zeroing their entries of `g` and of `H v`, and making their
+//! rows and columns of the blocks the identity's.
 
 use std::collections::VecDeque;
 
@@ -236,6 +240,9 @@ pub struct LmOptimizer {
     /// Per parameter, the ridge weight in `F`: zero, or `mlp_ridge / n_draw`
     /// on the hidden units' weights.
     ridge: Vec<f64>,
+    /// Per parameter, whether it is held fixed: its gradient, curvature and
+    /// so its step are zero.
+    frozen: Vec<bool>,
     theta: Vec<f64>,
     lin: Linearization,
     r: Vec<f64>,
@@ -273,6 +280,7 @@ impl LmOptimizer {
         theta: Vec<f64>,
         lam: f64,
         mlp_ridge: f64,
+        frozen: Option<Vec<bool>>,
         settings: Settings,
     ) -> Result<Self> {
         if theta.len() != problem.n_params() {
@@ -280,6 +288,14 @@ impl LmOptimizer {
                 "theta has length {}, expected {}",
                 theta.len(),
                 problem.n_params()
+            );
+        }
+        let frozen = frozen.unwrap_or_else(|| vec![false; theta.len()]);
+        if frozen.len() != theta.len() {
+            bail!(
+                "frozen has length {}, expected {}",
+                frozen.len(),
+                theta.len()
             );
         }
         if problem.n_draw() == 0 {
@@ -304,6 +320,7 @@ impl LmOptimizer {
         Ok(Self {
             problem,
             ridge,
+            frozen,
             theta,
             lin,
             r,
@@ -348,17 +365,31 @@ impl LmOptimizer {
             *m = Mat::from_fn(size, size, |r, c| if r == c { diagonal[r] } else { 0.0 });
         }
         for block in &mut blocks {
-            for k in 0..block.matrix.nrows() {
+            let size = block.matrix.nrows();
+            for k in 0..size {
                 block.matrix[(k, k)] += self.ridge[block.start + k];
+            }
+            // A frozen parameter's row and column become the identity's, so
+            // that the preconditioner keeps its component of every CG
+            // vector zero.
+            for k in (0..size).filter(|&k| self.frozen[block.start + k]) {
+                for j in 0..size {
+                    block.matrix[(k, j)] = 0.0;
+                    block.matrix[(j, k)] = 0.0;
+                }
+                block.matrix[(k, k)] = 1.0;
             }
         }
 
-        // Marquardt floors per variable (conditioner).
+        // Marquardt floors per variable (conditioner), from its free
+        // parameters' curvature.
         let mut local = vec![f64::NEG_INFINITY; self.problem.n_var()];
         for block in &blocks {
             let var = self.problem.param_offset.row_of(block.start);
             for k in 0..block.matrix.nrows() {
-                local[var] = local[var].max(block.matrix[(k, k)]);
+                if !self.frozen[block.start + k] {
+                    local[var] = local[var].max(block.matrix[(k, k)]);
+                }
             }
         }
         let global = local
@@ -447,6 +478,13 @@ impl LmOptimizer {
         let mut out = self.problem.gauss_newton_product(&self.lin, v)?;
         for (((o, d), v), w) in out.iter_mut().zip(diagonal).zip(v).zip(&self.ridge) {
             *o += (lam * d + w) * v;
+        }
+        // Restricted to the free parameters; CG's vectors are zero on the
+        // frozen ones already.
+        for (o, &frozen) in out.iter_mut().zip(&self.frozen) {
+            if frozen {
+                *o = 0.0;
+            }
         }
         Ok(out)
     }
@@ -577,6 +615,11 @@ impl LmOptimizer {
         let mut g = self.problem.pullback(&self.lin, &self.r)?;
         for ((g, w), t) in g.iter_mut().zip(&self.ridge).zip(&self.theta) {
             *g += w * t;
+        }
+        for (g, &frozen) in g.iter_mut().zip(&self.frozen) {
+            if frozen {
+                *g = 0.0;
+            }
         }
         let rhs: Vec<f64> = g.iter().map(|v| -v).collect();
         let eta = match s.forcing {
@@ -792,6 +835,7 @@ impl PyLmOptimizer {
         lmp_size = 0,
         lmp_tol = 1e-8,
         mlp_ridge = 0.0,
+        frozen = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -819,7 +863,11 @@ impl PyLmOptimizer {
         lmp_size: usize,
         lmp_tol: f64,
         mlp_ridge: f64,
+        frozen: Option<PyReadonlyArray1<'_, bool>>,
     ) -> Result<Self> {
+        let frozen = frozen
+            .map(|mask| mask.as_slice().map(<[bool]>::to_vec))
+            .transpose()?;
         let forcing = match forcing {
             "residual" => Forcing::Residual,
             "rho" => Forcing::Rho,
@@ -849,7 +897,8 @@ impl PyLmOptimizer {
         };
         let theta = theta.as_slice()?.to_vec();
         let problem = problem.inner.clone();
-        let inner = py.detach(|| LmOptimizer::new(problem, theta, lam, mlp_ridge, settings))?;
+        let inner =
+            py.detach(|| LmOptimizer::new(problem, theta, lam, mlp_ridge, frozen, settings))?;
         Ok(Self { inner })
     }
 
@@ -927,7 +976,7 @@ mod tests {
         let theta = normal(&mut rng, problem.n_params(), 0.3);
         // A huge damping makes the step tiny, so GN's model is exact to
         // first order.
-        let mut lm = LmOptimizer::new(problem, theta.clone(), 1e6, 0.7, settings()).unwrap();
+        let mut lm = LmOptimizer::new(problem, theta.clone(), 1e6, 0.7, None, settings()).unwrap();
         let penalized = lm.ridge.iter().filter(|&&w| w > 0.0).count();
         assert!(penalized > 0 && penalized < theta.len());
         let ridge: f64 = lm.ridge.iter().zip(&theta).map(|(w, t)| w * t * t).sum();
@@ -936,6 +985,37 @@ mod tests {
         assert!(ridge > 0.0 && (info.f - expected).abs() <= 1e-12 * expected);
         assert!(info.accept, "{info:?}");
         assert!((info.rho - 1.0).abs() < 1e-3, "{info:?}");
+    }
+
+    /// Frozen parameters never move, the others do, and the loss still goes
+    /// down.
+    #[test]
+    fn frozen_parameters_stay_put() {
+        let problem = problem_with(Some(0.3), 64);
+        let frozen = problem.unit_param_mask();
+        assert!(frozen.iter().any(|&f| f) && frozen.iter().any(|&f| !f));
+        let mut rng = ChaCha8Rng::seed_from_u64(7);
+        let theta = normal(&mut rng, problem.n_params(), 0.3);
+        let mut lm = LmOptimizer::new(
+            problem,
+            theta.clone(),
+            0.1,
+            0.5,
+            Some(frozen.clone()),
+            settings(),
+        )
+        .unwrap();
+        let start = lm.objective();
+        for _ in 0..5 {
+            lm.step().unwrap();
+        }
+        assert!(lm.objective() < start);
+        for ((before, after), frozen) in theta.iter().zip(&lm.theta).zip(&frozen) {
+            if *frozen {
+                assert_eq!(before, after);
+            }
+        }
+        assert!(theta.iter().zip(&lm.theta).any(|(a, b)| a != b));
     }
 
     /// Bit for bit the same fit on any number of threads.
@@ -951,7 +1031,8 @@ mod tests {
                 .unwrap();
             pool.install(|| {
                 let mut lm =
-                    LmOptimizer::new(problem.clone(), theta.clone(), 0.1, 0.3, settings()).unwrap();
+                    LmOptimizer::new(problem.clone(), theta.clone(), 0.1, 0.3, None, settings())
+                        .unwrap();
                 for _ in 0..5 {
                     lm.step().unwrap();
                 }
