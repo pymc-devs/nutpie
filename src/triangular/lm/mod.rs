@@ -14,8 +14,8 @@
 //! followed, with a Fisher regularization `rho`, by one parent score per edge,
 //! `sqrt(rho) (L[i,j] - x_i A[i,j]) / sqrt(n_draw)`.
 //!
-//! Supported conditioners: one hidden layer with softplus, and the linear
-//! location skip. The transformer is a chain of `Contract2`, `TangentSAS` and
+//! Supported conditioners: one hidden layer with softplus or `gelu_tanh`,
+//! optionally on squashed inputs, and the linear location skip. The transformer is a chain of `Contract2`, `TangentSAS` and
 //! `PositiveAffine` layers, evaluated in the density direction.
 //!
 //! Parameters are laid out per variable, with no bucketing or padding.
@@ -46,8 +46,9 @@
 //! | `y`, `g` | the map's inputs and the log density's gradient there (data) |
 //! | `y_parents` | `y[P(i)]` |
 //! | `W1`, `b1`, `W2`, `b2`, `s` | variable `i`'s conditioner parameters, `theta_i`; `s` is the location skip ([`conditioner::Params`]) |
-//! | `a` | the hidden units' inputs, `W1 y_parents + b1` |
-//! | `h`, `h1`, `h2` | softplus and its first two derivatives at `a` (`h`, `h'`, `h''`) |
+//! | `z_parents`, `dz` | what the units see of the parents, `c asinh(y / c)` with an input squash `c` and `y` without, and its derivative in `y` |
+//! | `a` | the hidden units' inputs, `W1 z_parents + b1` |
+//! | `h`, `h1`, `h2` | the activation and its first two derivatives at `a` (`h`, `h'`, `h''`) |
 //! | `pi` | the transformer parameters, `W2 h + b2 + e_loc s . y_parents`, `n_par` of them |
 //! | `loc` | the index of the transformer parameter the skip adds to |
 //! | `T`, `Lambda` | the transformer `x_i = T(y_i; pi)` and `Lambda = log dT/dy_i` |

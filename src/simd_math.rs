@@ -189,6 +189,28 @@ pub(crate) fn softplus<S: Simd>(simd: S, a: S::f64s) -> (S::f64s, S::f64s, S::f6
     )
 }
 
+/// `jax.nn.gelu`'s default, the tanh approximation `a (1 + tanh(u)) / 2`
+/// with `u = c (a + k a^3)`, and its first two derivatives.
+#[simd]
+pub(crate) fn gelu_tanh<S: Simd>(simd: S, a: S::f64s) -> (S::f64s, S::f64s, S::f64s) {
+    const C: f64 = 0.797_884_560_802_865_4;
+    const K: f64 = 0.044_715;
+    let one = S::f64s::splat(simd, 1.0);
+    let a2 = a * a;
+    let u = (a2 * K + 1.0) * a * C;
+    let (_, t) = log_cosh_tanh(simd, u);
+    // `sech^2(u)`, and `u'`, `u''` in `a`.
+    let s = one - t * t;
+    let du = (a2 * (3.0 * K) + 1.0) * C;
+    let d2u = a * (6.0 * K * C);
+    let half_a = a * 0.5;
+    (
+        half_a * (t + 1.0),
+        (t + 1.0) * 0.5 + half_a * s * du,
+        s * du + half_a * s * (d2u - t * du * du * 2.0),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use fearless_simd::{dispatch, Level};
@@ -238,6 +260,39 @@ mod tests {
                 value.store_slice(&mut out[range.clone()]);
             }
         }
+    }
+
+    /// `gelu_tanh` against the scalar formula, and its derivatives against
+    /// central differences of the value and of the first derivative.
+    #[test]
+    fn gelu_tanh_and_its_derivatives() {
+        #[simd]
+        fn eval<S: Simd>(simd: S, x: f64) -> (f64, f64, f64) {
+            let (f, d1, d2) = gelu_tanh(simd, S::f64s::splat(simd, x));
+            (f.as_slice()[0], d1.as_slice()[0], d2.as_slice()[0])
+        }
+        let level = Level::new();
+        let at = |x: f64| dispatch!(level, simd => eval(simd, x));
+        let reference = |x: f64| {
+            0.5 * x * (1.0 + (0.797_884_560_802_865_4 * (x + 0.044_715 * x * x * x)).tanh())
+        };
+        let h = 1e-5;
+        for k in -60..=60 {
+            let x = 0.1 * k as f64;
+            let (f, d1, d2) = at(x);
+            assert!(
+                (f - reference(x)).abs() <= 1e-15 * (1.0 + x.abs()),
+                "f({x})"
+            );
+            let fd1 = (reference(x + h) - reference(x - h)) / (2.0 * h);
+            let fd2 = (at(x + h).1 - at(x - h).1) / (2.0 * h);
+            assert!((d1 - fd1).abs() <= 1e-8, "f'({x}): {d1} != {fd1}");
+            assert!((d2 - fd2).abs() <= 1e-8, "f''({x}): {d2} != {fd2}");
+        }
+        // Saturated: exactly the identity and zero, no NaN.
+        assert_eq!(at(40.0), (40.0, 1.0, 0.0));
+        let (f, d1, d2) = at(-40.0);
+        assert!(f == 0.0 && d1 == 0.0 && d2 == 0.0, "{f} {d1} {d2}");
     }
 
     #[test]
