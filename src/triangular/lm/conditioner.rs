@@ -12,8 +12,26 @@ use crate::triangular::jet::{packed_len, JetArena};
 use crate::triangular::layers::jet::{transformer, transformer_hessian};
 use crate::triangular::layers::{Layer, LayerSpec};
 
+/// The hidden units' activation, by its `nutpie.triangular_layout` name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Activation {
+    Softplus,
+    /// `jax.nn.gelu`'s default, the tanh approximation.
+    GeluTanh,
+}
+
+impl Activation {
+    pub(super) fn from_name(name: &str) -> Result<Self> {
+        match name {
+            "softplus" => Ok(Self::Softplus),
+            "gelu_tanh" => Ok(Self::GeluTanh),
+            other => bail!("unsupported activation {other:?}, expected 'softplus' or 'gelu_tanh'"),
+        }
+    }
+}
+
 /// The architecture every variable's conditioner and transformer share: one
-/// hidden layer of `n_unit` softplus units, `n_par` transformer parameters
+/// hidden layer of `n_unit` units (`activation`), `n_par` transformer parameters
 /// with the location skip into parameter `location` (`loc`), and the
 /// transformer layers.
 ///
@@ -27,6 +45,7 @@ pub(super) struct Conditioner {
     pub(super) location: usize,
     pub(super) layers: Vec<Layer>,
     pub(super) squash: Option<f64>,
+    pub(super) activation: Activation,
 }
 
 /// Where one variable's conditioner parameters sit in its slice.
@@ -202,7 +221,7 @@ pub(super) struct UnitState<S: Simd> {
     /// without a squash.
     pub(super) z_parents: Vec<S::f64s>,
     pub(super) dz: Vec<S::f64s>,
-    /// Softplus and its first two derivatives at the hidden units.
+    /// The activation and its first two derivatives at the hidden units.
     pub(super) h: Vec<S::f64s>,
     pub(super) h1: Vec<S::f64s>,
     pub(super) h2: Vec<S::f64s>,
@@ -243,6 +262,7 @@ impl Conditioner {
         location: usize,
         specs: Vec<LayerSpec>,
         squash: Option<f64>,
+        activation: Activation,
     ) -> Result<Self> {
         if location >= n_par {
             bail!("location index {location} out of range for {n_par} parameters");
@@ -267,6 +287,7 @@ impl Conditioner {
             location,
             layers,
             squash,
+            activation,
         })
     }
 
@@ -343,7 +364,10 @@ impl Conditioner {
         }
         for u in 0..self.n_unit {
             let a = dot(simd, theta.w1(u), &units.z_parents) + theta.b1(u);
-            let (h, h1, h2) = simd_math::softplus(simd, a);
+            let (h, h1, h2) = match self.activation {
+                Activation::Softplus => simd_math::softplus(simd, a),
+                Activation::GeluTanh => simd_math::gelu_tanh(simd, a),
+            };
             units.h[u] = h;
             units.h1[u] = h1;
             units.h2[u] = h2;
