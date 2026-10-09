@@ -42,6 +42,24 @@ If the effective sample size is much smaller than the number of draws, you might
 want to consider reparameterizing the model instead, to, for instance, remove
 posterior correlations.
 
+### Initial Points
+
+Each chain starts at a random point chosen by the model. To use your own
+initial points, pass a function to `with_init_point_fn` on the compiled model:
+
+```python
+def init_point(model, rng, chain_id):
+    return rng.uniform(-1, 1, size=model.n_dim)
+
+trace = nutpie.sample(compiled_model.with_init_point_fn(init_point))
+```
+
+The function can also return a dictionary of values for some of the
+parameters. See [Usage with PyMC](pymc-usage.qmd#initial-points) and
+[Usage with Stan](stan-usage.qmd#initial-points) for the details of each
+backend. The `init_mean` argument of `nutpie.sample` is deprecated and has no
+effect.
+
 ## Sampler Diagnostics
 
 You can enable more detailed diagnostics when troubleshooting:

@@ -1,23 +1,41 @@
+import dataclasses
 import json
 import os
+import threading
 import warnings
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from importlib.metadata import version
+from math import prod
 from typing import Any, Literal, cast, get_args, overload
 
 import arviz
 import numpy as np
 import pandas as pd
 import pyarrow
+import scipy.sparse as sp
 import xarray as xr
 
 from nutpie import _lib
+from nutpie.sparsity import (
+    Factorization,
+    check_hessian_sparsity,
+    factorize,
+    resolve_variables,
+)
 
 
 @dataclass(frozen=True)
 class CompiledModel:
     dims: dict[str, tuple[str, ...]] | None
     reparameterized_names: list[str] | None = field(default=None, kw_only=True)
+    # See `with_hessian_sparsity` and `with_factorization`. Both depend on
+    # the data, and are reset by `with_data`.
+    _hessian_sparsity: sp.csr_array | None = field(default=None, kw_only=True)
+    _factorization: Factorization | None = field(default=None, kw_only=True)
+    # Labels of the ``unconstrained_parameter`` dim of the sampler stats. Kept
+    # out of `coords`, which only describe the model's own dims.
+    _unconstrained_names: list[str] | None = field(default=None, kw_only=True)
 
     @property
     def n_dim(self) -> int:
@@ -37,12 +55,209 @@ class CompiledModel:
     def _make_model(self, *args, **kwargs):
         raise NotImplementedError()
 
+    def with_init_point_fn(self, init_point_fn):
+        """Use a custom function to generate the initial point of each chain.
+
+        Parameters
+        ----------
+        init_point_fn : Callable[[CompiledModel, np.random.Generator, int], np.ndarray]
+            Called as ``init_point_fn(model, rng, chain_id)``, where ``model``
+            is the compiled model that is sampled. Must return a point on the
+            unconstrained space with shape ``(n_dim,)``. Some backends also
+            accept a dict of values, see their documentation. If the log
+            density is not finite at the returned point, the function is
+            called again with a new ``rng``.
+        """
+        raise NotImplementedError()
+
+    def with_hessian_sparsity(self, sparsity=None, **kwargs):
+        """Set or detect the sparsity pattern of the Hessian of the log density
+        on the unconstrained space.
+
+        The pattern is the conditional-dependency graph of the posterior. It
+        is used by :meth:`with_factorization`, and depends on the data, so
+        :meth:`with_data` resets it.
+
+        Parameters
+        ----------
+        sparsity:
+            Boolean ``(n_dim, n_dim)`` dense or sparse matrix. It is stored as
+            a symmetric ``scipy.sparse.csr_array`` with a true diagonal. If
+            None, the pattern is detected
+            at a few initial points of the model (see
+            :meth:`with_init_point_fn`). An entry is nonzero if the Hessian is
+            nonzero at any of the points. Dependencies in branches of the
+            model that are not taken at any of the points are not detected.
+        **kwargs:
+            Options for the detection, which depend on the backend.
+        """
+        self._check_has_data()
+        if sparsity is None:
+            sparsity = self._detect_hessian_sparsity(**kwargs)
+        elif kwargs:
+            raise TypeError(
+                "Detection options can not be used with an explicit sparsity."
+            )
+        sparsity = check_hessian_sparsity(sparsity, self.n_dim)
+        return dataclasses.replace(
+            self, _hessian_sparsity=sparsity, _factorization=None
+        )
+
+    def with_factorization(self, order="metis", *, front=None):
+        """Compute a symbolic factorization of the Hessian sparsity pattern.
+
+        It consists of a variable order and the pattern of the Cholesky
+        factor with that order. The triangular flow uses it to decide which
+        earlier variables each variable may depend on. Requires
+        :meth:`with_hessian_sparsity` first. The METIS order needs pymetis.
+
+        Parameters
+        ----------
+        order:
+            ``"metis"`` (nested dissection, the default), ``"amd"``
+            (approximate minimum degree, which usually needs less fill but
+            gives less parallelism), ``"natural"``, or an explicit order
+            (``order[k]`` is the parameter at position ``k``).
+        front:
+            Parameters to put at the front of the order, before the
+            automatically ordered rest. Given as indices, names of
+            unconstrained parameters or names of model variables (all their
+            parameters).
+        """
+        if self._hessian_sparsity is None:
+            raise ValueError(
+                "The factorization needs the Hessian sparsity. "
+                "Call `with_hessian_sparsity()` first."
+            )
+        factorization = self._factorize(self._hessian_sparsity, order, front)
+        return dataclasses.replace(self, _factorization=factorization)
+
+    @property
+    def hessian_sparsity(self) -> sp.csr_array | None:
+        """The Hessian sparsity pattern set by :meth:`with_hessian_sparsity`."""
+        return self._hessian_sparsity
+
+    @property
+    def factorization(self) -> Factorization | None:
+        """The factorization set by :meth:`with_factorization`."""
+        return self._factorization
+
+    def _check_has_data(self):
+        """Raise if the model needs data before its structure is known."""
+
+    def _detect_hessian_sparsity(self, **kwargs):
+        raise NotImplementedError(
+            f"{type(self).__name__} can not detect the Hessian sparsity. "
+            "Pass it explicitly with `with_hessian_sparsity(array)`."
+        )
+
+    def _unconstrained_parameter_names(self) -> list[str] | None:
+        """Labels of the ``unconstrained_parameter`` dim of the trace, None if
+        the model has none (the dim then gets an integer index)."""
+        return self._unconstrained_names
+
+    def _unconstrained_parameters(self) -> list[str]:
+        """Names of the unconstrained parameters, as in the
+        ``unconstrained_parameter`` coordinate of the trace."""
+        names = self._unconstrained_parameter_names()
+        if names is not None:
+            return [str(name) for name in names]
+        return [str(i) for i in range(self.n_dim)]
+
+    def _unconstrained_variables(self) -> list[str]:
+        """The model variable each unconstrained parameter belongs to."""
+        return self._unconstrained_parameters()
+
+    def _factorize(self, sparsity, order="metis", front=None) -> Factorization:
+        parameters = self._unconstrained_parameters()
+        variables = self._unconstrained_variables()
+        front = resolve_variables(front or (), parameters, variables)
+        return factorize(
+            sparsity,
+            order=order,
+            front=front,
+            unconstrained_parameters=parameters,
+            variables=variables,
+        )
+
+    def _adapter_kwargs(self, settings, stop_event) -> dict:
+        """Extra arguments for the transform adapter of one sampler run.
+
+        `stop_event` is set when sampling is aborted, so that a flow fit that
+        is running in a chain's thread can stop early.
+        """
+        return {**self._flow_structure_kwargs(settings), "stop_event": stop_event}
+
+    def _flow_structure_kwargs(self, settings) -> dict:
+        """Order and sparsity for the triangular flow, if it is used.
+
+        Without a factorization, a default one is computed for this sampler.
+        """
+        args = getattr(self, "_transform_adapt_args", None) or {}
+        if settings.as_dict()["adaptation"] != "flow":
+            return {}
+        if args.get("coupling_type", "triangular") != "triangular":
+            return {}
+        if args.get("sparsity") is not None:
+            return {}
+
+        factorization = self._factorization
+        if factorization is None:
+            sparsity = self._hessian_sparsity
+            if sparsity is None:
+                try:
+                    sparsity = check_hessian_sparsity(
+                        self._detect_hessian_sparsity(), self.n_dim
+                    )
+                except Exception as err:
+                    raise RuntimeError(
+                        "The triangular flow needs the Hessian sparsity of the "
+                        "model, and it could not be detected. Set it with "
+                        "`with_hessian_sparsity(array)`, or use a different "
+                        "`coupling_type`."
+                    ) from err
+            factorization = self._factorize(sparsity)
+        return {"order": factorization.order, "sparsity": factorization.filled}
+
+    def _repr_header(self) -> str:
+        return type(self).__name__
+
+    def _repr_items(self) -> list[tuple[str, str]]:
+        """Backend-independent lines of the repr."""
+        items = []
+        args = getattr(self, "_transform_adapt_args", None)
+        if args:
+            items.append(("transform adapt", _format_kwargs(args)))
+        init_point_fn = getattr(self, "_init_point_fn", None)
+        if init_point_fn is not None:
+            name = getattr(init_point_fn, "__name__", type(init_point_fn).__name__)
+            items.append(("init point fn", name))
+        if self._hessian_sparsity is not None:
+            n = self._hessian_sparsity.shape[0]
+            edges = (self._hessian_sparsity.nnz - n) // 2
+            items.append(
+                ("hessian sparsity", f"{edges} of {n * (n - 1) // 2} pairs nonzero")
+            )
+        if self._factorization is not None:
+            f = self._factorization
+            summary = (
+                f"{f.method}, fill {f.num_fill}, "
+                f"max {f.max_parents} parents, {f.num_levels} levels"
+            )
+            items.append(("factorization", summary))
+        return items
+
+    def __repr__(self):
+        lines = [self._repr_header()]
+        lines.extend(f"  {label}: {value}" for label, value in self._repr_items())
+        return "\n".join(lines)
+
     def benchmark_logp(self, point, num_evals, cores):
         """Time how long the logp gradient evaluation takes.
 
         # Parameters
         """
-        model = self._make_model(point)
+        model = self._make_model()
         times = []
         if isinstance(cores, int):
             cores = [cores]
@@ -57,6 +272,96 @@ class CompiledModel:
             data = data.rename_axis(columns="evaluation")
             times.append(data)
         return pd.concat(times)
+
+
+def _format_kwargs(kwargs, max_len=60):
+    def format_value(value):
+        if isinstance(value, np.ndarray):
+            return f"<array {value.shape}>"
+        text = repr(value)
+        return text if len(text) <= 20 else f"<{type(value).__name__}>"
+
+    text = ", ".join(f"{key}={format_value(value)}" for key, value in kwargs.items())
+    return text if len(text) <= max_len else text[: max_len - 3] + "..."
+
+
+def _flatten_point(values, names, shapes, base=None):
+    """Concatenate a dict of arrays into one flat float64 array, in the
+    order given by ``names``.
+
+    Variables missing from ``values`` are taken from the flat array
+    ``base``. If ``base`` is None, all variables must be given.
+    """
+    unknown = [
+        name for name in values if name not in names and np.size(values[name]) > 0
+    ]
+    if unknown:
+        raise KeyError(
+            f"Unknown variables in initial point: {unknown}. "
+            f"Expected a subset of {list(names)}."
+        )
+
+    total_size = sum(prod(shape) for shape in shapes)
+    if base is None:
+        flat_array = np.empty(total_size, dtype="float64", order="C")
+    else:
+        flat_array = np.array(base, dtype="float64", order="C", copy=True)
+        if flat_array.shape != (total_size,):
+            raise ValueError(
+                f"Default initial point has shape {flat_array.shape}, "
+                f"expected {(total_size,)}"
+            )
+    cursor = 0
+
+    for name, shape in zip(names, shapes, strict=True):
+        n = prod(shape)
+        if name not in values:
+            if base is None:
+                raise KeyError(f"Initial point is missing a value for {name}")
+            cursor += n
+            continue
+        value = np.asarray(values[name])
+        if tuple(value.shape) != tuple(shape):
+            raise ValueError(
+                f"Size of initial value for {name} is {value.shape}, "
+                f"expected {tuple(shape)}"
+            )
+        flat_array[cursor : cursor + n] = value.ravel().astype("float64")
+        cursor += n
+
+    return flat_array
+
+
+def _wrap_init_point_fn(init_point_fn, model, convert_dict=None):
+    """Adapt a user ``fn(model, rng, chain_id)`` to the ``fn(seed, chain_id)``
+    signature the rust models call.
+
+    If ``convert_dict`` is given, the user function may also return a
+    dict, which is converted with ``convert_dict(values, seed, chain_id)``.
+    The seed passed there is independent of the user's rng, and can be
+    used to fill in missing values.
+    """
+
+    def init_point(seed, chain_id):
+        user_seed, fill_seed = np.random.SeedSequence(seed).spawn(2)
+        point = init_point_fn(model, np.random.default_rng(user_seed), chain_id)
+        if isinstance(point, Mapping):
+            if convert_dict is None:
+                raise TypeError(
+                    "The init point function must return an array for this model."
+                )
+            return convert_dict(point, int(fill_seed.generate_state(1)[0]), chain_id)
+        return np.ascontiguousarray(point, dtype=np.float64)
+
+    return init_point
+
+
+def _check_reserved_names(coords, dims):
+    """The trace uses ``unconstrained_parameter`` for the dim of the sampler
+    stats, so the model must not use it as a coord or dim."""
+    used = set(coords) | {dim for var_dims in dims.values() for dim in var_dims}
+    if "unconstrained_parameter" in used:
+        raise ValueError("Model contains invalid name 'unconstrained_parameter'.")
 
 
 def _arrow_to_arviz(
@@ -215,11 +520,12 @@ def _add_arrow_data(data_dict, max_length, batch, chain, n_chains, dims, skip_va
 _progress_style = """
 <style>
     :root {
-        --column-width-1: 40%; /* Progress column width */
-        --column-width-2: 15%; /* Chain column width */
-        --column-width-3: 15%; /* Divergences column width */
-        --column-width-4: 15%; /* Step Size column width */
-        --column-width-5: 15%; /* Gradients/Draw column width */
+        --column-width-1: 35%; /* Progress column width */
+        --column-width-2: 13%; /* Chain column width */
+        --column-width-3: 13%; /* Divergences column width */
+        --column-width-4: 13%; /* Step Size column width */
+        --column-width-5: 13%; /* Gradients/Draw column width */
+        --column-width-6: 13%; /* Log Fisher column width */
     }
 
     .nutpie {
@@ -251,6 +557,7 @@ _progress_style = """
     .nutpie th:nth-child(3) { width: var(--column-width-3); }
     .nutpie th:nth-child(4) { width: var(--column-width-4); }
     .nutpie th:nth-child(5) { width: var(--column-width-5); }
+    .nutpie th:nth-child(6) { width: var(--column-width-6); }
 
     .nutpie progress {
         width: 100%;
@@ -330,6 +637,7 @@ _progress_template = """
                 <th>Divergences</th>
                 <th>Step Size</th>
                 <th>Gradients/Draw</th>
+                <th>Log Fisher</th>
             </tr>
         </thead>
         <tbody id="chain-details">
@@ -344,7 +652,8 @@ _progress_template = """
                     <td>{{ chain.finished_draws }}</td>
                     <td>{{ chain.divergences }}</td>
                     <td>{{ chain.step_size }}</td>
-                    <td>{{ chain.latest_num_steps }}</td>
+                    <td>{{ chain.latest_num_gradients }}</td>
+                    <td>{{ chain.log_fisher_distance }}</td>
                 </tr>
             {% endfor %}
             </tr>
@@ -467,13 +776,17 @@ def in_notebook():
         return False  # Probably standard Python interpreter
 
 
-_ZarrStoreType = (
-    _lib.store.S3Store
-    | _lib.store.LocalStore
-    | _lib.store.HTTPStore
-    | _lib.store.GCSStore
-    | _lib.store.AzureStore
-)
+# Builds without the `zarr` feature (e.g. wasm) have no store module.
+if hasattr(_lib, "store"):
+    _ZarrStoreType = (
+        _lib.store.S3Store
+        | _lib.store.LocalStore
+        | _lib.store.HTTPStore
+        | _lib.store.GCSStore
+        | _lib.store.AzureStore
+    )
+else:
+    _ZarrStoreType = Any
 
 
 class _BackgroundSampler:
@@ -492,7 +805,6 @@ class _BackgroundSampler:
         self,
         compiled_model,
         settings,
-        init_mean,
         cores,
         *,
         progress_bar=True,
@@ -581,14 +893,16 @@ class _BackgroundSampler:
         else:
             progress_type = _lib.ProgressType.indicatif(progress_rate)
 
+        # Tells flow fits in the chain threads to stop, see `abort`
+        self._stop_event = threading.Event()
         self._sampler = compiled_model._make_sampler(
             settings,
-            init_mean,
             cores,
             progress_type,
             progress_callback,
             progress_rate,
             self._store,
+            stop_event=self._stop_event,
         )
 
     def wait(self, *, timeout=None):
@@ -669,16 +983,22 @@ class _BackgroundSampler:
                     "inference_library_settings": json.dumps(self._settings.as_dict()),
                 }
 
+                coords = {
+                    name: pd.Index(vals)
+                    for name, vals in (self._compiled_model.coords or {}).items()
+                }
+                # The zarr store gets these from `vector_coord` on the rust side.
+                names = self._compiled_model._unconstrained_parameter_names()
+                if names is not None:
+                    coords["unconstrained_parameter"] = pd.Index(names)
+
                 return _arrow_to_arviz(
                     draw_batches,
                     stat_batches,
                     skip_vars=skip_vars,
                     reparameterized_names=self._compiled_model.reparameterized_names,
                     keep_unconstrained_draw=self._store_unconstrained,
-                    coords={
-                        name: pd.Index(vals)
-                        for name, vals in self._compiled_model.coords.items()
-                    },
+                    coords=coords,
                     save_warmup=self._save_warmup,
                     attrs={"sample_stats": attrs},
                 )
@@ -704,12 +1024,16 @@ class _BackgroundSampler:
 
     def abort(self):
         """Abort sampling and return the trace produced so far."""
+        # Set before the chains are joined, so that a running flow fit
+        # doesn't delay the abort until it is done.
+        self._stop_event.set()
         self._sampler.abort()
         results = self._sampler.take_results()
         return self._extract(results)
 
     def cancel(self):
         """Abort sampling and discard progress."""
+        self._stop_event.set()
         self._sampler.abort()
 
     def __del__(self):
@@ -871,9 +1195,9 @@ def sample(
     progress_bar: bool
         If true, display the progress bar (default)
     init_mean: ndarray
-        Initialize the chains using jittered values around this
-        point on the transformed parameter space. Defaults to
-        zeros.
+        Deprecated and ignored. Use
+        ``compiled_model.with_init_point_fn`` to control the initial
+        points of the chains.
     store_unconstrained: bool
         If True, store the unconstrained (transformed) draws in two forms:
         a flat ``unconstrained_draw`` vector in ``sample_stats`` and a
@@ -895,6 +1219,26 @@ def sample(
         The maximum depth of the tree for each draw. The maximum
         number of gradient evaluations for each draw will
         be 2 ^ maxdepth.
+    walnuts: bool, default=False
+        Use WALNUTS (within-orbit adaptive step sizes) instead of plain
+        NUTS: each leapfrog step is split into smaller micro steps if
+        needed to keep the energy error below ``walnuts_max_error``.
+        Only for ``sampler="nuts"``, and not supported together with
+        ``microcanonical_trajectory``. *Experimental.*
+    walnuts_max_error: float > 0, default=0.5
+        Maximum error of the Hamiltonian within a macro step.
+    walnuts_max_step_halvings: int, default=5
+        Maximum number of times the micro step size is halved. If the
+        macro step is still not within tolerance, it counts as a
+        divergence.
+    walnuts_min_micro_steps: int > 0, default=1
+        Number of micro steps in the first attempt of each macro step.
+    walnuts_energy_criterion: {"max_min", "endpoint"}, default="max_min"
+        How the energy error of a macro step is measured: ``"max_min"``
+        uses ``max H - min H`` over all micro steps, ``"endpoint"`` uses
+        ``|H(end) - H(start)|``.
+
+        Setting any of the ``walnuts_*`` options enables WALNUTS.
     return_raw_trace: bool, default=False
         Return the raw trace object (an apache arrow structure)
         instead of converting to arviz.
@@ -949,13 +1293,19 @@ def sample(
         - ``started`` – whether the chain has started
         - ``latest_num_steps`` – leapfrog steps in the last trajectory
         - ``total_num_steps`` – cumulative leapfrog steps
+        - ``latest_num_gradients`` – gradient evaluations in the last
+          trajectory (differs from the steps with WALNUTS)
+        - ``total_num_gradients`` – cumulative gradient evaluations
+        - ``fisher_distance`` – ``‖z + ∇z‖²`` of the last draw in the
+          transformed space, a single-draw Fisher divergence estimate
         - ``step_size`` – current step size
         - ``runtime_ms`` – wall-clock time spent sampling (milliseconds)
         - ``divergent_draws`` – list of draw indices that diverged
 
         The callback fires at the same rate as the progress bar
         (``progress_rate`` ms). It runs on a background thread, so it must
-        be thread-safe. Exceptions raised inside it are printed to stderr
+        be thread-safe. (Builds without threads, e.g. on wasm, call it from
+        inside ``wait`` instead.) Exceptions raised inside it are printed to stderr
         and otherwise silently swallowed so that sampling is not interrupted.
         The built-in progress bar is still shown regardless of whether this
         callback is set.
@@ -1067,13 +1417,17 @@ def sample(
         else:
             cores = min(chains, cast(int, available))
 
-    if init_mean is None:
-        init_mean = np.zeros(compiled_model.n_dim)
+    if init_mean is not None:
+        warnings.warn(
+            "`init_mean` is deprecated and has no effect. Use "
+            "`compiled_model.with_init_point_fn` to set initial points.",
+            FutureWarning,
+            stacklevel=2,
+        )
 
     background_sampler = _BackgroundSampler(
         compiled_model,
         settings,
-        init_mean,
         cores,
         progress_bar=progress_bar,
         progress_callback=progress_callback,

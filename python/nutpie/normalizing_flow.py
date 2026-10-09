@@ -9,6 +9,7 @@ import flowjax.flows
 import jax
 import jax.numpy as jnp
 import numpy as np
+import scipy.sparse
 from equinox.nn import Linear
 from flowjax import bijections
 from flowjax.bijections.bijection import AbstractBijection
@@ -17,6 +18,8 @@ from flowjax.utils import arraylike_to_array
 from jaxtyping import Array, ArrayLike, PyTree
 from paramax import NonTrainable, Parameterize, unwrap
 from paramax.wrappers import AbstractUnwrappable
+
+from nutpie.triangular import SparseTriangularMap
 
 
 def _generate_sequences(k, r_vals):
@@ -293,6 +296,37 @@ class FactoredMLP(eqx.Module, strict=True):
         else:
             x = eqx.filter_vmap(lambda a, b: a(b))(self.final_activation, x)
         return x
+
+
+def _scale_last_layer(mlp, scale):
+    """Return a copy of an MLP-like conditioner (``FactoredMLP`` or
+    ``eqx.nn.MLP``) with only its output layer scaled down."""
+    last = jax.tree_util.tree_map(
+        lambda x: x * scale if eqx.is_inexact_array(x) else x, mlp.layers[-1]
+    )
+    return eqx.tree_at(lambda m: m.layers[-1], mlp, last)
+
+
+def zero_init_conditioners(bijection, scale=1e-3):
+    """Shrink a freshly-initialized bijection towards the identity by
+    scaling down only the *output* layer of each conditioner MLP it
+    contains, leaving hidden layers at their normal initialization scale.
+
+    This replaces naively scaling every parameter in the bijection by
+    ``scale``: doing that shrinks every layer of a conditioner's MLP, so the
+    signal (and gradient) passing through an ``nn_depth``-layer network gets
+    attenuated roughly like ``scale ** nn_depth``, which can leave training
+    with essentially no usable gradient to start from. Scaling only the
+    final layer keeps the network at (near-)identity output while hidden
+    layers, and thus the gradients flowing back through them, stay at their
+    normal scale.
+    """
+    is_mlp = lambda x: isinstance(x, (FactoredMLP, eqx.nn.MLP))
+    return jax.tree_util.tree_map(
+        lambda leaf: _scale_last_layer(leaf, scale) if is_mlp(leaf) else leaf,
+        bijection,
+        is_leaf=is_mlp,
+    )
 
 
 class AsymmetricAffine(bijections.AbstractBijection):
@@ -1214,102 +1248,282 @@ class Planar(bijections.AbstractBijection):
         return x, -logdet_inner
 
 
+def _log_cosh(v):
+    """log(cosh(v)), stable for large |v|."""
+    a = jnp.abs(v)
+    return a + jnp.log1p(jnp.exp(-2.0 * a)) - jnp.log(2.0)
+
+
+def _bounded_log_gamma(unbounded, low, high):
+    """Squash ``unbounded`` into ``(low, high)``, fixing 0 -> 0.
+
+    A shifted, scaled logistic, chosen so that ``f(0) = 0`` and ``f'(0) = 1``:
+    the map is unchanged to first order around the identity, so zero-init and
+    anything calibrated against the unbounded parameterization still see the
+    same local scaling. It
+    is ``C^inf`` and strictly monotone, and handles asymmetric bounds --
+    ``low < 0 < high`` is required, since ``log gamma = 0`` is the identity
+    and has to stay reachable in the interior.
+    """
+    width = high - low
+    at_zero = -low / width  # sigmoid(offset), so that f(0) == 0
+    offset = jnp.log(at_zero / (1.0 - at_zero))
+    slope = width / (-low * high)  # so that f'(0) == 1
+    return low + width * jax.nn.sigmoid(slope * unbounded + offset)
+
+
 class Contract2(bijections.AbstractBijection):
+    shape: tuple[int, ...]
     alpha: Array | None
     beta: Array
     sigma: Array
     mu: Array
     nu: Array
-    shape: tuple[int, ...]
     cond_shape: tuple[int, ...] | None = None
+    log_gamma_bounds: tuple[float, float] | None = eqx.field(static=True, default=None)
 
-    def __init__(self, alpha, beta, sigma, mu, nu):
+    def __init__(self, alpha, beta, sigma, mu, nu, log_gamma_bounds=None):
+        """
+        Args:
+            log_gamma_bounds: Optional ``(low, high)`` on ``log gamma``, with
+                ``low < 0 < high``. ``alpha`` itself stays unconstrained; it is
+                ``log gamma = asinh(alpha)`` that is squashed. Bounds are in
+                logs because ``gamma`` is a tail *exponent* -- ``T(x) ~
+                x**gamma`` -- so it composes multiplicatively along a chain and
+                additively in logs, and a symmetric bound ``(-b, b)`` means
+                "at most ``e**b`` times heavier or lighter tails". Unbounded,
+                a ``gamma`` fitted on one window's draws maps the next
+                window's slightly wider draws to astronomical values. Defaults
+                to unbounded, reproducing the previous behaviour exactly.
+        """
+        if log_gamma_bounds is not None:
+            low, high = log_gamma_bounds
+            if not low < 0.0 < high:
+                raise ValueError(
+                    "log_gamma_bounds must satisfy low < 0 < high, got "
+                    f"{log_gamma_bounds}."
+                )
+            log_gamma_bounds = (float(low), float(high))
+        self.log_gamma_bounds = log_gamma_bounds
         if alpha is not None:
             self.alpha = jnp.array(alpha)
         else:
             self.alpha = None
-        self.beta = jnp.array(beta)
-        self.sigma = jnp.array(sigma)
-        self.mu = jnp.array(mu)
-        self.nu = jnp.array(nu)
-        self.shape = beta.shape
-        assert self.shape == ()
+        if beta is not None:
+            self.beta = jnp.array(beta)
+        else:
+            self.beta = None
+        if sigma is not None:
+            self.sigma = jnp.array(sigma)
+        else:
+            self.sigma = None
+        if mu is not None:
+            self.mu = jnp.array(mu)
+        else:
+            self.mu = None
+        if nu is not None:
+            self.nu = jnp.array(nu)
+        else:
+            self.nu = None
+        self.shape = ()
+
+    def _log_params(self):
+        """log gamma, log delta, log sigma_mod.
+
+        The original computes gamma = alpha + sqrt(1 + alpha**2), which is
+        exp(asinh(alpha)); taking the log directly is exact everywhere.
+
+        Both `transform_and_log_det` and `inverse_and_log_det` route through
+        here, so `log_gamma_bounds` constrains the two directions consistently.
+        """
+        if self.alpha is not None:
+            log_gamma = jnp.arcsinh(self.alpha)
+            if self.log_gamma_bounds is not None:
+                log_gamma = _bounded_log_gamma(log_gamma, *self.log_gamma_bounds)
+        else:
+            log_gamma = jnp.zeros(())
+        if self.beta is not None:
+            log_beta = jnp.arcsinh(self.beta)
+        else:
+            log_beta = jnp.zeros(())
+        if self.sigma is not None:
+            log_sigma = jnp.arcsinh(self.sigma)
+        else:
+            log_sigma = jnp.zeros(())
+
+        return log_gamma, log_beta, log_sigma
 
     def transform_and_log_det(
         self, x: ArrayLike, condition: ArrayLike | None = None
     ) -> tuple[Array, Array]:
+        """Forward transformation:
+
+            T(x) = (2*sigma_mod/gamma) * sinh(gamma*u + 2*log(delta)) + mu,
+            u    = asinh((x - nu)/2),
+
+        which is the original expression with z = exp(u) and
+        delta**2 * z**gamma - delta**(-2) * z**(-gamma) = 2*sinh(gamma*u + 2*log(delta)).
+
+            log T'(x) = log(sigma_mod) + logcosh(gamma*u + 2*log(delta)) - logcosh(u)
         """
-        Forward transformation:
+        log_gamma, log_delta, log_sigma = self._log_params()
+        gamma = jnp.exp(log_gamma)
 
-          T(x) = sigma_mod * (delta^2 * z^gamma - delta^(-2) * z^(-gamma)) / gamma + mu,
-
-        where
-          gamma = exp(alpha),
-          delta = exp(beta),
-          sigma_mod = sigma + sqrt(1 + sigma^2),
-          z = x/2 + sqrt(1 + x^2/4)
-          (note: z = exp(asinh(x/2))).
-
-        """
-        if self.alpha is not None:
-            gamma = jnp.exp(self.alpha)
+        if self.nu is not None:
+            centred = x - self.nu
         else:
-            gamma = 1
-        delta = jnp.exp(self.beta)
-        sigma_mod = self.sigma + jnp.sqrt(1 + self.sigma * self.sigma)
-        mu = self.mu
-        nu = self.nu
+            centred = x
+        u = jnp.arcsinh(centred / 2)
+        arg = gamma * u + 2.0 * log_delta
 
-        def trafo(x):
-            x = x - nu
-            z = x / 2 + jnp.sqrt(1 + x * x / 4)
-            return (
-                sigma_mod
-                * (delta**2 * z**gamma - delta ** (-2) * z ** (-gamma))
-                / gamma
-                + mu
-            )
+        y = 2.0 * jnp.exp(log_sigma - log_gamma) * jnp.sinh(arg)
 
-        y, det = jax.jvp(trafo, [x], [jnp.ones(())])
-        return y, jnp.log(det)
+        if self.mu is not None:
+            y = y + self.mu
+        log_det = log_sigma + _log_cosh(arg) - _log_cosh(u)
+        return y, log_det
 
     def inverse_and_log_det(
         self, y: ArrayLike, condition: ArrayLike | None = None
     ) -> tuple[Array, Array]:
+        """Inverse transformation.
+
+        With A = gamma*(y - mu)/sigma_mod, the forward relation is
+        sinh(gamma*u + 2*log(delta)) = A/2, so
+
+            gamma*u + 2*log(delta) = asinh(A/2),
+            x = 2*sinh(u) + nu.
+
+        asinh(A/2) replaces (A + sqrt(A**2 + 4))/2, which cancels for A << 0.
         """
-        Inverse transformation:
+        log_gamma, log_delta, log_sigma = self._log_params()
+        gamma = jnp.exp(log_gamma)
 
-          Given y, we compute x such that
-              y = T(x) = sigma_mod * (delta^2 * z^gamma - delta^(-2) * z^(-gamma)) / gamma + mu,
-          with z = x/2 + sqrt(1 + x^2/4) = exp(asinh(x/2)).
-
-          The inverse is computed via:
-
-              1. Set sigma_mod = sigma + sqrt(1 + sigma^2), gamma = exp(alpha), delta = exp(beta).
-              2. Define A = (gamma/sigma_mod) * (y - mu).
-              3. Solve for w from: delta^2 * w - delta^(-2) / w = A,
-                 i.e., w = (A + sqrt(A^2 + 4)) / (2 * delta^2), where w = z^gamma.
-              4. Recover z = w^(1/gamma).
-              5. Then, x = z - 1/z.
-        """
-        if self.alpha is not None:
-            gamma = jnp.exp(self.alpha)
+        if self.nu is None:
+            nu = jnp.zeros(())
         else:
-            gamma = 1
-        delta = jnp.exp(self.beta)
-        sigma_mod = self.sigma + jnp.sqrt(1 + self.sigma * self.sigma)
-        mu = self.mu
-        nu = self.nu
+            nu = self.nu
 
-        def inv_trafo(y):
-            A = (gamma / sigma_mod) * (y - mu)
-            w = (A + jnp.sqrt(A * A + 4)) / (2 * delta**2)
-            z = w ** (1 / gamma)
-            z = z - 1 / z
-            return z + nu
+        if self.mu is None:
+            mu = jnp.zeros(())
+        else:
+            mu = self.mu
 
-        x, det = jax.jvp(inv_trafo, [y], [jnp.ones(())])
-        return x, jnp.log(det)
+        half_a = jnp.exp(log_gamma - log_sigma) * (y - mu) / 2.0
+        arg = jnp.arcsinh(half_a)  # == gamma*u + 2*log(delta)
+        u = (arg - 2.0 * log_delta) / gamma
+
+        x = 2.0 * jnp.sinh(u) + nu
+        # logcosh(asinh(half_a)) = 0.5*log1p(half_a**2)
+        log_det = _log_cosh(u) - log_sigma - 0.5 * jnp.log1p(half_a * half_a)
+        return x, log_det
+
+
+def _optional(value):
+    return None if value is None else jnp.array(value)
+
+
+def _positive(x):
+    """``x + sqrt(1 + x**2)``: positive, and 1 at zero.
+
+    For ``x < 0`` the sum cancels, losing all precision below ``1e-8``, so
+    that branch is evaluated as ``1 / (sqrt(1 + x**2) - x)``. Both branches go
+    through ``sqrt(1 + x**2) + |x| >= 1``, so neither divides by zero, which
+    `jnp.where` would turn into a NaN gradient.
+    """
+    s = jnp.sqrt(1 + x**2) + jnp.abs(x)
+    return jnp.where(x >= 0, s, 1 / s)
+
+
+class TangentSAS(bijections.AbstractBijection):
+    """Tangent sinh-arcsinh: one sinh-arcsinh layer pinned to the identity to
+    first order at its centre ``nu``,
+
+        S(u) = [sinh(c asinh(b u) / b + eps) - sinh(eps)] / (c cosh(eps)),
+        y    = nu + S(x - nu),
+
+    so ``S(0) = 0`` and ``S'(0) = 1``. ``b`` sets where the tails start,
+    ``r = c / b`` is the tail exponent (``S(u) ~ u**r``), and ``eps`` the
+    skew. With ``c = r b`` the argument is ``r asinh(b u) + eps``.
+
+    The fields are unconstrained: ``b = sigmoid(b_raw)`` in ``(0, 1)`` and
+    ``r = r_raw + sqrt(1 + r_raw**2)`` positive. A field that is `None` stays
+    at its value for zero, and all zeros give the identity.
+    """
+
+    shape: tuple[int, ...]
+    nu: Array | None
+    eps: Array | None
+    b: Array | None
+    r: Array | None
+    cond_shape: tuple[int, ...] | None = None
+
+    def __init__(self, nu, eps, b, r):
+        self.nu = _optional(nu)
+        self.eps = _optional(eps)
+        self.b = _optional(b)
+        self.r = _optional(r)
+        self.shape = ()
+
+    def _params(self):
+        """nu, eps, b, r."""
+        zero = jnp.zeros(())
+        nu = zero if self.nu is None else self.nu
+        eps = zero if self.eps is None else self.eps
+        b = jax.nn.sigmoid(zero if self.b is None else self.b)
+        r = jnp.ones(()) if self.r is None else _positive(self.r)
+        return nu, eps, b, r
+
+    def transform_and_log_det(
+        self, x: ArrayLike, condition: ArrayLike | None = None
+    ) -> tuple[Array, Array]:
+        """``log S'(u) = logcosh(arg) - logcosh(eps) - 0.5 log1p((b u)**2)``."""
+        nu, eps, b, r = self._params()
+        w = b * (x - nu)
+        arg = r * jnp.arcsinh(w) + eps
+        y = nu + (jnp.sinh(arg) - jnp.sinh(eps)) / (r * b * jnp.cosh(eps))
+        log_det = _log_cosh(arg) - _log_cosh(eps) - 0.5 * jnp.log1p(w * w)
+        return y, log_det
+
+    def inverse_and_log_det(
+        self, y: ArrayLike, condition: ArrayLike | None = None
+    ) -> tuple[Array, Array]:
+        """With ``q = sinh(arg) = r b cosh(eps) (y - nu) + sinh(eps)``:
+        ``a = asinh(b u) = (asinh(q) - eps) / r`` and ``x = nu + sinh(a) / b``.
+        In the log det, ``logcosh(asinh(q)) = 0.5 log1p(q**2)`` and
+        ``0.5 log1p((b u)**2) = logcosh(a)``."""
+        nu, eps, b, r = self._params()
+        q = r * b * jnp.cosh(eps) * (y - nu) + jnp.sinh(eps)
+        a = (jnp.arcsinh(q) - eps) / r
+        x = nu + jnp.sinh(a) / b
+        log_det = _log_cosh(a) + _log_cosh(eps) - 0.5 * jnp.log1p(q * q)
+        return x, log_det
+
+
+class PositiveAffine(bijections.AbstractBijection):
+    """``y = loc + scale_mod * x`` with ``scale_mod = scale + sqrt(1 +
+    scale**2)``, so ``scale`` is unconstrained and zero is the identity."""
+
+    shape: tuple[int, ...]
+    loc: Array
+    scale: Array
+    cond_shape: tuple[int, ...] | None = None
+
+    def __init__(self, loc, scale):
+        self.loc = jnp.array(loc)
+        self.scale = jnp.array(scale)
+        self.shape = ()
+
+    def transform_and_log_det(
+        self, x: ArrayLike, condition: ArrayLike | None = None
+    ) -> tuple[Array, Array]:
+        # log(scale_mod) == asinh(scale)
+        return self.loc + _positive(self.scale) * x, jnp.arcsinh(self.scale)
+
+    def inverse_and_log_det(
+        self, y: ArrayLike, condition: ArrayLike | None = None
+    ) -> tuple[Array, Array]:
+        return (y - self.loc) / _positive(self.scale), -jnp.arcsinh(self.scale)
 
 
 class DipBij(bijections.AbstractBijection):
@@ -1414,12 +1628,113 @@ class Activation(eqx.Module):
         return self.fn(*args)
 
 
+class ElementwiseTransformer(bijections.AbstractBijection):
+    """A `make_transformer` chain that knows which parameter is its location.
+
+    The location is a parameter entering the forward map purely additively,
+    ``transform(x) = T0(x) + location``, so in the density direction it is the
+    shift ``y - location`` applied directly to the model-space value.
+    Conditioners use it to route a linear function of the parents straight to
+    the conditional mean (see `SparseTriangularMap`).
+
+    `location_field` is ``(layer, field)``: the location is attribute `field`
+    of ``chain.bijections[layer]``. `None` if the chain has no such parameter.
+    """
+
+    chain: bijections.Chain
+    location_field: tuple[int, str] | None = eqx.field(static=True)
+    shape: tuple[int, ...] = ()
+    cond_shape: tuple[int, ...] | None = None
+
+    def location(self):
+        if self.location_field is None:
+            return None
+        layer, field = self.location_field
+        return getattr(self.chain.bijections[layer], field)
+
+    def transform_and_log_det(self, x, condition=None):
+        return self.chain.transform_and_log_det(x, condition)
+
+    def inverse_and_log_det(self, y, condition=None):
+        return self.chain.inverse_and_log_det(y, condition)
+
+
 def make_transformer(
-    affine_transformer=False, contract_transformer=True, asymmetric_transformer=True
+    affine_transformer=False,
+    contract_transformer=True,
+    asymmetric_transformer=True,
+    log_gamma_bounds=None,
+    tangent_sas_transformer=0,
+    tangent_sas_fix_b=False,
 ):
+    """Elementwise transformer as a chain of the requested layers.
+
+    Each argument is a *count*; ``True``/``False`` still work as 1/0. Layers
+    are chained in the order affine -> asymmetric -> contract -> tangent SAS,
+    and tangent SAS layers are followed by one `PositiveAffine`.
+
+    Parameters the chain makes redundant are disabled here rather than left
+    for the optimizer to find. Two additive shifts applied back to back
+    compose, so only their difference is identified: `Contract2` ends with
+    ``+ mu`` and starts with ``- nu``, so in a stack of ``n`` every interior
+    ``mu`` is exactly redundant with the following ``nu``. Keeping ``nu``
+    throughout and dropping all but the last ``mu`` gives ``4n + 1``
+    parameters at full rank.
+
+    The alternative of dropping ``nu`` everywhere is also full rank at ``4n``,
+    but measurably weaker: on 1-d targets it cost ~566x on Student-t5 and
+    ~48x on Student-t3 against the ``4n + 1`` form, which itself matches an
+    unrestricted ``5n`` chain to two significant figures (and at ``n = 3``
+    beats it -- removing exactly-flat directions helps the optimizer, the
+    same effect `lmopt.MARQUARDT_FLOOR` guards against).
+
+    A leading `bijections.Affine` also ends in a shift, so it makes the first
+    `Contract2`'s ``nu`` redundant in the same way and that one is dropped
+    too. The inverted `AsymmetricAffine` does *not*: inverting turns its
+    output shift into an input shift, leaving a following ``nu`` identified.
+
+    Args:
+        affine_transformer: Number of leading affine layers. More than one is
+            pointless -- consecutive affines compose to a single affine.
+        contract_transformer: Number of `Contract2` (sinh-arcsinh) layers.
+            ``alpha``, ``beta`` and ``sigma`` stay free on every layer: each
+            layer needs its own shape parameters, and concentrating them in
+            one layer forfeits most of what stacking buys (measured ~32x on
+            Student-t3, and a collapse from 3.5e-2 to 2.8 on a bimodal
+            target). ``alpha`` in particular sets the tail exponent
+            ``gamma``, which multiplies along the chain -- pin it to 1 and
+            the whole stack is asymptotically linear however deep it is.
+        asymmetric_transformer: Number of `AsymmetricAffine` layers, applied
+            inverted, with initial locations spread evenly over ``[-2, 2]``
+            (so a count of 3 reproduces the previous ``[-2, 0, 2]``).
+        log_gamma_bounds: Optional ``(low, high)`` bound on each `Contract2`
+            layer's ``log gamma``, see that class. Note the bound is per
+            layer and log gamma adds along a chain, so ``n`` layers bounded at
+            ``high`` reach ``n * high`` overall.
+        tangent_sas_transformer: Number of `TangentSAS` layers. If nonzero,
+            they are followed by a `PositiveAffine`, which holds the location.
+        tangent_sas_fix_b: Fix every `TangentSAS` layer's ``b`` at 1/2
+            instead of fitting it.
+
+    Returns:
+        An `ElementwiseTransformer`, whose location is the last layer's output
+        shift: the trailing `PositiveAffine`'s ``loc``, the last `Contract2`'s
+        ``mu``, or the `Affine`'s ``loc`` when that is the only layer kind.
+        None if the chain ends in an inverted `AsymmetricAffine`.
+    """
+    n_affine = int(affine_transformer)
+    n_contract = int(contract_transformer)
+    n_asymmetric = int(asymmetric_transformer)
+    n_tangent_sas = int(tangent_sas_transformer)
+
+    if min(n_affine, n_contract, n_asymmetric, n_tangent_sas) < 0:
+        raise ValueError("transformer counts must be non-negative.")
+    if n_affine + n_contract + n_asymmetric + n_tangent_sas == 0:
+        raise ValueError("make_transformer needs at least one layer.")
+
     elemwises = []
 
-    if affine_transformer:
+    for _ in range(n_affine):
         affine = bijections.Affine(jnp.zeros(()), jnp.ones(()))
         scale = Parameterize(lambda x: x + jnp.sqrt(1 + x**2), jnp.zeros(()))
         affine = eqx.tree_at(
@@ -1429,8 +1744,11 @@ def make_transformer(
         )
         elemwises.append(affine)
 
-    if asymmetric_transformer:
-        for loc in [0.0]:
+    if n_asymmetric:
+        locs = (
+            [0.0] if n_asymmetric == 1 else list(np.linspace(-2.0, 2.0, n_asymmetric))
+        )
+        for loc in locs:
             scale = Parameterize(lambda x: x + jnp.sqrt(1 + x**2), jnp.zeros(()))
             theta = Parameterize(lambda x: x + jnp.sqrt(1 + x**2), jnp.zeros(()))
 
@@ -1452,20 +1770,48 @@ def make_transformer(
             )
             elemwises.append(bijections.Invert(affine))
 
-    if contract_transformer:
+    for index in range(n_contract):
+        is_last = index == n_contract - 1
+        # A preceding affine already ends in a free shift, so this layer's own
+        # input shift would only ever enter as the difference of the two.
+        shift_already_available = index == 0 and n_affine > 0
         elemwises.append(
             Contract2(
-                None,
-                jnp.zeros(()),
-                jnp.zeros(()),
-                jnp.zeros(()),
-                jnp.zeros(()),
+                alpha=jnp.zeros(()),
+                beta=jnp.zeros(()),
+                sigma=jnp.zeros(()),
+                mu=jnp.zeros(()) if is_last else None,
+                nu=None if shift_already_available else jnp.zeros(()),
+                log_gamma_bounds=log_gamma_bounds,
             )
         )
 
-    if len(elemwises) == 1:
-        return elemwises[0]
-    return bijections.Chain(elemwises)
+    if n_tangent_sas:
+        for _ in range(n_tangent_sas):
+            elemwises.append(
+                TangentSAS(
+                    nu=jnp.zeros(()),
+                    eps=jnp.zeros(()),
+                    b=None if tangent_sas_fix_b else jnp.zeros(()),
+                    r=jnp.zeros(()),
+                )
+            )
+        elemwises.append(PositiveAffine(jnp.zeros(()), jnp.zeros(())))
+
+    # The location is the last layer's output shift, which nothing after it
+    # undoes. `Contract2` ends in ``+ mu`` and the affines in ``+ loc``; the
+    # inverted `AsymmetricAffine` has only an *input* shift, so a chain ending
+    # in one has no location.
+    last = elemwises[-1]
+    if isinstance(last, PositiveAffine):
+        location_field = (len(elemwises) - 1, "loc")
+    elif isinstance(last, Contract2):
+        location_field = (len(elemwises) - 1, "mu")
+    elif isinstance(last, bijections.Affine):
+        location_field = (len(elemwises) - 1, "loc")
+    else:
+        location_field = None
+    return ElementwiseTransformer(bijections.Chain(elemwises), location_field)
 
 
 def make_twin_flow_scan(
@@ -1508,10 +1854,7 @@ def make_twin_flow_scan(
             )
 
             if zero_init:
-                coupling = jax.tree_util.tree_map(
-                    lambda x: x * 1e-3 if eqx.is_inexact_array(x) else x,
-                    coupling,
-                )
+                coupling = zero_init_conditioners(coupling)
             return coupling
 
         layers = []
@@ -1785,10 +2128,7 @@ def make_flow_loop(
         )
 
         if zero_init:
-            coupling = jax.tree_util.tree_map(
-                lambda x: x * 1e-3 if eqx.is_inexact_array(x) else x,
-                coupling,
-            )
+            coupling = zero_init_conditioners(coupling)
 
         flow = coupling
 
@@ -1853,12 +2193,350 @@ def make_flow_loop(
     return bijection
 
 
+def make_sparse_triangular_map(
+    key,
+    n_dim,
+    *,
+    order: ArrayLike,
+    sparsity: ArrayLike,
+    zero_init=True,
+    n_buckets=8,
+    n_level_segments=8,
+    nn_width=None,
+    nn_depth=None,
+    activation,
+    location_skip=True,
+    affine_transformer=False,
+    contract_transformer=False,
+    asymmetric_transformer=False,
+    tangent_sas_transformer=0,
+    tangent_sas_fix_b=False,
+    log_gamma_bounds=None,
+    feature_degree=None,
+    input_squash=None,
+):
+    """Build a `SparseTriangularMap` bijection for the given ordering.
+
+    Unlike coupling layers, a single triangular map already gives every
+    variable an arbitrarily flexible, invertible conditional transform given
+    its parents, so (unlike the other flows in this module) there is no
+    benefit to stacking several of these with the same `order` and
+    `sparsity`: doing so would not add any expressivity, only cost. `order`
+    is applied by sandwiching the (order-less) `SparseTriangularMap` between
+    a `bijections.Permute` and its inverse, rather than baking the ordering
+    into the triangular map itself.
+
+    Args:
+        order: Permutation of ``range(n_dim)`` giving the variable ordering
+            used for the triangular structure. ``order[k]`` is the index (in
+            the original, unpermuted variable space) of the variable
+            transformed at position ``k``; a variable can only depend on
+            variables earlier in this order.
+
+            If `sparsity` comes from a symbolic Cholesky factorization, this
+            must be the **reverse** of the elimination order that factorization
+            used (``order = p[::-1]`` for a CHOLMOD/AMD permutation ``p``),
+            because the map is lower triangular and so factorizes the
+            precision as ``Lambda = C^T C`` rather than ``L L^T``. See
+            `SparseTriangularMap` for the full argument. Reversing costs no
+            fill: the fill count is the one the elimination order achieved.
+        sparsity: ``(n_dim, n_dim)`` dense or scipy sparse matrix
+            convertible to boolean, the Markov-blanket adjacency matrix, see
+            `SparseTriangularMap`.
+            ``sparsity[i, j]`` being truthy means ``j`` may be used to
+            parameterize the transform of ``i``, provided ``j`` precedes
+            ``i`` in ``order``.
+        location_skip: Linear map from each variable's parents straight to
+            its transformer location, see `SparseTriangularMap`.
+        affine_transformer, contract_transformer, asymmetric_transformer,
+        tangent_sas_transformer, tangent_sas_fix_b, log_gamma_bounds:
+            The elementwise transformer, see `make_transformer`. If all
+            counts are zero, `SparseTriangularMap`'s own default transformer
+            is used.
+        feature_degree: Degree of the `HermiteFeatures` the conditioners see
+            instead of the raw parents, see `SparseTriangularMap`. None for
+            the raw parents.
+        input_squash: Scale of the ``c * asinh(y / c)`` the conditioner MLPs
+            see of the parents, see `SparseTriangularMap`. None for the raw
+            parents.
+    """
+    if nn_width is None:
+        nn_width = 16
+    if nn_depth is None:
+        nn_depth = 1
+
+    order = np.asarray(order)
+    if scipy.sparse.issparse(sparsity):
+        # The triangular map still works with a dense pattern for now
+        sparsity = sparsity.toarray()
+    sparsity = np.asarray(sparsity, dtype=bool)
+
+    if order.shape != (n_dim,):
+        raise ValueError(f"order must have shape ({n_dim},), got {order.shape}.")
+    if not np.array_equal(np.sort(order), np.arange(n_dim)):
+        raise ValueError("order must be a permutation of range(n_dim).")
+    if sparsity.shape != (n_dim, n_dim):
+        raise ValueError(
+            f"sparsity must have shape {(n_dim, n_dim)}, got {sparsity.shape}."
+        )
+
+    # Reindex the sparsity pattern into the "sorted" position space given by
+    # `order`, so that `SparseTriangularMap` (which assumes variable `i`
+    # precedes variable `j` whenever `i < j`) can be used unchanged.
+    sparsity_sorted = sparsity[np.ix_(order, order)]
+
+    transformer = None
+    if (
+        affine_transformer
+        or contract_transformer
+        or asymmetric_transformer
+        or tangent_sas_transformer
+    ):
+        transformer = make_transformer(
+            affine_transformer=affine_transformer,
+            contract_transformer=contract_transformer,
+            asymmetric_transformer=asymmetric_transformer,
+            tangent_sas_transformer=tangent_sas_transformer,
+            tangent_sas_fix_b=tangent_sas_fix_b,
+            log_gamma_bounds=log_gamma_bounds,
+        )
+
+    layer = SparseTriangularMap(
+        key,
+        blanket=sparsity_sorted,
+        transformer=transformer,
+        n_buckets=n_buckets,
+        n_level_segments=n_level_segments,
+        nn_width=nn_width,
+        nn_depth=nn_depth,
+        nn_activation=activation,
+        location_skip=location_skip,
+        feature_degree=feature_degree,
+        input_squash=input_squash,
+    )
+    if zero_init:
+        layer = zero_init_conditioners(layer)
+
+    layer = bijections.Sandwich(layer, bijections.Permute(jnp.asarray(order)))
+
+    """
+    contract = eqx.filter_vmap(
+        lambda: Contract2(jnp.zeros(()), jnp.zeros(()), jnp.zeros(()), jnp.zeros(()), jnp.zeros(())),
+        #lambda: Contract2(None, None, None, None, jnp.zeros(())),
+        axis_size=len(order),
+    )()
+    contract = bijections.Vmap(contract, in_axes=eqx.if_array(0))
+    #contract = bijections.Invert(contract)
+    """
+    return bijections.Chain([layer])
+
+
+def _pattern_lower_indices(pattern):
+    """Row/column indices of the lower triangle (incl. diagonal) of `pattern`."""
+    pattern = np.asarray(pattern, dtype=bool)
+    dim = pattern.shape[0]
+    mask = np.tril(pattern | pattern.T | np.eye(dim, dtype=bool))
+    return np.nonzero(mask)
+
+
+def fisher_optimal_precision(
+    draws,
+    grads,
+    pattern,
+    *,
+    maxiter: int = 200,
+    tol: float = 1e-10,
+):
+    """Precision matrix of the Fisher-optimal linear map with a given sparsity.
+
+    A linear triangular map ``w = C s`` has whitened Fisher divergence
+
+    .. code-block:: text
+
+        E ||C s + C^-T g||^2 = tr(M Sigma) + tr(M^-1 G) - 2 dim,   M = C^T C
+
+    (the cross term is constant because ``C^T C^-T = I`` and
+    ``E[g s^T] = -I``). So the loss sees ``C`` only through ``M = C^T C``,
+    and because `pattern` is fill-completed for the map's order, ``{C^T C : C
+    lower triangular with this pattern}`` is exactly ``{M positive definite
+    with this pattern}``. The problem is therefore *convex* in ``M``:
+    ``tr(M Sigma)`` is linear, ``tr(M^-1 G)`` is convex, and the objective
+    diverges as ``M`` approaches singularity, so it is self-barriering.
+
+    Note what this is *not*. The tempting cheap alternative -- regressing
+    ``-g`` on ``s`` row by row, i.e. minimizing ``E||M s + g||^2`` -- expands
+    to ``tr(M Sigma M) - 2 tr(M) + tr(G)``, whose minimizer is ``M =
+    Sigma^-1``: the score covariance drops out entirely and the result is the
+    draw covariance in disguise. The stationarity condition here is instead
+    ``M Sigma M = G``, whose unconstrained solution is the matrix geometric
+    mean of ``Sigma^-1`` and ``G``.
+
+    Nothing dense is ever formed. The gradient is
+    ``P[Sigma - M^-1 G M^-1]``, which in sample form is a difference of two
+    empirical second moments evaluated only on the pattern,
+
+    .. code-block:: text
+
+        grad_ij = mean_k [ s_ki s_kj - y_ki y_kj ],    M y_k = g_k
+
+    so an iteration costs one sparse solve per draw plus ``O(n_draws * nnz)``
+    to accumulate the moments. With an empty pattern this reduces to
+    ``M_ii = sqrt(G_ii / Sigma_ii)``, the diagonal geometric mean `make_flow`
+    already uses.
+
+    The map has to be affine rather than merely linear, because the whitened
+    residual of a Gaussian with mean ``mu`` is ``C (s - mu)``: without an
+    intercept it is off by a constant whenever the coordinates the map sees
+    are not exactly centered, which is the normal case (`make_flow`'s
+    preceding affine layer only centers approximately). That costs nothing
+    to handle. Writing the map as ``w = C (s - c)`` and minimizing over
+    ``c`` gives ``c = mean(s) + M^-1 mean(g)``; substituting it back
+    collapses every ``c``-dependent term into ``-mean(g)^T M^-1 mean(g)``,
+    leaving exactly the objective above with **both** moments centered. So
+    the intercept is profiled out rather than iterated on: use covariances
+    instead of second moments, solve once, then read ``c`` off the result.
+
+    Args:
+        draws: ``(n_draws, dim)`` draws, in the order the map uses.
+        grads: ``(n_draws, dim)`` gradients of the target log density at
+            `draws`, in the same order.
+        pattern: ``(dim, dim)`` boolean adjacency matrix, fill-completed for
+            the map's order (see `make_sparse_triangular_map`).
+        maxiter: Maximum number of L-BFGS iterations.
+        tol: Gradient tolerance for the L-BFGS convergence check.
+
+    Returns:
+        ``(M, center)``, with ``M`` a ``scipy.sparse`` CSC matrix and
+        ``center`` the offset the map subtracts, i.e. the optimal linear map
+        is ``w = C (s - center)``.
+    """
+    import scipy.sparse as sp
+    from scipy.optimize import minimize
+    from scipy.sparse.linalg import splu
+
+    draws = np.asarray(draws, dtype=np.float64)
+    grads = np.asarray(grads, dtype=np.float64)
+    n_draws, dim = draws.shape
+
+    rows, cols = _pattern_lower_indices(pattern)
+    is_diag = rows == cols
+    # Off-diagonal entries appear twice in the symmetric matrix, so their
+    # directional derivative picks up a factor of two.
+    grad_weight = np.where(is_diag, 1.0, 2.0)
+
+    # Centered, because the intercept is profiled out (see above).
+    draw_mean = draws.mean(0)
+    grad_mean = grads.mean(0)
+    centered_draws = draws - draw_mean
+    centered_grads = grads - grad_mean
+
+    # Empirical covariance, evaluated only on the pattern.
+    sigma_vals = (centered_draws[:, rows] * centered_draws[:, cols]).sum(0) / n_draws
+
+    def to_matrix(theta):
+        lower = sp.coo_matrix((theta, (rows, cols)), shape=(dim, dim))
+        strict = sp.coo_matrix(
+            (theta[~is_diag], (cols[~is_diag], rows[~is_diag])), shape=(dim, dim)
+        )
+        return (lower + strict).tocsc()
+
+    def objective(theta):
+        matrix = to_matrix(theta)
+        try:
+            # `diag_pivot_thresh=0` turns SuperLU into a Cholesky-like
+            # factorization for symmetric positive definite input; a
+            # non-positive pivot then means we left the feasible set.
+            factor = splu(matrix, diag_pivot_thresh=0, permc_spec="MMD_AT_PLUS_A")
+        except RuntimeError:
+            return np.inf, np.zeros_like(theta)
+        if not (factor.U.diagonal() > 0).all():
+            return np.inf, np.zeros_like(theta)
+
+        y = factor.solve(centered_grads.T).T
+        value = (centered_draws * (centered_draws @ matrix)).sum() / n_draws
+        value = value + (centered_grads * y).sum() / n_draws
+
+        y_vals = (y[:, rows] * y[:, cols]).sum(0) / n_draws
+        return value, (sigma_vals - y_vals) * grad_weight
+
+    # Start from the diagonal geometric mean, which is the exact solution
+    # when the pattern is empty and a feasible (positive definite) point
+    # otherwise.
+    diag0 = np.sqrt(centered_grads.var(0) / np.maximum(centered_draws.var(0), 1e-300))
+    theta0 = np.where(is_diag, diag0[rows], 0.0)
+
+    result = minimize(
+        objective,
+        theta0,
+        jac=True,
+        method="L-BFGS-B",
+        options={"maxiter": maxiter, "gtol": tol, "ftol": 1e-15},
+    )
+    matrix = to_matrix(result.x)
+
+    # c = mean(s) + M^-1 mean(g), the offset that makes the whitened residual
+    # mean-free.
+    factor = splu(matrix, diag_pivot_thresh=0, permc_spec="MMD_AT_PLUS_A")
+    center = draw_mean + factor.solve(grad_mean)
+    return matrix, center
+
+
+def reverse_cholesky(matrix):
+    """Lower-triangular ``C`` with ``C.T @ C == matrix``.
+
+    This is the factorization a `SparseTriangularMap` needs (see that class's
+    note on the triangle convention), as opposed to the usual ``L @ L.T``.
+    It is computed as an ordinary Cholesky of the reversed matrix: reversing
+    a lower-triangular factor gives an upper-triangular one, and
+    ``(X[J][:, J]).T == X.T[J][:, J]``.
+    """
+    import scipy.sparse as sp
+    from sksparse.cholmod import cholesky
+
+    dim = matrix.shape[0]
+    rev = np.arange(dim)[::-1]
+    reversed_matrix = sp.csc_matrix(matrix)[rev][:, rev]
+    # `order="natural"` is essential: any fill-reducing permutation here
+    # would destroy the ordering the triangular map is built around.
+    factor, perm = cholesky(sp.csc_matrix(reversed_matrix), order="natural", lower=True)
+    assert np.array_equal(perm, np.arange(dim))
+    return sp.csc_matrix(factor).T[rev][:, rev]
+
+
+def diag_from_gradients(positions, gradients):
+    """``(mean, scale)`` of a diagonal normal from the gradients alone, as
+    nuts-rs initializes its diagonal mass matrix.
+
+    The variance is ``1 / mean(|g|)``, clipped, and the mean is where a normal
+    with that variance has the observed score, ``x + var g``, averaged over the
+    draws. At a single draw, the score of that normal matches the gradient
+    exactly, so an exact-normal trajectory starts with no residual force.
+    """
+    with np.errstate(divide="ignore"):
+        diag = 1 / np.sqrt(np.abs(gradients).mean(0))
+    diag = np.clip(np.where(np.isnan(diag), 1.0, diag), 1e-10, 1e10)
+    mean = (positions + diag**2 * gradients).mean(0)
+    return mean, diag
+
+
+def make_diag_flow(mean, diag):
+    """The diagonal affine ``x = mean + diag * z`` every flow of `make_flow`
+    starts with, with ``diag`` parameterized to stay positive."""
+    diag_param = Parameterize(_positive, (diag**2 - 1) / (2 * diag))
+    diag_affine = bijections.Affine(mean, diag)
+    return eqx.tree_at(
+        where=lambda aff: aff.scale,
+        pytree=diag_affine,
+        replace=diag_param,
+    )
+
+
 def make_flow(
     seed,
     positions,
     gradients,
     *,
-    zero_init=False,
+    zero_init=True,
     householder_layer=False,
     dct_layer=False,
     untransformed_dim: int | list[int | None] | None = None,
@@ -1874,9 +2552,18 @@ def make_flow(
     affine_transformer=False,
     contract_transformer=False,
     asymmetric_transformer=False,
+    tangent_sas_transformer=0,
+    tangent_sas_fix_b=False,
+    log_gamma_bounds=None,
     sandwich_householder=False,
     activation=None,
     reuse_embed=False,
+    order: ArrayLike | None = None,
+    sparsity: ArrayLike | None = None,
+    location_skip: bool = True,
+    feature_degree: int | None = None,
+    input_squash: float | None = None,
+    n_buckets: int = 8,
 ):
     if activation is None:
         activation = jax.nn.leaky_relu
@@ -1903,10 +2590,7 @@ def make_flow(
     if n_draws == 0:
         raise ValueError("No draws")
     elif n_draws == 1:
-        assert np.all(gradients != 0)
-        diag = np.clip(1 / jnp.sqrt(jnp.abs(gradients[0])), 1e-8, 1e8)
-        assert np.isfinite(diag).all()
-        mean = jnp.zeros_like(diag)
+        mean, diag = diag_from_gradients(positions, gradients)
     else:
         pos_std = np.clip(positions.std(0), 1e-8, 1e8)
         grad_std = np.clip(gradients.std(0), 1e-8, 1e8)
@@ -1915,19 +2599,8 @@ def make_flow(
 
     key = jax.random.key(seed % (2**63), impl="threefry2x32")
 
-    diag_param = Parameterize(
-        lambda x: x + jnp.sqrt(1 + x**2),
-        (diag**2 - 1) / (2 * diag),
-    )
-    diag_affine = bijections.Affine(mean, diag)
-    diag_affine = eqx.tree_at(
-        where=lambda aff: aff.scale,
-        pytree=diag_affine,
-        replace=diag_param,
-    )
-
     flows = [
-        diag_affine,
+        make_diag_flow(mean, diag),
     ]
 
     if n_layers == 0:
@@ -2007,6 +2680,49 @@ def make_flow(
             contract_transformer=contract_transformer,
             activation=activation,
         )
+    elif kind == "triangular":
+        if sparsity is None:
+            raise ValueError(
+                "kind='triangular' requires a `sparsity` argument "
+                "(a boolean Markov-blanket adjacency matrix of shape "
+                "(n_dim, n_dim))."
+            )
+        if order is None:
+            order = np.arange(n_dim)
+        inner = make_sparse_triangular_map(
+            key,
+            n_dim,
+            order=order,
+            sparsity=sparsity,
+            zero_init=zero_init,
+            nn_width=nn_width,
+            nn_depth=nn_depth,
+            activation=activation,
+            location_skip=location_skip,
+            affine_transformer=affine_transformer,
+            contract_transformer=contract_transformer,
+            asymmetric_transformer=asymmetric_transformer,
+            tangent_sas_transformer=tangent_sas_transformer,
+            tangent_sas_fix_b=tangent_sas_fix_b,
+            log_gamma_bounds=log_gamma_bounds,
+            feature_degree=feature_degree,
+            input_squash=input_squash,
+            n_buckets=n_buckets,
+        )
+        if feature_degree is not None:
+            # The marginal maps of the features, fitted on the draws as the
+            # triangular map sees them: standardized, then in its order.
+            from nutpie.triangular import fit_marginal_maps
+
+            standardized = ((positions - np.asarray(mean)) / np.asarray(diag))[
+                :, np.asarray(order)
+            ]
+            where = lambda chain: chain.bijections[0].inner
+            inner = eqx.tree_at(
+                where,
+                inner,
+                where(inner).with_marginal_maps(fit_marginal_maps(standardized)),
+            )
     else:
         raise ValueError(f"Unknown flow kind: {kind}")
     return bijections.Chain([inner, *flows])
@@ -2142,10 +2858,7 @@ def extend_flow(
             )
 
         if zero_init:
-            coupling = jax.tree_util.tree_map(
-                lambda x: x * 1e-3 if eqx.is_inexact_array(x) else x,
-                coupling,
-            )
+            coupling = zero_init_conditioners(coupling)
 
         inner = bijections.Sandwich(coupling, inner_permute)
 
@@ -2176,10 +2889,7 @@ def extend_flow(
             )
 
             if zero_init:
-                coupling = jax.tree_util.tree_map(
-                    lambda x: x * 1e-3 if eqx.is_inexact_array(x) else x,
-                    coupling,
-                )
+                coupling = zero_init_conditioners(coupling)
 
             if verbose:
                 print(costs[permute.permutation][inner.outer.permutation])

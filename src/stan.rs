@@ -1,39 +1,36 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use std::{ffi::CString, path::PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use bridgestan::open_library;
 use itertools::Itertools;
-use nuts_rs::{CpuLogpFunc, CpuMath, HasDims, LogpError, Model, Storable, Value};
+use numpy::{PyArray1, PyReadonlyArray1};
+use nuts_rs::{
+    CpuLogpFunc, CpuMath, HasDims, InitPositionError, LogpError, Model, Storable, Value,
+};
 use pyo3::exceptions::PyRuntimeError;
-use pyo3::types::{PyDict, PyNone, PyTuple};
+use pyo3::types::{PyDict, PyNone};
 use pyo3::{exceptions::PyValueError, pyclass, pymethods, PyResult};
 use pyo3::{prelude::*, BoundObject};
 use rand::prelude::Distribution;
-use rand::{rng, Rng};
+use rand::{rng, Rng, SeedableRng};
+use rand_chacha::ChaCha8Rng;
 use rand_distr::StandardNormal;
 use smallvec::{SmallVec, ToSmallVec};
 
 use thiserror::Error;
 
-use crate::common::{ItemType, PyValue, PyVariable};
-use crate::wrapper::PyTransformAdapt;
+use crate::common::{copy_init_point, ItemType, PyValue, PyVariable};
+use crate::hessian_sparsity::{hessian_sparsity, HessianVectorProduct, SparsityOptions};
+use crate::wrapper::{soft_clip, NativeFlow, PyTransformAdapt};
 
 type InnerModel = bridgestan::Model<Arc<bridgestan::StanLibrary>>;
 
 #[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct StanLibrary(Arc<bridgestan::StanLibrary>);
-
-#[derive(Clone, Debug)]
-struct Parameter {
-    name: String,
-    shape: Vec<usize>,
-    size: usize,
-    start_idx: usize,
-    end_idx: usize,
-}
 
 #[pymethods]
 impl StanLibrary {
@@ -42,37 +39,6 @@ impl StanLibrary {
         let lib = open_library(path)
             .map_err(|e| PyValueError::new_err(format!("Could not open stan libray: {e}")))?;
         Ok(Self(Arc::new(lib)))
-    }
-}
-
-#[pyclass]
-pub struct StanVariable(Parameter);
-
-#[pymethods]
-impl StanVariable {
-    #[getter]
-    fn name(&self) -> String {
-        self.0.name.clone()
-    }
-
-    #[getter]
-    fn shape<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
-        PyTuple::new(py, self.0.shape.iter())
-    }
-
-    #[getter]
-    fn size(&self) -> usize {
-        self.0.size
-    }
-
-    #[getter]
-    fn start_idx(&self) -> usize {
-        self.0.start_idx
-    }
-
-    #[getter]
-    fn end_idx(&self) -> usize {
-        self.0.end_idx
     }
 }
 
@@ -87,14 +53,89 @@ pub struct StanModel {
     #[pyo3(get)]
     dims: HashMap<String, Vec<String>>,
     unc_names: Value,
+    init_point_func: Option<Arc<Py<PyAny>>>,
+    parameters: Vec<Parameter>,
 }
 
-/// Return meta information about the constrained parameters of the model
-fn params(
-    var_string: &str,
+/// A stan variable in the flat output of `param_constrain`.
+///
+/// Stan stores values in fortran order. For complex variables the real
+/// and imaginary parts are interleaved, so `start_idx..end_idx` has
+/// fortran shape `[2, *shape]`. In the trace, complex variables are split
+/// into two variables `name.real` and `name.imag`.
+#[derive(Clone, Debug)]
+struct Parameter {
+    name: String,
+    shape: Vec<usize>,
+    /// Number of elements, not counting real and imaginary parts separately
+    size: usize,
+    is_complex: bool,
+    start_idx: usize,
+    end_idx: usize,
+}
+
+impl Parameter {
+    /// Append the values of the trace variables of this parameter in C
+    /// order to `out`, one vector per variable.
+    fn unpack(&self, flat: &[f64], out: &mut Vec<Vec<f64>>) {
+        let slice = &flat[self.start_idx..self.end_idx];
+        let mut values = Vec::with_capacity(slice.len());
+        let mut stan_shape: SmallVec<[u64; 8]> = self.shape.iter().map(|&d| d as u64).collect();
+        if self.is_complex {
+            stan_shape.insert(0, 2);
+        }
+        // For rank < 2 fortran and C order are the same
+        if slice.is_empty() || stan_shape.len() < 2 {
+            values.extend_from_slice(slice);
+        } else {
+            fortran_to_c_order(slice, &stan_shape, &mut values);
+        }
+        if self.is_complex {
+            // In C order with shape `[2, *shape]`, all real parts come first
+            let imag = values.split_off(self.size);
+            out.push(values);
+            out.push(imag);
+        } else {
+            out.push(values);
+        }
+    }
+}
+
+/// Create the variables of the trace for the stan parameters.
+fn trace_variables(
+    parameters: &[Parameter],
     all_dims: &mut HashMap<String, Vec<String>>,
     dim_sizes: &mut HashMap<String, u64>,
 ) -> anyhow::Result<Vec<PyVariable>> {
+    let mut variables = Vec::new();
+    for param in parameters {
+        let shape: Vec<u64> = param.shape.iter().map(|&d| d as u64).collect();
+        let names = if param.is_complex {
+            vec![
+                format!("{}.real", param.name),
+                format!("{}.imag", param.name),
+            ]
+        } else {
+            vec![param.name.clone()]
+        };
+        // The indices of the variables are only nominal, the values are
+        // extracted with `Parameter::unpack`.
+        for (i, name) in names.into_iter().enumerate() {
+            variables.push(PyVariable::new(
+                name,
+                ItemType(nuts_rs::ItemType::F64),
+                Some(shape.clone()),
+                all_dims,
+                dim_sizes,
+                Some(param.start_idx + i * param.size),
+            )?);
+        }
+    }
+    Ok(variables)
+}
+
+/// Parse the comma separated parameter names returned by stan.
+fn params(var_string: &str) -> anyhow::Result<Vec<Parameter>> {
     if var_string.is_empty() {
         return Ok(vec![]);
     }
@@ -143,7 +184,7 @@ fn params(
         .collect();
 
     // Group variables by name and build Parameter objects
-    let mut variables = Vec::new();
+    let mut parameters = Vec::new();
     let mut start_idx = 0;
 
     for (name, group) in &parsed_variables?.iter().chunk_by(|(name, _, _)| name) {
@@ -151,46 +192,22 @@ fn params(
         let (shape, is_complex) = determine_variable_shape(group)
             .context(format!("Error while parsing stan variable {name}"))?;
 
-        // Calculate total size of this variable
         let size: usize = shape.iter().product();
-        let mut end_idx = start_idx + size;
+        let end_idx = start_idx + if is_complex { 2 * size } else { size };
 
-        // Create Parameter objects (one for real and one for imag if complex)
-        if is_complex {
-            variables.push(PyVariable::new(
-                format!("{name}.real"),
-                ItemType(nuts_rs::ItemType::F64),
-                Some(shape.iter().map(|&d| d as u64).collect()),
-                all_dims,
-                dim_sizes,
-                Some(start_idx),
-            )?);
-            start_idx = end_idx;
-            end_idx = start_idx + size;
-            variables.push(PyVariable::new(
-                format!("{name}.imag"),
-                ItemType(nuts_rs::ItemType::F64),
-                Some(shape.iter().map(|&d| d as u64).collect()),
-                all_dims,
-                dim_sizes,
-                Some(start_idx),
-            )?);
-        } else {
-            variables.push(PyVariable::new(
-                name.to_string(),
-                ItemType(nuts_rs::ItemType::F64),
-                Some(shape.iter().map(|&d| d as u64).collect()),
-                all_dims,
-                dim_sizes,
-                Some(start_idx),
-            )?);
-        }
+        parameters.push(Parameter {
+            name: name.to_string(),
+            shape,
+            size,
+            is_complex,
+            start_idx,
+            end_idx,
+        });
 
-        // Move to the next variable
         start_idx = end_idx;
     }
 
-    Ok(variables)
+    Ok(parameters)
 }
 
 // Helper function to determine the shape and complex flag for a group of variables
@@ -304,7 +321,7 @@ impl StanModel {
             None => rng().next_u32(),
         };
         let data: Option<CString> = data.map(CString::new).transpose()?;
-        let mut model =
+        let model =
             bridgestan::Model::new(lib.0, data.as_ref(), seed).map_err(anyhow::Error::new)?;
 
         // TODO: bridgestan should not require mut self here
@@ -320,7 +337,8 @@ impl StanModel {
         let model = Arc::new(model);
 
         let var_string = model.param_names(true, true);
-        let variables = params(var_string, &mut dims, &mut dim_sizes)?;
+        let parameters = params(var_string)?;
+        let variables = trace_variables(&parameters, &mut dims, &mut dim_sizes)?;
         let transform_adapter = transform_adapter.map(PyTransformAdapt::new);
 
         Ok(StanModel {
@@ -331,6 +349,8 @@ impl StanModel {
             coords,
             dims,
             unc_names,
+            init_point_func: None,
+            parameters,
         })
     }
 
@@ -347,6 +367,185 @@ impl StanModel {
 
     pub fn ndim(&self) -> usize {
         self.inner.param_unc_num()
+    }
+
+    /// Return a copy of the model that uses `transform_adapter` for the
+    /// normalizing flow adaptation.
+    pub fn with_transform_adapter(&self, transform_adapter: Py<PyAny>) -> Self {
+        Self {
+            transform_adapter: Some(PyTransformAdapt::new(transform_adapter)),
+            ..self.clone()
+        }
+    }
+
+    /// Names of the unconstrained parameters.
+    pub fn unconstrained_names(&self) -> Vec<String> {
+        match &self.unc_names {
+            Value::Strings(names) => names.clone(),
+            _ => unreachable!("Unconstrained names are strings"),
+        }
+    }
+
+    #[pyo3(signature = (include_tp=false, include_gq=false))]
+    pub fn param_num(&self, include_tp: bool, include_gq: bool) -> usize {
+        self.inner.param_num(include_tp, include_gq)
+    }
+
+    /// Whether the model was compiled with autodiff Hessians
+    /// (`BRIDGESTAN_AD_HESSIAN=true`). Otherwise bridgestan uses finite
+    /// differences for Hessians.
+    #[getter]
+    pub fn ad_hessian(&self) -> bool {
+        self.inner
+            .info()
+            .to_string_lossy()
+            .contains("BRIDGESTAN_AD_HESSIAN=true")
+    }
+
+    /// Return the log density and the product of its Hessian with `v`.
+    #[pyo3(signature = (theta_unc, v, propto=true, jacobian=true))]
+    pub fn log_density_hessian_vector_product<'py>(
+        &self,
+        py: Python<'py>,
+        theta_unc: PyReadonlyArray1<'py, f64>,
+        v: PyReadonlyArray1<'py, f64>,
+        propto: bool,
+        jacobian: bool,
+    ) -> anyhow::Result<(f64, Bound<'py, PyArray1<f64>>)> {
+        self.check_ad_hessian()?;
+        let theta_unc = self.check_unc_len(theta_unc.as_slice()?)?;
+        let v = self.check_unc_len(v.as_slice()?)?;
+        let mut hvp = vec![0f64; self.inner.param_unc_num()];
+        let logp = self
+            .inner
+            .log_density_hessian_vector_product(theta_unc, v, propto, jacobian, &mut hvp)?;
+        Ok((logp, PyArray1::from_vec(py, hvp)))
+    }
+
+    /// Detect the sparsity pattern of the Hessian of the log density on the
+    /// unconstrained space.
+    ///
+    /// The pattern is the union of the patterns at `num_points` initial
+    /// points of the model, computed from autodiff Hessian-vector products.
+    /// See `crate::hessian_sparsity` for the algorithm. Returns the symmetric
+    /// pattern with a true diagonal in CSR format (`indptr`, `indices`), the
+    /// number of Hessian-vector products and the number of colours of the
+    /// verification stage.
+    #[pyo3(signature = (num_points=4, seed=None, bloom_size=None, num_hashes=3, max_tries=100))]
+    pub fn hessian_sparsity<'py>(
+        &self,
+        py: Python<'py>,
+        num_points: usize,
+        seed: Option<u64>,
+        bloom_size: Option<usize>,
+        num_hashes: usize,
+        max_tries: usize,
+    ) -> anyhow::Result<(
+        Bound<'py, PyArray1<i64>>,
+        Bound<'py, PyArray1<i64>>,
+        usize,
+        usize,
+    )> {
+        self.check_ad_hessian()?;
+        let seed = seed.unwrap_or_else(|| rng().next_u64());
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+
+        let points = self.hessian_points(py, &mut rng, num_points, max_tries)?;
+        let options = SparsityOptions {
+            bloom_size,
+            num_hashes,
+            seed: rng.next_u64(),
+        };
+        let inner = &self.inner;
+        let pattern = py.detach(|| {
+            let signals = SignalCheck::new();
+            hessian_sparsity(&StanHessian { inner }, &points, &options, || {
+                signals.check()
+            })
+        })?;
+
+        let (indptr, indices) = pattern.to_csr();
+        Ok((
+            PyArray1::from_vec(py, indptr),
+            PyArray1::from_vec(py, indices),
+            pattern.num_hvps,
+            pattern.num_colors,
+        ))
+    }
+
+    /// Return a copy of the model that generates initial points with
+    /// `init_point_func(seed, chain_id)`. It must return either a flat
+    /// unconstrained point, or a Stan JSON string with values for some or
+    /// all parameters.
+    pub fn with_init_point_func(&self, init_point_func: Py<PyAny>) -> Self {
+        Self {
+            init_point_func: Some(Arc::new(init_point_func)),
+            ..self.clone()
+        }
+    }
+
+    /// Map a point on the unconstrained space to the flat (column-major)
+    /// constrained parameter vector.
+    #[pyo3(signature = (theta_unc, include_tp=false, include_gq=false, seed=None))]
+    pub fn param_constrain<'py>(
+        &self,
+        py: Python<'py>,
+        theta_unc: PyReadonlyArray1<'py, f64>,
+        include_tp: bool,
+        include_gq: bool,
+        seed: Option<u32>,
+    ) -> anyhow::Result<Bound<'py, PyArray1<f64>>> {
+        let theta_unc = theta_unc.as_slice()?;
+        if theta_unc.len() != self.inner.param_unc_num() {
+            bail!(
+                "Unconstrained point has length {} (expected {})",
+                theta_unc.len(),
+                self.inner.param_unc_num()
+            );
+        }
+        let mut out = vec![0f64; self.inner.param_num(include_tp, include_gq)];
+        let mut rng = if include_gq {
+            let seed = seed.unwrap_or_else(|| rng().next_u32());
+            Some(bridgestan::Rng::new(self.inner.clone_library_ref(), seed)?)
+        } else {
+            None
+        };
+        self.inner
+            .param_constrain(theta_unc, include_tp, include_gq, &mut out, rng.as_mut())?;
+        Ok(PyArray1::from_vec(py, out))
+    }
+
+    /// Map a flat (column-major) constrained parameter vector to the
+    /// unconstrained space.
+    pub fn param_unconstrain<'py>(
+        &self,
+        py: Python<'py>,
+        theta: PyReadonlyArray1<'py, f64>,
+    ) -> anyhow::Result<Bound<'py, PyArray1<f64>>> {
+        let theta = theta.as_slice()?;
+        if theta.len() != self.inner.param_num(false, false) {
+            bail!(
+                "Constrained point has length {} (expected {})",
+                theta.len(),
+                self.inner.param_num(false, false)
+            );
+        }
+        let mut out = vec![0f64; self.inner.param_unc_num()];
+        self.inner.param_unconstrain(theta, &mut out)?;
+        Ok(PyArray1::from_vec(py, out))
+    }
+
+    /// Map constrained parameter values in Stan JSON format to the
+    /// unconstrained space.
+    pub fn param_unconstrain_json<'py>(
+        &self,
+        py: Python<'py>,
+        json: String,
+    ) -> anyhow::Result<Bound<'py, PyArray1<f64>>> {
+        let json = CString::new(json)?;
+        let mut out = vec![0f64; self.inner.param_unc_num()];
+        self.inner.param_unconstrain_json(&json, &mut out)?;
+        Ok(PyArray1::from_vec(py, out))
     }
 
     /*
@@ -370,11 +569,12 @@ impl StanModel {
     */
 }
 
-pub struct StanDensity<'model> {
-    model: &'model StanModel,
-    rng: bridgestan::Rng<&'model bridgestan::StanLibrary>,
+pub struct StanDensity {
+    model: Arc<StanModel>,
+    rng: bridgestan::Rng<Arc<bridgestan::StanLibrary>>,
     transform_adapter: Option<PyTransformAdapt>,
     expanded_buffer: Vec<f64>,
+    native_flow: NativeFlow,
 }
 
 #[derive(Debug, Error)]
@@ -397,8 +597,8 @@ impl LogpError for StanLogpError {
 
 pub struct ExpandedVector(Vec<Option<nuts_rs::Value>>);
 
-impl<'model> Storable<StanDensity<'model>> for ExpandedVector {
-    fn names<'a>(parent: &'a StanDensity<'model>) -> Vec<&'a str> {
+impl Storable<StanDensity> for ExpandedVector {
+    fn names<'a>(parent: &'a StanDensity) -> Vec<&'a str> {
         parent
             .model
             .variables
@@ -407,7 +607,7 @@ impl<'model> Storable<StanDensity<'model>> for ExpandedVector {
             .collect()
     }
 
-    fn item_type(parent: &StanDensity<'model>, item: &str) -> nuts_rs::ItemType {
+    fn item_type(parent: &StanDensity, item: &str) -> nuts_rs::ItemType {
         parent
             .model
             .variables
@@ -417,7 +617,7 @@ impl<'model> Storable<StanDensity<'model>> for ExpandedVector {
             .expect("Item not found")
     }
 
-    fn dims<'a>(parent: &'a StanDensity<'model>, item: &str) -> Vec<&'a str> {
+    fn dims<'a>(parent: &'a StanDensity, item: &str) -> Vec<&'a str> {
         parent
             .model
             .variables
@@ -427,7 +627,7 @@ impl<'model> Storable<StanDensity<'model>> for ExpandedVector {
             .expect("Item not found")
     }
 
-    fn get_all<'a>(&'a mut self, parent: &'a StanDensity<'model>) -> Vec<(&'a str, Option<Value>)> {
+    fn get_all<'a>(&'a mut self, parent: &'a StanDensity) -> Vec<(&'a str, Option<Value>)> {
         self.0
             .iter_mut()
             .zip(parent.model.variables.iter())
@@ -436,7 +636,7 @@ impl<'model> Storable<StanDensity<'model>> for ExpandedVector {
     }
 }
 
-impl<'model> HasDims for StanDensity<'model> {
+impl HasDims for StanDensity {
     fn dim_sizes(&self) -> HashMap<String, u64> {
         self.model.dim_sizes.clone()
     }
@@ -446,7 +646,7 @@ impl<'model> HasDims for StanDensity<'model> {
     }
 }
 
-impl<'model> CpuLogpFunc for StanDensity<'model> {
+impl CpuLogpFunc for StanDensity {
     type LogpError = StanLogpError;
     type FlowParameters = Py<PyAny>;
     type ExpandedVector = ExpandedVector;
@@ -490,31 +690,15 @@ impl<'model> CpuLogpFunc for StanDensity<'model> {
             .context("Failed to constrain the parameters of the draw")
             .map_err(|e| nuts_rs::CpuMathError::ExpandError(format!("{}", e)))?;
 
-        let mut vars = Vec::new();
-
-        for var in self.model.variables.iter() {
-            let mut out = Vec::with_capacity(var.num_elements);
-            let start = var.start_idx.expect("Variable start index not set");
-            let end = var.end_idx.expect("Variable end index not set");
-            let slice = &self.expanded_buffer[start..end];
-            assert!(slice.len() == var.num_elements);
-
-            if var.num_elements == 0 {
-                vars.push(Some(Value::F64(out)));
-                continue;
-            }
-
-            // The slice is in fortran order. This doesn't matter if it low dim
-            if var.shape.as_slice().len() < 2 {
-                out.extend_from_slice(slice);
-                vars.push(Some(Value::F64(out)));
-                continue;
-            }
-
-            // We need to transpose
-            fortran_to_c_order(slice, var.shape.as_slice(), &mut out);
-            vars.push(Some(Value::F64(out)));
+        let mut values = Vec::with_capacity(self.model.variables.len());
+        for param in self.model.parameters.iter() {
+            param.unpack(&self.expanded_buffer, &mut values);
         }
+        assert!(values.len() == self.model.variables.len());
+        let vars = values
+            .into_iter()
+            .map(|values| Some(Value::F64(values)))
+            .collect();
 
         Ok(ExpandedVector(vars))
     }
@@ -549,7 +733,30 @@ impl<'model> CpuLogpFunc for StanDensity<'model> {
         untransformed_gradient: &mut [f64],
         transformed_position: &[f64],
         transformed_gradient: &mut [f64],
+        clip: Option<f64>,
     ) -> std::result::Result<(f64, f64), Self::LogpError> {
+        // Native path: no Python at all. `native_flow` is moved out for the
+        // call so the logp closure can borrow `self`.
+        let adapter = self
+            .transform_adapter
+            .clone()
+            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?;
+        let mut native = std::mem::take(&mut self.native_flow);
+        let result = native.init_from_transformed_position(
+            &adapter,
+            params,
+            untransformed_position,
+            untransformed_gradient,
+            transformed_position,
+            transformed_gradient,
+            clip,
+            |y, grad| self.logp(y, grad),
+        );
+        self.native_flow = native;
+        if let Some(out) = result? {
+            return Ok(out);
+        }
+
         let adapter = self
             .transform_adapter
             .as_mut()
@@ -564,6 +771,7 @@ impl<'model> CpuLogpFunc for StanDensity<'model> {
             .context("Failed init_from_transformed_position_part1")?;
 
         let logp = self.logp(untransformed_position, untransformed_gradient)?;
+        soft_clip(untransformed_gradient, clip);
 
         let adapter = self
             .transform_adapter
@@ -588,10 +796,12 @@ impl<'model> CpuLogpFunc for StanDensity<'model> {
         untransformed_gradient: &mut [f64],
         transformed_position: &mut [f64],
         transformed_gradient: &mut [f64],
+        clip: Option<f64>,
     ) -> std::result::Result<(f64, f64), Self::LogpError> {
         let logp = self
             .logp(untransformed_position, untransformed_gradient)
             .context("Failed to call stan logp function")?;
+        soft_clip(untransformed_gradient, clip);
 
         let logdet = self
             .transform_adapter
@@ -616,6 +826,7 @@ impl<'model> CpuLogpFunc for StanDensity<'model> {
         untransformed_logp: impl ExactSizeIterator<Item = &'a f64>,
         params: &'a mut Py<PyAny>,
     ) -> std::result::Result<(), Self::LogpError> {
+        self.native_flow.invalidate();
         self.transform_adapter
             .as_mut()
             .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?
@@ -637,6 +848,7 @@ impl<'model> CpuLogpFunc for StanDensity<'model> {
         untransformed_gradient: &[f64],
         chain: u64,
     ) -> std::result::Result<Py<PyAny>, Self::LogpError> {
+        self.native_flow.invalidate();
         let trafo = self
             .transform_adapter
             .as_mut()
@@ -754,8 +966,127 @@ impl<'model> DrawStorage for StanTrace<'model> {
 }
 */
 
+impl StanModel {
+    fn check_ad_hessian(&self) -> Result<()> {
+        if !self.ad_hessian() {
+            bail!(
+                "Automatic hessian sparsity detection requires hessian information.
+                 Compile with `nutpie.compile_stan_model(..., ad_hessian=True)`."
+            );
+        }
+        Ok(())
+    }
+
+    /// Generate `num_points` initial points with finite log density.
+    fn hessian_points<R: Rng + ?Sized>(
+        &self,
+        py: Python<'_>,
+        rng: &mut R,
+        num_points: usize,
+        max_tries: usize,
+    ) -> Result<Vec<Vec<f64>>> {
+        let n = self.inner.param_unc_num();
+        let mut points = Vec::with_capacity(num_points);
+        let mut last_error = None;
+        for _ in 0..num_points.saturating_mul(max_tries) {
+            if points.len() == num_points {
+                break;
+            }
+            py.check_signals()?;
+            let mut position = vec![0f64; n];
+            match self.init_position(rng, points.len() as u64, &mut position) {
+                Ok(()) => {}
+                Err(InitPositionError::Retry(err)) => {
+                    last_error = Some(err);
+                    continue;
+                }
+                Err(InitPositionError::Fatal(err)) => {
+                    return Err(err.context("Could not generate a point to evaluate the Hessian"));
+                }
+            }
+            let inner = &self.inner;
+            match py.detach(|| inner.log_density(&position, true, true)) {
+                Ok(logp) if logp.is_finite() => points.push(position),
+                Ok(logp) => last_error = Some(anyhow!("Log density is {logp}")),
+                Err(err) => last_error = Some(err.into()),
+            }
+        }
+        if points.len() < num_points {
+            let err = last_error.unwrap_or_else(|| anyhow!("No points were tried"));
+            return Err(err.context(format!(
+                "Found only {} of {num_points} points with finite log density \
+                 to evaluate the Hessian",
+                points.len()
+            )));
+        }
+        Ok(points)
+    }
+
+    fn check_unc_len<'a>(&self, values: &'a [f64]) -> Result<&'a [f64]> {
+        if values.len() != self.inner.param_unc_num() {
+            bail!(
+                "Array has length {} (expected {})",
+                values.len(),
+                self.inner.param_unc_num()
+            );
+        }
+        Ok(values)
+    }
+}
+
+/// How often the Hessian sparsity detection checks for a KeyboardInterrupt.
+const SIGNAL_CHECK_INTERVAL: Duration = Duration::from_millis(100);
+
+struct StanHessian<'a> {
+    inner: &'a InnerModel,
+}
+
+/// Lets Python handle signals at most every `SIGNAL_CHECK_INTERVAL`, since
+/// the detection runs without the GIL. A KeyboardInterrupt is returned as
+/// the plain `PyErr`, so that pyo3 raises it unchanged.
+struct SignalCheck {
+    last: Mutex<Instant>,
+}
+
+impl SignalCheck {
+    fn new() -> Self {
+        Self {
+            last: Mutex::new(Instant::now()),
+        }
+    }
+
+    /// Called from all detection threads; whichever finds the interval
+    /// elapsed checks, the others skip.
+    fn check(&self) -> Result<()> {
+        {
+            let Ok(mut last) = self.last.try_lock() else {
+                return Ok(());
+            };
+            if last.elapsed() < SIGNAL_CHECK_INTERVAL {
+                return Ok(());
+            }
+            *last = Instant::now();
+        }
+        Python::attach(|py| py.check_signals())?;
+        Ok(())
+    }
+}
+
+impl HessianVectorProduct for StanHessian<'_> {
+    fn dim(&self) -> usize {
+        self.inner.param_unc_num()
+    }
+
+    fn hvp(&self, point: &[f64], vector: &[f64], out: &mut [f64]) -> Result<()> {
+        self.inner
+            .log_density_hessian_vector_product(point, vector, true, true, out)
+            .context("Failed to compute Hessian-vector product")?;
+        Ok(())
+    }
+}
+
 impl Model for StanModel {
-    type Math<'model> = CpuMath<StanDensity<'model>>;
+    type Math = CpuMath<StanDensity>;
 
     /*
     fn new_trace<'a, S: Settings, R: rand::Rng + ?Sized>(
@@ -784,22 +1115,48 @@ impl Model for StanModel {
     }
     */
 
-    fn math<R: Rng + ?Sized>(&self, rng: &mut R) -> anyhow::Result<Self::Math<'_>> {
-        let rng = self.inner.new_rng(rng.next_u32())?;
+    fn math<R: Rng + ?Sized>(self: Arc<StanModel>, rng: &mut R) -> anyhow::Result<Self::Math> {
+        let rng = bridgestan::Rng::new(self.inner.clone_library_ref(), rng.next_u32())?;
         let num_expanded = self.inner.param_num(true, true);
         Ok(CpuMath::new(StanDensity {
-            model: &self,
+            model: self.clone(),
             rng,
             transform_adapter: self.transform_adapter.clone(),
             expanded_buffer: vec![0f64; num_expanded],
+            native_flow: NativeFlow::default(),
         }))
     }
 
     fn init_position<R: rand::Rng + ?Sized>(
         &self,
         rng: &mut R,
+        chain_id: u64,
         position: &mut [f64],
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), InitPositionError> {
+        if let Some(init_func) = self.init_point_func.as_ref() {
+            let seed = rng.next_u64();
+            let stan_seed = rng.next_u32();
+            // The init function returns either an unconstrained array or
+            // constrained values as a Stan JSON string.
+            return Python::attach(|py| {
+                let init_point = init_func
+                    .call1(py, (seed, chain_id))
+                    .context("Failed to initialize point")?;
+                let init_point = init_point.bind(py);
+                let Ok(json) = init_point.extract::<String>() else {
+                    return Ok(copy_init_point(init_point, position)?);
+                };
+                let json = CString::new(json).context("Invalid initial point json")?;
+                // Parameters missing from the json are drawn uniformly from
+                // [-2, 2] on the unconstrained space. Stan checks that the
+                // log density is finite, and the sampler retries if it isn't.
+                let mut stan_rng = bridgestan::Rng::new(self.inner.clone_library_ref(), stan_seed)
+                    .context("Could not create stan rng")?;
+                self.inner
+                    .param_initialize(&mut stan_rng, &json, 2.0, 1, true, position)
+                    .map_err(|err| InitPositionError::Retry(err.into()))
+            });
+        }
         let dist = StandardNormal;
         dist.sample_iter(rng)
             .zip(position.iter_mut())
@@ -870,17 +1227,63 @@ mod tests {
         assert!(expect.iter().zip_eq(out.iter()).all(|(a, b)| a == b));
     }
 
+    fn parse(
+        vars: &str,
+        dims: &mut HashMap<String, Vec<String>>,
+        dim_sizes: &mut HashMap<String, u64>,
+    ) -> anyhow::Result<Vec<crate::common::PyVariable>> {
+        super::trace_variables(&super::params(vars)?, dims, dim_sizes)
+    }
+
+    #[test]
+    fn unpack_complex() {
+        let mut dims = HashMap::new();
+        let mut dim_sizes = HashMap::new();
+
+        // A real scalar, a complex vector of length 2 and a complex
+        // matrix of shape (2, 2).
+        let vars = "a,\
+            z.1.real,z.1.imag,z.2.real,z.2.imag,\
+            m.1.1.real,m.1.1.imag,m.2.1.real,m.2.1.imag,\
+            m.1.2.real,m.1.2.imag,m.2.2.real,m.2.2.imag";
+        let parameters = super::params(vars).unwrap();
+        let variables = super::trace_variables(&parameters, &mut dims, &mut dim_sizes).unwrap();
+        let names: Vec<_> = variables.iter().map(|var| var.name.as_str()).collect();
+        assert_eq!(names, ["a", "z.real", "z.imag", "m.real", "m.imag"]);
+
+        // Values as stan returns them: interleaved and in fortran order
+        let flat = [
+            0., //
+            1., 10., 2., 20., //
+            11., -11., 21., -21., 12., -12., 22., -22.,
+        ];
+        let mut out = vec![];
+        for param in parameters.iter() {
+            param.unpack(&flat, &mut out);
+        }
+        assert_eq!(
+            out,
+            vec![
+                vec![0.],
+                vec![1., 2.],
+                vec![10., 20.],
+                vec![11., 12., 21., 22.],
+                vec![-11., -12., -21., -22.],
+            ]
+        );
+    }
+
     #[test]
     fn parse_vars() {
         let mut dims = HashMap::new();
         let mut dim_sizes = HashMap::new();
 
         let vars = "";
-        let parsed = super::params(vars, &mut dims, &mut dim_sizes).unwrap();
+        let parsed = parse(vars, &mut dims, &mut dim_sizes).unwrap();
         assert!(parsed.len() == 0);
 
         let vars = "x.1.1,x.2.1,x.3.1,x.1.2,x.2.2,x.3.2";
-        let parsed = super::params(vars, &mut dims, &mut dim_sizes).unwrap();
+        let parsed = parse(vars, &mut dims, &mut dim_sizes).unwrap();
         assert!(parsed.len() == 1);
         let parsed = parsed[0].clone();
         assert!(parsed.name == "x");
@@ -888,14 +1291,23 @@ mod tests {
 
         // Incorrect order
         let vars = "x.1.2,x.1.1,x.2.1,x.2.2,x.3.1,x.3.2";
-        assert!(super::params(vars, &mut dims, &mut dim_sizes).is_err());
+        assert!(parse(vars, &mut dims, &mut dim_sizes).is_err());
 
         // Incorrect order
         let vars = "x.1.2.real,x.1.2.imag";
-        assert!(super::params(vars, &mut dims, &mut dim_sizes).is_err());
+        assert!(parse(vars, &mut dims, &mut dim_sizes).is_err());
 
         let vars = "x.1.1.real,x.1.1.imag,x.2.1.real,x.2.1.imag,x.3.1.real,x.3.1.imag";
-        let parsed = super::params(vars, &mut dims, &mut dim_sizes).unwrap();
+        let parameters = super::params(vars).unwrap();
+        assert_eq!(parameters.len(), 1);
+        let param = &parameters[0];
+        assert_eq!(param.name, "x");
+        assert!(param.is_complex);
+        assert_eq!(param.shape, vec![3, 1]);
+        assert_eq!(param.size, 3);
+        assert_eq!((param.start_idx, param.end_idx), (0, 6));
+
+        let parsed = parse(vars, &mut dims, &mut dim_sizes).unwrap();
         assert!(parsed.len() == 2);
         let var = parsed[0].clone();
         assert!(var.name == "x.real");
@@ -907,7 +1319,7 @@ mod tests {
 
         // Test single variable
         let vars = "alpha";
-        let parsed = super::params(vars, &mut dims, &mut dim_sizes).unwrap();
+        let parsed = parse(vars, &mut dims, &mut dim_sizes).unwrap();
         assert_eq!(parsed.len(), 1);
         let var = &parsed[0];
         assert_eq!(var.name, "alpha");
@@ -916,7 +1328,7 @@ mod tests {
 
         // Test multiple scalar variables
         let vars = "alpha,beta,gamma";
-        let parsed = super::params(vars, &mut dims, &mut dim_sizes).unwrap();
+        let parsed = parse(vars, &mut dims, &mut dim_sizes).unwrap();
         assert_eq!(parsed.len(), 3);
         assert_eq!(parsed[0].name, "alpha");
         assert_eq!(parsed[1].name, "beta");
@@ -924,7 +1336,7 @@ mod tests {
 
         // Test 1D array
         let vars = "theta.1,theta.2,theta.3,theta.4";
-        let parsed = super::params(vars, &mut dims, &mut dim_sizes).unwrap();
+        let parsed = parse(vars, &mut dims, &mut dim_sizes).unwrap();
         assert_eq!(parsed.len(), 1);
         let var = &parsed[0];
         assert_eq!(var.name, "theta");
@@ -933,7 +1345,7 @@ mod tests {
 
         // Test variable name with colons and dots
         let vars = "x:1:2.4:1.1,x:1:2.4:1.2,x:1:2.4:1.3";
-        let parsed = super::params(vars, &mut dims, &mut dim_sizes).unwrap();
+        let parsed = parse(vars, &mut dims, &mut dim_sizes).unwrap();
         assert_eq!(parsed.len(), 1);
         let var = &parsed[0];
         assert_eq!(var.name, "x:1:2.4:1");
@@ -1143,7 +1555,7 @@ mod tests {
             ultimate.2.3:2.3.5,
             ultimate.2.3:2.4.5
         ";
-        let parsed = super::params(vars, &mut dims, &mut dim_sizes).unwrap();
+        let parsed = parse(vars, &mut dims, &mut dim_sizes).unwrap();
         assert_eq!(parsed[0].name, "a");
         assert_eq!(parsed[0].shape.as_slice(), vec![0; 0]);
 
