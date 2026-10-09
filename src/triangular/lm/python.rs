@@ -100,6 +100,13 @@ impl PyFisherResiduals {
         PyArray1::from_vec(py, self.inner.unit_weight_mask())
     }
 
+    /// Per parameter, whether it belongs to the hidden units (`W1`, `b1` or
+    /// `W2`); `LmOptimizer`'s ``frozen`` to fit only the linear part.
+    #[getter]
+    fn unit_param_mask<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<bool>> {
+        PyArray1::from_vec(py, self.inner.unit_param_mask())
+    }
+
     /// Start of each variable's parameter slice, plus the total.
     #[getter]
     fn param_offsets<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<i64>> {
