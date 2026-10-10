@@ -8,7 +8,6 @@ from functools import wraps
 from importlib.util import find_spec
 from math import prod
 from typing import TYPE_CHECKING, Any, Literal, Union, cast
-from uuid import uuid4
 
 import numpy as np
 import pandas as pd
@@ -33,6 +32,9 @@ if TYPE_CHECKING:
 
 
 _UNCONSTRAINED_PARAMETER = "unconstrained_parameter"
+
+# Bump when native callback or shared-data extraction semantics change.
+_NUMBA_CFUNC_CACHE_VERSION = 1
 
 
 def _rv_dict_to_flat_array_wrapper(
@@ -310,7 +312,7 @@ def _compile_pymc_model_numba(
     for val in [*logp_fn_pt.get_shared(), *expand_fn_pt.get_shared()]:
         if val in seen:
             continue
-        key = uuid4().hex
+        key = str(len(shared_data))
         shared_data[key] = np.array(val.get_value(), order="C", copy=True)
         shared_var_keys[val] = key
         seen.add(val)
@@ -331,7 +333,13 @@ def _compile_pymc_model_numba(
             category=numba.NumbaWarning,  # type: ignore
         )
 
-        logp_numba = numba.cfunc(c_sig, **kwargs)(logp_numba_raw)
+        logp_numba = _compile_numba_cfunc(
+            logp_numba_raw,
+            c_sig,
+            logp_fn,
+            (n_dim, user_data.dtype, tuple(logp_shared_keys)),
+            **kwargs,
+        )
 
     expand_shared_keys = [shared_var_keys[var] for var in expand_fn_pt.get_shared()]
     expand_numba_raw, c_sig_expand = _make_c_expand_func(
@@ -344,7 +352,13 @@ def _compile_pymc_model_numba(
             category=numba.NumbaWarning,  # type: ignore
         )
 
-        expand_numba = numba.cfunc(c_sig_expand, **kwargs)(expand_numba_raw)
+        expand_numba = _compile_numba_cfunc(
+            expand_numba_raw,
+            c_sig_expand,
+            expand_fn,
+            (n_dim, n_expanded, user_data.dtype, tuple(expand_shared_keys)),
+            **kwargs,
+        )
 
     dims, coords = _prepare_dims_and_coords(model, shape_info, reparameterized_names)
 
@@ -561,6 +575,11 @@ def compile_pymc_model(
     freeze_model : bool | None
         Freeze all dimensions and shared variables to treat them as compile time
         constants.
+    **kwargs
+        Additional Numba callback compilation options. With recent PyTensor
+        versions, callback caching follows ``pytensor.config.numba__cache``
+        by default; pass ``cache=False`` to disable it. Shared data remains
+        runtime input and can be updated with ``with_data``.
 
     Returns
     -------
@@ -867,6 +886,41 @@ def _make_functions(
     )
 
 
+def _compile_numba_cfunc(fn, signature, graph_fn, abi_key, **kwargs):
+    import numba
+
+    try:
+        from pytensor import config
+        from pytensor.link.numba.cache import (
+            CACHED_SRC_FUNCTIONS,
+            compile_numba_function_src,
+            hash_from_pickle_dump,
+        )
+        from pytensor.link.numba.dispatch.basic import numba_njit
+    except ImportError:
+        return numba.cfunc(signature, **kwargs)(fn)
+
+    cache = kwargs.pop("cache", config.numba__cache)
+    graph_key = CACHED_SRC_FUNCTIONS.get(graph_fn.py_func)
+    if not cache or not config.numba__cache or graph_key is None:
+        return numba.cfunc(signature, cache=cache, **kwargs)(fn)
+
+    cache_key = hash_from_pickle_dump(
+        (_NUMBA_CFUNC_CACHE_VERSION, fn.__name__, graph_key, signature, abi_key, kwargs)
+    )
+    # Same strategy as PyTensor's numba_funcify_ensure_cache: keep the callable
+    # in globals so its fresh dispatcher UUID isn't hashed as a closure value.
+    callback = numba_njit(fn, **({"fastmath": False} | kwargs))
+    arguments = ", ".join(f"arg{i}" for i in range(len(signature.args)))
+    generated = compile_numba_function_src(
+        f"def {fn.__name__}({arguments}): return callback({arguments})",
+        fn.__name__,
+        global_env={"callback": callback, "__name__": __name__},
+        cache_key=cache_key,
+    )
+    return numba.cfunc(signature, cache=True, **kwargs)(generated)
+
+
 def make_extraction_fn(inner, shared_data, shared_var_keys, record_dtype):
     import numba
     from numba import literal_unroll
@@ -884,14 +938,21 @@ def make_extraction_fn(inner, shared_data, shared_var_keys, record_dtype):
         [
             key,
             len(shared_data[key].shape),
-            shared_data[key].shape,
+            (0,) * shared_data[key].ndim,
             np.dtype(shared_data[key].dtype),
         ]
         for key in shared_var_keys
     )
 
     indices = tuple(range(len(shared_var_keys)))
-    shared_tuple = tuple(shared_data[key] for key in shared_var_keys)
+    # Only the types seed the tuple; every entry is replaced from user_data.
+    # Capturing the real arrays can prevent caching when observations are large.
+    shared_tuple = tuple(
+        np.empty((0,) * shared_data[key].ndim, dtype=shared_data[key].dtype)
+        for key in shared_var_keys
+    )
+    for value in shared_tuple:
+        value.flags.writeable = False
 
     @intrinsic
     def tuple_setitem_literal(typingctx, tup, idx, val):
