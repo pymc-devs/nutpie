@@ -92,6 +92,69 @@ use sweeps::{TileScratch, VariableScratch};
 pub(crate) use tiles::Linearization;
 use tiles::{Data, Tiled};
 
+/// Which of the optimizer's ridge strengths a parameter carries, see
+/// [`FisherResiduals::ridge_classes`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RidgeClass {
+    None,
+    /// The location skip `s`.
+    Skip,
+    /// `W1`, or `W2` into a field that is neither the location nor a shape
+    /// field.
+    Mlp,
+    /// `W2` into the location.
+    MlpLoc,
+    /// `b2` of a shape field.
+    Shape,
+    /// `W2` into a shape field.
+    MlpShape,
+}
+
+/// The ridge strengths of the optimizer's objective, per [`RidgeClass`]:
+/// `mlp` on the units' weights, `skip` on the location skip, and `shape` on
+/// what feeds the shape fields directly, `b2` and the units' `W2`.
+///
+/// What moves the location is weighed against the conditional's width: a
+/// shift `Delta` of the location moves `x_i` by `delta_i Delta`, so the skip
+/// and the units' `W2` into the location carry a factor `E[delta_i^2]`, the
+/// variable's [`FisherResiduals::loc_scales`]. For a Gaussian conditional
+/// that makes the skip's ridge one on the precision's Cholesky factor,
+/// `s / sigma_i`.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct RidgeStrengths {
+    pub(crate) mlp: f64,
+    pub(crate) skip: f64,
+    pub(crate) shape: f64,
+}
+
+impl RidgeStrengths {
+    pub(crate) fn check(&self) -> Result<()> {
+        for (name, value) in [
+            ("mlp_ridge", self.mlp),
+            ("skip_ridge", self.skip),
+            ("shape_ridge", self.shape),
+        ] {
+            if !(value.is_finite() && value >= 0.0) {
+                bail!("{name} must be finite and non-negative, got {value}");
+            }
+        }
+        Ok(())
+    }
+
+    /// The strength on a parameter of class `class` of a variable with loc
+    /// scale `loc_scale`.
+    pub(crate) fn of(&self, class: RidgeClass, loc_scale: f64) -> f64 {
+        match class {
+            RidgeClass::None => 0.0,
+            RidgeClass::Skip => self.skip * loc_scale,
+            RidgeClass::Mlp => self.mlp,
+            RidgeClass::MlpLoc => self.mlp * loc_scale,
+            RidgeClass::Shape => self.shape,
+            RidgeClass::MlpShape => self.mlp + self.shape,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct FisherResiduals {
     level: Level,
@@ -158,6 +221,46 @@ impl FisherResiduals {
     /// part of each conditioner, its biases `b2` and the skip.
     pub(crate) fn unit_param_mask(&self) -> Vec<bool> {
         self.unit_mask(true)
+    }
+
+    /// Per parameter, which of the optimizer's ridge strengths it carries.
+    pub(crate) fn ridge_classes(&self) -> Vec<RidgeClass> {
+        let shape_param = self.conditioner.shape_param_mask();
+        let loc = self.conditioner.location;
+        let mut classes = vec![RidgeClass::None; self.n_params()];
+        for i in 0..self.n_var() {
+            let (start, shape) = (self.params(i).start, self.shape(i));
+            for u in 0..shape.n_unit {
+                for k in shape.w1(u) {
+                    classes[start + k] = RidgeClass::Mlp;
+                }
+                for (m, k) in shape.w2(u).enumerate() {
+                    classes[start + k] = if m == loc {
+                        RidgeClass::MlpLoc
+                    } else if shape_param[m] {
+                        RidgeClass::MlpShape
+                    } else {
+                        RidgeClass::Mlp
+                    };
+                }
+            }
+            for (m, k) in shape.b2().enumerate() {
+                if shape_param[m] {
+                    classes[start + k] = RidgeClass::Shape;
+                }
+            }
+            for k in shape.skip() {
+                classes[start + k] = RidgeClass::Skip;
+            }
+        }
+        classes
+    }
+
+    /// Per variable, `E[delta_i^2]` over the draws at `lin`: the squared
+    /// inverse width of its conditional, which scales the ridge on what moves
+    /// its location (see [`RidgeStrengths`]).
+    pub(crate) fn loc_scales(&self, lin: &Linearization) -> Vec<f64> {
+        lin.delta.mean_squares()
     }
 
     fn unit_mask(&self, with_bias: bool) -> Vec<bool> {

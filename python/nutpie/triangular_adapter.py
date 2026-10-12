@@ -136,6 +136,8 @@ def _run_lm(
     val_problem=None,
     early_stopping=True,
     mlp_ridge=0.0,
+    skip_ridge=0.0,
+    shape_ridge=0.0,
     freeze_units=False,
 ):
     """The Rust LM fit of `problem` (a `FisherResiduals` with data) from
@@ -165,6 +167,8 @@ def _run_lm(
         lmp_size=lmp_size,
         lmp_tol=lmp_tol,
         mlp_ridge=mlp_ridge,
+        skip_ridge=skip_ridge,
+        shape_ridge=shape_ridge,
         frozen=problem.unit_param_mask if freeze_units else None,
         val_problem=val_problem,
         early_stopping=early_stopping,
@@ -175,8 +179,10 @@ def _run_lm(
     # Evaluated afresh: early stopping may have returned an earlier `theta`
     # than the last step's.
     r = problem.residuals(theta, linearize=False)
-    unit_weights = theta[problem.unit_weight_mask]
-    ridge = mlp_ridge / problem.n_draw * float(unit_weights @ unit_weights)
+    strengths = problem.ridge_strengths(
+        theta, mlp_ridge=mlp_ridge, skip_ridge=skip_ridge, shape_ridge=shape_ridge
+    )
+    ridge = float(strengths @ theta**2) / problem.n_draw
     train = float(r @ r)
     losses = {
         "objective": train + ridge,
@@ -251,6 +257,8 @@ class TriangularFlowAdapter:
         lm_linear_steps,
         lm_min_loss,
         lm_mlp_ridge,
+        lm_skip_ridge,
+        lm_shape_ridge,
         lm_patience,
         lm_forcing,
         lm_max_exact_block_size,
@@ -305,6 +313,8 @@ class TriangularFlowAdapter:
             "lmp_size": lm_lmp_size,
             "lmp_tol": lm_lmp_tol,
             "mlp_ridge": lm_mlp_ridge,
+            "skip_ridge": lm_skip_ridge,
+            "shape_ridge": lm_shape_ridge,
         }
         # The Rust LM fit needs a multiple of its SIMD width of draws.
         self._draw_multiple = FisherResiduals.simd_width()
