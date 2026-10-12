@@ -123,16 +123,10 @@ impl TriangularFlow {
     }
 
     /// The LM residuals of the draws, see [`FisherResiduals`].
-    fn problem(
-        &self,
-        positions: &[f64],
-        gradients: &[f64],
-        fisher_regularization: Option<f64>,
-    ) -> Result<FisherResiduals> {
+    fn problem(&self, positions: &[f64], gradients: &[f64]) -> Result<FisherResiduals> {
         let mut problem = FisherResiduals::new(
             self.structure.graph.clone(),
             self.structure.conditioner.clone(),
-            fisher_regularization,
         )?;
         let (y, g) = self.undo_affine(positions, gradients)?;
         problem.set_data(y, g)?;
@@ -141,9 +135,7 @@ impl TriangularFlow {
 
     /// The mean Fisher divergence of the draws.
     fn fisher_divergence(&self, positions: &[f64], gradients: &[f64]) -> Result<f64> {
-        let (r, _) = self
-            .problem(positions, gradients, None)?
-            .residuals(&self.theta)?;
+        let (r, _) = self.problem(positions, gradients)?.residuals(&self.theta)?;
         Ok(r.iter().map(|r| r * r).sum())
     }
 
@@ -162,7 +154,7 @@ impl TriangularFlow {
         let positions = position.repeat(width);
         let gradients = gradient.repeat(width);
         let (_, lin) = self
-            .problem(&positions, &gradients, None)?
+            .problem(&positions, &gradients)?
             .residuals(&self.theta)?;
         let (x, w, delta) = (lin.x.to_rows(), lin.w.to_rows(), lin.delta.to_rows());
 
@@ -322,7 +314,7 @@ impl PyTriangularFlow {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(Self {
             inner: TriangularFlow::new(
-                FisherResiduals::new(graph, conditioner, None)?,
+                FisherResiduals::new(graph, conditioner)?,
                 specs,
                 theta.as_slice()?.to_vec(),
                 permutation,
@@ -414,17 +406,14 @@ impl PyTriangularFlow {
 
     /// The LM residuals of the draws (`(n_draw, n_var)` each, `n_draw` a
     /// multiple of `FisherResiduals.simd_width()`), for `triangular_lm.fit`.
-    #[pyo3(signature = (positions, gradients, fisher_regularization = None))]
     fn residuals(
         &self,
         positions: PyReadonlyArray2<'_, f64>,
         gradients: PyReadonlyArray2<'_, f64>,
-        fisher_regularization: Option<f64>,
     ) -> Result<PyFisherResiduals> {
         Ok(PyFisherResiduals::from_inner(self.inner.problem(
             rows(&positions, "positions")?,
             rows(&gradients, "gradients")?,
-            fisher_regularization,
         )?))
     }
 

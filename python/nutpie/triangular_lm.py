@@ -168,7 +168,7 @@ def map_data(flow, draws, grads):
     return tmap, np.asarray(y, dtype=np.float64), np.asarray(g, dtype=np.float64)
 
 
-def make_residuals(tmap, y=None, g=None, *, fisher_regularization=None):
+def make_residuals(tmap, y=None, g=None):
     """A `FisherResiduals` for `tmap` (unwrapped), with data `y`, `g` if
     given (see `map_data`)."""
     from nutpie._lib import FisherResiduals
@@ -195,7 +195,6 @@ def make_residuals(tmap, y=None, g=None, *, fisher_regularization=None):
         n_par=n_par,
         location_index=int(tmap.conditioners[0].location_index),
         transformer=transformer_dicts(specs),
-        fisher_regularization=fisher_regularization,
         input_squash=tmap.input_squash,
         activation=_activation(tmap),
     )
@@ -235,11 +234,9 @@ def _describe_step(i, info):
 
 def fisher_divergence(problem, theta):
     """The Fisher divergence of `problem`'s draws at `theta`: the squared norm
-    of its residuals without the `fisher_regularization` ones."""
-    n_var = len(problem.param_offsets) - 1
+    of its residuals."""
     r = problem.residuals(np.asarray(theta, np.float64), linearize=False)
-    r = r.reshape(problem.n_draw, problem.n_residuals)[:, :n_var]
-    return float(np.vdot(r, r))
+    return float(r @ r)
 
 
 def fit(

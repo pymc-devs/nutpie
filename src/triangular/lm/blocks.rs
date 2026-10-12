@@ -60,13 +60,12 @@ struct SeedProducts<S: Simd> {
 /// One Jacobian row of variable `i`'s residuals in its parameters
 /// `theta_i`, by the residual: `x_i` (only to fold into the others, see
 /// [`FisherResiduals::block_rows`]), `i`'s own term of `q = J^T w - g +
-/// grad_y log_det`, the term of parent `j`'s, and edge `j`'s score.
+/// grad_y log_det`, and the term of parent `j`'s.
 #[derive(Clone, Copy)]
 enum Seed {
     X,
     Own,
     Edge(usize),
-    Score(usize),
 }
 
 /// A [`Seed`]'s cotangent on the local outputs `(x_i, delta_i, mu_i)`, and
@@ -81,24 +80,17 @@ struct SeedCotangent<S: Simd> {
 
 impl Seed {
     /// The seed of row `col` of [`FisherResiduals::block_rows`].
-    fn of_column(col: usize, n_parent: usize) -> Self {
+    fn of_column(col: usize) -> Self {
         match col {
             0 => Seed::X,
             1 => Seed::Own,
-            _ if col < 2 + n_parent => Seed::Edge(col - 2),
-            _ => Seed::Score(col - 2 - n_parent),
+            _ => Seed::Edge(col - 2),
         }
     }
 
-    /// The cotangent, given `w_i`, `x_i` and `A[i, :]`.
+    /// The cotangent, given `w_i`.
     #[inline(always)]
-    fn cotangent<S: Simd>(
-        self,
-        simd: S,
-        w_i: S::f64s,
-        x_i: S::f64s,
-        edge_a: &[S::f64s],
-    ) -> SeedCotangent<S> {
+    fn cotangent<S: Simd>(self, simd: S, w_i: S::f64s) -> SeedCotangent<S> {
         let zero = S::f64s::splat(simd, 0.0);
         let one = S::f64s::splat(simd, 1.0);
         let (x, delta, mu, edge) = match self {
@@ -107,8 +99,6 @@ impl Seed {
             Seed::Own => (zero, -w_i, -one, None),
             // q_j = -L[i,j] - A[i,j] w_i
             Seed::Edge(j) => (zero, zero, zero, Some((j, -w_i, -one))),
-            // score_j = L[i,j] - x_i A[i,j]
-            Seed::Score(j) => (-edge_a[j], zero, zero, Some((j, -x_i, one))),
         };
         SeedCotangent { x, delta, mu, edge }
     }
@@ -216,8 +206,7 @@ impl FisherResiduals {
 
     /// Variable `i`'s Jacobian rows for one tile, as columns of `b.rows`
     /// (`n_theta = |theta_i|` each): `a = dx_i/dtheta_i`, then the `n_s = 1 +
-    /// n_p` rows of `B' = B + alpha a` (see [`Self::variable_blocks`]), then
-    /// with regularization the `n_score = n_p` scores scaled by `sqrt(rho)`;
+    /// n_p` rows of `B' = B + alpha a` (see [`Self::variable_blocks`]);
     /// `n_col` in all.
     #[simd]
     fn block_rows<S: Simd>(
@@ -232,11 +221,6 @@ impl FisherResiduals {
         let shape = theta.shape;
         let n_theta = shape.size();
         let (n_p, n_s) = (shape.n_parent, shape.n_parent + 1);
-        let n_score = if self.regularization.is_some() {
-            n_p
-        } else {
-            0
-        };
         let zero = S::f64s::splat(simd, 0.0);
 
         let BlockScratch {
@@ -266,7 +250,6 @@ impl FisherResiduals {
         }
         let y_own = y.value(simd, tile, i);
         let w_i = lin.w.value(simd, tile, i);
-        let x_i = lin.x.value(simd, tile, i);
         let delta_i = lin.delta.value(simd, tile, i);
 
         self.conditioner.evaluate(simd, theta, units);
@@ -288,7 +271,7 @@ impl FisherResiduals {
         // `C = dpi/dy_parents = W2 diag(h') W1 diag(dz) + e_loc s^T`: `t_bar
         // = c_a C e_j` and `l_bar = c_l C e_j`. So all seeds together need
         // the products `C`, `H[pi, pi] C` and `W2^T pi_bar`.
-        let seed = |col| Seed::of_column(col, n_p).cotangent(simd, w_i, x_i, edge_a);
+        let seed = |col| Seed::of_column(col).cotangent(simd, w_i);
 
         pi_jac.clear();
         pi_jac.resize(n_par * n_p, zero);
@@ -326,7 +309,7 @@ impl FisherResiduals {
 
         // pi_bar = x_bar t + H_T[pi, z] (delta_bar, t_bar) + H_Lambda[pi, z]
         // (mu_bar, l_bar), with `z = (y_i, pi)`
-        let n_col = 1 + n_s + n_score;
+        let n_col = 1 + n_s;
         pi_bar.clear();
         pi_bar.resize(n_col * n_par, zero);
         for (col, pi) in pi_bar.chunks_exact_mut(n_par).enumerate() {
@@ -415,16 +398,12 @@ impl FisherResiduals {
                 &mut rest[(1 + j) * n_theta..(2 + j) * n_theta],
             );
         }
-        let reg = self.regularization.unwrap_or(0.0);
-        for value in &mut rest[n_s * n_theta..] {
-            *value *= reg;
-        }
     }
 
     /// Variable `i`'s exact blocks (see `notes/lm_exact_blocks_identity.md`):
     ///
     /// ```text
-    /// G = sum_draws B'^T K B' / n_draw   (+ the scores' Gram)
+    /// G = sum_draws B'^T K B' / n_draw
     /// ```
     ///
     /// where `B = dq/dtheta_i` for the local cotangent `q` on `S_i = {i} +
@@ -447,11 +426,6 @@ impl FisherResiduals {
         let n_p = shape.n_parent;
         let n_s = n_p + 1;
         let theta = self.params_of(&lin.theta, i);
-        let n_score = if self.regularization.is_some() {
-            n_p
-        } else {
-            0
-        };
 
         let mut blocks: Vec<GnBlock> = (0..n_theta)
             .step_by(max_block_size)
@@ -477,10 +451,10 @@ impl FisherResiduals {
         let mut k_mat = Mat::<f64>::zeros(n_s, n_s);
 
         // `G += P Q^T` over batches of draws, with the columns of `P`
-        // (`p_mat`) each draw's `B'` and scaled score rows, and those of `Q`
-        // (`q_mat`) the matching `K B'` and score rows: one matrix product per
-        // batch and sub-block, instead of streaming every block once per row.
-        let per_draw = n_s + n_score;
+        // (`p_mat`) each draw's `B'`, and those of `Q` (`q_mat`) the matching
+        // `K B'`: one matrix product per batch and sub-block, instead of
+        // streaming every block once per row.
+        let per_draw = n_s;
         let batch = BLOCK_DRAW_BATCH.min(lin.data.n_draw);
         let mut p_mat = Mat::<f64>::zeros(n_theta, batch * per_draw);
         let mut q_mat = Mat::<f64>::zeros(n_theta, batch * per_draw);
@@ -492,7 +466,7 @@ impl FisherResiduals {
             for lane in 0..self.width {
                 let draw = tile * self.width + lane;
 
-                // `B'` and the scores of this draw, skipping `a`.
+                // `B'` of this draw, skipping `a`.
                 let first = in_batch * per_draw;
                 for c in 0..per_draw {
                     let rows = &b.rows[(1 + c) * n_theta..(2 + c) * n_theta];
@@ -515,10 +489,6 @@ impl FisherResiduals {
                     1.0,
                     Par::Seq,
                 );
-                q_mat
-                    .as_mut()
-                    .subcols_mut(first + n_s, n_score)
-                    .copy_from(p_mat.as_ref().subcols(first + n_s, n_score));
                 in_batch += 1;
 
                 if in_batch == batch || draw + 1 == lin.data.n_draw {

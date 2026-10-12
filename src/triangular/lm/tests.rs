@@ -36,24 +36,15 @@ fn param(index: usize, offset: f64) -> Option<Param> {
 
 /// `Contract2` (bounded), `TangentSAS` and `PositiveAffine`, eleven
 /// parameters, the location in `Contract2`'s `mu`.
-fn problem(
-    regularization: Option<f64>,
-    squash: Option<f64>,
-    activation: Activation,
-) -> FisherResiduals {
-    problem_squashed(regularization, squash, activation, N_DRAW)
+fn problem(squash: Option<f64>, activation: Activation) -> FisherResiduals {
+    problem_squashed(squash, activation, N_DRAW)
 }
 
-pub(super) fn problem_with(regularization: Option<f64>, n_draw: usize) -> FisherResiduals {
-    problem_squashed(regularization, None, Activation::Softplus, n_draw)
+pub(super) fn problem_with(n_draw: usize) -> FisherResiduals {
+    problem_squashed(None, Activation::Softplus, n_draw)
 }
 
-fn problem_squashed(
-    regularization: Option<f64>,
-    squash: Option<f64>,
-    activation: Activation,
-    n_draw: usize,
-) -> FisherResiduals {
+fn problem_squashed(squash: Option<f64>, activation: Activation, n_draw: usize) -> FisherResiduals {
     let specs = vec![
         LayerSpec::Contract2(Contract2Spec {
             alpha: param(0, 0.1),
@@ -75,7 +66,7 @@ fn problem_squashed(
         }),
     ];
     let conditioner = Conditioner::new(3, 11, 3, specs, squash, activation).unwrap();
-    let mut problem = FisherResiduals::new(graph(), conditioner, regularization).unwrap();
+    let mut problem = FisherResiduals::new(graph(), conditioner).unwrap();
     let mut rng = ChaCha8Rng::seed_from_u64(0);
     let n_var = problem.n_var();
     let y = normal(&mut rng, n_draw * n_var, 1.0);
@@ -99,21 +90,19 @@ fn assert_close(actual: &[f64], expected: &[f64], tol: f64) {
     }
 }
 
-/// `(fisher_regularization, input_squash, activation)`; the data are
-/// standard normal, so a squash at 0.7 is well away from the identity.
-const CASES: [(Option<f64>, Option<f64>, Activation); 6] = [
-    (None, None, Activation::Softplus),
-    (Some(0.3), None, Activation::Softplus),
-    (None, Some(0.7), Activation::Softplus),
-    (Some(0.3), Some(0.7), Activation::Softplus),
-    (None, None, Activation::GeluTanh),
-    (Some(0.3), Some(0.7), Activation::GeluTanh),
+/// `(input_squash, activation)`; the data are standard normal, so a squash
+/// at 0.7 is well away from the identity.
+const CASES: [(Option<f64>, Activation); 4] = [
+    (None, Activation::Softplus),
+    (Some(0.7), Activation::Softplus),
+    (None, Activation::GeluTanh),
+    (Some(0.7), Activation::GeluTanh),
 ];
 
 #[test]
 fn pushforward_matches_finite_differences() {
-    for (rho, squash, activation) in CASES {
-        let problem = problem(rho, squash, activation);
+    for (squash, activation) in CASES {
+        let problem = problem(squash, activation);
         let mut rng = ChaCha8Rng::seed_from_u64(1);
         let theta = normal(&mut rng, problem.n_params(), 0.3);
         let v = normal(&mut rng, problem.n_params(), 1.0);
@@ -141,8 +130,8 @@ fn pushforward_matches_finite_differences() {
 
 #[test]
 fn pullback_is_the_adjoint_and_products_compose() {
-    for (rho, squash, activation) in CASES {
-        let problem = problem(rho, squash, activation);
+    for (squash, activation) in CASES {
+        let problem = problem(squash, activation);
         let mut rng = ChaCha8Rng::seed_from_u64(2);
         let theta = normal(&mut rng, problem.n_params(), 0.3);
         let v = normal(&mut rng, problem.n_params(), 1.0);
@@ -165,8 +154,8 @@ fn pullback_is_the_adjoint_and_products_compose() {
 
 #[test]
 fn blocks_match_the_dense_gram() {
-    for (rho, squash, activation) in CASES {
-        let problem = problem(rho, squash, activation);
+    for (squash, activation) in CASES {
+        let problem = problem(squash, activation);
         let mut rng = ChaCha8Rng::seed_from_u64(3);
         let theta = normal(&mut rng, problem.n_params(), 0.3);
         let (_, lin) = problem.residuals(&theta).unwrap();
@@ -201,7 +190,7 @@ fn blocks_match_the_dense_gram() {
 #[test]
 fn reductions_do_not_depend_on_the_threads() {
     // Many tiles, so that the work is split between threads.
-    let problem = problem_with(Some(0.3), 512);
+    let problem = problem_with(512);
     let mut rng = ChaCha8Rng::seed_from_u64(4);
     let theta = normal(&mut rng, problem.n_params(), 0.3);
     let v = normal(&mut rng, problem.n_params(), 1.0);

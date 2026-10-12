@@ -174,14 +174,13 @@ def _run_lm(
     accepted = [info for info in hist if info["accept"]]
     # Evaluated afresh: early stopping may have returned an earlier `theta`
     # than the last step's.
-    n_var = len(problem.param_offsets) - 1
     r = problem.residuals(theta, linearize=False)
-    r_fisher = r.reshape(problem.n_draw, problem.n_residuals)[:, :n_var]
     unit_weights = theta[problem.unit_weight_mask]
     ridge = mlp_ridge / problem.n_draw * float(unit_weights @ unit_weights)
+    train = float(r @ r)
     losses = {
-        "objective": float(r @ r) + ridge,
-        "train": float(np.vdot(r_fisher, r_fisher)),
+        "objective": train + ridge,
+        "train": train,
         "val": None if val_problem is None else fisher_divergence(val_problem, theta),
     }
     # The damping to carry over is the one after the last accepted step:
@@ -251,7 +250,6 @@ class TriangularFlowAdapter:
         solver_rtol,
         lm_linear_steps,
         lm_min_loss,
-        lm_fisher_regularization,
         lm_mlp_ridge,
         lm_patience,
         lm_forcing,
@@ -308,7 +306,6 @@ class TriangularFlowAdapter:
             "lmp_tol": lm_lmp_tol,
             "mlp_ridge": lm_mlp_ridge,
         }
-        self._lm_fisher_regularization = lm_fisher_regularization
         # The Rust LM fit needs a multiple of its SIMD width of draws.
         self._draw_multiple = FisherResiduals.simd_width()
         # Damping the previous LM fit ended with, to start the next one from,
@@ -542,9 +539,7 @@ class TriangularFlowAdapter:
                 f"{log_f}  current {_format_log_f(old_loss)}  -> refit  ({draw_counts})",
             )
 
-        problem = base.residuals(
-            *train, fisher_regularization=self._lm_fisher_regularization
-        )
+        problem = base.residuals(*train)
         val_problem = None if val is None else base.residuals(*val)
         theta, losses, lam, n_steps, n_accepted = _run_lm(
             problem,

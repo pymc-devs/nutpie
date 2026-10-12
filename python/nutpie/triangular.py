@@ -979,41 +979,26 @@ class SparseTriangularMap(bijections.AbstractBijection):
             log_det = log_det + logdet_bucket
         return x, log_det
 
-    def inverse_gradient_and_val(self, draw, grad, logp, *, parent_scores=False):
-        """``(x, grad_x, logp - log_det)``, plus the per-bucket parent scores
-        (see `parent_scores`) with `parent_scores`, at little extra cost."""
+    def inverse_gradient_and_val(self, draw, grad, logp):
+        """``(x, grad_x, logp - log_det)``."""
 
         def inverse_wrapper(y):
-            x, log_det, *aux = self.inverse_and_log_det_and_jacobian(
-                y, parent_scores=parent_scores
-            )
+            x, log_det, *aux = self.inverse_and_log_det_and_jacobian(y)
             return log_det, (x, *aux)
 
         (log_det, aux), log_det_grad = jax.value_and_grad(
             inverse_wrapper, has_aux=True
         )(draw)
-        x, bucket_jacobian_rows, jacobian_diagonal, *scores = aux
+        x, bucket_jacobian_rows, jacobian_diagonal = aux
 
         edge_values = _flatten_edge_values(bucket_jacobian_rows, self.jacobian_layout)
 
         grad_x = _solve_triangular_sparse(
             edge_values, jacobian_diagonal, self.jacobian_layout, grad - log_det_grad
         )
-        return x, grad_x, logp - log_det, *scores
+        return x, grad_x, logp - log_det
 
-    def parent_scores(self, y):
-        """Per bucket ``(bucket_size, max_parents)``: the parent scores
-        ``d/dy_j log q(y_i | y_pa)`` at fixed ``y_i``, zero on padded slots.
-
-        Their mean square over draws from ``q`` is the squared Fisher speed of
-        the conditional ``q(. | y_pa)`` along parent ``j`` (see
-        `notes/flow_fisher_regularizer.md`, option B).
-        """
-        return self.inverse_and_log_det_and_jacobian(y, parent_scores=True)[-1]
-
-    def gauss_newton_factors(
-        self, y, grad, cholesky_jitter=None, fisher_regularization=None
-    ):
+    def gauss_newton_factors(self, y, grad, cholesky_jitter=None):
         """Per-draw factors of the exact Gauss-Newton blocks of the Fisher
         residual ``r = x + w``, with ``J^T w = grad - grad_y log_det``.
 
@@ -1030,10 +1015,6 @@ class SparseTriangularMap(bijections.AbstractBijection):
         conditioned ``J`` rounding can make it numerically indefinite. With
         a `cholesky_jitter`, a failed Cholesky is retried on
         ``K + cholesky_jitter * max(diag K) I``.
-
-        With a `fisher_regularization` ``lambda``, ``V`` gets ``k`` more rows,
-        ``sqrt(lambda)`` times the Jacobian of `parent_scores`, for the
-        regularizer residuals. Each only depends on its own conditioner.
         """
         dim = self.shape[0]
 
@@ -1071,13 +1052,9 @@ class SparseTriangularMap(bijections.AbstractBijection):
                 )
                 q_own = -dl_dy - dx_dy * w_i
                 q_parents = -dl_dp - dx_dp * w_i
-                outputs = [x_i[None], q_own[None], q_parents]
-                if fisher_regularization is not None:
-                    # `parent_scores`, from the same derivatives
-                    outputs.append(dl_dp - x_i * dx_dp)
-                return jnp.concatenate(outputs)
+                return jnp.concatenate([x_i[None], q_own[None], q_parents])
 
-            # (k + 2, n_params), plus k score rows if regularized
+            # (k + 2, n_params)
             jac = jax.jacrev(local)(flat)
             n_block = real.shape[0]
             a = jac[0]
@@ -1094,11 +1071,7 @@ class SparseTriangularMap(bijections.AbstractBijection):
             c = jnp.zeros(real.shape[0], a.dtype).at[0].set(1.0 / delta_i)
             Linv_c = jax.scipy.linalg.solve_triangular(L, c, lower=True)
             s = jnp.sqrt(jnp.maximum(1.0 - Linv_c @ Linv_c, 0.0))
-            rows = [(s * a)[None], L.T @ B + jnp.outer(Linv_c, a)]
-            if fisher_regularization is not None:
-                scores = jac[n_block + 1 :] * real[1:, None]
-                rows.append(jnp.sqrt(fisher_regularization) * scores)
-            return jnp.concatenate(rows)
+            return jnp.concatenate([(s * a)[None], L.T @ B + jnp.outer(Linv_c, a)])
 
         factors = []
         for bucket, conditioner in enumerate(self.conditioners):
@@ -1125,14 +1098,9 @@ class SparseTriangularMap(bijections.AbstractBijection):
             )
         return factors
 
-    def inverse_and_log_det_and_jacobian(
-        self, y, condition=None, *, parent_scores=False
-    ):
+    def inverse_and_log_det_and_jacobian(self, y, condition=None):
         """Parallel y -> x pass returning ``x``, ``log|det J|``, and ``J`` as
-        per-bucket rows ``(bucket_size, max_parents)`` plus its diagonal.
-
-        With `parent_scores`, also returns the per-bucket parent scores (see
-        `parent_scores`), from a second pullback of the same pass."""
+        per-bucket rows ``(bucket_size, max_parents)`` plus its diagonal."""
         (dim,) = self.shape
         y_padded = jnp.concatenate([y, jnp.zeros((1,), y.dtype)])
 
@@ -1150,44 +1118,32 @@ class SparseTriangularMap(bijections.AbstractBijection):
             )
             one, zero = jnp.ones_like(x_i), jnp.zeros_like(x_i)
             parent_derivatives, own_derivative = pull((one, zero))
-            if not parent_scores:
-                return x_i, log_det_i, parent_derivatives, own_derivative
-            # d/dy_pa (log_det_i - x_i**2 / 2) at fixed y_i
-            log_det_parent_derivatives, _ = pull((zero, one))
-            scores = jnp.where(
-                parent_indices < dim,
-                log_det_parent_derivatives - x_i * parent_derivatives,
-                0.0,
-            )
-            return x_i, log_det_i, parent_derivatives, own_derivative, scores
+            return x_i, log_det_i, parent_derivatives, own_derivative
 
         x = jnp.zeros((dim,), y.dtype)
         jacobian_diagonal = jnp.zeros((dim,), y.dtype)
         log_det = jnp.zeros((), y.dtype)
         bucket_jacobian_rows = []
-        bucket_scores = []
 
         for bucket in range(len(self.conditioners)):
             members = self.bucket_members[bucket]
             parent_indices = self.bucket_parent_indices[bucket]
 
-            bucket_x, bucket_log_det, bucket_rows, bucket_diagonal, *scores = (
-                eqx.filter_vmap(differentiate_one_variable)(
-                    self.conditioners[bucket],
-                    y_padded[parent_indices],
-                    parent_indices,
-                    y[members],
-                )
+            bucket_x, bucket_log_det, bucket_rows, bucket_diagonal = eqx.filter_vmap(
+                differentiate_one_variable
+            )(
+                self.conditioners[bucket],
+                y_padded[parent_indices],
+                parent_indices,
+                y[members],
             )
 
             x = x.at[members].set(bucket_x)
             jacobian_diagonal = jacobian_diagonal.at[members].set(bucket_diagonal)
             log_det = log_det + jnp.sum(bucket_log_det)
             bucket_jacobian_rows.append(bucket_rows)
-            bucket_scores.extend(scores)
 
-        out = (x, log_det, tuple(bucket_jacobian_rows), jacobian_diagonal)
-        return (*out, tuple(bucket_scores)) if parent_scores else out
+        return x, log_det, tuple(bucket_jacobian_rows), jacobian_diagonal
 
     def transform_and_log_det(self, x, condition=None):
         """Ancestral x -> y pass: one scan per level segment."""
