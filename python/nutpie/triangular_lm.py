@@ -206,7 +206,18 @@ def make_residuals(tmap, y=None, g=None):
     return problem
 
 
-def _describe_step(i, info):
+def _describe_start(prefix, objective, train, val):
+    """The row before the first step: the losses ``fit`` starts from, with
+    `train` (the plain Fisher divergence) only if it differs from the
+    objective."""
+    return (
+        f"{prefix}{'start':>5}  log obj={np.log(objective):+.2f}  "
+        + ("" if train == objective else f"log F={np.log(train):+.2f}  ")
+        + ("" if val is None else f"val={np.log(val):+.2f}")
+    ).rstrip()
+
+
+def _describe_step(i, info, prefix="", show_eta=True):
     fallbacks = "".join(
         f"  {label}: {info[key]}"
         for key, label in [
@@ -216,13 +227,18 @@ def _describe_step(i, info):
         if info[key]
     )
     return (
-        f"{i:3d}  log F={np.log(info['F_new']):+.2f}  "
-        f"rho={info['rho']:+.2f}  "
+        f"{prefix}{i:5d}  log obj={np.log(info['F_new']):+.2f}  "
+        + (
+            f"log F={np.log(info['F_new'] - info['ridge_new']):+.2f}  "
+            if info["ridge_new"]
+            else ""
+        )
+        + f"rho={info['rho']:+.2f}  "
         # f"rho_full={info['rho_full']:+.2f}  "
         f"lam={info['lam_out']:.1e}  "
-        f"cg={info['n_cg']:3d}{' ' if info['cg_converged'] else '*'} "
-        f"eta={info['cg_eta']:.3f}"
-        f"{' ' if info['rebuilt_blocks'] else '~'}  "
+        f"cg={info['n_cg']:3d}{' ' if info['cg_converged'] else '*'}"
+        + (f" eta={info['cg_eta']:.3f}" if show_eta else "")
+        + f"{' ' if info['rebuilt_blocks'] else '~'}  "
         f"|g|={info['grad_norm']:.2e}  "
         f"|p|={info['full_step_norm']:.2e}  "
         f"a={info['step_length']:.2f}"
@@ -252,6 +268,7 @@ def fit(
     should_stop=None,
     val_problem=None,
     early_stopping=True,
+    prefix="",
     **settings,
 ):
     """Levenberg-Marquardt fit of `problem` (a `FisherResiduals` with data)
@@ -270,6 +287,9 @@ def fit(
     fraction `rtol`, the same rule as for the training loss, and returns the
     parameters of the lowest ``val_F`` instead of the last.
 
+    With `verbose`, prints a row for the start and one per step, and why the
+    fit stopped, each line beginning with `prefix`.
+
     Returns ``(theta, lam, hist)``: the fitted parameters, the final damping
     and one info dict per step (all of them, also after `early_stopping`
     went back to an earlier `theta`).
@@ -282,6 +302,11 @@ def fit(
     val_F = None if val_problem is None else fisher_divergence(val_problem, theta)
     best_val, best_theta, best_step = val_F, theta, -1
     val_ref, val_stalled = val_F, 0
+    if verbose:
+        train_F = fisher_divergence(problem, theta)
+        print(_describe_start(prefix, optimizer.loss, train_F, val_F))
+    # Under `forcing="model"`, `eta` is always `cg_tol`.
+    show_eta = settings.get("forcing", "residual") != "model"
     hist = []
     for i in range(n_steps):
         info = optimizer.step()
@@ -304,7 +329,7 @@ def fit(
             else:
                 val_stalled += 1
         if verbose:
-            print(_describe_step(i, info))
+            print(_describe_step(i, info, prefix, show_eta))
 
         if info["F_out"] < best_loss * (1.0 - (rtol or 0.0)):
             best_loss, stalled = info["F_out"], 0
@@ -315,14 +340,14 @@ def fit(
         if rtol is not None and stalled >= patience:
             if verbose:
                 print(
-                    f"loss improved by less than {rtol:g} (relative) in the last "
-                    f"{patience} steps; stopping"
+                    f"{prefix}objective improved by less than {rtol:g} (relative) "
+                    f"in the last {patience} steps; stopping"
                 )
             break
         if early_stopping and val_problem is not None and val_stalled >= patience:
             if verbose:
                 print(
-                    f"validation loss improved by less than {rtol or 0:g} "
+                    f"{prefix}validation loss improved by less than {rtol or 0:g} "
                     f"(relative) in the last {patience} steps; stopping"
                 )
             break
@@ -330,6 +355,6 @@ def fit(
     if early_stopping and val_problem is not None and best_step < len(hist) - 1:
         if verbose:
             step = "the start" if best_step < 0 else f"step {best_step}"
-            print(f"back to the best validation loss, at {step}")
+            print(f"{prefix}back to the best validation loss, at {step}")
         return best_theta, optimizer.lam, hist
     return np.asarray(optimizer.theta), optimizer.lam, hist

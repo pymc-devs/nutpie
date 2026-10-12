@@ -139,9 +139,11 @@ def _run_lm(
     skip_ridge=0.0,
     shape_ridge=0.0,
     freeze_units=False,
+    prefix="",
 ):
     """The Rust LM fit of `problem` (a `FisherResiduals` with data) from
-    `theta`, see `nutpie.triangular_lm.fit`.
+    `theta`, see `nutpie.triangular_lm.fit`, whose verbose lines begin with
+    `prefix`.
 
     `val_problem` holds the held-out draws for the validation loss and,
     with `early_stopping`, the early stopping. `freeze_units` holds the
@@ -160,6 +162,7 @@ def _run_lm(
         rtol=rtol,
         patience=patience,
         verbose=verbose,
+        prefix=prefix,
         should_stop=should_stop,
         cg_max=linear_steps,
         forcing=forcing,
@@ -447,7 +450,11 @@ class TriangularFlowAdapter:
 
     def _update_diag(self, positions, gradients, n_draws):
         keep, n_repeats = _recent_distinct(positions)
-        repeats = f", {n_repeats} repeats skipped" if n_repeats else ""
+        repeats = (
+            f", {n_repeats} repeat{'' if n_repeats == 1 else 's'} skipped"
+            if n_repeats
+            else ""
+        )
         if len(keep) < _MIN_DIAG_DRAWS:
             # Too few draws for variances: scale by the gradient instead, so
             # that a bad scale from earlier does not keep the chain stuck.
@@ -559,6 +566,7 @@ class TriangularFlowAdapter:
             freeze_units=freeze_units,
             lam0=self._lm_lam,
             verbose=self._verbose >= 2,
+            prefix=f"chain {self._chain} ",
             should_stop=self._should_stop,
             **self._lm_settings,
         )
@@ -604,6 +612,12 @@ class TriangularFlowAdapter:
 
         if no_progress:
             report("keep flow, no LM step accepted")
+            return
+
+        # Early stopping went back to where the fit started, which for a
+        # refit is the current flow.
+        if not fresh and np.array_equal(theta, base.theta):
+            report("keep flow, no step improved val")
             return
 
         if not np.isfinite(old_loss) and not np.isfinite(new_loss):

@@ -283,6 +283,53 @@ def test_rust_lm_with_limited_memory_preconditioner():
     np.testing.assert_allclose(hist[-1]["F_out"], base[-1]["F_out"], rtol=0.1)
 
 
+def test_step_line_separates_the_ridge():
+    """Each step reports the ridge's part of ``F_new``, and the step line
+    shows the plain Fisher divergence next to the objective only with a
+    ridge."""
+    from nutpie.triangular_lm import _describe_step, fit, map_data
+
+    params, static, data, _loss_fn = _flow_problem()
+    tmap, y, g = map_data(eqx.combine(params, static), data[0], data[1])
+    problem = make_residuals(tmap, y, g)
+    theta = pack_params(tmap)
+    for ridge in [0.0, 10.0]:
+        _, _, hist = fit(problem, theta, n_steps=2, mlp_ridge=ridge, skip_ridge=ridge)
+        info = hist[-1]
+        line = _describe_step(1, info)
+        assert "log obj=" in line
+        assert ("log F=" in line) == (ridge > 0)
+        assert (info["ridge_new"] > 0) == (ridge > 0)
+        assert info["ridge_new"] < info["F_new"]
+
+
+def test_verbose_lines(capsys):
+    """Every verbose line of `fit` carries the prefix, the first is the start,
+    and ``eta`` is left out where it is constant."""
+    from nutpie.triangular_lm import fit, map_data
+
+    params, static, data, _loss_fn = _flow_problem(n_draw=96)
+    flow = eqx.combine(params, static)
+    tmap, y, g = map_data(flow, data[0][:64], data[1][:64])
+    _, val_y, val_g = map_data(flow, data[0][64:], data[1][64:])
+    problem = make_residuals(tmap, y, g)
+    val_problem = make_residuals(tmap, val_y, val_g)
+    for forcing in ["residual", "model"]:
+        fit(
+            problem,
+            pack_params(tmap),
+            n_steps=3,
+            verbose=True,
+            prefix="chain 3 ",
+            val_problem=val_problem,
+            forcing=forcing,
+        )
+        lines = capsys.readouterr().out.splitlines()
+        assert lines and all(line.startswith("chain 3 ") for line in lines)
+        assert "start" in lines[0] and "val=" in lines[0]
+        assert ("eta=" in lines[1]) == (forcing != "model")
+
+
 def test_lm_rust_method_updates_the_flow():
     """`fit_to_data(method="lm-rust")` writes the fitted conditioners back:
     the returned flow's loss is the one the fit reports."""
@@ -334,11 +381,11 @@ def test_lm_rust_validation_loss():
             np.log(losses["val"][0]), loss_fn(fitted, static, *val), rtol=1e-8
         )
         np.testing.assert_allclose(
-            np.log(losses["train_fisher"][0]),
+            np.log(losses["train"][0]),
             loss_fn(fitted, static, *train),
             rtol=1e-8,
         )
-        assert losses["train_fisher"][0] < losses["train"][0]
+        assert losses["train"][0] < losses["objective"][0]
 
 
 @pytest.mark.parametrize("early_stopping", [True, False])
@@ -502,8 +549,8 @@ def test_lm_rust_ridges(kind):
     assert mask.any() and not mask.all()
     strengths = problem.ridge_strengths(theta_ridge, **{f"{kind}_ridge": 1e3})
     np.testing.assert_allclose(
-        losses["train"][0],
-        losses["train_fisher"][0] + strengths @ theta_ridge**2 / 64,
+        losses["objective"][0],
+        losses["train"][0] + strengths @ theta_ridge**2 / 64,
         rtol=1e-10,
     )
     assert penalized @ penalized < 0.1 * theta_free[mask] @ theta_free[mask]
