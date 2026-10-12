@@ -103,6 +103,8 @@ def fit_to_data(
     lm_lmp_size: int = 0,
     lm_lmp_tol: float = 1e-8,
     lm_mlp_ridge: float = 0.0,
+    lm_skip_ridge: float = 0.0,
+    lm_shape_ridge: float = 0.0,
     lm_freeze_units: bool = False,
     lm_print_blocks: bool = False,
     lm_diagnose: bool = False,
@@ -234,7 +236,26 @@ def fit_to_data(
             location skip), added to the mean Fisher divergence: a ridge of
             ``lm_mlp_ridge`` on its sum over the draws. Its minimum is the
             flow without the MLPs, so the MLPs are only used where the draws
-            support them. Only used when ``method`` is ``"lm-rust"``.
+            support them. The output weights into the location are measured
+            against the conditional's width, like the skip (see
+            ``lm_skip_ridge``). Only used when ``method`` is ``"lm-rust"``.
+        lm_skip_ridge: Ridge ``lm_skip_ridge * E[delta_i^2] ||s_i||^2 /
+            n_draws`` on each variable's linear location skip, with
+            ``delta_i = dx_i/dy_i`` averaged over the draws at the start of
+            each LM step. In the standardized coordinates the map sees, this
+            is how far the skip moves ``x_i`` for standard normal parents:
+            a shift of the location counts relative to the conditional's
+            width, and for a Gaussian conditional it is a ridge on the
+            precision's Cholesky factor. Needed where a variable has about
+            as many parents as there are draws. Only used when ``method`` is
+            ``"lm-rust"``.
+        lm_shape_ridge: Ridge ``lm_shape_ridge * ||.||^2 / n_draws`` on what
+            feeds the transformer's shape fields (``Contract2``'s ``alpha``
+            and ``beta``, all of ``TangentSAS``'s) directly: their output
+            biases and the MLPs' output weights into them, on top of
+            ``lm_mlp_ridge``. Pulls each conditional towards the affine
+            transformer it starts from. Only used when ``method`` is
+            ``"lm-rust"``.
         lm_freeze_units: Hold the conditioner MLPs' hidden units (both
             weights and the hidden biases) fixed and fit only the rest. On
             a zero-initialized flow, whose MLP outputs are zero, this fits
@@ -250,8 +271,8 @@ def fit_to_data(
             when ``method`` is ``"lm-rust"``; ``"adam"`` splits off its own
             (``val_prop``) and the others ignore it. ``losses["val"]`` is then
             its Fisher divergence and ``losses["train_fisher"]`` that of
-            ``x``, both without the ``lm_mlp_ridge`` term that
-            ``losses["train"]`` includes.
+            ``x``, both without the ridge terms that ``losses["train"]``
+            includes.
         early_stopping: With ``val_x``, stop the LM fit once ``lm_patience``
             steps lowered the validation loss by less than a fraction
             ``solver_rtol``, and return the parameters with the lowest one.
@@ -279,9 +300,12 @@ def fit_to_data(
         is_leaf=lambda leaf: isinstance(leaf, NonTrainable),
     )
 
-    if (lm_mlp_ridge or lm_freeze_units) and method != "lm-rust":
+    if (
+        lm_mlp_ridge or lm_skip_ridge or lm_shape_ridge or lm_freeze_units
+    ) and method != "lm-rust":
         raise ValueError(
-            "lm_mlp_ridge and lm_freeze_units are only supported with method='lm-rust'."
+            "lm_mlp_ridge, lm_skip_ridge, lm_shape_ridge and lm_freeze_units are "
+            "only supported with method='lm-rust'."
         )
 
     if method == "lm-rust":
@@ -301,6 +325,8 @@ def fit_to_data(
             lmp_size=lm_lmp_size,
             lmp_tol=lm_lmp_tol,
             mlp_ridge=lm_mlp_ridge,
+            skip_ridge=lm_skip_ridge,
+            shape_ridge=lm_shape_ridge,
             freeze_units=lm_freeze_units,
             verbose=verbose,
             should_stop=should_stop,
@@ -586,6 +612,8 @@ def _fit_lm_rust(
     val_data=None,
     early_stopping=True,
     mlp_ridge=0.0,
+    skip_ridge=0.0,
+    shape_ridge=0.0,
     freeze_units=False,
 ):
     """`_fit_lm` with exact blocks and the line search, in Rust (see
@@ -593,8 +621,8 @@ def _fit_lm_rust(
     `SparseTriangularMap`; everything else stays as it is.
 
     `val_data` are held-out draws for `fit`'s validation loss and, with
-    `early_stopping`, its early stopping. `mlp_ridge` and `freeze_units` are
-    `fit_to_data`'s ``lm_mlp_ridge`` and ``lm_freeze_units``. Returns ``(params, losses, lam, n_steps,
+    `early_stopping`, its early stopping. The ridges and `freeze_units` are
+    `fit_to_data`'s ``lm_*_ridge`` and ``lm_freeze_units``. Returns ``(params, losses, lam, n_steps,
     n_accepted)``, with the losses at the fitted parameters: ``"objective"``
     (what LM minimised, with the regularizations), ``"train"`` and ``"val"``
     (Fisher divergences, ``val`` `None` without `val_data`)."""
@@ -635,6 +663,8 @@ def _fit_lm_rust(
         val_problem=val_problem,
         early_stopping=early_stopping,
         mlp_ridge=mlp_ridge,
+        skip_ridge=skip_ridge,
+        shape_ridge=shape_ridge,
         freeze_units=freeze_units,
     )
 
@@ -1196,6 +1226,8 @@ class TransformAdapter:
         lm_residual_batch,
         lm_cholesky_jitter,
         lm_mlp_ridge,
+        lm_skip_ridge,
+        lm_shape_ridge,
         lm_probe_groups,
         lm_probe_rounds,
         lm_fit_affine,
@@ -1274,6 +1306,8 @@ class TransformAdapter:
         self._lm_probe_batch = lm_probe_batch
         self._lm_probes = lm_probes
         self._lm_mlp_ridge = lm_mlp_ridge
+        self._lm_skip_ridge = lm_skip_ridge
+        self._lm_shape_ridge = lm_shape_ridge
         self._lm_probe_groups = lm_probe_groups
         self._lm_probe_rounds = lm_probe_rounds
         self._lm_fit_affine = lm_fit_affine
@@ -1583,6 +1617,8 @@ class TransformAdapter:
                 lm_probe_batch=self._lm_probe_batch,
                 lm_probes=self._lm_probes,
                 lm_mlp_ridge=self._lm_mlp_ridge,
+                lm_skip_ridge=self._lm_skip_ridge,
+                lm_shape_ridge=self._lm_shape_ridge,
                 lm_freeze_units=freeze_units,
                 lm_probe_groups=self._lm_probe_groups,
                 lm_probe_rounds=self._lm_probe_rounds,
@@ -1831,7 +1867,7 @@ def make_transform_adapter(
     asymmetric_transformer=False,
     tangent_sas_transformer=1,
     tangent_sas_fix_b=False,
-    log_gamma_bounds=(-1.0, 1.0),
+    log_gamma_bounds=None,
     input_squash=1.0,
     reuse_embed=True,
     order=None,
@@ -1848,6 +1884,8 @@ def make_transform_adapter(
     lm_residual_batch=128,
     lm_cholesky_jitter=None,
     lm_mlp_ridge=0.0,
+    lm_skip_ridge=0.0,
+    lm_shape_ridge=0.0,
     lm_probe_groups=None,
     lm_probe_rounds=1,
     lm_fit_affine=False,
@@ -1916,9 +1954,16 @@ def make_transform_adapter(
     held-out draws, so the MLPs cannot make it worse there than this linear
     start, up to the noise of those draws.
 
-    ``lm_mlp_ridge`` penalizes the conditioner MLPs' weights (see
-    `fit_to_data`), with the flow without MLPs as its minimum. It leaves the
-    linear location skip free.
+    The LM fit's ridges (see `fit_to_data`): ``lm_mlp_ridge`` penalizes the
+    conditioner MLPs' weights, with the flow without MLPs as its minimum;
+    ``lm_skip_ridge`` the linear location skip, which needs it where a
+    variable has about as many parents as there are draws; and
+    ``lm_shape_ridge`` additionally what feeds the transformer's shape
+    fields, pulling each conditional towards an affine transformer. What
+    moves a variable's location (the skip and the MLP's output weights into
+    it) is measured against the conditional's width, refreshed every LM
+    step. All are ridges on the sum over the draws, so they weaken as the
+    windows grow.
     """
     if rust_flow:
         from nutpie.triangular_adapter import TriangularFlowAdapter
@@ -1970,6 +2015,8 @@ def make_transform_adapter(
             lm_linear_steps=lm_linear_steps,
             lm_min_loss=lm_min_loss,
             lm_mlp_ridge=lm_mlp_ridge,
+            lm_skip_ridge=lm_skip_ridge,
+            lm_shape_ridge=lm_shape_ridge,
             lm_patience=lm_patience,
             lm_forcing=lm_forcing,
             lm_max_exact_block_size=lm_max_exact_block_size,
@@ -2044,6 +2091,8 @@ def make_transform_adapter(
         lm_residual_batch=lm_residual_batch,
         lm_cholesky_jitter=lm_cholesky_jitter,
         lm_mlp_ridge=lm_mlp_ridge,
+        lm_skip_ridge=lm_skip_ridge,
+        lm_shape_ridge=lm_shape_ridge,
         lm_probe_groups=lm_probe_groups,
         lm_probe_rounds=lm_probe_rounds,
         lm_fit_affine=lm_fit_affine,

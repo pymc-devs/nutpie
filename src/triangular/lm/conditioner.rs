@@ -91,13 +91,13 @@ impl Shape {
     }
 
     #[inline(always)]
-    fn b2(&self) -> std::ops::Range<usize> {
+    pub(super) fn b2(&self) -> std::ops::Range<usize> {
         let start = self.n_unit * self.stride();
         start..start + self.n_par
     }
 
     #[inline(always)]
-    fn skip(&self) -> std::ops::Range<usize> {
+    pub(super) fn skip(&self) -> std::ops::Range<usize> {
         let start = self.n_unit * self.stride() + self.n_par;
         start..start + self.n_parent
     }
@@ -300,6 +300,16 @@ impl Conditioner {
 
     /// Where the parameters of a variable with `n_parent` parents sit in its
     /// slice.
+    /// Per transformer parameter, whether it feeds a field that shapes a
+    /// layer beyond an affine map (see [`Layer::shape_params`]).
+    pub(super) fn shape_param_mask(&self) -> Vec<bool> {
+        let mut mask = vec![false; self.n_par];
+        for k in self.layers.iter().flat_map(Layer::shape_params) {
+            mask[k] = true;
+        }
+        mask
+    }
+
     pub(super) fn shape(&self, n_parent: usize) -> Shape {
         Shape {
             n_parent,

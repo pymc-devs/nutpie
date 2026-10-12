@@ -85,6 +85,20 @@ impl Tiled {
         out
     }
 
+    /// Per value, its mean square over the draws.
+    pub(super) fn mean_squares(&self) -> Vec<f64> {
+        let mut out = vec![0.0; self.count];
+        for tile in 0..self.n_tile {
+            let values = self.tile(tile).chunks_exact(self.width);
+            for (out, lanes) in out.iter_mut().zip(values) {
+                *out += lanes.iter().map(|v| v * v).sum::<f64>();
+            }
+        }
+        let n_draw = (self.n_tile * self.width) as f64;
+        out.iter_mut().for_each(|v| *v /= n_draw);
+        out
+    }
+
     /// Value `k` of tile `tile`, as one vector.
     #[inline(always)]
     pub(super) fn value<S: Simd>(&self, simd: S, tile: usize, k: usize) -> S::f64s {

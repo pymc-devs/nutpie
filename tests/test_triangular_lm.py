@@ -467,17 +467,20 @@ def test_make_flow_passes_log_gamma_bounds():
     assert all(tuple(b) == (-1.0, 1.0) for b in bounds)
 
 
-def test_lm_rust_mlp_ridge():
-    """`lm_mlp_ridge` shrinks only the MLP weights, towards the flow without
-    MLPs, and the reported objective is the Fisher divergence plus the
-    ridge."""
+@pytest.mark.parametrize("kind", ["mlp", "skip", "shape"])
+def test_lm_rust_ridges(kind):
+    """`lm_mlp_ridge`, `lm_skip_ridge` and `lm_shape_ridge` each shrink their
+    own parameters, and the reported objective is the Fisher divergence plus
+    the ridge, with the location's terms scaled by the widths at the fitted
+    flow."""
     from nutpie.transform_adapter import fit_to_data
     from nutpie.triangular_lm import make_residuals, map_data, pack_params
 
     params, static, data, loss_fn = _flow_problem(n_draw=64)
     flow0 = eqx.combine(params, static)
     tmap0, y, g = map_data(flow0, data[0], data[1])
-    mask = make_residuals(tmap0, y, g).unit_weight_mask
+    problem = make_residuals(tmap0, y, g)
+    mask = problem.ridge_strengths(pack_params(tmap0), **{f"{kind}_ridge": 1.0}) > 0
 
     def fitted(ridge):
         flow, losses, _ = fit_to_data(
@@ -488,20 +491,22 @@ def test_lm_rust_mlp_ridge():
             method="lm-rust",
             max_epochs=15,
             lm_min_loss=0.0,
-            lm_mlp_ridge=ridge,
+            **{f"lm_{kind}_ridge": ridge},
         )
         tmap, _, _ = map_data(flow, data[0], data[1])
         return pack_params(tmap), losses
 
     theta_free, _ = fitted(0.0)
     theta_ridge, losses = fitted(1e3)
-    weights = theta_ridge[mask]
+    penalized = theta_ridge[mask]
+    assert mask.any() and not mask.all()
+    strengths = problem.ridge_strengths(theta_ridge, **{f"{kind}_ridge": 1e3})
     np.testing.assert_allclose(
         losses["train"][0],
-        losses["train_fisher"][0] + 1e3 / 64 * weights @ weights,
+        losses["train_fisher"][0] + strengths @ theta_ridge**2 / 64,
         rtol=1e-10,
     )
-    assert weights @ weights < 0.1 * theta_free[mask] @ theta_free[mask]
+    assert penalized @ penalized < 0.1 * theta_free[mask] @ theta_free[mask]
 
 
 def test_lm_rust_freeze_units():

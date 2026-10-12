@@ -142,4 +142,18 @@ impl Layer {
             LayerSpec::PositiveAffine(spec) => Layer::PositiveAffine(spec),
         })
     }
+
+    /// The conditioner outputs of the fields that shape the layer beyond an
+    /// affine map: `Contract2`'s `alpha` and `beta` (with both zero it is
+    /// affine, `sigma`, `mu` and `nu` being its scale and shifts), and all of
+    /// `TangentSAS`'s, which is the identity at `eps = 0`, `r = 1` whatever
+    /// its `b` and `nu`.
+    pub(crate) fn shape_params(&self) -> impl Iterator<Item = usize> {
+        let fields = match *self {
+            Layer::Contract2(c) => [c.alpha, c.beta, None, None],
+            Layer::TangentSas(t) => [t.nu, t.eps, t.b, t.r],
+            Layer::PositiveAffine(_) => [None; 4],
+        };
+        fields.into_iter().flatten().map(|p| p.index)
+    }
 }
