@@ -295,10 +295,10 @@ def test_rust_lm_with_limited_memory_preconditioner():
     still converges to about the same loss, and it is actually used."""
     from nutpie.triangular_lm import fit, map_data
 
-    params, static, data, loss_fn = _flow_problem(rho=0.1)
+    params, static, data, _loss_fn = _flow_problem(rho=0.1)
     tmap, y, g = map_data(eqx.combine(params, static), data[0], data[1])
     problem = make_residuals(tmap, y, g, fisher_regularization=0.1)
-    settings = dict(n_steps=30, max_block_size=8, cg_tol=1e-6, verbose=False)
+    settings = {"n_steps": 30, "max_block_size": 8, "cg_tol": 1e-6, "verbose": False}
 
     _, _, base = fit(problem, pack_params(tmap), **settings)
     _, _, hist = fit(problem, pack_params(tmap), lmp_size=8, **settings)
