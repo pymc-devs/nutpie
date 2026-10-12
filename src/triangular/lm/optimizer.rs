@@ -244,7 +244,9 @@ pub struct LmOptimizer {
     /// so its step are zero.
     frozen: Vec<bool>,
     theta: Vec<f64>,
-    lin: Linearization,
+    /// The linearization at `theta`; `None` only within `step`, so that a
+    /// trial point's never sits next to it.
+    lin: Option<Linearization>,
     r: Vec<f64>,
     lam: f64,
     nu: f64,
@@ -322,7 +324,7 @@ impl LmOptimizer {
             ridge,
             frozen,
             theta,
-            lin,
+            lin: Some(lin),
             r,
             lam,
             nu: settings.nu0,
@@ -337,10 +339,14 @@ impl LmOptimizer {
         })
     }
 
+    fn lin(&self) -> &Linearization {
+        self.lin.as_ref().expect("the linearization at theta")
+    }
+
     fn build_blocks(&self) -> Result<Blocks> {
         let mut blocks = self
             .problem
-            .gauss_newton_blocks(&self.lin, self.settings.max_block_size)?;
+            .gauss_newton_blocks(self.lin(), self.settings.max_block_size)?;
 
         // Non-finite sub-blocks fall back to their finite diagonal; one would
         // otherwise spread through the global floor into every damping.
@@ -475,7 +481,7 @@ impl LmOptimizer {
 
     /// `(H + lam D) v`, with `H = J^T J + diag(ridge)`.
     fn damped_product(&self, diagonal: &[f64], lam: f64, v: &[f64]) -> Result<Vec<f64>> {
-        let mut out = self.problem.gauss_newton_product(&self.lin, v)?;
+        let mut out = self.problem.gauss_newton_product(self.lin(), v)?;
         for (((o, d), v), w) in out.iter_mut().zip(diagonal).zip(v).zip(&self.ridge) {
             *o += (lam * d + w) * v;
         }
@@ -612,7 +618,7 @@ impl LmOptimizer {
         let lmp_rank = lmp.as_ref().map_or(0, Lmp::rank);
 
         // Half the gradient of `F`: `J^T r + ridge theta`.
-        let mut g = self.problem.pullback(&self.lin, &self.r)?;
+        let mut g = self.problem.pullback(self.lin(), &self.r)?;
         for ((g, w), t) in g.iter_mut().zip(&self.ridge).zip(&self.theta) {
             *g += w * t;
         }
@@ -644,8 +650,13 @@ impl LmOptimizer {
 
         let step_to =
             |p: &[f64]| -> Vec<f64> { self.theta.iter().zip(p).map(|(t, p)| t + p).collect() };
-        let (mut r_new, mut lin_new) = self.problem.residuals(&step_to(&p))?;
-        let mut jp = self.problem.pushforward(&self.lin, &p)?;
+        let mut jp = self.problem.pushforward(self.lin(), &p)?;
+        // From here on only a rejected step needs the linearization at
+        // `theta` again; it is cheaper to recompute it then than to hold it
+        // next to the trial point's.
+        self.lin = None;
+        let (mut r_new, lin_new) = self.problem.residuals(&step_to(&p))?;
+        let mut lin_new = Some(lin_new);
         // `p^T H p`, with `H` including the ridge.
         let curvature_along = |jp: &[f64], p: &[f64]| -> f64 {
             dot(jp, jp)
@@ -674,13 +685,14 @@ impl LmOptimizer {
             .clamp(s.ls_min_fraction, 1.0);
         if f_new.is_finite() && curvature > 0.0 && fraction < 0.95 {
             let p_short: Vec<f64> = p.iter().map(|v| fraction * v).collect();
-            let (r_short, lin_short) = self.problem.residuals(&step_to(&p_short))?;
+            // Without its linearization, recomputed if the step is taken.
+            let r_short = self.problem.residual_values(&step_to(&p_short))?;
             let f_short = dot(&r_short, &r_short) + self.ridge_penalty(&p_short);
             // Kept only if it actually beats the full step; NaN compares false.
             if f_short < f_new {
                 p = p_short;
                 r_new = r_short;
-                lin_new = lin_short;
+                lin_new = None;
                 // `J` is linear, so the shortened step's `Jp` is just rescaled.
                 for v in jp.iter_mut() {
                     *v *= fraction;
@@ -784,10 +796,15 @@ impl LmOptimizer {
         if accept {
             self.theta = step_to(&p);
             self.r = r_new;
-            self.lin = lin_new;
+            self.lin = Some(match lin_new {
+                Some(lin) => lin,
+                None => self.problem.residuals(&self.theta)?.1,
+            });
             self.p_prev = p;
             self.accepted_since_build += 1;
         } else {
+            drop(lin_new);
+            self.lin = Some(self.problem.residuals(&self.theta)?.1);
             // A rejected `p` was solved for a different `lam`: discard it.
             self.p_prev.fill(0.0);
         }
