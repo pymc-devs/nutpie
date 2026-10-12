@@ -270,9 +270,9 @@ def fit_to_data(
         val_x: Held-out data, like ``x``, for the validation loss. Only used
             when ``method`` is ``"lm-rust"``; ``"adam"`` splits off its own
             (``val_prop``) and the others ignore it. ``losses["val"]`` is then
-            its Fisher divergence and ``losses["train_fisher"]`` that of
-            ``x``, both without the ridge terms that ``losses["train"]``
-            includes.
+            its Fisher divergence. With ``"lm-rust"``, ``losses["train"]`` is
+            that of ``x``, both without the ridges, and
+            ``losses["objective"]`` what LM minimised, with them.
         early_stopping: With ``val_x``, stop the LM fit once ``lm_patience``
             steps lowered the validation loss by less than a fraction
             ``solver_rtol``, and return the parameters with the lowest one.
@@ -333,11 +333,11 @@ def fit_to_data(
             val_data=val_data,
             early_stopping=early_stopping,
         )
-        objective = lm_losses["objective"]
+        train = lm_losses["train"]
         losses = {
-            "train": [objective],
-            "train_fisher": [lm_losses["train"]],
-            "val": [objective if lm_losses["val"] is None else lm_losses["val"]],
+            "objective": [lm_losses["objective"]],
+            "train": [train],
+            "val": [train if lm_losses["val"] is None else lm_losses["val"]],
             "lm_lam": lam,
             "lm_steps": n_steps,
             "lm_accepted": n_accepted,
@@ -1404,7 +1404,11 @@ class TransformAdapter:
                 logps = np.asarray(logps)
 
                 keep, n_repeats = _recent_distinct(positions)
-                repeats = f", {n_repeats} repeats skipped" if n_repeats else ""
+                repeats = (
+                    f", {n_repeats} repeat{'' if n_repeats == 1 else 's'} skipped"
+                    if n_repeats
+                    else ""
+                )
                 if len(keep) < _MIN_DIAG_DRAWS:
                     # Too few draws for variances: scale by the gradient
                     # instead, so that a bad scale from earlier does not keep
@@ -1657,7 +1661,7 @@ class TransformAdapter:
 
             def report(decision):
                 steps = fit_losses.get("lm_steps")
-                train = fit_losses.get("train_fisher")
+                train = fit_losses["train"] if self._method == "lm-rust" else None
                 self._report(
                     n_draws,
                     f"{log_f}  current {_format_log_f(old_loss)}  "

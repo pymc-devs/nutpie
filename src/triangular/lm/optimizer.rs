@@ -214,6 +214,8 @@ pub struct StepInfo {
     f: f64,
     #[serde(rename = "F_new")]
     f_new: f64,
+    /// The ridge's part of `F_new`.
+    ridge_new: f64,
     #[serde(rename = "F_out")]
     f_out: f64,
     accept: bool,
@@ -706,7 +708,8 @@ impl LmOptimizer {
         };
 
         let f = self.objective();
-        let mut f_new = dot(&r_new, &r_new) + self.ridge_penalty(&p);
+        let mut ridge_new = self.ridge_penalty(&p);
+        let mut f_new = dot(&r_new, &r_new) + ridge_new;
         let pred_full = -dot(&p, &g) - 0.5 * curvature_along(&jp, &p);
         let rho_full = safe_ratio(0.5 * (f - f_new), pred_full);
         let full_step_good =
@@ -724,7 +727,8 @@ impl LmOptimizer {
             let p_short: Vec<f64> = p.iter().map(|v| fraction * v).collect();
             // Without its linearization, recomputed if the step is taken.
             let r_short = self.problem.residual_values(&step_to(&p_short))?;
-            let f_short = dot(&r_short, &r_short) + self.ridge_penalty(&p_short);
+            let ridge_short = self.ridge_penalty(&p_short);
+            let f_short = dot(&r_short, &r_short) + ridge_short;
             // Kept only if it actually beats the full step; NaN compares false.
             if f_short < f_new {
                 p = p_short;
@@ -735,6 +739,7 @@ impl LmOptimizer {
                     *v *= fraction;
                 }
                 f_new = f_short;
+                ridge_new = ridge_short;
                 step_length = fraction;
             }
         }
@@ -807,6 +812,7 @@ impl LmOptimizer {
         let info = StepInfo {
             f,
             f_new,
+            ridge_new,
             f_out: if accept { f_new } else { f },
             accept,
             rho,
