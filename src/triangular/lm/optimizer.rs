@@ -988,7 +988,7 @@ mod tests {
     /// the actual decrease, so `rho -> 1`.
     #[test]
     fn ridge_enters_the_model_consistently() {
-        let problem = problem_with(None, 64);
+        let problem = problem_with(64);
         let mut rng = ChaCha8Rng::seed_from_u64(6);
         let theta = normal(&mut rng, problem.n_params(), 0.3);
         // A huge damping makes the step tiny, so GN's model is exact to
@@ -1008,7 +1008,7 @@ mod tests {
     /// down.
     #[test]
     fn frozen_parameters_stay_put() {
-        let problem = problem_with(Some(0.3), 64);
+        let problem = problem_with(64);
         let frozen = problem.unit_param_mask();
         assert!(frozen.iter().any(|&f| f) && frozen.iter().any(|&f| !f));
         let mut rng = ChaCha8Rng::seed_from_u64(7);
@@ -1038,7 +1038,7 @@ mod tests {
     /// Bit for bit the same fit on any number of threads.
     #[test]
     fn steps_do_not_depend_on_the_threads() {
-        let problem = problem_with(Some(0.3), 512);
+        let problem = problem_with(512);
         let mut rng = ChaCha8Rng::seed_from_u64(5);
         let theta = normal(&mut rng, problem.n_params(), 0.3);
         let run = |threads: usize| {

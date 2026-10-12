@@ -41,7 +41,6 @@ impl PyFisherResiduals {
         n_par,
         location_index,
         transformer,
-        fisher_regularization = None,
         input_squash = None,
         activation = "softplus",
     ))]
@@ -53,7 +52,6 @@ impl PyFisherResiduals {
         n_par: usize,
         location_index: usize,
         transformer: &Bound<'_, PyAny>,
-        fisher_regularization: Option<f64>,
         input_squash: Option<f64>,
         activation: &str,
     ) -> Result<Self> {
@@ -69,7 +67,6 @@ impl PyFisherResiduals {
                     input_squash,
                     Activation::from_name(activation)?,
                 )?,
-                fisher_regularization,
             )?,
             lin: None,
         })

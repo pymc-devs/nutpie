@@ -79,39 +79,16 @@ def _setup(
     return tmap, y, g
 
 
-def _score_index(tmap):
-    """Positions of the edges, in CSR order, in the concatenated per-bucket
-    parent scores."""
-    (dim,) = tmap.shape
-    position = {}
-    offset = 0
-    for members, parents in zip(tmap.bucket_members, tmap.bucket_parent_indices):
-        parents = np.asarray(parents)
-        width = parents.shape[1]
-        for local, variable in enumerate(np.asarray(members)):
-            n_parent = int(np.sum(parents[local] < dim))
-            position[int(variable)] = offset + local * width + np.arange(n_parent)
-        offset += parents.size
-    return np.concatenate([position[i] for i in range(dim)]).astype(np.int64)
-
-
-def _jax_residuals(tmap, y, g, rho):
+def _jax_residuals(tmap, y, g):
     index = param_index(tmap)
-    score_index = _score_index(tmap)
     n_draw = y.shape[0]
 
     def residuals(theta):
         flow_map = unpack_params(tmap, theta, index)
 
         def one(y, g):
-            x, grad_x, _, scores = flow_map.inverse_gradient_and_val(
-                y, g, 0.0, parent_scores=True
-            )
-            out = x + grad_x
-            if rho is not None:
-                scores = jnp.concatenate([s.ravel() for s in scores])[score_index]
-                out = jnp.concatenate([out, jnp.sqrt(rho) * scores])
-            return out
+            x, grad_x, _ = flow_map.inverse_gradient_and_val(y, g, 0.0)
+            return x + grad_x
 
         return jax.vmap(one)(jnp.asarray(y), jnp.asarray(g)) / np.sqrt(n_draw)
 
@@ -134,14 +111,13 @@ CASES = [
 ]
 
 
-@pytest.mark.parametrize("rho", [None, 0.3])
 @pytest.mark.parametrize("case", CASES)
-def test_operators_match_jax(case, rho):
+def test_operators_match_jax(case):
     tmap, y, g = _setup(**case)
-    problem = make_residuals(tmap, y, g, fisher_regularization=rho)
+    problem = make_residuals(tmap, y, g)
     theta = pack_params(tmap)
     shape = (y.shape[0], problem.n_residuals)
-    reference = _jax_residuals(tmap, y, g, rho)
+    reference = _jax_residuals(tmap, y, g)
 
     r = problem.residuals(theta).reshape(shape)
     np.testing.assert_allclose(r, reference(theta), rtol=1e-10, atol=1e-12)
@@ -166,16 +142,15 @@ def test_operators_match_jax(case, rho):
     )
 
 
-@pytest.mark.parametrize("rho", [None, 0.3])
 @pytest.mark.parametrize("max_block_size", [7, 1000])
 @pytest.mark.parametrize("case", CASES)
-def test_gauss_newton_blocks_match_dense_gram(case, max_block_size, rho):
+def test_gauss_newton_blocks_match_dense_gram(case, max_block_size):
     tmap, y, g = _setup(**case)
-    problem = make_residuals(tmap, y, g, fisher_regularization=rho)
+    problem = make_residuals(tmap, y, g)
     theta = pack_params(tmap)
     problem.residuals(theta)
 
-    jac = jax.jacfwd(_jax_residuals(tmap, y, g, rho))(theta)
+    jac = jax.jacfwd(_jax_residuals(tmap, y, g))(theta)
     jac = np.asarray(jac).reshape(-1, theta.size)
     gram = jac.T @ jac
 
@@ -207,7 +182,7 @@ def test_unpack_inverts_pack():
     np.testing.assert_array_equal(pack_params(shifted), theta + 1.0)
 
 
-def _flow_problem(dim=7, n_draw=64, rho=None, seed=0):
+def _flow_problem(dim=7, n_draw=64, seed=0):
     """A `make_flow(kind="triangular")` flow near its init, its data and a
     `FisherLoss`."""
     import flowjax
@@ -244,11 +219,10 @@ def _flow_problem(dim=7, n_draw=64, rho=None, seed=0):
         lambda leaf: leaf + 0.05 * jnp.asarray(rng.normal(size=leaf.shape)), params
     )
     data = (jnp.asarray(x), jnp.asarray(g), jnp.zeros(n_draw))
-    return params, static, data, FisherLoss(fisher_regularization=rho)
+    return params, static, data, FisherLoss()
 
 
-@pytest.mark.parametrize("rho", [None, 0.1])
-def test_rust_lm_steps_match_lmopt(rho):
+def test_rust_lm_steps_match_lmopt():
     """With every conditioner in one sub-block, both preconditioners are the
     same matrix, so the steps agree up to rounding. `lmopt` has neither the
     `lam_lo` reset nor the larger `lam0`."""
@@ -256,7 +230,7 @@ def test_rust_lm_steps_match_lmopt(rho):
     from nutpie.transform_adapter import gn_factor_fn, res_fn
     from nutpie.triangular_lm import fit, map_data
 
-    params, static, data, loss_fn = _flow_problem(rho=rho)
+    params, static, data, loss_fn = _flow_problem()
     n_steps = 4
     _, reference = lmopt.fit(
         params,
@@ -272,7 +246,7 @@ def test_rust_lm_steps_match_lmopt(rho):
     )
 
     tmap, y, g = map_data(eqx.combine(params, static), data[0], data[1])
-    problem = make_residuals(tmap, y, g, fisher_regularization=rho)
+    problem = make_residuals(tmap, y, g)
     _, _, hist = fit(
         problem,
         pack_params(tmap),
@@ -295,9 +269,9 @@ def test_rust_lm_with_limited_memory_preconditioner():
     still converges to about the same loss, and it is actually used."""
     from nutpie.triangular_lm import fit, map_data
 
-    params, static, data, _loss_fn = _flow_problem(rho=0.1)
+    params, static, data, _loss_fn = _flow_problem()
     tmap, y, g = map_data(eqx.combine(params, static), data[0], data[1])
-    problem = make_residuals(tmap, y, g, fisher_regularization=0.1)
+    problem = make_residuals(tmap, y, g)
     settings = {"n_steps": 30, "max_block_size": 8, "cg_tol": 1e-6, "verbose": False}
 
     _, _, base = fit(problem, pack_params(tmap), **settings)
@@ -314,7 +288,7 @@ def test_lm_rust_method_updates_the_flow():
     the returned flow's loss is the one the fit reports."""
     from nutpie.transform_adapter import fit_to_data
 
-    params, static, data, loss_fn = _flow_problem(rho=0.1)
+    params, static, data, loss_fn = _flow_problem()
     initial = float(jnp.sum(loss_fn.residuals(params, static, *data) ** 2))
     flow, losses, _ = fit_to_data(
         jax.random.key(0),
@@ -335,10 +309,10 @@ def test_lm_rust_method_updates_the_flow():
 def test_lm_rust_validation_loss():
     """`fit_to_data(method="lm-rust", val_x=...)` reports the Fisher
     divergences of the train and held-out draws at the returned flow, without
-    the regularization."""
+    the ridge."""
     from nutpie.transform_adapter import fit_to_data
 
-    params, static, data, loss_fn = _flow_problem(n_draw=96, rho=0.1)
+    params, static, data, loss_fn = _flow_problem(n_draw=96)
     train = tuple(a[:64] for a in data)
     val = tuple(a[64:] for a in data)
     for early_stopping in [True, False]:
@@ -352,6 +326,7 @@ def test_lm_rust_validation_loss():
             method="lm-rust",
             max_epochs=8,
             lm_min_loss=0.0,
+            lm_mlp_ridge=10.0,
         )
         fitted, _ = eqx.partition(flow, eqx.is_inexact_array)
         # `FisherLoss.__call__` is the log of the plain Fisher divergence.
@@ -372,7 +347,7 @@ def test_rust_lm_early_stopping(early_stopping):
     validation loss seen (the start included); without, the last ones."""
     from nutpie.triangular_lm import fisher_divergence, fit, map_data
 
-    params, static, data, _ = _flow_problem(n_draw=48, rho=None)
+    params, static, data, _ = _flow_problem(n_draw=48)
     flow = eqx.combine(params, static)
     tmap, y, g = map_data(flow, data[0][:16], data[1][:16])
     _, val_y, val_g = map_data(flow, data[0][16:], data[1][16:])
@@ -499,7 +474,7 @@ def test_lm_rust_mlp_ridge():
     from nutpie.transform_adapter import fit_to_data
     from nutpie.triangular_lm import make_residuals, map_data, pack_params
 
-    params, static, data, loss_fn = _flow_problem(n_draw=64, rho=None)
+    params, static, data, loss_fn = _flow_problem(n_draw=64)
     flow0 = eqx.combine(params, static)
     tmap0, y, g = map_data(flow0, data[0], data[1])
     mask = make_residuals(tmap0, y, g).unit_weight_mask
@@ -535,7 +510,7 @@ def test_lm_rust_freeze_units():
     from nutpie.transform_adapter import fit_to_data
     from nutpie.triangular_lm import make_residuals, map_data, pack_params
 
-    params, static, data, loss_fn = _flow_problem(n_draw=64, rho=0.1)
+    params, static, data, loss_fn = _flow_problem(n_draw=64)
     flow0 = eqx.combine(params, static)
     tmap0, y, g = map_data(flow0, data[0], data[1])
     mask = make_residuals(tmap0, y, g).unit_param_mask

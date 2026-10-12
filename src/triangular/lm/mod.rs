@@ -11,9 +11,6 @@
 //! r = (x + w) / sqrt(n_draw),   J^T w = g - grad_y log_det,
 //! ```
 //!
-//! followed, with a Fisher regularization `rho`, by one parent score per edge,
-//! `sqrt(rho) (L[i,j] - x_i A[i,j]) / sqrt(n_draw)`.
-//!
 //! Supported conditioners: one hidden layer with softplus or `gelu_tanh`,
 //! optionally on squashed inputs, and the linear location skip. The transformer is a chain of `Contract2`, `TangentSAS` and
 //! `PositiveAffine` layers, evaluated in the density direction.
@@ -95,11 +92,6 @@ use sweeps::{TileScratch, VariableScratch};
 pub(crate) use tiles::Linearization;
 use tiles::{Data, Tiled};
 
-/// Bytes of residual cotangents [`FisherResiduals::sum_pullbacks`] keeps for
-/// one block of tiles, but at least [`MIN_BLOCK_TILES`] tiles' worth.
-const PULLBACK_BLOCK_BYTES: usize = 512 << 20;
-const MIN_BLOCK_TILES: usize = 16;
-
 #[derive(Clone)]
 pub(crate) struct FisherResiduals {
     level: Level,
@@ -109,55 +101,13 @@ pub(crate) struct FisherResiduals {
     /// Each variable's slice of the flat parameter vector.
     pub(crate) param_offset: Offsets,
     conditioner: Conditioner,
-    /// `sqrt(fisher_regularization)`, if regularized.
-    regularization: Option<f64>,
     inverse: SelectedInverseLayout,
     /// Shared with every [`Linearization`] made from it.
     data: Option<Arc<Data>>,
-    pullback_buffers: PullbackBuffers,
-}
-
-/// [`FisherResiduals::sum_pullbacks`]'s `r_bar` and `z` of one block of
-/// tiles, kept between calls so that each GN product doesn't fault in fresh
-/// pages. A clone starts without them.
-#[derive(Default)]
-struct PullbackBuffers(Mutex<Option<(Tiled, Tiled)>>);
-
-impl Clone for PullbackBuffers {
-    fn clone(&self) -> Self {
-        Self::default()
-    }
-}
-
-impl PullbackBuffers {
-    /// The kept buffers if they hold `block_len` tiles, else new ones. A
-    /// concurrent call finds none and makes its own.
-    fn take(&self, block_len: usize, n_res: usize, n_var: usize, width: usize) -> (Tiled, Tiled) {
-        match self.0.lock().expect("never poisoned").take() {
-            Some((r_bar, z)) if r_bar.n_tile() == block_len => (r_bar, z),
-            _ => (
-                Tiled::zeros(block_len, n_res, width),
-                Tiled::zeros(block_len, n_var, width),
-            ),
-        }
-    }
-
-    fn put(&self, buffers: (Tiled, Tiled)) {
-        *self.0.lock().expect("never poisoned") = Some(buffers);
-    }
 }
 
 impl FisherResiduals {
-    fn new(
-        graph: Pattern,
-        conditioner: Conditioner,
-        fisher_regularization: Option<f64>,
-    ) -> Result<Self> {
-        if let Some(rho) = fisher_regularization {
-            if rho.is_nan() || rho < 0.0 {
-                bail!("fisher_regularization must be non-negative, got {rho}");
-            }
-        }
+    fn new(graph: Pattern, conditioner: Conditioner) -> Result<Self> {
         let param_offset = Offsets::from_lens(
             (0..graph.n_var()).map(|i| conditioner.shape(graph.n_parent(i)).size()),
         );
@@ -168,10 +118,8 @@ impl FisherResiduals {
             graph,
             param_offset,
             conditioner,
-            regularization: fisher_regularization.map(f64::sqrt),
             inverse,
             data: None,
-            pullback_buffers: PullbackBuffers::default(),
         })
     }
 
@@ -196,11 +144,6 @@ impl FisherResiduals {
 
     pub(crate) fn n_residuals(&self) -> usize {
         self.n_var()
-            + if self.regularization.is_some() {
-                self.n_edge()
-            } else {
-                0
-            }
     }
 
     /// Per parameter, whether it is a weight of the units, `W1` or `W2`:
@@ -396,30 +339,39 @@ impl FisherResiduals {
     /// `J^T r_bar` summed over the tiles, with `cotangent(tile, s)` loading
     /// tile `tile` into `s` and leaving its `r_bar` in `s.residual`.
     ///
-    /// In blocks of tiles: first, in parallel over the block's tiles, the
-    /// triangular solve of each ([`Self::pullback_solve`]), then, in parallel
-    /// over the variables, each variable's local pullback over the block's
-    /// tiles in order, its lanes summed straight into its slice of the
-    /// gradient ([`Self::pullback_variable`]). So a variable's parameters stay
-    /// in cache across the tiles, the gradient is the only parameter-sized
-    /// buffer, and the order of every addition depends only on the problem's
-    /// sizes, not on the threads.
+    /// First, in parallel over the tiles, the triangular solve of each
+    /// ([`Self::pullback_solve`]), keeping `r_bar` and `z` for all draws (only
+    /// `n_var` values per draw each). Then, in parallel over the variables,
+    /// each variable's local pullback over the tiles in order, its lanes
+    /// summed straight into its slice of the gradient
+    /// ([`Self::pullback_variable`]). So a variable's parameters stay in cache
+    /// across the tiles, the gradient is the only parameter-sized buffer, and
+    /// the order of every addition depends only on the number of tiles, not
+    /// on the threads.
     fn sum_pullbacks<S: Simd>(
         &self,
         simd: S,
         lin: &Linearization,
         cotangent: impl Fn(usize, &mut TileScratch<S>) + Sync,
     ) -> Vec<f64> {
-        let (n_var, n_res, n_tile) = (self.n_var(), self.n_residuals(), lin.data.n_tile());
-        let tile_bytes = (n_res + n_var) * self.width * std::mem::size_of::<f64>();
-        let block_len = (PULLBACK_BLOCK_BYTES / tile_bytes)
-            .max(MIN_BLOCK_TILES)
-            .min(n_tile);
-        // Every tile a block uses is overwritten, so old values don't matter.
-        let (mut r_bar, mut z) = self
-            .pullback_buffers
-            .take(block_len, n_res, n_var, self.width);
+        let (n_var, n_tile) = (self.n_var(), lin.data.n_tile());
+        let mut r_bar = Tiled::zeros(n_tile, self.n_residuals(), self.width);
+        let mut z = Tiled::zeros(n_tile, n_var, self.width);
         let scratch = PerThread::new();
+        r_bar
+            .tiles_mut()
+            .into_par_iter()
+            .zip(z.tiles_mut())
+            .enumerate()
+            .for_each(|(tile, (r_bar, z))| {
+                scratch.with(
+                    || TileScratch::new(simd, self),
+                    |s| {
+                        cotangent(tile, s);
+                        self.pullback_solve(simd, lin, s, r_bar, z);
+                    },
+                );
+            });
 
         let mut grad = vec![0.0; self.n_params()];
         let mut grad_of_var = Vec::with_capacity(n_var);
@@ -430,32 +382,10 @@ impl FisherResiduals {
             rest = tail;
         }
 
-        for start in (0..n_tile).step_by(block_len) {
-            let tiles = start..(start + block_len).min(n_tile);
-            r_bar
-                .tiles_mut()
-                .into_par_iter()
-                .zip(z.tiles_mut())
-                .take(tiles.len())
-                .enumerate()
-                .for_each(|(k, (r_bar, z))| {
-                    scratch.with(
-                        || TileScratch::new(simd, self),
-                        |s| {
-                            cotangent(start + k, s);
-                            self.pullback_solve(simd, lin, s, r_bar, z);
-                        },
-                    );
-                });
-            grad_of_var.par_iter_mut().enumerate().for_each_init(
-                || VariableScratch::new(simd, self),
-                |ws, (i, out)| {
-                    self.pullback_variable(simd, lin, &r_bar, &z, tiles.clone(), i, ws, out)
-                },
-            );
-        }
-        drop(grad_of_var);
-        self.pullback_buffers.put((r_bar, z));
+        grad_of_var.into_par_iter().enumerate().for_each_init(
+            || VariableScratch::new(simd, self),
+            |ws, (i, out)| self.pullback_variable(simd, lin, &r_bar, &z, i, ws, out),
+        );
         grad
     }
 }

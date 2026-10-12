@@ -220,13 +220,6 @@ impl FisherResiduals {
         for i in 0..n_var {
             residual[i] = (x[i] + w[i]) * scale;
         }
-        if let Some(reg) = self.regularization {
-            for i in 0..n_var {
-                for e in self.graph.edges(i) {
-                    residual[n_var + e] = (edge_l[e] - x[i] * edge_a[e]) * (scale * reg);
-                }
-            }
-        }
 
         store(simd, residual, out);
         if let Some(out_lin) = out_lin {
@@ -252,7 +245,7 @@ impl FisherResiduals {
                         LinearTile {
                             edge_a,
                             delta,
-                            x,
+                            x: _,
                             w,
                         },
                     ..
@@ -299,14 +292,6 @@ impl FisherResiduals {
         for i in 0..n_var {
             residual[i] = (x_dot[i] + w_dot[i]) * scale;
         }
-        if let Some(reg) = self.regularization {
-            for i in 0..n_var {
-                for e in self.graph.edges(i) {
-                    residual[n_var + e] =
-                        (l_dot[e] - x_dot[i] * edge_a[e] - x[i] * a_dot[e]) * (scale * reg);
-                }
-            }
-        }
     }
 
     /// The first half of `J^T r_bar` for one tile, already loaded into `s`
@@ -337,9 +322,8 @@ impl FisherResiduals {
     }
 
     /// The second half: variable `i`'s local pullback, summed over the
-    /// tiles `tiles` in order and then over the lanes, into `out`, its slice
-    /// of the gradient. Tile `tiles.start + k`'s `r_bar` and `z` are tile `k`
-    /// of `r_bar` and `z`.
+    /// tiles in order and then over the lanes, into `out`, its slice of the
+    /// gradient.
     #[simd]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn pullback_variable<S: Simd>(
@@ -348,12 +332,10 @@ impl FisherResiduals {
         lin: &Linearization,
         r_bar: &Tiled,
         z: &Tiled,
-        tiles: std::ops::Range<usize>,
         i: usize,
         ws: &mut VariableScratch<S>,
         out: &mut [f64],
     ) {
-        let n_var = self.n_var();
         let scale = lin.data.scale();
         let shape = self.shape(i);
         let theta_i = self.params_of(&lin.theta, i);
@@ -367,32 +349,19 @@ impl FisherResiduals {
         grad.clear();
         grad.resize(shape.size(), S::f64s::splat(simd, 0.0));
 
-        for (k, tile) in tiles.enumerate() {
-            let (x_i, w_i, z_i) = (
-                lin.x.value(simd, tile, i),
-                lin.w.value(simd, tile, i),
-                z.value(simd, k, i),
-            );
-            let mut x_bar = r_bar.value(simd, k, i) * scale;
+        for tile in 0..lin.data.n_tile() {
+            let (w_i, z_i) = (lin.w.value(simd, tile, i), z.value(simd, tile, i));
             units.y_parents.clear();
             cot_a.clear();
             cot_l.clear();
-            for (e, p) in self.graph.entries(i) {
+            for &p in self.graph.parents(i) {
                 units.y_parents.push(lin.data.y.value(simd, tile, p));
-                let z_p = z.value(simd, k, p);
-                let mut a = -(w_i * z_p);
-                let mut l = -z_p;
-                if let Some(reg) = self.regularization {
-                    let o = r_bar.value(simd, k, n_var + e) * (scale * reg);
-                    x_bar -= o * lin.edge_a.value(simd, tile, e);
-                    a -= x_i * o;
-                    l += o;
-                }
-                cot_a.push(a);
-                cot_l.push(l);
+                let z_p = z.value(simd, tile, p);
+                cot_a.push(-(w_i * z_p));
+                cot_l.push(-z_p);
             }
             let cot = Cotangent {
-                x: x_bar,
+                x: r_bar.value(simd, tile, i) * scale,
                 delta: -(w_i * z_i),
                 mu: -z_i,
                 edge_a: cot_a,
