@@ -78,7 +78,7 @@ mod sweeps;
 mod tests;
 mod tiles;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Result};
 use fearless_simd::{dispatch, prelude::*, Level};
@@ -86,17 +86,19 @@ use rayon::prelude::*;
 
 use crate::triangular::pattern::{Offsets, Pattern};
 pub(crate) use blocks::GnBlock;
-use conditioner::{Conditioner, Params, ParamsMut, Shape, UnitState};
+use conditioner::{Conditioner, Params, Shape, UnitState};
 pub(crate) use flow::PyTriangularFlow;
 pub(crate) use python::PyFisherResiduals;
 use selected_inverse::SelectedInverseLayout;
 use simd::{f64_width, store};
-use sweeps::TileScratch;
+use sweeps::{TileScratch, VariableScratch};
 pub(crate) use tiles::Linearization;
 use tiles::{Data, Tiled};
 
-/// Tiles [`FisherResiduals::sum_over_tiles`] sums in one task, in order.
-const TILES_PER_TASK: usize = 4;
+/// Bytes of residual cotangents [`FisherResiduals::sum_pullbacks`] keeps for
+/// one block of tiles, but at least [`MIN_BLOCK_TILES`] tiles' worth.
+const PULLBACK_BLOCK_BYTES: usize = 512 << 20;
+const MIN_BLOCK_TILES: usize = 16;
 
 #[derive(Clone)]
 pub(crate) struct FisherResiduals {
@@ -112,6 +114,37 @@ pub(crate) struct FisherResiduals {
     inverse: SelectedInverseLayout,
     /// Shared with every [`Linearization`] made from it.
     data: Option<Arc<Data>>,
+    pullback_buffers: PullbackBuffers,
+}
+
+/// [`FisherResiduals::sum_pullbacks`]'s `r_bar` and `z` of one block of
+/// tiles, kept between calls so that each GN product doesn't fault in fresh
+/// pages. A clone starts without them.
+#[derive(Default)]
+struct PullbackBuffers(Mutex<Option<(Tiled, Tiled)>>);
+
+impl Clone for PullbackBuffers {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl PullbackBuffers {
+    /// The kept buffers if they hold `block_len` tiles, else new ones. A
+    /// concurrent call finds none and makes its own.
+    fn take(&self, block_len: usize, n_res: usize, n_var: usize, width: usize) -> (Tiled, Tiled) {
+        match self.0.lock().expect("never poisoned").take() {
+            Some((r_bar, z)) if r_bar.n_tile() == block_len => (r_bar, z),
+            _ => (
+                Tiled::zeros(block_len, n_res, width),
+                Tiled::zeros(block_len, n_var, width),
+            ),
+        }
+    }
+
+    fn put(&self, buffers: (Tiled, Tiled)) {
+        *self.0.lock().expect("never poisoned") = Some(buffers);
+    }
 }
 
 impl FisherResiduals {
@@ -138,6 +171,7 @@ impl FisherResiduals {
             regularization: fisher_regularization.map(f64::sqrt),
             inverse,
             data: None,
+            pullback_buffers: PullbackBuffers::default(),
         })
     }
 
@@ -221,10 +255,6 @@ impl FisherResiduals {
         Params::new(&values[self.params(i)], self.shape(i))
     }
 
-    fn params_of_mut<'a, T>(&self, values: &'a mut [T], i: usize) -> ParamsMut<'a, T> {
-        ParamsMut::new(&mut values[self.params(i)], self.shape(i))
-    }
-
     pub(crate) fn set_data(&mut self, y: Vec<f64>, g: Vec<f64>) -> Result<()> {
         let n_var = self.n_var();
         if n_var == 0 || !y.len().is_multiple_of(n_var) || y.len() != g.len() {
@@ -275,23 +305,40 @@ impl FisherResiduals {
         let Some(data) = &self.data else {
             bail!("no data: call `set_data` first");
         };
-        Ok(dispatch!(self.level, simd => self.residuals_with(simd, theta, data)))
+        let mut lin = Linearization::zeros(theta, data.clone(), self.n_var(), self.n_edge());
+        let r =
+            dispatch!(self.level, simd => self.residuals_with(simd, theta, data, Some(&mut lin)));
+        Ok((r, lin))
+    }
+
+    /// The residuals at `theta` alone, without the memory of a
+    /// linearization.
+    pub(crate) fn residual_values(&self, theta: &[f64]) -> Result<Vec<f64>> {
+        self.check_params(theta, "theta")?;
+        let Some(data) = &self.data else {
+            bail!("no data: call `set_data` first");
+        };
+        Ok(dispatch!(self.level, simd => self.residuals_with(simd, theta, data, None)))
     }
 
     fn residuals_with<S: Simd>(
         &self,
         simd: S,
         theta: &[f64],
-        data: &Arc<Data>,
-    ) -> (Vec<f64>, Linearization) {
-        let mut lin = Linearization::zeros(theta, data.clone(), self.n_var(), self.n_edge());
+        data: &Data,
+        lin: Option<&mut Linearization>,
+    ) -> Vec<f64> {
         let mut out = Tiled::zeros(data.n_tile(), self.n_residuals(), self.width);
-        let tiles: Vec<_> = lin.tiles_mut().into_iter().zip(out.tiles_mut()).collect();
+        let lin_tiles: Vec<_> = match lin {
+            Some(lin) => lin.tiles_mut().into_iter().map(Some).collect(),
+            None => (0..data.n_tile()).map(|_| None).collect(),
+        };
+        let tiles: Vec<_> = lin_tiles.into_iter().zip(out.tiles_mut()).collect();
         tiles.into_par_iter().enumerate().for_each_init(
             || TileScratch::new(simd, self),
             |s, (tile, (lin, out))| self.primal_tile(simd, theta, data, tile, lin, out, s),
         );
-        (out.to_rows(), lin)
+        out.to_rows()
     }
 
     pub(crate) fn pushforward(&self, lin: &Linearization, v: &[f64]) -> Result<Vec<f64>> {
@@ -322,10 +369,9 @@ impl FisherResiduals {
 
     fn pullback_with<S: Simd>(&self, simd: S, lin: &Linearization, r_bar: &[f64]) -> Vec<f64> {
         let r_bar = Tiled::from_rows(r_bar, lin.data.n_draw, self.width);
-        self.sum_over_tiles(simd, lin, |tile, grad, s| {
+        self.sum_pullbacks(simd, lin, |tile, s| {
             self.load_tile(simd, lin, tile, s);
             r_bar.load(simd, tile, &mut s.residual);
-            self.pullback_tile(simd, lin, s, grad);
         })
     }
 
@@ -341,49 +387,98 @@ impl FisherResiduals {
         lin: &Linearization,
         v: &[f64],
     ) -> Vec<f64> {
-        self.sum_over_tiles(simd, lin, |tile, grad, s| {
+        self.sum_pullbacks(simd, lin, |tile, s| {
             self.load_tile(simd, lin, tile, s);
             self.pushforward_tile(simd, lin, v, s);
-            self.pullback_tile(simd, lin, s, grad);
         })
     }
 
-    /// `sum_tiles f(tile)`, each `f` accumulating its tile's lanes into a
-    /// gradient.
+    /// `J^T r_bar` summed over the tiles, with `cotangent(tile, s)` loading
+    /// tile `tile` into `s` and leaving its `r_bar` in `s.residual`.
     ///
-    /// Deterministic: the tiles are halved at fixed points down to runs of at
-    /// most [`TILES_PER_TASK`], each run is summed in order, and the two halves
-    /// are added left plus right. So the order of every addition depends only
-    /// on the number of tiles, not on the threads or how they were scheduled.
-    fn sum_over_tiles<S: Simd>(
+    /// In blocks of tiles: first, in parallel over the block's tiles, the
+    /// triangular solve of each ([`Self::pullback_solve`]), then, in parallel
+    /// over the variables, each variable's local pullback over the block's
+    /// tiles in order, its lanes summed straight into its slice of the
+    /// gradient ([`Self::pullback_variable`]). So a variable's parameters stay
+    /// in cache across the tiles, the gradient is the only parameter-sized
+    /// buffer, and the order of every addition depends only on the problem's
+    /// sizes, not on the threads.
+    fn sum_pullbacks<S: Simd>(
         &self,
         simd: S,
         lin: &Linearization,
-        f: impl Fn(usize, &mut [S::f64s], &mut TileScratch<S>) + Sync,
+        cotangent: impl Fn(usize, &mut TileScratch<S>) + Sync,
     ) -> Vec<f64> {
-        self.sum_tiles(simd, 0..lin.data.n_tile(), &f)
+        let (n_var, n_res, n_tile) = (self.n_var(), self.n_residuals(), lin.data.n_tile());
+        let tile_bytes = (n_res + n_var) * self.width * std::mem::size_of::<f64>();
+        let block_len = (PULLBACK_BLOCK_BYTES / tile_bytes)
+            .max(MIN_BLOCK_TILES)
+            .min(n_tile);
+        // Every tile a block uses is overwritten, so old values don't matter.
+        let (mut r_bar, mut z) = self
+            .pullback_buffers
+            .take(block_len, n_res, n_var, self.width);
+        let scratch = PerThread::new();
+
+        let mut grad = vec![0.0; self.n_params()];
+        let mut grad_of_var = Vec::with_capacity(n_var);
+        let mut rest = grad.as_mut_slice();
+        for i in 0..n_var {
+            let (head, tail) = rest.split_at_mut(self.param_offset.row_len(i));
+            grad_of_var.push(head);
+            rest = tail;
+        }
+
+        for start in (0..n_tile).step_by(block_len) {
+            let tiles = start..(start + block_len).min(n_tile);
+            r_bar
+                .tiles_mut()
+                .into_par_iter()
+                .zip(z.tiles_mut())
+                .take(tiles.len())
+                .enumerate()
+                .for_each(|(k, (r_bar, z))| {
+                    scratch.with(
+                        || TileScratch::new(simd, self),
+                        |s| {
+                            cotangent(start + k, s);
+                            self.pullback_solve(simd, lin, s, r_bar, z);
+                        },
+                    );
+                });
+            grad_of_var.par_iter_mut().enumerate().for_each_init(
+                || VariableScratch::new(simd, self),
+                |ws, (i, out)| {
+                    self.pullback_variable(simd, lin, &r_bar, &z, tiles.clone(), i, ws, out)
+                },
+            );
+        }
+        drop(grad_of_var);
+        self.pullback_buffers.put((r_bar, z));
+        grad
+    }
+}
+
+/// One value per thread of the current rayon pool, made on its first use
+/// there, so that big scratch is allocated once per thread rather than per
+/// task.
+struct PerThread<T>(Vec<Mutex<Option<T>>>);
+
+impl<T> PerThread<T> {
+    fn new() -> Self {
+        Self(
+            (0..rayon::current_num_threads())
+                .map(|_| Mutex::new(None))
+                .collect(),
+        )
     }
 
-    fn sum_tiles<S: Simd, F>(&self, simd: S, tiles: std::ops::Range<usize>, f: &F) -> Vec<f64>
-    where
-        F: Fn(usize, &mut [S::f64s], &mut TileScratch<S>) + Sync,
-    {
-        if tiles.len() <= TILES_PER_TASK {
-            let mut grad = vec![S::f64s::splat(simd, 0.0); self.n_params()];
-            let mut s = TileScratch::new(simd, self);
-            for tile in tiles {
-                f(tile, &mut grad, &mut s);
-            }
-            return grad.iter().map(|g| g.reduce_sum()).collect();
-        }
-        let mid = tiles.start + tiles.len() / 2;
-        let (mut left, right) = rayon::join(
-            || self.sum_tiles(simd, tiles.start..mid, f),
-            || self.sum_tiles(simd, mid..tiles.end, f),
-        );
-        for (left, right) in left.iter_mut().zip(&right) {
-            *left += right;
-        }
-        left
+    /// `f` of this thread's value. `f` must not wait on other rayon tasks,
+    /// which could run on this thread and ask for the same value.
+    fn with<R>(&self, init: impl FnOnce() -> T, f: impl FnOnce(&mut T) -> R) -> R {
+        let slot = rayon::current_thread_index().unwrap_or(0) % self.0.len();
+        let mut value = self.0[slot].lock().expect("a task panicked");
+        f(value.get_or_insert_with(init))
     }
 }

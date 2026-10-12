@@ -4,9 +4,9 @@
 use fearless_simd::prelude::*;
 use fearless_simd_macros::simd;
 
-use super::conditioner::{Cotangent, Scratch, UnitState};
+use super::conditioner::{Cotangent, ParamsMut, Scratch, UnitState};
 use super::simd::store;
-use super::tiles::{Data, LinearTile, LinearTileMut, Linearization};
+use super::tiles::{Data, LinearTile, LinearTileMut, Linearization, Tiled};
 use super::FisherResiduals;
 
 /// One tile's draws and linearization, as vectors.
@@ -36,15 +36,6 @@ struct TangentWork<S: Simd> {
     l_dot: Vec<S::f64s>,
 }
 
-/// The pullback's cotangents.
-struct CotangentWork<S: Simd> {
-    /// `J^{-1}` of the residual cotangents.
-    z: Vec<S::f64s>,
-    /// `A_bar` and `L_bar`, per edge.
-    cot_a: Vec<S::f64s>,
-    cot_l: Vec<S::f64s>,
-}
-
 /// Per-thread scratch for the sweeps over one tile.
 pub(super) struct TileScratch<S: Simd> {
     tile: Tile<S>,
@@ -52,9 +43,35 @@ pub(super) struct TileScratch<S: Simd> {
     local: Scratch<S>,
     primal: PrimalWork<S>,
     tangent: TangentWork<S>,
-    cotangent: CotangentWork<S>,
+    /// `J^{-1}` of the residual cotangents, per variable.
+    z: Vec<S::f64s>,
     /// The tile's residuals, or their cotangents.
     pub(super) residual: Vec<S::f64s>,
+}
+
+/// Per-thread scratch for [`FisherResiduals::pullback_variable`]: one
+/// variable's edges and parameters.
+pub(super) struct VariableScratch<S: Simd> {
+    units: UnitState<S>,
+    local: Scratch<S>,
+    /// `A_bar` and `L_bar`, per parent.
+    cot_a: Vec<S::f64s>,
+    cot_l: Vec<S::f64s>,
+    /// The variable's slice of the gradient, per lane.
+    grad: Vec<S::f64s>,
+}
+
+impl<S: Simd> VariableScratch<S> {
+    pub(super) fn new(simd: S, problem: &FisherResiduals) -> Self {
+        let max_parent = problem.graph.max_parent();
+        Self {
+            units: problem.unit_state(simd),
+            local: problem.conditioner.scratch(simd),
+            cot_a: Vec::with_capacity(max_parent),
+            cot_l: Vec::with_capacity(max_parent),
+            grad: Vec::with_capacity(problem.param_offset.max_len()),
+        }
+    }
 }
 
 impl<S: Simd> TileScratch<S> {
@@ -81,11 +98,7 @@ impl<S: Simd> TileScratch<S> {
                 a_dot: by_edge(),
                 l_dot: by_edge(),
             },
-            cotangent: CotangentWork {
-                z: by_var(),
-                cot_a: by_edge(),
-                cot_l: by_edge(),
-            },
+            z: by_var(),
             residual: vec![zero; problem.n_residuals()],
         }
     }
@@ -136,7 +149,7 @@ impl FisherResiduals {
     }
 
     /// The primal of one tile: its residuals into `out` and its
-    /// linearization into `out_lin`.
+    /// linearization into `out_lin`, if given.
     #[simd]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn primal_tile<S: Simd>(
@@ -145,7 +158,7 @@ impl FisherResiduals {
         theta: &[f64],
         data: &Data,
         tile: usize,
-        out_lin: LinearTileMut<'_>,
+        out_lin: Option<LinearTileMut<'_>>,
         out: &mut [f64],
         s: &mut TileScratch<S>,
     ) {
@@ -216,7 +229,9 @@ impl FisherResiduals {
         }
 
         store(simd, residual, out);
-        s.tile.lin.store(simd, out_lin);
+        if let Some(out_lin) = out_lin {
+            s.tile.lin.store(simd, out_lin);
+        }
     }
 
     /// `J v` for one tile, already loaded into `s`, into `s.residual`.
@@ -294,76 +309,108 @@ impl FisherResiduals {
         }
     }
 
-    /// Accumulates `J^T r_bar` for one tile, already loaded into `s` with
-    /// `r_bar` in `s.residual`, into `grad`.
+    /// The first half of `J^T r_bar` for one tile, already loaded into `s`
+    /// with `r_bar` in `s.residual`: `z = J^{-1} r_bar`, coupling the
+    /// variables. Stores `r_bar` and `z` for [`Self::pullback_variable`].
     #[simd]
-    pub(super) fn pullback_tile<S: Simd>(
+    pub(super) fn pullback_solve<S: Simd>(
         &self,
         simd: S,
         lin: &Linearization,
         s: &mut TileScratch<S>,
-        grad: &mut [S::f64s],
+        r_bar_out: &mut [f64],
+        z_out: &mut [f64],
     ) {
-        let n_var = self.n_var();
         let scale = lin.data.scale();
         let TileScratch {
-            tile:
-                Tile {
-                    y,
-                    lin:
-                        LinearTile {
-                            edge_a,
-                            delta,
-                            x,
-                            w,
-                        },
-                    ..
-                },
-            units,
-            local,
-            cotangent: CotangentWork { z, cot_a, cot_l },
+            tile: Tile { lin: tile_lin, .. },
+            z,
             residual: r_bar,
             ..
         } = s;
-
-        for i in 0..n_var {
+        for i in 0..self.n_var() {
             z[i] = r_bar[i] * scale;
         }
-        self.solve(simd, edge_a, delta, z);
+        self.solve(simd, &tile_lin.edge_a, &tile_lin.delta, z);
+        store(simd, r_bar, r_bar_out);
+        store(simd, z, z_out);
+    }
 
-        for i in 0..n_var {
-            self.gather_parents(i, y, &mut units.y_parents);
-            let edges = self.graph.edges(i);
-            let mut x_bar = r_bar[i] * scale;
+    /// The second half: variable `i`'s local pullback, summed over the
+    /// tiles `tiles` in order and then over the lanes, into `out`, its slice
+    /// of the gradient. Tile `tiles.start + k`'s `r_bar` and `z` are tile `k`
+    /// of `r_bar` and `z`.
+    #[simd]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn pullback_variable<S: Simd>(
+        &self,
+        simd: S,
+        lin: &Linearization,
+        r_bar: &Tiled,
+        z: &Tiled,
+        tiles: std::ops::Range<usize>,
+        i: usize,
+        ws: &mut VariableScratch<S>,
+        out: &mut [f64],
+    ) {
+        let n_var = self.n_var();
+        let scale = lin.data.scale();
+        let shape = self.shape(i);
+        let theta_i = self.params_of(&lin.theta, i);
+        let VariableScratch {
+            units,
+            local,
+            cot_a,
+            cot_l,
+            grad,
+        } = ws;
+        grad.clear();
+        grad.resize(shape.size(), S::f64s::splat(simd, 0.0));
+
+        for (k, tile) in tiles.enumerate() {
+            let (x_i, w_i, z_i) = (
+                lin.x.value(simd, tile, i),
+                lin.w.value(simd, tile, i),
+                z.value(simd, k, i),
+            );
+            let mut x_bar = r_bar.value(simd, k, i) * scale;
+            units.y_parents.clear();
+            cot_a.clear();
+            cot_l.clear();
             for (e, p) in self.graph.entries(i) {
-                let z_p = z[p];
-                cot_a[e] = -(w[i] * z_p);
-                cot_l[e] = -z_p;
+                units.y_parents.push(lin.data.y.value(simd, tile, p));
+                let z_p = z.value(simd, k, p);
+                let mut a = -(w_i * z_p);
+                let mut l = -z_p;
                 if let Some(reg) = self.regularization {
-                    let o = r_bar[n_var + e] * (scale * reg);
-                    x_bar -= o * edge_a[e];
-                    cot_a[e] -= x[i] * o;
-                    cot_l[e] += o;
+                    let o = r_bar.value(simd, k, n_var + e) * (scale * reg);
+                    x_bar -= o * lin.edge_a.value(simd, tile, e);
+                    a -= x_i * o;
+                    l += o;
                 }
+                cot_a.push(a);
+                cot_l.push(l);
             }
             let cot = Cotangent {
                 x: x_bar,
-                delta: -(w[i] * z[i]),
-                mu: -z[i],
-                edge_a: &cot_a[edges.clone()],
-                edge_l: &cot_l[edges],
+                delta: -(w_i * z_i),
+                mu: -z_i,
+                edge_a: cot_a,
+                edge_l: cot_l,
             };
-            let theta_i = self.params_of(&lin.theta, i);
             self.conditioner.evaluate(simd, theta_i, units);
             self.conditioner.local_pullback(
                 simd,
                 theta_i,
                 units,
                 &cot,
-                y[i],
+                lin.data.y.value(simd, tile, i),
                 local,
-                self.params_of_mut(grad, i),
+                ParamsMut::new(grad, shape),
             );
+        }
+        for (out, g) in out.iter_mut().zip(grad.iter()) {
+            *out += g.reduce_sum();
         }
     }
 }
