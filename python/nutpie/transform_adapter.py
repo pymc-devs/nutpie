@@ -1869,7 +1869,7 @@ def make_transform_adapter(
     solver_rtol=5e-2,
     solver_atol=1e-6,
     lm_linear_steps=80,
-    lm_min_loss=math.exp(-3),
+    lm_min_loss=math.exp(-3),  # noqa: B008
     lm_probe_batch=32,
     lm_probes=1024,
     lm_residual_batch=128,

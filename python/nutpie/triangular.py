@@ -1207,7 +1207,7 @@ class SparseTriangularMap(bijections.AbstractBijection):
                     parents = y.at[parent_idx].get(mode="fill", fill_value=0.0)
                     conditioner_group = jax.tree.map(
                         lambda leaf: (
-                            leaf[local_members] if eqx.is_array(leaf) else leaf
+                            leaf[local_members] if eqx.is_array(leaf) else leaf  # noqa: B023
                         ),
                         self.conditioners[bucket],
                     )

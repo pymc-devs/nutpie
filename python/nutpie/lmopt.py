@@ -496,10 +496,10 @@ def precompute_Minvs(blocks, plans, n_samples, lam, floors):
     for i, (H, p) in enumerate(zip(blocks, plans)):
         shrinkage = p["q"] / (p["q"] + n_samples)
         if floors is None:
-            inv = lambda H: _block_inv(H, lam, None, shrinkage)
+            inv = lambda H: _block_inv(H, lam, None, shrinkage)  # noqa: B023
             Minv, bad = jax.vmap(jax.vmap(inv))(H)
         else:
-            inv = lambda H, floor: _block_inv(H, lam, floor, shrinkage)
+            inv = lambda H, floor: _block_inv(H, lam, floor, shrinkage)  # noqa: B023
             Minv, bad = jax.vmap(jax.vmap(inv, in_axes=(0, None)))(H, floors[i])
         out.append(Minv)
         failed.append(jnp.sum(bad))
@@ -586,11 +586,13 @@ def describe_diagnostics(info, plans, labels=None, top=4):
     """
     log = lambda x: f"{float(np.log(x)):+.2f}" if np.isfinite(x) and x > 0 else "  nan"
     lines = [
-        f"       geodesic: log F full={log(float(info['geo_F_full']))}"
-        f" accelerated={log(float(info['geo_F']))}"
-        f"  rho_quad={float(info['geo_rho_quad']):+.2f}"
-        f"  2|a|/|p|={float(info['geo_ratio']):.2f}"
-        f"  cg={int(info['geo_cg'])}"
+        (
+            f"       geodesic: log F full={log(float(info['geo_F_full']))}"
+            f" accelerated={log(float(info['geo_F']))}"
+            f"  rho_quad={float(info['geo_rho_quad']):+.2f}"
+            f"  2|a|/|p|={float(info['geo_ratio']):.2f}"
+            f"  cg={int(info['geo_cg'])}"
+        )
     ]
     if "conditioner_step_norms" not in info:
         return "\n".join(lines)
@@ -904,10 +906,6 @@ def step(
     if nonfinite_blocks is not None:
         info["nonfinite_blocks"] = nonfinite_blocks
         info["failed_inverses"] = failed_inverses
-    # Block eigenvalue diagnostics, disabled.
-    if False and plans is not None:
-        info["block_min_eig"] = jnp.stack([jnp.min(jnp.linalg.eigvalsh(H)) for H in Hb])
-        info["block_max_eig"] = jnp.stack([jnp.max(jnp.linalg.eigvalsh(H)) for H in Hb])
     return theta_out, r_out, lam_out, p_out, Hb, info
 
 

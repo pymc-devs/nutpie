@@ -175,10 +175,7 @@ def _is_identity(fn) -> bool:
     import jax.numpy as jnp
 
     probe = jnp.asarray([-1.5, 0.0, 2.25])
-    try:
-        return bool(np.allclose(np.asarray(fn(probe)), np.asarray(probe)))
-    except Exception:  # pragma: no cover - non-elementwise final activation
-        return False
+    return bool(np.allclose(np.asarray(fn(probe)), np.asarray(probe)))
 
 
 def _chain_layers(transformer):

@@ -260,10 +260,10 @@ def test_conditioner_capacity_matches_residuals(x64, fitted_flow):
         parent_indices = np.asarray(tmap.bucket_parent_indices[bucket])
         width = _hidden_width(conditioner)
         for m, member in enumerate(np.asarray(tmap.bucket_members[bucket])):
-            one = eqx.combine(jax.tree.map(lambda a: a[m], arrays), static)
+            one = eqx.combine(jax.tree.map(lambda a: a[m], arrays), static)  # noqa: B023
             parents = y_padded[:, parent_indices[m]]
             indices = tmap.bucket_parent_indices[bucket][m]
-            mean = jax.vmap(lambda p: _unit_features(tmap, one)(p, indices))(
+            mean = jax.vmap(lambda p: _unit_features(tmap, one)(p, indices))(  # noqa: B023
                 parents
             ).mean(0)
             directions = _gate_directions(one, mean)
@@ -271,11 +271,12 @@ def test_conditioner_capacity_matches_residuals(x64, fitted_flow):
 
             def perturbed(gates):
                 change, _ = eqx.partition(
-                    unravel(directions @ gates), eqx.is_inexact_array
+                    unravel(directions @ gates),  # noqa: B023
+                    eqx.is_inexact_array,
                 )
-                new = jax.tree.map(lambda a, d: a.at[m].add(d), arrays, change)
+                new = jax.tree.map(lambda a, d: a.at[m].add(d), arrays, change)  # noqa: B023
                 conditioners = list(tmap.conditioners)
-                conditioners[bucket] = eqx.combine(new, static)
+                conditioners[bucket] = eqx.combine(new, static)  # noqa: B023
                 return residuals(
                     eqx.tree_at(
                         lambda b: where(b).conditioners, flow, tuple(conditioners)
