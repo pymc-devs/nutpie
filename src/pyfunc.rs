@@ -15,7 +15,7 @@ use thiserror::Error;
 
 use crate::{
     common::{PyValue, PyVariable},
-    wrapper::PyTransformAdapt,
+    transform::PyTransformAdapt,
 };
 
 #[pyclass(from_py_object)]

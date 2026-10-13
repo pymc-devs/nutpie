@@ -1,0 +1,43 @@
+{
+  "python": "3.13.1 (main, Feb 18 2026, 20:57:27) [Clang 21.0.0git (https:/github.com/llvm/llvm-project 2f05451198e2f222ec66cec489",
+  "nutpie": "0.16.12",
+  "extension": "/tmp/nutpie-probe/nutpie/_lib.so",
+  "gaussian": {
+    "shape": [
+      2,
+      500
+    ],
+    "mean": -0.08180182140567091,
+    "std": 0.9558430036282342,
+    "seconds": 0.14349999999999596
+  },
+  "transforms": {
+    "draws": 100,
+    "density_gradient_checks": 3
+  },
+  "mutable_data": {
+    "old_gradient": [
+      5.0
+    ],
+    "new_gradient": [
+      14.0
+    ],
+    "ownership_and_memory_growth": true
+  },
+  "mmm_compile_seconds": 27.162400000000005,
+  "mmm": {
+    "dimensions": 15,
+    "draws": 50,
+    "tune": 100,
+    "density_gradient_checks": 3,
+    "seconds": 0.7617999999999938
+  },
+  "toolchain": {
+    "emscripten": "4.0.9",
+    "rust": "1.96.0-nightly (3102493c7 2026-03-12)",
+    "chrome": "146.0.7680.153",
+    "host": "macOS ARM64"
+  },
+  "upstream_commit": "98c0e879cdd110c14e6bc82a001251b53a990f58",
+  "native_validation": "cargo check --locked passed; native runtime regression tests not run"
+}

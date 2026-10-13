@@ -1,0 +1,7 @@
+implementation=CPython
+version=3.13
+shared=true
+abi3=false
+pointer_width=32
+build_flags=
+suppress_build_script_link_lines=true

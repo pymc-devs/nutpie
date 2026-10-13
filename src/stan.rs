@@ -18,7 +18,7 @@ use smallvec::{SmallVec, ToSmallVec};
 use thiserror::Error;
 
 use crate::common::{ItemType, PyValue, PyVariable};
-use crate::wrapper::PyTransformAdapt;
+use crate::transform::PyTransformAdapt;
 
 type InnerModel = bridgestan::Model<Arc<bridgestan::StanLibrary>>;
 
