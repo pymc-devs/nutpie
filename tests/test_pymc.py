@@ -786,18 +786,8 @@ def tmp_path():
 
 @pytest.mark.pymc
 @parameterize_backends
-def test_dims_model(backend, gradient_backend, request):
+def test_dims_model(backend, gradient_backend):
     import pymc.dims as pmd
-
-    if backend == "mlx":
-        request.applymarker(
-            pytest.mark.xfail(
-                reason="ZeroSumNormal checks its mean against atol=1e-9, which "
-                "its float32 transform cannot meet",
-                raises=RuntimeError,
-                strict=True,
-            )
-        )
 
     coords = {"a": range(3), "b": range(5)}
     with pm.Model(coords=coords) as model:
