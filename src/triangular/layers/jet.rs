@@ -8,7 +8,9 @@
 use fearless_simd::prelude::*;
 use fearless_simd_macros::simd;
 
-use super::{Contract2, Layer, Param, PositiveAffineSpec, TangentSasSpec};
+use super::{
+    AsymmetricSas, Contract2, Layer, LogGammaBound, Param, PositiveAffineSpec, TangentSasSpec,
+};
 use crate::triangular::jet::{Jet, JetArena};
 
 /// The transformer parameters `pi` of one variable as jet inputs.
@@ -35,23 +37,30 @@ impl<S: Simd> Fields<'_, S> {
     }
 }
 
+/// `log gamma = asinh(alpha)`, squashed into `bound` if given
+/// (`_bounded_log_gamma`).
+#[inline(always)]
+fn log_gamma<S: Simd>(ws: &mut JetArena<S>, alpha: Jet, bound: Option<LogGammaBound>) -> Jet {
+    let log_gamma = ws.asinh(alpha);
+    match bound {
+        None => log_gamma,
+        Some(b) => {
+            let t = ws.scale(log_gamma, b.slope);
+            let t = ws.add_const(t, b.offset);
+            let t = ws.sigmoid(t);
+            let t = ws.scale(t, b.width);
+            ws.add_const(t, b.low)
+        }
+    }
+}
+
 impl Contract2 {
     /// `Contract2.inverse_and_log_det`.
     #[inline(always)]
     fn inverse<S: Simd>(&self, ws: &mut JetArena<S>, fields: &Fields<S>, x: Jet) -> (Jet, Jet) {
-        let log_gamma = fields.get(ws, self.alpha).map(|alpha| {
-            let log_gamma = ws.asinh(alpha);
-            match self.bound {
-                None => log_gamma,
-                Some(b) => {
-                    let t = ws.scale(log_gamma, b.slope);
-                    let t = ws.add_const(t, b.offset);
-                    let t = ws.sigmoid(t);
-                    let t = ws.scale(t, b.width);
-                    ws.add_const(t, b.low)
-                }
-            }
-        });
+        let log_gamma = fields
+            .get(ws, self.alpha)
+            .map(|alpha| log_gamma(ws, alpha, self.bound));
         let log_delta = fields.get(ws, self.beta).map(|beta| ws.asinh(beta));
         let log_sigma = fields.get(ws, self.sigma).map(|sigma| ws.asinh(sigma));
 
@@ -178,6 +187,53 @@ fn tangent_sas_inverse<S: Simd>(
     (out, ld)
 }
 
+impl AsymmetricSas {
+    /// `AsymmetricSAS.inverse_and_log_det`: with `gamma` that of `y`'s side,
+    /// `q = gamma y` and `t = asinh(q) / gamma`, `x = c + sinh(t) /
+    /// scale_mod` and `log_det = logcosh(t) - log scale_mod - 0.5 log1p(q^2)`.
+    #[inline(always)]
+    fn inverse<S: Simd>(&self, ws: &mut JetArena<S>, fields: &Fields<S>, y: Jet) -> (Jet, Jet) {
+        let alpha_pos = fields.get_or_zero(ws, self.alpha_pos);
+        let log_gamma_pos = log_gamma(ws, alpha_pos, self.bound);
+        let alpha_neg = fields.get_or_zero(ws, self.alpha_neg);
+        let log_gamma_neg = log_gamma(ws, alpha_neg, self.bound);
+        let positive = ws.value(&y).simd_ge(0.0);
+        let log_gamma = ws.select(positive, log_gamma_pos, log_gamma_neg);
+
+        let gamma = ws.copy(&log_gamma);
+        let gamma = ws.exp(gamma);
+        let q = ws.mul(y, gamma);
+        let t = ws.copy(&q);
+        let t = ws.asinh(t);
+        let inv_gamma = ws.neg(log_gamma);
+        let inv_gamma = ws.exp(inv_gamma);
+        let t = ws.mul(t, inv_gamma);
+
+        let mut out = ws.copy(&t);
+        out = ws.sinh(out);
+        let log_scale = fields.get(ws, self.a).map(|a| ws.asinh(a));
+        if let Some(log_scale) = &log_scale {
+            let factor = ws.copy(log_scale);
+            let factor = ws.neg(factor);
+            let factor = ws.exp(factor);
+            out = ws.mul(out, factor);
+        }
+        if let Some(c) = fields.get(ws, self.c) {
+            out = ws.add(out, c);
+        }
+
+        let mut ld = ws.log_cosh(t);
+        let q = ws.square(q);
+        let q = ws.ln_1p(q);
+        let q = ws.scale(q, 0.5);
+        ld = ws.sub(ld, q);
+        if let Some(log_scale) = log_scale {
+            ld = ws.sub(ld, log_scale);
+        }
+        (out, ld)
+    }
+}
+
 /// `PositiveAffine.inverse_and_log_det`: `x = (y - loc) / scale_mod`, and
 /// `1 / scale_mod = positive(-scale)`.
 #[inline(always)]
@@ -251,6 +307,7 @@ fn evaluate_transformer<S: Simd>(
         let (out, ld) = match layer {
             Layer::Contract2(layer) => layer.inverse(ws, &fields, x),
             Layer::TangentSas(layer) => tangent_sas_inverse(layer, ws, &fields, x),
+            Layer::AsymmetricSas(layer) => layer.inverse(ws, &fields, x),
             Layer::PositiveAffine(layer) => positive_affine_inverse(layer, ws, &fields, x),
         };
         x = out;

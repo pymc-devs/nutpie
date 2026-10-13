@@ -52,7 +52,8 @@ def check_supported(tmap):
     """Raise `NotImplementedError` unless the Rust residuals support `tmap`:
     depth-1 softplus or GELU (`jax.nn.gelu`, the tanh approximation)
     conditioners with the location skip, no parent features, and a
-    transformer of `Contract2`, `TangentSAS` and `PositiveAffine` layers."""
+    transformer of `Contract2`, `TangentSAS`, `AsymmetricSAS` and
+    `PositiveAffine` layers."""
     from nutpie.triangular import LocationSkipMlp
 
     if tmap.feature_degree is not None:

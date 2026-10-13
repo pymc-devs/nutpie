@@ -31,9 +31,7 @@ def x64():
 def test_fisher_information_affine(x64):
     """For y = mu + sigma x, the Fisher information in (mu, sigma) is
     diag(1 / sigma^2, 2 / sigma^2), whatever the parameterization."""
-    transformer = make_transformer(
-        affine_transformer=1, contract_transformer=0, asymmetric_transformer=0
-    )
+    transformer = make_transformer("affine")
     constructor, num_params = get_ravelled_pytree_constructor(
         transformer,
         filter_spec=eqx.is_inexact_array,
@@ -56,9 +54,7 @@ def test_fisher_information_affine(x64):
 def test_velocity_parity_affine(x64):
     """A location change has an even latent velocity, a scale change an odd
     one, which is what splits the speed into its two parts."""
-    transformer = make_transformer(
-        affine_transformer=1, contract_transformer=0, asymmetric_transformer=0
-    )
+    transformer = make_transformer("affine")
     constructor, num_params = get_ravelled_pytree_constructor(
         transformer,
         filter_spec=eqx.is_inexact_array,

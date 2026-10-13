@@ -44,6 +44,16 @@ pub(crate) struct TangentSasSpec {
     pub(crate) r: Option<Param>,
 }
 
+/// `nutpie.normalizing_flow.AsymmetricSAS`, with its raw fields.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub(crate) struct AsymmetricSasSpec {
+    pub(crate) c: Option<Param>,
+    pub(crate) a: Option<Param>,
+    pub(crate) alpha_pos: Option<Param>,
+    pub(crate) alpha_neg: Option<Param>,
+    pub(crate) log_gamma_bounds: Option<(f64, f64)>,
+}
+
 /// `nutpie.normalizing_flow.PositiveAffine`, with its raw fields.
 #[derive(Debug, Clone, Copy, Deserialize)]
 pub(crate) struct PositiveAffineSpec {
@@ -58,6 +68,7 @@ pub(crate) struct PositiveAffineSpec {
 pub(crate) enum LayerSpec {
     Contract2(Contract2Spec),
     TangentSas(TangentSasSpec),
+    AsymmetricSas(AsymmetricSasSpec),
     PositiveAffine(PositiveAffineSpec),
 }
 
@@ -67,6 +78,7 @@ impl LayerSpec {
         let fields = match *self {
             LayerSpec::Contract2(c) => [c.alpha, c.beta, c.sigma, c.mu, c.nu],
             LayerSpec::TangentSas(t) => [t.nu, t.eps, t.b, t.r, None],
+            LayerSpec::AsymmetricSas(t) => [t.c, t.a, t.alpha_pos, t.alpha_neg, None],
             LayerSpec::PositiveAffine(a) => [a.loc, a.scale, None, None, None],
         };
         fields.into_iter().flatten()
@@ -126,11 +138,37 @@ impl Contract2 {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AsymmetricSas {
+    c: Option<Param>,
+    a: Option<Param>,
+    alpha_pos: Option<Param>,
+    alpha_neg: Option<Param>,
+    bound: Option<LogGammaBound>,
+}
+
+impl AsymmetricSas {
+    fn new(spec: AsymmetricSasSpec) -> Result<Self> {
+        let bound = match spec.log_gamma_bounds {
+            None => None,
+            Some((low, high)) => Some(LogGammaBound::new(low, high)?),
+        };
+        Ok(Self {
+            c: spec.c,
+            a: spec.a,
+            alpha_pos: spec.alpha_pos,
+            alpha_neg: spec.alpha_neg,
+            bound,
+        })
+    }
+}
+
 /// A transformer layer, ready to evaluate.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Layer {
     Contract2(Contract2),
     TangentSas(TangentSasSpec),
+    AsymmetricSas(AsymmetricSas),
     PositiveAffine(PositiveAffineSpec),
 }
 
@@ -139,6 +177,7 @@ impl Layer {
         Ok(match spec {
             LayerSpec::Contract2(spec) => Layer::Contract2(Contract2::new(spec)?),
             LayerSpec::TangentSas(spec) => Layer::TangentSas(spec),
+            LayerSpec::AsymmetricSas(spec) => Layer::AsymmetricSas(AsymmetricSas::new(spec)?),
             LayerSpec::PositiveAffine(spec) => Layer::PositiveAffine(spec),
         })
     }
@@ -146,12 +185,13 @@ impl Layer {
     /// The conditioner outputs of the fields that shape the layer beyond an
     /// affine map: `Contract2`'s `alpha` and `beta` (with both zero it is
     /// affine, `sigma`, `mu` and `nu` being its scale and shifts), and all of
-    /// `TangentSAS`'s, which is the identity at `eps = 0`, `r = 1` whatever
-    /// its `b` and `nu`.
+    /// `TangentSAS`'s and `AsymmetricSAS`'s, which are the identity at
+    /// `eps = 0`, `r = 1` and `gamma_pm = 1` whatever their shift and scale.
     pub(crate) fn shape_params(&self) -> impl Iterator<Item = usize> {
         let fields = match *self {
             Layer::Contract2(c) => [c.alpha, c.beta, None, None],
             Layer::TangentSas(t) => [t.nu, t.eps, t.b, t.r],
+            Layer::AsymmetricSas(t) => [t.c, t.a, t.alpha_pos, t.alpha_neg],
             Layer::PositiveAffine(_) => [None; 4],
         };
         fields.into_iter().flatten().map(|p| p.index)

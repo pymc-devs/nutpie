@@ -361,6 +361,18 @@ impl<S: Simd> JetArena<S> {
         a
     }
 
+    /// `a` on the lanes where `mask` holds and `b` elsewhere: a function
+    /// with one expression on either side of a branch point.
+    #[inline(always)]
+    pub(crate) fn select(&mut self, mask: S::mask64s, a: Jet, b: Jet) -> Jet {
+        let (a_slot, b_slot) = self.pair(&a, &b);
+        for (a, &b) in a_slot.iter_mut().zip(b_slot) {
+            *a = mask.select(*a, b);
+        }
+        self.release(b);
+        a
+    }
+
     #[inline(always)]
     pub(crate) fn scale(&mut self, j: Jet, c: f64) -> Jet {
         let range = self.range(&j);

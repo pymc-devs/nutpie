@@ -20,6 +20,7 @@ import numpy as np
 import scipy.sparse as sp
 
 from nutpie.triangular_layout import (
+    AsymmetricSASSpec,
     Contract2Spec,
     PositiveAffineSpec,
     TangentSASSpec,
@@ -54,28 +55,36 @@ def _activation_name(activation) -> str:
         ) from None
 
 
+RUST_TRANSFORMERS = ("affine", "sas", "tangent_sas", "asymmetric_sas")
+
+
 def transformer_spec(
+    transformer="sas",
+    transformer_layers=1,
     *,
-    contract_transformer=0,
-    tangent_sas_transformer=0,
     tangent_sas_fix_b=False,
     log_gamma_bounds=None,
 ):
-    """``(specs, n_par, location_index)`` of `make_transformer`'s chain with
-    these counts (and no affine or asymmetric layers), as
+    """``(specs, n_par, location_index)`` of `make_transformer`'s chain, as
     `triangular_layout._probe_transformer` finds them on the JAX transformer.
 
     Conditioner output ``k`` feeds one field of one layer; the fields are
     numbered in the order the JAX transformer's arrays flatten in, and every
-    field starts at zero, so its offset is zero. With both counts zero, this
-    is `SparseTriangularMap`'s default transformer, two `Contract2` layers.
+    field starts at zero, so its offset is zero.
     """
-    n_contract = int(contract_transformer)
-    n_tangent_sas = int(tangent_sas_transformer)
-    if n_contract < 0 or n_tangent_sas < 0:
-        raise ValueError("transformer counts must be non-negative.")
-    if n_contract == 0 and n_tangent_sas == 0:
-        n_contract = 2
+    layers = int(transformer_layers)
+    if layers < 1:
+        raise ValueError("a transformer needs at least one layer.")
+    if transformer not in RUST_TRANSFORMERS:
+        raise NotImplementedError(
+            f"the Rust flow does not support the {transformer!r} transformer, "
+            f"only {RUST_TRANSFORMERS}."
+        )
+    if transformer == "affine" and layers != 1:
+        raise ValueError("an affine transformer has exactly one layer.")
+    n_contract = layers if transformer == "sas" else 0
+    n_tangent_sas = layers if transformer == "tangent_sas" else 0
+    n_asymmetric_sas = layers if transformer == "asymmetric_sas" else 0
     if log_gamma_bounds is not None:
         log_gamma_bounds = tuple(map(float, log_gamma_bounds))
 
@@ -110,7 +119,21 @@ def transformer_spec(
         b = None if tangent_sas_fix_b else field()
         r = field()
         specs.append(TangentSASSpec(nu=nu, eps=eps, b=b, r=r))
-    if n_tangent_sas:
+    for index in range(n_asymmetric_sas):
+        # The first layer acts on the standard-normal base, see
+        # `make_transformer`.
+        c, a = (field(), field()) if index else (None, None)
+        alpha_pos, alpha_neg = field(), field()
+        specs.append(
+            AsymmetricSASSpec(
+                c=c,
+                a=a,
+                alpha_pos=alpha_pos,
+                alpha_neg=alpha_neg,
+                log_gamma_bounds=log_gamma_bounds,
+            )
+        )
+    if transformer != "sas":
         loc, scale = field(), field()
         specs.append(PositiveAffineSpec(loc=loc, scale=scale))
         location = loc
@@ -170,8 +193,8 @@ def build_triangular_flow(
     nn_width=16,
     activation="softplus",
     zero_init=True,
-    contract_transformer=0,
-    tangent_sas_transformer=0,
+    transformer="sas",
+    transformer_layers=1,
     tangent_sas_fix_b=False,
     log_gamma_bounds=None,
     input_squash=None,
@@ -200,8 +223,8 @@ def build_triangular_flow(
         raise ValueError("order must be a permutation of range(dim).")
 
     specs, n_par, location_index = transformer_spec(
-        contract_transformer=contract_transformer,
-        tangent_sas_transformer=tangent_sas_transformer,
+        transformer,
+        transformer_layers,
         tangent_sas_fix_b=tangent_sas_fix_b,
         log_gamma_bounds=log_gamma_bounds,
     )
