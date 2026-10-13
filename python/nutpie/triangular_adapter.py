@@ -252,6 +252,7 @@ class TriangularFlowAdapter:
         val_block_size,
         early_stopping,
         linear_fits,
+        refit_diag,
         debug_save_bijection,
         stop_event,
         nn_width,
@@ -300,6 +301,7 @@ class TriangularFlowAdapter:
         self._val_block_size = val_block_size
         self._early_stopping = early_stopping
         self._linear_fits = linear_fits
+        self._refit_diag = refit_diag
         # LM fits of the current flow so far, see `linear_fits`.
         self._flow_fits = 0
         self._debug_save_bijection = debug_save_bijection
@@ -569,12 +571,18 @@ class TriangularFlowAdapter:
             )
             return
 
+        # A fresh flow's affine already comes from these draws.
+        refit_diag = self._refit_diag and not fresh
+        if refit_diag:
+            base = base.with_affine(*diag_affine(*train))
+
         # Header for the LM steps printed below; a fresh flow has its own.
         if self._verbose >= 2 and not fresh:
             self._report(
                 n_draws,
                 f"{log_f}  current {_format_log_f(old_loss)}  -> "
-                f"{'linear ' if linear_fit else ''}refit  ({draw_counts})",
+                f"{'linear ' if linear_fit else ''}refit"
+                f"{', new diag' if refit_diag else ''}  ({draw_counts})",
             )
 
         self._flow_fits += 1

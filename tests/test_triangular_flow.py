@@ -277,10 +277,30 @@ def test_built_flow_inverts_and_fits():
     assert after < before
 
 
-def test_rust_flow_adapter():
+def test_with_affine_restandardizes():
+    """`with_affine` keeps the conditioners and standardizes the draws with
+    the new affine: ``y = (x - loc) / scale`` and ``g_y = g * scale``, in the
+    triangular order."""
+    x, g = _draws()
+    order = np.random.default_rng(3).permutation(DIM)
+    flow = build_triangular_flow(0, x, g, sparsity=_banded(DIM, order), order=order)
+    rng = np.random.default_rng(4)
+    loc, scale = rng.normal(size=DIM), np.exp(rng.normal(size=DIM))
+    moved = flow.with_affine(loc, scale)
+    np.testing.assert_array_equal(moved.theta, flow.theta)
+    y, gy = moved.undo_affine(x, g)
+    np.testing.assert_allclose(y, ((x - loc) / scale)[:, order], rtol=1e-12)
+    np.testing.assert_allclose(gy, (g * scale)[:, order], rtol=1e-12)
+    with pytest.raises(RuntimeError, match="nonzero"):
+        flow.with_affine(loc, np.zeros(DIM))
+
+
+@pytest.mark.parametrize("refit_diag", [False, True])
+def test_rust_flow_adapter(refit_diag):
     """The Rust-path adapter: a diagonal affine for the first windows, then a
-    triangular flow fitted to a correlated normal, and its sampler interface
-    consistent with that flow."""
+    triangular flow fitted to a correlated normal and refitted (with
+    `refit_diag`, in new coordinates), and its sampler interface consistent
+    with that flow."""
     from nutpie._lib import TriangularFlow
     from nutpie.transform_adapter import make_transform_adapter
 
@@ -294,15 +314,19 @@ def test_rust_flow_adapter():
     sparsity = ~np.eye(dim, dtype=bool)
 
     adapter = make_transform_adapter(
-        rust_flow=True, num_diag_windows=2, initial_skip=0, nn_width=4
+        rust_flow=True,
+        num_diag_windows=2,
+        initial_skip=0,
+        nn_width=4,
+        refit_diag=refit_diag,
     )(0, x[0], g[0], 0, logp_fn=None, sparsity=sparsity, order=np.arange(dim))
     for n_draws in [20, 40]:
         adapter.update(n_draws, list(x[:n_draws]), list(g[:n_draws]), np.zeros(n_draws))
         assert isinstance(adapter.flow_transform_layout(), dict)
-    adapter.update(400, list(x), list(g), np.zeros(400))
+    for _ in range(2):
+        adapter.update(400, list(x), list(g), np.zeros(400))
     flow = adapter.flow_transform_layout()
     assert isinstance(flow, TriangularFlow)
-    assert adapter.transformation_id == 3
     # A normal is a linear flow away: fitted almost exactly.
     assert flow.fisher_divergence(x[:64], g[:64]) < 1e-3
 
