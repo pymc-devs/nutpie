@@ -105,7 +105,7 @@ def fit_to_data(
     lm_mlp_ridge: float = 0.0,
     lm_skip_ridge: float = 0.0,
     lm_shape_ridge: float = 0.0,
-    lm_freeze_units: bool = False,
+    lm_linear_fit: bool = False,
     lm_print_blocks: bool = False,
     lm_diagnose: bool = False,
     should_stop: Callable[[], bool] | None = None,
@@ -256,11 +256,12 @@ def fit_to_data(
             ``lm_mlp_ridge``. Pulls each conditional towards the affine
             transformer it starts from. Only used when ``method`` is
             ``"lm-rust"``.
-        lm_freeze_units: Hold the conditioner MLPs' hidden units (both
-            weights and the hidden biases) fixed and fit only the rest. On
-            a zero-initialized flow, whose MLP outputs are zero, this fits
-            the flow without MLPs. Only used when ``method`` is
-            ``"lm-rust"``.
+        lm_linear_fit: Hold what makes the conditioners and transformers
+            nonlinear fixed: the MLPs' hidden units (weights and hidden
+            biases) and the biases of the transformer's shape fields. On a
+            zero-initialized flow, whose MLP outputs are zero, this fits the
+            flow without MLPs and with affine transformers. Only used when
+            ``method`` is ``"lm-rust"``.
         lm_min_loss: Stop the LM fit once the Fisher divergence falls below
             this. Note that the divergence is a *sum* over dimensions, so this
             is an absolute, dimension-independent target: it bounds each
@@ -301,10 +302,10 @@ def fit_to_data(
     )
 
     if (
-        lm_mlp_ridge or lm_skip_ridge or lm_shape_ridge or lm_freeze_units
+        lm_mlp_ridge or lm_skip_ridge or lm_shape_ridge or lm_linear_fit
     ) and method != "lm-rust":
         raise ValueError(
-            "lm_mlp_ridge, lm_skip_ridge, lm_shape_ridge and lm_freeze_units are "
+            "lm_mlp_ridge, lm_skip_ridge, lm_shape_ridge and lm_linear_fit are "
             "only supported with method='lm-rust'."
         )
 
@@ -327,7 +328,7 @@ def fit_to_data(
             mlp_ridge=lm_mlp_ridge,
             skip_ridge=lm_skip_ridge,
             shape_ridge=lm_shape_ridge,
-            freeze_units=lm_freeze_units,
+            linear_fit=lm_linear_fit,
             verbose=verbose,
             should_stop=should_stop,
             val_data=val_data,
@@ -614,15 +615,15 @@ def _fit_lm_rust(
     mlp_ridge=0.0,
     skip_ridge=0.0,
     shape_ridge=0.0,
-    freeze_units=False,
+    linear_fit=False,
 ):
     """`_fit_lm` with exact blocks and the line search, in Rust (see
     `nutpie.triangular_lm.fit`). Fits the conditioners of the flow's
     `SparseTriangularMap`; everything else stays as it is.
 
     `val_data` are held-out draws for `fit`'s validation loss and, with
-    `early_stopping`, its early stopping. The ridges and `freeze_units` are
-    `fit_to_data`'s ``lm_*_ridge`` and ``lm_freeze_units``. Returns ``(params, losses, lam, n_steps,
+    `early_stopping`, its early stopping. The ridges and `linear_fit` are
+    `fit_to_data`'s ``lm_*_ridge`` and ``lm_linear_fit``. Returns ``(params, losses, lam, n_steps,
     n_accepted)``, with the losses at the fitted parameters: ``"objective"``
     (what LM minimised, with the regularizations), ``"train"`` and ``"val"``
     (Fisher divergences, ``val`` `None` without `val_data`)."""
@@ -665,7 +666,7 @@ def _fit_lm_rust(
         mlp_ridge=mlp_ridge,
         skip_ridge=skip_ridge,
         shape_ridge=shape_ridge,
-        freeze_units=freeze_units,
+        linear_fit=linear_fit,
     )
 
     fitted = eqx.filter(
@@ -1245,7 +1246,7 @@ class TransformAdapter:
         val_fraction,
         val_block_size,
         early_stopping,
-        linear_first_fit,
+        linear_fits,
     ):
         from nutpie._lib import FisherResiduals
 
@@ -1262,7 +1263,9 @@ class TransformAdapter:
         self._val_fraction = val_fraction
         self._val_block_size = val_block_size
         self._early_stopping = early_stopping
-        self._linear_first_fit = linear_first_fit
+        self._linear_fits = linear_fits
+        # LM fits of the current flow so far, see `linear_fits`.
+        self._flow_fits = 0
         # The Rust LM fit needs a multiple of its SIMD width of draws.
         self._draw_multiple = FisherResiduals.simd_width()
         self._num_layers = num_layers
@@ -1505,10 +1508,12 @@ class TransformAdapter:
             key = jax.random.PRNGKey(seed % (2**63))
 
             fresh = len(self._bijection.bijections) == 1
-            # A fresh flow's first fit only moves the linear part of its
-            # conditioners, see `make_transform_adapter`.
-            freeze_units = (
-                fresh and self._linear_first_fit and self._method == "lm-rust"
+            if fresh:
+                self._flow_fits = 0
+            # A flow's first `linear_fits` fits only move the linear part of
+            # its conditioners, see `make_transform_adapter`.
+            linear_fit = (
+                self._flow_fits < self._linear_fits and self._method == "lm-rust"
             )
             if fresh:
                 base = self._make_flow_fn(
@@ -1526,7 +1531,12 @@ class TransformAdapter:
                 self._report(
                     n_draws,
                     f"new flow: {_describe_flow(base)}"
-                    + (", first fit without the MLPs" if freeze_units else ""),
+                    + (
+                        f", first {self._linear_fits} fit"
+                        f"{'' if self._linear_fits == 1 else 's'} linear"
+                        if self._linear_fits and self._method == "lm-rust"
+                        else ""
+                    ),
                 )
                 if self._verbose >= 2:
                     fresh_loss = self._loss_fn(params, static, *eval_data)
@@ -1592,10 +1602,11 @@ class TransformAdapter:
             if self._verbose >= 2 and base is self._bijection:
                 self._report(
                     n_draws,
-                    f"{log_f}  current {_format_log_f(old_loss)}  -> refit  "
-                    f"({draw_counts})",
+                    f"{log_f}  current {_format_log_f(old_loss)}  -> "
+                    f"{'linear ' if linear_fit else ''}refit  ({draw_counts})",
                 )
 
+            self._flow_fits += 1
             fit, fit_losses, opt_state = fit_flow(
                 key,
                 base,
@@ -1623,7 +1634,7 @@ class TransformAdapter:
                 lm_mlp_ridge=self._lm_mlp_ridge,
                 lm_skip_ridge=self._lm_skip_ridge,
                 lm_shape_ridge=self._lm_shape_ridge,
-                lm_freeze_units=freeze_units,
+                lm_linear_fit=linear_fit,
                 lm_probe_groups=self._lm_probe_groups,
                 lm_probe_rounds=self._lm_probe_rounds,
                 lm_fit_affine=self._lm_fit_affine,
@@ -1865,14 +1876,14 @@ def make_transform_adapter(
     num_householder=8,
     twin_layers=False,
     activation=None,
-    max_epochs=40,
+    max_epochs=60,
     affine_transformer=False,
-    contract_transformer=0,
+    contract_transformer=1,
     asymmetric_transformer=False,
-    tangent_sas_transformer=1,
+    tangent_sas_transformer=0,
     tangent_sas_fix_b=False,
     log_gamma_bounds=None,
-    input_squash=1.0,
+    input_squash=None,
     reuse_embed=True,
     order=None,
     sparsity=None,
@@ -1887,9 +1898,9 @@ def make_transform_adapter(
     lm_probes=1024,
     lm_residual_batch=128,
     lm_cholesky_jitter=None,
-    lm_mlp_ridge=0.0,
-    lm_skip_ridge=0.0,
-    lm_shape_ridge=0.0,
+    lm_mlp_ridge=1.0,
+    lm_skip_ridge=0.1,
+    lm_shape_ridge=10.0,
     lm_probe_groups=None,
     lm_probe_rounds=1,
     lm_fit_affine=False,
@@ -1897,17 +1908,17 @@ def make_transform_adapter(
     lm_line_search=True,
     lm_forcing="model",
     lm_exact_blocks=True,
-    lm_max_exact_block_size=256,
+    lm_max_exact_block_size=512,
     lm_lmp_size=8,
     lm_lmp_tol=1e-8,
     native_flow=True,
     stop_event=None,
     forget_fraction=0.5,
     recency=1.0,
-    val_fraction=0.2,
+    val_fraction=0.3,
     val_block_size=16,
     early_stopping=True,
-    linear_first_fit=True,
+    linear_fits=1,
     rust_flow=True,
 ):
     """The adapter for `nutpie.sample`'s ``transform_adapt``.
@@ -1949,12 +1960,13 @@ def make_transform_adapter(
     growth away from the draws becomes a high-power blowup of the map.
     ``None`` gives the MLPs the raw parents.
 
-    With ``linear_first_fit`` (and ``method="lm-rust"``), the first fit of
-    a new flow holds the conditioner MLPs' hidden units fixed (see
-    `fit_to_data`'s ``lm_freeze_units``). Their outputs start at zero
-    (``zero_init``), so that fit is the flow without MLPs, which converges
-    quickly; later fits start from it and use the MLPs where the draws
-    support them. A refit only replaces the flow if it does better on the
+    With ``method="lm-rust"``, the first ``linear_fits`` fits of a new flow
+    hold what makes it nonlinear fixed (see `fit_to_data`'s
+    ``lm_linear_fit``): the conditioner MLPs' hidden units and the
+    transformer's shape fields. The MLP outputs start at zero
+    (``zero_init``), so these fit the flow without MLPs and with affine
+    transformers, which converges quickly; later fits start from it and use
+    the MLPs and the shape fields where the draws support them. A refit only replaces the flow if it does better on the
     held-out draws, so the MLPs cannot make it worse there than this linear
     start, up to the noise of those draws.
 
@@ -2003,7 +2015,7 @@ def make_transform_adapter(
             val_fraction=val_fraction,
             val_block_size=val_block_size,
             early_stopping=early_stopping,
-            linear_first_fit=linear_first_fit,
+            linear_fits=linear_fits,
             debug_save_bijection=debug_save_bijection,
             stop_event=stop_event,
             nn_width=nn_width,
@@ -2114,5 +2126,5 @@ def make_transform_adapter(
         val_fraction=val_fraction,
         val_block_size=val_block_size,
         early_stopping=early_stopping,
-        linear_first_fit=linear_first_fit,
+        linear_fits=linear_fits,
     )

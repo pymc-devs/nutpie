@@ -1084,8 +1084,19 @@ mod tests {
     #[test]
     fn frozen_parameters_stay_put() {
         let problem = problem_with(64);
-        let frozen = problem.unit_param_mask();
+        let frozen = problem.nonlinear_param_mask();
         assert!(frozen.iter().any(|&f| f) && frozen.iter().any(|&f| !f));
+        // The shape fields' biases, and nothing feeding the affine ones
+        // linearly, are frozen.
+        for (class, &frozen) in problem.ridge_classes().iter().zip(&frozen) {
+            match class {
+                RidgeClass::Shape | RidgeClass::Mlp | RidgeClass::MlpLoc | RidgeClass::MlpShape => {
+                    assert!(frozen)
+                }
+                RidgeClass::Skip => assert!(!frozen),
+                RidgeClass::None => {}
+            }
+        }
         let mut rng = ChaCha8Rng::seed_from_u64(7);
         let theta = normal(&mut rng, problem.n_params(), 0.3);
         let mut lm = LmOptimizer::new(

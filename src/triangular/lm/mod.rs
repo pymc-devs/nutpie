@@ -209,18 +209,27 @@ impl FisherResiduals {
         self.n_var()
     }
 
-    /// Per parameter, whether it is a weight of the units, `W1` or `W2`:
-    /// what the optimizer's MLP ridge penalizes. With all of them zero, each
-    /// conditioner is its biases and the skip alone.
-    pub(crate) fn unit_weight_mask(&self) -> Vec<bool> {
-        self.unit_mask(false)
-    }
-
-    /// Per parameter, whether it belongs to the hidden units (`W1`, `b1` or
-    /// `W2`): with these frozen at `W2 = 0`, a fit only moves the linear
-    /// part of each conditioner, its biases `b2` and the skip.
-    pub(crate) fn unit_param_mask(&self) -> Vec<bool> {
-        self.unit_mask(true)
+    /// Per parameter, whether it makes a conditioner or its transformer
+    /// nonlinear: the hidden units (`W1`, `b1`, `W2`) and the biases `b2` of
+    /// the shape fields. With these frozen at `W2 = 0` and the shape fields
+    /// at their affine start, a fit only moves the linear part of each
+    /// conditioner into the affine fields: the skip and their `b2`.
+    pub(crate) fn nonlinear_param_mask(&self) -> Vec<bool> {
+        let shape_param = self.conditioner.shape_param_mask();
+        let mut mask = vec![false; self.n_params()];
+        for i in 0..self.n_var() {
+            let (start, shape) = (self.params(i).start, self.shape(i));
+            for u in 0..shape.n_unit {
+                for k in shape.w1(u).chain(shape.w2(u)) {
+                    mask[start + k] = true;
+                }
+                mask[start + shape.b1(u)] = true;
+            }
+            for (m, k) in shape.b2().enumerate() {
+                mask[start + k] = shape_param[m];
+            }
+        }
+        mask
     }
 
     /// Per parameter, which of the optimizer's ridge strengths it carries.
@@ -261,22 +270,6 @@ impl FisherResiduals {
     /// its location (see [`RidgeStrengths`]).
     pub(crate) fn loc_scales(&self, lin: &Linearization) -> Vec<f64> {
         lin.delta.mean_squares()
-    }
-
-    fn unit_mask(&self, with_bias: bool) -> Vec<bool> {
-        let mut mask = vec![false; self.n_params()];
-        for i in 0..self.n_var() {
-            let (start, shape) = (self.params(i).start, self.shape(i));
-            for u in 0..shape.n_unit {
-                for k in shape.w1(u).chain(shape.w2(u)) {
-                    mask[start + k] = true;
-                }
-                if with_bias {
-                    mask[start + shape.b1(u)] = true;
-                }
-            }
-        }
-        mask
     }
 
     /// The number of draws, zero before [`Self::set_data`].

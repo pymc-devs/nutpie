@@ -94,13 +94,6 @@ impl PyFisherResiduals {
         self.inner.n_draw()
     }
 
-    /// Per parameter, whether it is a hidden-unit weight (`W1` or `W2`), the
-    /// parameters `LmOptimizer`'s ``mlp_ridge`` penalizes.
-    #[getter]
-    fn unit_weight_mask<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<bool>> {
-        PyArray1::from_vec(py, self.inner.unit_weight_mask())
-    }
-
     /// Per parameter, the strength `LmOptimizer`'s ridge with these
     /// arguments puts on it at `theta`, before the division by ``n_draw``.
     /// What moves a variable's location is scaled by the mean of its
@@ -132,11 +125,12 @@ impl PyFisherResiduals {
         Ok(PyArray1::from_vec(py, values))
     }
 
-    /// Per parameter, whether it belongs to the hidden units (`W1`, `b1` or
-    /// `W2`); `LmOptimizer`'s ``frozen`` to fit only the linear part.
+    /// Per parameter, whether it makes a conditioner or its transformer
+    /// nonlinear: the hidden units and the biases of the transformer's shape
+    /// fields. `LmOptimizer`'s ``frozen`` for a linear fit.
     #[getter]
-    fn unit_param_mask<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<bool>> {
-        PyArray1::from_vec(py, self.inner.unit_param_mask())
+    fn nonlinear_param_mask<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<bool>> {
+        PyArray1::from_vec(py, self.inner.nonlinear_param_mask())
     }
 
     /// Start of each variable's parameter slice, plus the total.

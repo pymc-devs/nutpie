@@ -138,7 +138,7 @@ def _run_lm(
     mlp_ridge=0.0,
     skip_ridge=0.0,
     shape_ridge=0.0,
-    freeze_units=False,
+    linear_fit=False,
     prefix="",
 ):
     """The Rust LM fit of `problem` (a `FisherResiduals` with data) from
@@ -146,8 +146,9 @@ def _run_lm(
     `prefix`.
 
     `val_problem` holds the held-out draws for the validation loss and,
-    with `early_stopping`, the early stopping. `freeze_units` holds the
-    hidden units fixed. Returns ``(theta, losses, lam, n_steps,
+    with `early_stopping`, the early stopping. `linear_fit` holds what makes
+    the conditioners and transformers nonlinear fixed (see
+    `FisherResiduals.nonlinear_param_mask`). Returns ``(theta, losses, lam, n_steps,
     n_accepted)``, with the losses at the returned `theta`: ``"objective"``
     (what LM minimised, with the regularizations), ``"train"`` and ``"val"``
     (Fisher divergences, ``val`` `None` without `val_problem`)."""
@@ -172,7 +173,7 @@ def _run_lm(
         mlp_ridge=mlp_ridge,
         skip_ridge=skip_ridge,
         shape_ridge=shape_ridge,
-        frozen=problem.unit_param_mask if freeze_units else None,
+        frozen=problem.nonlinear_param_mask if linear_fit else None,
         val_problem=val_problem,
         early_stopping=early_stopping,
     )
@@ -244,7 +245,7 @@ class TriangularFlowAdapter:
         val_fraction,
         val_block_size,
         early_stopping,
-        linear_first_fit,
+        linear_fits,
         debug_save_bijection,
         stop_event,
         nn_width,
@@ -290,7 +291,9 @@ class TriangularFlowAdapter:
         self._val_fraction = val_fraction
         self._val_block_size = val_block_size
         self._early_stopping = early_stopping
-        self._linear_first_fit = linear_first_fit
+        self._linear_fits = linear_fits
+        # LM fits of the current flow so far, see `linear_fits`.
+        self._flow_fits = 0
         self._debug_save_bijection = debug_save_bijection
         # Set by the main thread when sampling is aborted. The training runs
         # in a chain's thread, where Python never raises KeyboardInterrupt.
@@ -512,9 +515,11 @@ class TriangularFlowAdapter:
         log_f = "log F" if val is None else "log F val"
 
         fresh = self._flow is None
-        # A fresh flow's first fit only moves the linear part of its
+        if fresh:
+            self._flow_fits = 0
+        # A flow's first `linear_fits` fits only move the linear part of its
         # conditioners, see `make_transform_adapter`.
-        freeze_units = fresh and self._linear_first_fit
+        linear_fit = self._flow_fits < self._linear_fits
         if fresh:
             base = build_triangular_flow(
                 seed,
@@ -526,7 +531,12 @@ class TriangularFlowAdapter:
             self._report(
                 n_draws,
                 f"new flow: {_describe(base)}"
-                + (", first fit without the MLPs" if freeze_units else ""),
+                + (
+                    f", first {self._linear_fits} fit"
+                    f"{'' if self._linear_fits == 1 else 's'} linear"
+                    if self._linear_fits
+                    else ""
+                ),
             )
             if self._verbose >= 2:
                 fresh_loss = np.log(base.fisher_divergence(*eval_data))
@@ -553,9 +563,11 @@ class TriangularFlowAdapter:
         if self._verbose >= 2 and not fresh:
             self._report(
                 n_draws,
-                f"{log_f}  current {_format_log_f(old_loss)}  -> refit  ({draw_counts})",
+                f"{log_f}  current {_format_log_f(old_loss)}  -> "
+                f"{'linear ' if linear_fit else ''}refit  ({draw_counts})",
             )
 
+        self._flow_fits += 1
         problem = base.residuals(*train)
         val_problem = None if val is None else base.residuals(*val)
         theta, losses, lam, n_steps, n_accepted = _run_lm(
@@ -563,7 +575,7 @@ class TriangularFlowAdapter:
             base.theta,
             val_problem=val_problem,
             early_stopping=self._early_stopping,
-            freeze_units=freeze_units,
+            linear_fit=linear_fit,
             lam0=self._lm_lam,
             verbose=self._verbose >= 2,
             prefix=f"chain {self._chain} ",
