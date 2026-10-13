@@ -395,6 +395,28 @@ impl PyTriangularFlow {
         Ok(Self { inner })
     }
 
+    /// The same flow with the diagonal affine `loc + scale * w`, one entry
+    /// per variable. The conditioners keep their parameters, now in the new
+    /// standardized coordinates.
+    fn with_affine(
+        &self,
+        loc: PyReadonlyArray1<'_, f64>,
+        scale: PyReadonlyArray1<'_, f64>,
+    ) -> Result<Self> {
+        let mut inner = self.inner.clone();
+        let (loc, scale) = (loc.as_slice()?, scale.as_slice()?);
+        let n = inner.loc.len();
+        if loc.len() != n || scale.len() != n {
+            bail!("loc and scale must each have one entry per variable");
+        }
+        if scale.iter().any(|s| !(s.is_finite() && *s != 0.0)) {
+            bail!("scale must be finite and nonzero");
+        }
+        inner.loc = loc.to_vec();
+        inner.scale = scale.to_vec();
+        Ok(Self { inner })
+    }
+
     /// Draws and gradients, `(n_draw, n_var)` each, with the diagonal affine
     /// undone and reordered into the triangular order.
     fn undo_affine<'py>(

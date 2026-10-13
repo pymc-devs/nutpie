@@ -1936,6 +1936,7 @@ def make_transform_adapter(
     val_block_size=16,
     early_stopping=True,
     linear_fits=1,
+    refit_diag=False,
     rust_flow=True,
 ):
     """The adapter for `nutpie.sample`'s ``transform_adapt``.
@@ -1992,6 +1993,12 @@ def make_transform_adapter(
     held-out draws, so the MLPs cannot make it worse there than this linear
     start, up to the noise of those draws.
 
+    With ``refit_diag`` (and ``rust_flow``), every refit first replaces the
+    flow's diagonal affine by one fitted to that window's training draws,
+    as a new flow gets, and then fits the conditioners from their current
+    parameters in those new coordinates. Otherwise the affine stays the one
+    the flow was created with, from the draws of its first window.
+
     The LM fit's ridges (see `fit_to_data`): ``lm_mlp_ridge`` penalizes the
     conditioner MLPs' weights, with the flow without MLPs as its minimum;
     ``lm_skip_ridge`` the linear location skip, which needs it where a
@@ -2007,6 +2014,8 @@ def make_transform_adapter(
     step. All are ridges on the sum over the draws, so they weaken as the
     windows grow.
     """
+    if refit_diag and not rust_flow:
+        raise ValueError("refit_diag is only supported with rust_flow=True.")
     if rust_flow:
         from nutpie.triangular_adapter import TriangularFlowAdapter
 
@@ -2041,6 +2050,7 @@ def make_transform_adapter(
             val_block_size=val_block_size,
             early_stopping=early_stopping,
             linear_fits=linear_fits,
+            refit_diag=refit_diag,
             debug_save_bijection=debug_save_bijection,
             stop_event=stop_event,
             nn_width=nn_width,
