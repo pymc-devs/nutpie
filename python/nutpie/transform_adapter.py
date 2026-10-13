@@ -104,6 +104,7 @@ def fit_to_data(
     lm_lmp_tol: float = 1e-8,
     lm_mlp_ridge: float = 0.0,
     lm_skip_ridge: float = 0.0,
+    lm_scale_skip_ridge: float = 0.0,
     lm_shape_ridge: float = 0.0,
     lm_linear_fit: bool = False,
     lm_print_blocks: bool = False,
@@ -249,6 +250,11 @@ def fit_to_data(
             precision's Cholesky factor. Needed where a variable has about
             as many parents as there are draws. Only used when ``method`` is
             ``"lm-rust"``.
+        lm_scale_skip_ridge: Ridge ``lm_scale_skip_ridge * ||r_i||^2 /
+            n_draws`` on each variable's scale skip ``r_i``, the linear map
+            from its parents to its transformer's scale field. Unlike the
+            location skip's, not scaled by the width: the scale fields are
+            already relative. Only used when ``method`` is ``"lm-rust"``.
         lm_shape_ridge: Ridge ``lm_shape_ridge * ||.||^2 / n_draws`` on what
             feeds the transformer's shape fields (``Contract2``'s ``alpha``
             and ``beta``, all of ``TangentSAS``'s) directly: their output
@@ -258,7 +264,8 @@ def fit_to_data(
             ``"lm-rust"``.
         lm_linear_fit: Hold what makes the conditioners and transformers
             nonlinear fixed: the MLPs' hidden units (weights and hidden
-            biases) and the biases of the transformer's shape fields. On a
+            biases), the biases of the transformer's shape fields and the
+            scale skip. On a
             zero-initialized flow, whose MLP outputs are zero, this fits the
             flow without MLPs and with affine transformers. Only used when
             ``method`` is ``"lm-rust"``.
@@ -302,11 +309,15 @@ def fit_to_data(
     )
 
     if (
-        lm_mlp_ridge or lm_skip_ridge or lm_shape_ridge or lm_linear_fit
+        lm_mlp_ridge
+        or lm_skip_ridge
+        or lm_scale_skip_ridge
+        or lm_shape_ridge
+        or lm_linear_fit
     ) and method != "lm-rust":
         raise ValueError(
-            "lm_mlp_ridge, lm_skip_ridge, lm_shape_ridge and lm_linear_fit are "
-            "only supported with method='lm-rust'."
+            "The lm_*_ridge arguments and lm_linear_fit are only supported with "
+            "method='lm-rust'."
         )
 
     if method == "lm-rust":
@@ -327,6 +338,7 @@ def fit_to_data(
             lmp_tol=lm_lmp_tol,
             mlp_ridge=lm_mlp_ridge,
             skip_ridge=lm_skip_ridge,
+            scale_skip_ridge=lm_scale_skip_ridge,
             shape_ridge=lm_shape_ridge,
             linear_fit=lm_linear_fit,
             verbose=verbose,
@@ -614,6 +626,7 @@ def _fit_lm_rust(
     early_stopping=True,
     mlp_ridge=0.0,
     skip_ridge=0.0,
+    scale_skip_ridge=0.0,
     shape_ridge=0.0,
     linear_fit=False,
 ):
@@ -665,6 +678,7 @@ def _fit_lm_rust(
         early_stopping=early_stopping,
         mlp_ridge=mlp_ridge,
         skip_ridge=skip_ridge,
+        scale_skip_ridge=scale_skip_ridge,
         shape_ridge=shape_ridge,
         linear_fit=linear_fit,
     )
@@ -1228,6 +1242,7 @@ class TransformAdapter:
         lm_cholesky_jitter,
         lm_mlp_ridge,
         lm_skip_ridge,
+        lm_scale_skip_ridge,
         lm_shape_ridge,
         lm_probe_groups,
         lm_probe_rounds,
@@ -1310,6 +1325,7 @@ class TransformAdapter:
         self._lm_probes = lm_probes
         self._lm_mlp_ridge = lm_mlp_ridge
         self._lm_skip_ridge = lm_skip_ridge
+        self._lm_scale_skip_ridge = lm_scale_skip_ridge
         self._lm_shape_ridge = lm_shape_ridge
         self._lm_probe_groups = lm_probe_groups
         self._lm_probe_rounds = lm_probe_rounds
@@ -1633,6 +1649,7 @@ class TransformAdapter:
                 lm_probes=self._lm_probes,
                 lm_mlp_ridge=self._lm_mlp_ridge,
                 lm_skip_ridge=self._lm_skip_ridge,
+                lm_scale_skip_ridge=self._lm_scale_skip_ridge,
                 lm_shape_ridge=self._lm_shape_ridge,
                 lm_linear_fit=linear_fit,
                 lm_probe_groups=self._lm_probe_groups,
@@ -1886,6 +1903,7 @@ def make_transform_adapter(
     order=None,
     sparsity=None,
     location_skip=True,
+    scale_skip=True,
     feature_degree=None,
     method="lm-rust",
     solver_rtol=5e-2,
@@ -1898,6 +1916,7 @@ def make_transform_adapter(
     lm_cholesky_jitter=None,
     lm_mlp_ridge=1.0,
     lm_skip_ridge=0.1,
+    lm_scale_skip_ridge=1.0,
     lm_shape_ridge=10.0,
     lm_probe_groups=None,
     lm_probe_rounds=1,
@@ -1978,7 +1997,11 @@ def make_transform_adapter(
     ``lm_skip_ridge`` the linear location skip, which needs it where a
     variable has about as many parents as there are draws; and
     ``lm_shape_ridge`` additionally what feeds the transformer's shape
-    fields, pulling each conditional towards an affine transformer. What
+    fields, pulling each conditional towards an affine transformer.
+    ``scale_skip`` adds a second linear skip, from the parents to the
+    transformer's scale field (in the transformer's own parameterization of
+    it), regularized by ``lm_scale_skip_ridge`` and held at zero by the
+    linear fits. What
     moves a variable's location (the skip and the MLP's output weights into
     it) is measured against the conditional's width, refreshed every LM
     step. All are ridges on the sum over the draws, so they weaken as the
@@ -2028,12 +2051,14 @@ def make_transform_adapter(
             tangent_sas_fix_b=tangent_sas_fix_b,
             log_gamma_bounds=log_gamma_bounds,
             input_squash=input_squash,
+            scale_skip=scale_skip,
             max_epochs=max_epochs,
             solver_rtol=solver_rtol,
             lm_linear_steps=lm_linear_steps,
             lm_min_loss=lm_min_loss,
             lm_mlp_ridge=lm_mlp_ridge,
             lm_skip_ridge=lm_skip_ridge,
+            lm_scale_skip_ridge=lm_scale_skip_ridge,
             lm_shape_ridge=lm_shape_ridge,
             lm_patience=lm_patience,
             lm_forcing=lm_forcing,
@@ -2075,6 +2100,7 @@ def make_transform_adapter(
             order=order,
             sparsity=sparsity,
             location_skip=location_skip,
+            scale_skip=scale_skip,
             feature_degree=feature_degree,
         ),
         show_progress=show_progress,
@@ -2108,6 +2134,7 @@ def make_transform_adapter(
         lm_cholesky_jitter=lm_cholesky_jitter,
         lm_mlp_ridge=lm_mlp_ridge,
         lm_skip_ridge=lm_skip_ridge,
+        lm_scale_skip_ridge=lm_scale_skip_ridge,
         lm_shape_ridge=lm_shape_ridge,
         lm_probe_groups=lm_probe_groups,
         lm_probe_rounds=lm_probe_rounds,

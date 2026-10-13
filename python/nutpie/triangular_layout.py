@@ -121,6 +121,8 @@ class TriangularLayout:
         skip_weight, skip_index: `LocationSkipMlp` weights, aligned with
             `parent_index`, added to conditioner output `skip_index`. Zeros if
             there is no skip.
+        scale_skip_weight, scale_skip_index: The same for its scale skip;
+            `None` if there is none.
         feature_degree, feature_params: Parent features of the map. With
             degree ``K > 0`` the MLPs see ``K`` Hermite features per parent,
             parent-major, of the parent through its `marginal_to_normal` map
@@ -142,6 +144,8 @@ class TriangularLayout:
     layer_out: np.ndarray
     skip_weight: np.ndarray
     skip_index: int
+    scale_skip_weight: np.ndarray | None
+    scale_skip_index: int | None
     feature_degree: int
     feature_params: np.ndarray
     input_squash: float | None
@@ -329,6 +333,12 @@ def extract_layout(flow_map) -> TriangularLayout:
         )
     (skip_index,) = skip_indices
     skip_index = 0 if skip_index is None else int(skip_index)
+    scale_indices = {None if skip is None else skip.scale_index for skip in skips}
+    if len(scale_indices) != 1:
+        raise NotImplementedError(
+            "All conditioner buckets must agree on the scale skip."
+        )
+    (scale_skip_index,) = scale_indices
 
     feature_degree = flow_map.feature_degree or 0
     features_per_parent = max(feature_degree, 1)
@@ -373,6 +383,7 @@ def extract_layout(flow_map) -> TriangularLayout:
     parents_of: list[np.ndarray | None] = [None] * dim
     weights_of: list[np.ndarray | None] = [None] * dim
     skip_of: list[np.ndarray | None] = [None] * dim
+    scale_skip_of: list[np.ndarray | None] = [None] * dim
 
     for bucket in range(n_buckets):
         members = np.asarray(flow_map.bucket_members[bucket])
@@ -389,6 +400,11 @@ def extract_layout(flow_map) -> TriangularLayout:
             if skips[bucket] is None
             else np.asarray(skips[bucket].skip, dtype=np.float64)
         )
+        scale_skip = (
+            None
+            if scale_skip_index is None
+            else np.asarray(skips[bucket].scale_skip, dtype=np.float64)
+        )
         for local, variable in enumerate(members):
             variable = int(variable)
             row = parent_indices[local]
@@ -403,6 +419,8 @@ def extract_layout(flow_map) -> TriangularLayout:
             skip_of[variable] = (
                 np.zeros(len(real)) if skip is None else skip[local, : len(real)]
             )
+            if scale_skip is not None:
+                scale_skip_of[variable] = scale_skip[local, : len(real)]
 
             parts = []
             for layer_index, (weight, bias) in enumerate(layers):
@@ -426,6 +444,11 @@ def extract_layout(flow_map) -> TriangularLayout:
         else np.zeros(0, dtype=np.int64)
     )
     skip_weight = np.concatenate(skip_of) if dim else np.zeros(0)
+    scale_skip_weight = (
+        None
+        if scale_skip_index is None
+        else (np.concatenate(scale_skip_of) if dim else np.zeros(0))
+    )
 
     sizes = np.array([len(part) for part in weights_of], dtype=np.int64)
     blob_offset = np.zeros(dim + 1, dtype=np.int64)
@@ -452,6 +475,8 @@ def extract_layout(flow_map) -> TriangularLayout:
         layer_out=layer_out,
         skip_weight=skip_weight,
         skip_index=skip_index,
+        scale_skip_weight=scale_skip_weight,
+        scale_skip_index=None if scale_skip_index is None else int(scale_skip_index),
         feature_degree=int(feature_degree),
         feature_params=feature_params,
         input_squash=flow_map.input_squash,

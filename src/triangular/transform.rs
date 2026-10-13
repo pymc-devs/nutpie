@@ -937,6 +937,9 @@ pub struct TriangularTransform {
     /// weight per edge. All zeros when the conditioners have none.
     skip_weight: Vec<f64>,
     skip_index: usize,
+    /// The same to conditioner output `scale_skip_index`, the transformer's
+    /// scale field, if the conditioners have a scale skip.
+    scale_skip: Option<(Vec<f64>, usize)>,
     /// Parent features: with `feature_degree = K > 0` the MLPs see, for each
     /// parent, the orthonormal Hermite polynomials of degree `1..=K` of the
     /// parent through its marginal map (`marginal_to_normal` with
@@ -997,11 +1000,18 @@ impl TriangularTransform {
         let (start, n_in) = (edges.start, edges.len());
         let parents = self.parents.parents(variable);
         // Taken before the MLP runs, which reuses `inputs` as a layer buffer.
-        let skip: f64 = self.skip_weight[edges.clone()]
-            .iter()
-            .zip(parents)
-            .map(|(weight, &parent)| weight * y[parent as usize].get())
-            .sum();
+        let linear = |weight: &[f64]| -> f64 {
+            weight[edges.clone()]
+                .iter()
+                .zip(parents)
+                .map(|(weight, &parent)| weight * y[parent as usize].get())
+                .sum()
+        };
+        let skip = linear(&self.skip_weight);
+        let scale_skip = self
+            .scale_skip
+            .as_ref()
+            .map(|(weight, index)| (linear(weight), *index));
         let degree = self.feature_degree;
         let n_mlp_in = if degree == 0 {
             for (slot, &parent) in pad.inputs[..n_in].iter_mut().zip(parents) {
@@ -1041,6 +1051,9 @@ impl TriangularTransform {
             },
         });
         pad.acc[self.skip_index] += skip;
+        if let Some((value, index)) = scale_skip {
+            pad.acc[index] += value;
+        }
 
         if !TAPE {
             let result = transform_element(&self.layers, &pad.acc[..self.num_params], x);
@@ -1100,11 +1113,17 @@ impl TriangularTransform {
                     pad.edge_l[j] *= dz;
                 }
             }
-            let skip_dy = pad.dy_dtheta[self.skip_index];
-            let skip_dld = pad.dld_dtheta[self.skip_index];
-            for (k, &weight) in self.skip_weight[edges].iter().enumerate() {
-                pad.edge_y[k] += skip_dy * weight;
-                pad.edge_l[k] += skip_dld * weight;
+            let skips = std::iter::once((&self.skip_weight, self.skip_index)).chain(
+                self.scale_skip
+                    .as_ref()
+                    .map(|(weight, index)| (weight, *index)),
+            );
+            for (weight, index) in skips {
+                let (skip_dy, skip_dld) = (pad.dy_dtheta[index], pad.dld_dtheta[index]);
+                for (k, &weight) in weight[edges.clone()].iter().enumerate() {
+                    pad.edge_y[k] += skip_dy * weight;
+                    pad.edge_l[k] += skip_dld * weight;
+                }
             }
             for k in 0..n_in {
                 self.tape.edges[2 * (start + k)].set(pad.edge_y[k]);
@@ -1376,6 +1395,7 @@ fn build_transform(
     layer_out: &[i64],
     skip_weight: &[f64],
     skip_index: i64,
+    scale_skip: Option<(&[f64], i64)>,
     feature_degree: i64,
     feature_params: &[f64],
     input_squash: Option<f64>,
@@ -1396,6 +1416,7 @@ fn build_transform(
         layer_out,
         skip_weight,
         skip_index,
+        scale_skip,
         feature_degree,
         feature_params,
         input_squash,
@@ -1420,6 +1441,7 @@ pub(crate) fn build_transform_from_specs(
     layer_out: &[i64],
     skip_weight: &[f64],
     skip_index: i64,
+    scale_skip: Option<(&[f64], i64)>,
     feature_degree: i64,
     feature_params: &[f64],
     input_squash: Option<f64>,
@@ -1482,6 +1504,19 @@ pub(crate) fn build_transform_from_specs(
         .ok()
         .filter(|&index| index < num_params)
         .ok_or_else(|| anyhow::anyhow!("skip_index {skip_index} is out of range"))?;
+    let scale_skip = match scale_skip {
+        None => None,
+        Some((weight, index)) => {
+            if weight.len() != parents.n_edge() {
+                bail!("scale_skip_weight must have one entry per parent_index entry");
+            }
+            let index = usize::try_from(index)
+                .ok()
+                .filter(|&i| i < num_params && i != skip_index)
+                .ok_or_else(|| anyhow::anyhow!("scale_skip_index {index} is out of range"))?;
+            Some((weight.to_vec(), index))
+        }
+    };
     let max_parents = parents.max_parent();
     let act_deriv_len: usize = layer_out[..layer_out.len() - 1].iter().sum();
 
@@ -1522,6 +1557,7 @@ pub(crate) fn build_transform_from_specs(
         layer_out,
         skip_weight,
         skip_index,
+        scale_skip,
         feature_degree,
         feature_params,
         input_squash,
@@ -1589,6 +1625,13 @@ impl FlowTransform {
                 .to_vec())
         }
 
+        let scale_skip = match layout.get_item("scale_skip_index")? {
+            Some(index) if !index.is_none() => Some((
+                floats(layout, "scale_skip_weight")?,
+                index.extract::<i64>()?,
+            )),
+            _ => None,
+        };
         let has_map = layout.contains("parent_indptr")?;
         let map = has_map
             .then(|| {
@@ -1600,6 +1643,7 @@ impl FlowTransform {
                     &ints(layout, "layer_out")?,
                     &floats(layout, "skip_weight")?,
                     item(layout, "skip_index")?.extract()?,
+                    scale_skip.as_ref().map(|(w, i)| (w.as_slice(), *i)),
                     item(layout, "feature_degree")?.extract()?,
                     &floats(layout, "feature_params")?,
                     match layout.get_item("input_squash")? {
@@ -1738,6 +1782,8 @@ impl PySparseTriangularTransform {
         min_parallel_work,
         schedule,
         input_squash = None,
+        scale_skip_weight = None,
+        scale_skip_index = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -1758,7 +1804,18 @@ impl PySparseTriangularTransform {
         min_parallel_work: i64,
         schedule: &str,
         input_squash: Option<f64>,
+        scale_skip_weight: Option<PyReadonlyArray1<'_, f64>>,
+        scale_skip_index: Option<i64>,
     ) -> Result<Self> {
+        let scale_skip_weight = scale_skip_weight
+            .as_ref()
+            .map(|w| w.as_slice())
+            .transpose()?;
+        let scale_skip = match (scale_skip_weight, scale_skip_index) {
+            (Some(weight), Some(index)) => Some((weight, index)),
+            (None, None) => None,
+            _ => bail!("give both scale_skip_weight and scale_skip_index, or neither"),
+        };
         Ok(Self {
             inner: build_transform(
                 parent_indptr.as_slice()?,
@@ -1768,6 +1825,7 @@ impl PySparseTriangularTransform {
                 layer_out.as_slice()?,
                 skip_weight.as_slice()?,
                 skip_index,
+                scale_skip,
                 feature_degree,
                 feature_params.as_slice()?,
                 input_squash,

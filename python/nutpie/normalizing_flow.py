@@ -1722,10 +1722,16 @@ class ElementwiseTransformer(bijections.AbstractBijection):
 
     `location_field` is ``(layer, field)``: the location is attribute `field`
     of ``chain.bijections[layer]``. `None` if the chain has no such parameter.
+
+    `scale_field` is the same for the parameter that sets the scale of the
+    chain's output, in whatever parameterization its layer uses (``scale``
+    of a `PositiveAffine`, ``sigma`` of a `Contract2`). Conditioners route a
+    linear function of the parents to it as well.
     """
 
     chain: bijections.Chain
     location_field: tuple[int, str] | None = eqx.field(static=True)
+    scale_field: tuple[int, str] | None = eqx.field(static=True, default=None)
     shape: tuple[int, ...] = ()
     cond_shape: tuple[int, ...] | None = None
 
@@ -1733,6 +1739,12 @@ class ElementwiseTransformer(bijections.AbstractBijection):
         if self.location_field is None:
             return None
         layer, field = self.location_field
+        return getattr(self.chain.bijections[layer], field)
+
+    def scale(self):
+        if self.scale_field is None:
+            return None
+        layer, field = self.scale_field
         return getattr(self.chain.bijections[layer], field)
 
     def transform_and_log_det(self, x, condition=None):
@@ -1863,16 +1875,19 @@ def make_transformer(
             elemwises.append(bijections.Invert(affine))
 
     # The location is the last layer's output shift, which nothing after it
-    # undoes: `PositiveAffine`'s ``loc`` or `Contract2`'s ``mu``. The inverted
-    # `AsymmetricAffine` has only an *input* shift.
-    last = elemwises[-1]
-    if isinstance(last, PositiveAffine):
-        location_field = (len(elemwises) - 1, "loc")
-    elif isinstance(last, Contract2):
-        location_field = (len(elemwises) - 1, "mu")
+    # undoes: `PositiveAffine`'s ``loc`` or `Contract2`'s ``mu``; the scale
+    # is that layer's output scale. The inverted `AsymmetricAffine` has only
+    # an *input* shift, and neither.
+    last = len(elemwises) - 1
+    if isinstance(elemwises[last], PositiveAffine):
+        location_field, scale_field = (last, "loc"), (last, "scale")
+    elif isinstance(elemwises[last], Contract2):
+        location_field, scale_field = (last, "mu"), (last, "sigma")
     else:
-        location_field = None
-    return ElementwiseTransformer(bijections.Chain(elemwises), location_field)
+        location_field, scale_field = None, None
+    return ElementwiseTransformer(
+        bijections.Chain(elemwises), location_field, scale_field
+    )
 
 
 def make_twin_flow_scan(
@@ -2254,6 +2269,7 @@ def make_sparse_triangular_map(
     nn_depth=None,
     activation,
     location_skip=True,
+    scale_skip=True,
     transformer="sas",
     transformer_layers=1,
     tangent_sas_fix_b=False,
@@ -2294,6 +2310,7 @@ def make_sparse_triangular_map(
             ``i`` in ``order``.
         location_skip: Linear map from each variable's parents straight to
             its transformer location, see `SparseTriangularMap`.
+        scale_skip: The same to its transformer's scale field.
         transformer, transformer_layers, tangent_sas_fix_b, log_gamma_bounds:
             The elementwise transformer, see `make_transformer`.
         feature_degree: Degree of the `HermiteFeatures` the conditioners see
@@ -2345,6 +2362,7 @@ def make_sparse_triangular_map(
         nn_depth=nn_depth,
         nn_activation=activation,
         location_skip=location_skip,
+        scale_skip=scale_skip,
         feature_degree=feature_degree,
         input_squash=input_squash,
     )
@@ -2593,6 +2611,7 @@ def make_flow(
     order: ArrayLike | None = None,
     sparsity: ArrayLike | None = None,
     location_skip: bool = True,
+    scale_skip: bool = True,
     feature_degree: int | None = None,
     input_squash: float | None = None,
     n_buckets: int = 8,
@@ -2729,6 +2748,7 @@ def make_flow(
             nn_depth=nn_depth,
             activation=activation,
             location_skip=location_skip,
+            scale_skip=scale_skip,
             transformer=transformer,
             transformer_layers=transformer_layers,
             tangent_sas_fix_b=tangent_sas_fix_b,

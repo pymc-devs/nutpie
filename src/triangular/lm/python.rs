@@ -41,6 +41,7 @@ impl PyFisherResiduals {
         n_par,
         location_index,
         transformer,
+        scale_index = None,
         input_squash = None,
         activation = "softplus",
     ))]
@@ -52,6 +53,7 @@ impl PyFisherResiduals {
         n_par: usize,
         location_index: usize,
         transformer: &Bound<'_, PyAny>,
+        scale_index: Option<usize>,
         input_squash: Option<f64>,
         activation: &str,
     ) -> Result<Self> {
@@ -63,6 +65,7 @@ impl PyFisherResiduals {
                     n_unit,
                     n_par,
                     location_index,
+                    scale_index,
                     specs,
                     input_squash,
                     Activation::from_name(activation)?,
@@ -98,18 +101,27 @@ impl PyFisherResiduals {
     /// arguments puts on it at `theta`, before the division by ``n_draw``.
     /// What moves a variable's location is scaled by the mean of its
     /// ``(dx_i/dy_i)^2`` over the draws at `theta`.
-    #[pyo3(signature = (theta, *, mlp_ridge = 0.0, skip_ridge = 0.0, shape_ridge = 0.0))]
+    #[pyo3(signature = (
+        theta,
+        *,
+        mlp_ridge = 0.0,
+        skip_ridge = 0.0,
+        scale_skip_ridge = 0.0,
+        shape_ridge = 0.0,
+    ))]
     fn ridge_strengths<'py>(
         &self,
         py: Python<'py>,
         theta: PyReadonlyArray1<'py, f64>,
         mlp_ridge: f64,
         skip_ridge: f64,
+        scale_skip_ridge: f64,
         shape_ridge: f64,
     ) -> Result<Bound<'py, PyArray1<f64>>> {
         let strengths = RidgeStrengths {
             mlp: mlp_ridge,
             skip: skip_ridge,
+            scale_skip: scale_skip_ridge,
             shape: shape_ridge,
         };
         strengths.check()?;

@@ -65,8 +65,10 @@ def transformer_spec(
     tangent_sas_fix_b=False,
     log_gamma_bounds=None,
 ):
-    """``(specs, n_par, location_index)`` of `make_transformer`'s chain, as
-    `triangular_layout._probe_transformer` finds them on the JAX transformer.
+    """``(specs, n_par, location_index, scale_index)`` of
+    `make_transformer`'s chain, as `triangular_layout._probe_transformer`
+    finds them on the JAX transformer: the conditioner outputs feeding its
+    location and its scale field.
 
     Conditioner output ``k`` feeds one field of one layer; the fields are
     numbered in the order the JAX transformer's arrays flatten in, and every
@@ -113,7 +115,7 @@ def transformer_spec(
                 log_gamma_bounds=log_gamma_bounds,
             )
         )
-        location = mu
+        location, scale = mu, sigma
     for _ in range(n_tangent_sas):
         nu, eps = field(), field()
         b = None if tangent_sas_fix_b else field()
@@ -137,7 +139,7 @@ def transformer_spec(
         loc, scale = field(), field()
         specs.append(PositiveAffineSpec(loc=loc, scale=scale))
         location = loc
-    return tuple(specs), count, location[0]
+    return tuple(specs), count, location[0], scale[0]
 
 
 def diag_from_gradients(positions, gradients):
@@ -198,6 +200,7 @@ def build_triangular_flow(
     tangent_sas_fix_b=False,
     log_gamma_bounds=None,
     input_squash=None,
+    scale_skip=True,
 ):
     """A new triangular flow for the draws, as `make_flow(kind="triangular",
     n_layers=1, nn_depth=1, location_skip=True)` builds it.
@@ -207,7 +210,7 @@ def build_triangular_flow(
     like `equinox.nn.Linear`; with `zero_init` its output layer is scaled by
     ``1e-3``, so the map starts close to the identity, as
     `normalizing_flow.zero_init_conditioners`. The map's output biases and
-    the location skip start at zero.
+    the skips start at zero.
     """
     from nutpie._lib import TriangularFlow
 
@@ -222,12 +225,13 @@ def build_triangular_flow(
     if not np.array_equal(np.sort(order), np.arange(dim)):
         raise ValueError("order must be a permutation of range(dim).")
 
-    specs, n_par, location_index = transformer_spec(
+    specs, n_par, location_index, scale_index = transformer_spec(
         transformer,
         transformer_layers,
         tangent_sas_fix_b=tangent_sas_fix_b,
         log_gamma_bounds=log_gamma_bounds,
     )
+    n_skip = 2 if scale_skip else 1
     parents = _parents(sparsity, order)
     n_unit = int(nn_width)
 
@@ -243,7 +247,7 @@ def build_triangular_flow(
             units.append(rng.uniform(-in_limit, in_limit, size=n_parent + 1))
             units.append(out_scale * rng.uniform(-out_limit, out_limit, size=n_par))
         slices.extend(units)
-        slices.append(np.zeros(n_par + n_parent))
+        slices.append(np.zeros(n_par + n_skip * n_parent))
     theta = np.concatenate(slices) if slices else np.zeros(0)
 
     mean, diag = diag_affine(positions, gradients)
@@ -255,6 +259,7 @@ def build_triangular_flow(
         n_unit=n_unit,
         n_par=n_par,
         location_index=location_index,
+        scale_index=scale_index if scale_skip else None,
         transformer=transformer_dicts(specs),
         theta=theta,
         permutation=order,
@@ -304,6 +309,7 @@ def from_jax(bijection):
         n_unit=int(first.out_features),
         n_par=n_par,
         location_index=int(tmap.conditioners[0].location_index),
+        scale_index=tmap.conditioners[0].scale_index,
         transformer=transformer_dicts(
             _probe_transformer(tmap.transformer_constructor, n_par)
         ),

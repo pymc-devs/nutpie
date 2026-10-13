@@ -261,14 +261,16 @@ impl FisherResiduals {
             hess_t,
             hess_l,
         } = &*curvature;
-        let (n_unit, n_par, loc) = (shape.n_unit, shape.n_par, self.conditioner.location);
+        let (n_unit, n_par) = (shape.n_unit, shape.n_par);
+        let skips = &self.conditioner.skips;
         let (t, l) = (&grad_t[1..], &grad_l[1..]);
 
         // Each Jacobian row is the local pullback (see `local_pullback`) of
         // one seed `(x_bar, delta_bar, mu_bar)` plus, for an edge `j`, the
         // one-hot cotangents `c_a e_j` on `A[i, :]` and `c_l e_j` on
         // `L[i, :]`. Through the units these collapse onto the columns of
-        // `C = dpi/dy_parents = W2 diag(h') W1 diag(dz) + e_loc s^T`: `t_bar
+        // `C = dpi/dy_parents = W2 diag(h') W1 diag(dz) + sum_k e_k s_k^T`,
+        // over the skips `s_k` into their fields `e_k`: `t_bar
         // = c_a C e_j` and `l_bar = c_l C e_j`. So all seeds together need
         // the products `C`, `H[pi, pi] C` and `W2^T pi_bar`.
         let seed = |col| Seed::of_column(col).cotangent(simd, w_i);
@@ -282,8 +284,10 @@ impl FisherResiduals {
                 axpy(simd, units.h1[u] * dz * w1, w2, column);
             }
         }
-        for (column, &skip) in pi_jac.chunks_exact_mut(n_par).zip(theta.skip()) {
-            column[loc] += skip;
+        for (k, &field) in skips.iter().enumerate() {
+            for (column, &skip) in pi_jac.chunks_exact_mut(n_par).zip(theta.skip(k)) {
+                column[field] += skip;
+            }
         }
 
         // `H[pi, pi] C`, from the packed lower triangles.
@@ -376,12 +380,14 @@ impl FisherResiduals {
                 *out.b1(u) = a_bar;
             }
             out.b2().copy_from_slice(pi);
-            let out_skip = out.skip();
-            for (out, &y) in out_skip.iter_mut().zip(&units.y_parents) {
-                *out = pi[loc] * y;
-            }
-            if let Some((j, c_a, c_l)) = edge {
-                out_skip[j] += c_a * t[loc] + c_l * l[loc];
+            for (k, &field) in skips.iter().enumerate() {
+                let out_skip = out.skip(k);
+                for (out, &y) in out_skip.iter_mut().zip(&units.y_parents) {
+                    *out = pi[field] * y;
+                }
+                if let Some((j, c_a, c_l)) = edge {
+                    out_skip[j] += c_a * t[field] + c_l * l[field];
+                }
             }
         }
 

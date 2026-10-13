@@ -72,6 +72,53 @@ def test_location_skip_is_the_conditional_mean(transformer_kwargs):
     np.testing.assert_allclose(np.asarray(x), y - weights @ y, atol=1e-3)
 
 
+@pytest.mark.parametrize("scale_skip", [True, False])
+def test_scale_skip_sets_the_conditional_scale(scale_skip):
+    """With the MLPs silenced, an affine transformer's scale field is the
+    scale skip alone, ``raw = r . y_parents``, so ``x = y / exp(asinh(raw))``
+    per variable; without the scale skip the conditioners have none."""
+    jax.config.update("jax_enable_x64", True)
+    dim = 8
+    flow = SparseTriangularMap(
+        jax.random.key(0),
+        blanket=_banded(dim),
+        n_buckets=2,
+        transformer=make_transformer("affine"),
+        scale_skip=scale_skip,
+    )
+    if not scale_skip:
+        assert all(c.scale_skip is None for c in flow.conditioners)
+        return
+    assert all(c.scale_index is not None for c in flow.conditioners)
+
+    rng = np.random.default_rng(1)
+    conditioners = []
+    weights = np.zeros((dim, dim))
+    for bucket, conditioner in enumerate(flow.conditioners):
+        members = np.asarray(flow.bucket_members[bucket])
+        parents = np.asarray(flow.bucket_parent_indices[bucket])
+        scale_skip_weights = 0.5 * rng.normal(size=conditioner.scale_skip.shape)
+        for local, variable in enumerate(members):
+            for slot, parent in enumerate(parents[local]):
+                if parent < dim:
+                    weights[variable, parent] = scale_skip_weights[local, slot]
+        mlp = _scale_last_layer(conditioner.mlp, 0.0)
+        conditioners.append(
+            eqx.tree_at(
+                lambda c: (c.mlp, c.scale_skip),
+                conditioner,
+                (mlp, jnp.asarray(scale_skip_weights)),
+            )
+        )
+    flow = eqx.tree_at(lambda f: f.conditioners, flow, tuple(conditioners))
+
+    y = rng.normal(size=dim)
+    x, log_det = flow.inverse_and_log_det(jnp.asarray(y))
+    raw = weights @ y
+    np.testing.assert_allclose(np.asarray(x), y * np.exp(-np.arcsinh(raw)), atol=1e-12)
+    np.testing.assert_allclose(log_det, -np.arcsinh(raw).sum(), atol=1e-12)
+
+
 def test_no_location_skip_without_an_output_shift():
     """A chain ending in an inverted `AsymmetricAffine` only has an input
     shift, so its conditioners must stay plain MLPs."""
@@ -169,11 +216,19 @@ def test_native_flow_transform_matches_jax(
         n_buckets=2,
         **{"activation": jax.nn.softplus, **transformer_kwargs},
     )
-    # Off the initialization, so every parameter matters.
+    # Off the initialization, so every parameter matters. The scale skips
+    # compound along the chain (each scale grows with its parents), so they
+    # get less, and from their own generator, so that every other parameter
+    # gets the same perturbation as without them.
     params, static = eqx.partition(bijection, eqx.is_inexact_array)
-    params = jax.tree.map(
-        lambda leaf: leaf + 0.1 * jnp.asarray(rng.normal(size=leaf.shape)), params
-    )
+    scale_rng = np.random.default_rng(1)
+
+    def perturb(path, leaf):
+        if "scale_skip" in jax.tree_util.keystr(path):
+            return leaf + 0.01 * jnp.asarray(scale_rng.normal(size=leaf.shape))
+        return leaf + 0.1 * jnp.asarray(rng.normal(size=leaf.shape))
+
+    params = jax.tree_util.tree_map_with_path(perturb, params)
     bijection = unwrap(eqx.combine(params, static))
 
     native = FlowTransform(flow_transform_layout(bijection))

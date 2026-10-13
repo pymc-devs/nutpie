@@ -19,7 +19,8 @@
 //!
 //! The objective is `F = ||r||^2 + sum_k ridge_k theta_k^2`: an optional
 //! ridge, with strengths by the parameter's role ([`RidgeStrengths`], see
-//! `PyLmOptimizer`'s `mlp_ridge`, `skip_ridge` and `shape_ridge`), which adds
+//! `PyLmOptimizer`'s `mlp_ridge`, `skip_ridge`, `scale_skip_ridge` and
+//! `shape_ridge`), which adds
 //! `diag(ridge)` to `H = J^T J`. Every quantity below, `F`, the gradient `g`,
 //! `H` and its blocks, includes it.
 //!
@@ -896,6 +897,7 @@ impl PyLmOptimizer {
         lmp_tol = 1e-8,
         mlp_ridge = 0.0,
         skip_ridge = 0.0,
+        scale_skip_ridge = 0.0,
         shape_ridge = 0.0,
         frozen = None,
     ))]
@@ -926,6 +928,7 @@ impl PyLmOptimizer {
         lmp_tol: f64,
         mlp_ridge: f64,
         skip_ridge: f64,
+        scale_skip_ridge: f64,
         shape_ridge: f64,
         frozen: Option<PyReadonlyArray1<'_, bool>>,
     ) -> Result<Self> {
@@ -964,6 +967,7 @@ impl PyLmOptimizer {
         let ridge = RidgeStrengths {
             mlp: mlp_ridge,
             skip: skip_ridge,
+            scale_skip: scale_skip_ridge,
             shape: shape_ridge,
         };
         let inner = py.detach(|| LmOptimizer::new(problem, theta, lam, ridge, frozen, settings))?;
@@ -1051,6 +1055,7 @@ mod tests {
         for class in [
             RidgeClass::None,
             RidgeClass::Skip,
+            RidgeClass::ScaleSkip,
             RidgeClass::Mlp,
             RidgeClass::MlpLoc,
             RidgeClass::Shape,
@@ -1063,6 +1068,7 @@ mod tests {
         let strengths = RidgeStrengths {
             mlp: 0.7,
             skip: 0.3,
+            scale_skip: 0.2,
             shape: 0.5,
         };
         // A huge damping makes the step tiny, so GN's model is exact to
@@ -1090,7 +1096,11 @@ mod tests {
         // linearly, are frozen.
         for (class, &frozen) in problem.ridge_classes().iter().zip(&frozen) {
             match class {
-                RidgeClass::Shape | RidgeClass::Mlp | RidgeClass::MlpLoc | RidgeClass::MlpShape => {
+                RidgeClass::Shape
+                | RidgeClass::ScaleSkip
+                | RidgeClass::Mlp
+                | RidgeClass::MlpLoc
+                | RidgeClass::MlpShape => {
                     assert!(frozen)
                 }
                 RidgeClass::Skip => assert!(!frozen),
