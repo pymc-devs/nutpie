@@ -99,6 +99,8 @@ pub(crate) enum RidgeClass {
     None,
     /// The location skip `s`.
     Skip,
+    /// The scale skip.
+    ScaleSkip,
     /// `W1`, or `W2` into a field that is neither the location nor a shape
     /// field.
     Mlp,
@@ -111,8 +113,10 @@ pub(crate) enum RidgeClass {
 }
 
 /// The ridge strengths of the optimizer's objective, per [`RidgeClass`]:
-/// `mlp` on the units' weights, `skip` on the location skip, and `shape` on
-/// what feeds the shape fields directly, `b2` and the units' `W2`.
+/// `mlp` on the units' weights, `skip` on the location skip, `scale_skip` on
+/// the scale skip (unscaled: whatever the scale field's parameterization, it
+/// is already relative), and `shape` on what feeds the shape fields
+/// directly, `b2` and the units' `W2`.
 ///
 /// What moves the location is weighed against the conditional's width: a
 /// shift `Delta` of the location moves `x_i` by `delta_i Delta`, so the skip
@@ -124,6 +128,7 @@ pub(crate) enum RidgeClass {
 pub(crate) struct RidgeStrengths {
     pub(crate) mlp: f64,
     pub(crate) skip: f64,
+    pub(crate) scale_skip: f64,
     pub(crate) shape: f64,
 }
 
@@ -132,6 +137,7 @@ impl RidgeStrengths {
         for (name, value) in [
             ("mlp_ridge", self.mlp),
             ("skip_ridge", self.skip),
+            ("scale_skip_ridge", self.scale_skip),
             ("shape_ridge", self.shape),
         ] {
             if !(value.is_finite() && value >= 0.0) {
@@ -147,6 +153,7 @@ impl RidgeStrengths {
         match class {
             RidgeClass::None => 0.0,
             RidgeClass::Skip => self.skip * loc_scale,
+            RidgeClass::ScaleSkip => self.scale_skip,
             RidgeClass::Mlp => self.mlp,
             RidgeClass::MlpLoc => self.mlp * loc_scale,
             RidgeClass::Shape => self.shape,
@@ -210,10 +217,11 @@ impl FisherResiduals {
     }
 
     /// Per parameter, whether it makes a conditioner or its transformer
-    /// nonlinear: the hidden units (`W1`, `b1`, `W2`) and the biases `b2` of
-    /// the shape fields. With these frozen at `W2 = 0` and the shape fields
-    /// at their affine start, a fit only moves the linear part of each
-    /// conditioner into the affine fields: the skip and their `b2`.
+    /// nonlinear: the hidden units (`W1`, `b1`, `W2`), the biases `b2` of
+    /// the shape fields and the scale skip. With these frozen at `W2 = 0`, the
+    /// shape fields at their affine start and the scale skip at zero, a fit
+    /// only moves the Gaussian part of each conditional: the location skip
+    /// and the affine fields' `b2`.
     pub(crate) fn nonlinear_param_mask(&self) -> Vec<bool> {
         let shape_param = self.conditioner.shape_param_mask();
         let mut mask = vec![false; self.n_params()];
@@ -227,6 +235,12 @@ impl FisherResiduals {
             }
             for (m, k) in shape.b2().enumerate() {
                 mask[start + k] = shape_param[m];
+            }
+            // A scale that depends on the parents is not linear either.
+            if self.conditioner.scale.is_some() {
+                for k in shape.skip(1) {
+                    mask[start + k] = true;
+                }
             }
         }
         mask
@@ -258,8 +272,13 @@ impl FisherResiduals {
                     classes[start + k] = RidgeClass::Shape;
                 }
             }
-            for k in shape.skip() {
+            for k in shape.skip(0) {
                 classes[start + k] = RidgeClass::Skip;
+            }
+            if self.conditioner.scale.is_some() {
+                for k in shape.skip(1) {
+                    classes[start + k] = RidgeClass::ScaleSkip;
+                }
             }
         }
         classes

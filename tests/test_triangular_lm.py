@@ -273,7 +273,7 @@ def test_rust_lm_steps_match_lmopt():
 
 def test_rust_lm_with_limited_memory_preconditioner():
     """The limited-memory preconditioner only changes the CG solves: the fit
-    still converges to about the same loss, and it is actually used."""
+    converges at least about as far, and it is actually used."""
     from nutpie.triangular_lm import fit, map_data
 
     params, static, data, _loss_fn = _flow_problem()
@@ -287,7 +287,8 @@ def test_rust_lm_with_limited_memory_preconditioner():
     assert hist[0]["lmp_rank"] == 0
     assert all(0 < info["lmp_rank"] <= 8 for info in hist[1:])
     assert hist[-1]["F_out"] < 0.1 * hist[0]["F"]
-    np.testing.assert_allclose(hist[-1]["F_out"], base[-1]["F_out"], rtol=0.1)
+    # It only changes the CG solves, so it must not cost the fit anything.
+    assert hist[-1]["F_out"] <= 1.1 * base[-1]["F_out"]
 
 
 def test_step_line_separates_the_ridge():

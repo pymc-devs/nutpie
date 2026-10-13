@@ -559,42 +559,50 @@ def fit_marginal_maps(y, *, steps: int = 100, ridge: float = 1e-3) -> np.ndarray
 
 class LocationSkipMlp(eqx.Module):
     """Conditioner MLP plus a linear skip from the parents to the transformer's
-    location.
+    location, and optionally a second one to its scale field.
 
     The skip weights enter linearly, so the dominant linear dependence on the
     parents is well conditioned from the start. The MLP may see other inputs
-    than the parents (`SparseTriangularMap`'s parent features); the skip is
-    always linear in the parents themselves.
+    than the parents (`SparseTriangularMap`'s parent features); the skips are
+    always linear in the parents themselves. The scale skip adds to the
+    conditioner output that feeds the transformer's scale field, so how that
+    becomes a scale is up to the transformer's parameterization.
     """
 
     mlp: eqx.nn.MLP
     skip: Array
     location_index: int = eqx.field(static=True)
+    scale_skip: Array | None = None
+    scale_index: int | None = eqx.field(static=True, default=None)
 
     def __call__(self, x: Array, inputs: Array | None = None) -> Array:
         inputs = x if inputs is None else inputs
-        return self.mlp(inputs).at[self.location_index].add(self.skip @ x)
+        out = self.mlp(inputs).at[self.location_index].add(self.skip @ x)
+        if self.scale_skip is not None:
+            out = out.at[self.scale_index].add(self.scale_skip @ x)
+        return out
 
 
-def _location_index(transformer, constructor, num_params):
-    """Index of the conditioner output that drives the location, or `None`.
-    Found by probing `constructor`."""
+def _field_index(transformer, constructor, num_params, field):
+    """Index of the conditioner output that drives the transformer's
+    `field` (``"location"`` or ``"scale"``), or `None`. Found by probing
+    `constructor`."""
     from nutpie.normalizing_flow import ElementwiseTransformer
 
     if not isinstance(transformer, ElementwiseTransformer):
         return None
     zeros = jnp.zeros((num_params,))
-    base = constructor(zeros).location()
+    base = getattr(constructor(zeros), field)()
     if base is None:
         return None
     hits = [
         k
         for k in range(num_params)
-        if constructor(zeros.at[k].set(1.0)).location() != base
+        if getattr(constructor(zeros.at[k].set(1.0)), field)() != base
     ]
     if len(hits) != 1:
         raise ValueError(
-            f"Expected one conditioner output to drive the location, found {hits}."
+            f"Expected one conditioner output to drive the {field}, found {hits}."
         )
     return hits[0]
 
@@ -633,6 +641,9 @@ class SparseTriangularMap(bijections.AbstractBijection):
         nn_activation: Conditioner activation function.
         location_skip: Wrap conditioners in `LocationSkipMlp`. Ignored if the
             transformer has no location.
+        scale_skip: Give the `LocationSkipMlp` a second linear skip, to the
+            conditioner output feeding the transformer's scale field. Needs
+            `location_skip`; ignored if the transformer has no scale field.
         feature_degree: If given, the conditioner MLPs see features of the
             parents instead of their raw values: each coordinate through its
             fixed marginal map to a standard normal (`marginal_to_normal`),
@@ -693,6 +704,7 @@ class SparseTriangularMap(bijections.AbstractBijection):
         nn_depth: int = 1,
         nn_activation: Callable = jax.nn.gelu,
         location_skip: bool = True,
+        scale_skip: bool = True,
         feature_degree: int | None = None,
         input_squash: float | None = None,
     ):
@@ -754,8 +766,13 @@ class SparseTriangularMap(bijections.AbstractBijection):
         )
 
         location_index = (
-            _location_index(transformer, constructor, num_params)
+            _field_index(transformer, constructor, num_params, "location")
             if location_skip
+            else None
+        )
+        scale_index = (
+            _field_index(transformer, constructor, num_params, "scale")
+            if location_index is not None and scale_skip
             else None
         )
         if feature_degree is not None and location_index is None:
@@ -776,8 +793,14 @@ class SparseTriangularMap(bijections.AbstractBijection):
             )
             if location_index is None:
                 return mlp
-            # Zero init: the skip is linear, so a random start gains nothing.
-            return LocationSkipMlp(mlp, jnp.zeros((in_size,)), location_index)
+            # Zero init: the skips are linear, so a random start gains nothing.
+            return LocationSkipMlp(
+                mlp,
+                jnp.zeros((in_size,)),
+                location_index,
+                None if scale_index is None else jnp.zeros((in_size,)),
+                scale_index,
+            )
 
         def net_cost(in_size):
             """Rough cost of one conditioner evaluation, to weight padding."""

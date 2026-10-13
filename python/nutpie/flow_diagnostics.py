@@ -506,7 +506,7 @@ class ConditionerCapacity:
 def _unit_features(tmap, net):
     """Features of one conditioner of `tmap` at its parent values and
     indices: its last hidden layer, then the parent values that feed the
-    location skip."""
+    location skip, and again those that feed the scale skip."""
     import equinox as eqx
     import jax.numpy as jnp
 
@@ -521,7 +521,8 @@ def _unit_features(tmap, net):
         inputs = tmap.mlp_inputs(parents, parent_indices)
         hidden = hidden_fn(parents if inputs is None else inputs)
         if isinstance(net, LocationSkipMlp):
-            return jnp.concatenate([hidden, parents])
+            skips = [parents] if net.scale_skip is None else [parents, parents]
+            return jnp.concatenate([hidden, *skips])
         return hidden
 
     return features
@@ -546,16 +547,26 @@ def _gate_directions(net, mean):
     width = last.weight.shape[1]
 
     def tangent(gates):
-        hidden, skipped = gates[:width], gates[width:]
+        hidden = gates[:width]
         shift = last.weight @ (hidden * mean[:width])
         zero = jax.tree.map(jnp.zeros_like, arrays)
         change = eqx.tree_at(
             lambda n: mlp(n).layers[-1].weight, zero, last.weight * hidden[None, :]
         )
         if skip:
+            n_in = net.skip.shape[-1]
+            skipped = gates[width : width + n_in]
+            skip_mean = mean[width : width + n_in]
             change = eqx.tree_at(lambda n: n.skip, change, net.skip * skipped)
-            skip_mean = net.skip @ (skipped * mean[width:])
-            shift = shift.at[net.location_index].add(skip_mean)
+            shift = shift.at[net.location_index].add(net.skip @ (skipped * skip_mean))
+            if net.scale_skip is not None:
+                scaled = gates[width + n_in :]
+                change = eqx.tree_at(
+                    lambda n: n.scale_skip, change, net.scale_skip * scaled
+                )
+                shift = shift.at[net.scale_index].add(
+                    net.scale_skip @ (scaled * mean[width + n_in :])
+                )
         change = eqx.tree_at(lambda n: mlp(n).layers[-1].bias, change, -shift)
         return ravel_pytree(change)[0]
 

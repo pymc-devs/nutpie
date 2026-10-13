@@ -98,6 +98,11 @@ def _pack(tmap, conditioners):
         w2 = np.asarray(second.weight)
         b2 = np.asarray(second.bias)
         skip = np.asarray(conditioner.skip)
+        scale_skip = (
+            None
+            if conditioner.scale_skip is None
+            else np.asarray(conditioner.scale_skip)
+        )
         members = np.asarray(tmap.bucket_members[bucket])
         parent_indices = np.asarray(tmap.bucket_parent_indices[bucket])
         for local, variable in enumerate(members):
@@ -111,9 +116,10 @@ def _pack(tmap, conditioners):
                 ],
                 axis=1,
             )
-            slices[int(variable)] = np.concatenate(
-                [units.ravel(), b2[local], skip[local, :n_parent]]
-            )
+            skips = [skip[local, :n_parent]]
+            if scale_skip is not None:
+                skips.append(scale_skip[local, :n_parent])
+            slices[int(variable)] = np.concatenate([units.ravel(), b2[local], *skips])
     return np.concatenate(slices)
 
 
@@ -195,6 +201,7 @@ def make_residuals(tmap, y=None, g=None):
         n_unit=n_unit,
         n_par=n_par,
         location_index=int(tmap.conditioners[0].location_index),
+        scale_index=tmap.conditioners[0].scale_index,
         transformer=transformer_dicts(specs),
         input_squash=tmap.input_squash,
         activation=_activation(tmap),

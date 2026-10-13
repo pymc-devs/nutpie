@@ -137,6 +137,7 @@ def _run_lm(
     early_stopping=True,
     mlp_ridge=0.0,
     skip_ridge=0.0,
+    scale_skip_ridge=0.0,
     shape_ridge=0.0,
     linear_fit=False,
     prefix="",
@@ -172,6 +173,7 @@ def _run_lm(
         lmp_tol=lmp_tol,
         mlp_ridge=mlp_ridge,
         skip_ridge=skip_ridge,
+        scale_skip_ridge=scale_skip_ridge,
         shape_ridge=shape_ridge,
         frozen=problem.nonlinear_param_mask if linear_fit else None,
         val_problem=val_problem,
@@ -184,7 +186,11 @@ def _run_lm(
     # than the last step's.
     r = problem.residuals(theta, linearize=False)
     strengths = problem.ridge_strengths(
-        theta, mlp_ridge=mlp_ridge, skip_ridge=skip_ridge, shape_ridge=shape_ridge
+        theta,
+        mlp_ridge=mlp_ridge,
+        skip_ridge=skip_ridge,
+        scale_skip_ridge=scale_skip_ridge,
+        shape_ridge=shape_ridge,
     )
     ridge = float(strengths @ theta**2) / problem.n_draw
     train = float(r @ r)
@@ -256,12 +262,14 @@ class TriangularFlowAdapter:
         tangent_sas_fix_b,
         log_gamma_bounds,
         input_squash,
+        scale_skip,
         max_epochs,
         solver_rtol,
         lm_linear_steps,
         lm_min_loss,
         lm_mlp_ridge,
         lm_skip_ridge,
+        lm_scale_skip_ridge,
         lm_shape_ridge,
         lm_patience,
         lm_forcing,
@@ -307,6 +315,7 @@ class TriangularFlowAdapter:
             "tangent_sas_fix_b": tangent_sas_fix_b,
             "log_gamma_bounds": log_gamma_bounds,
             "input_squash": input_squash,
+            "scale_skip": scale_skip,
         }
         self._lm_settings = {
             "max_steps": max_epochs,
@@ -320,6 +329,7 @@ class TriangularFlowAdapter:
             "lmp_tol": lm_lmp_tol,
             "mlp_ridge": lm_mlp_ridge,
             "skip_ridge": lm_skip_ridge,
+            "scale_skip_ridge": lm_scale_skip_ridge,
             "shape_ridge": lm_shape_ridge,
         }
         # The Rust LM fit needs a multiple of its SIMD width of draws.

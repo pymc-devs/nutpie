@@ -73,9 +73,10 @@ def test_transformer_spec_matches_the_probe(kwargs):
     n_par = int(tmap.conditioners[0].mlp.layers[1].out_features)
     probed = transformer_dicts(_probe_transformer(tmap.transformer_constructor, n_par))
 
-    specs, ours_n_par, location = transformer_spec(**kwargs)
+    specs, ours_n_par, location, scale = transformer_spec(**kwargs)
     assert ours_n_par == n_par
     assert location == int(tmap.conditioners[0].location_index)
+    assert scale == int(tmap.conditioners[0].scale_index)
     assert transformer_dicts(specs) == probed
 
 

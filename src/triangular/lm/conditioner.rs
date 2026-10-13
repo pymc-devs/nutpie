@@ -39,17 +39,21 @@ impl Activation {
 
 /// The architecture every variable's conditioner and transformer share: one
 /// hidden layer of `n_unit` units (`activation`), `n_par` transformer parameters
-/// with the location skip into parameter `location` (`loc`), and the
-/// transformer layers.
+/// with the location skip into parameter `location` (`loc`) and optionally
+/// the scale skip into parameter `scale`, and the transformer layers.
 ///
 /// With `squash = Some(c)`, the units see `z = c asinh(y / c)` of each parent
-/// instead of `y`, while the skip stays linear in `y`. The units' part of
+/// instead of `y`, while the skips stay linear in `y`. The units' part of
 /// every edge derivative then carries `z'(y_j)` (`dz`).
 #[derive(Debug, Clone)]
 pub(super) struct Conditioner {
     pub(super) n_unit: usize,
     pub(super) n_par: usize,
     pub(super) location: usize,
+    pub(super) scale: Option<usize>,
+    /// The transformer parameter each skip adds to: `location`, then
+    /// `scale` if there is a scale skip. Skip `k` is [`Shape::skip`]`(k)`.
+    pub(super) skips: Vec<usize>,
     pub(super) layers: Vec<Layer>,
     pub(super) squash: Option<f64>,
     pub(super) activation: Activation,
@@ -61,6 +65,7 @@ pub(super) struct Shape {
     pub(super) n_parent: usize,
     pub(super) n_unit: usize,
     pub(super) n_par: usize,
+    pub(super) n_skip: usize,
 }
 
 impl Shape {
@@ -70,7 +75,7 @@ impl Shape {
     }
 
     pub(super) fn size(&self) -> usize {
-        self.n_unit * self.stride() + self.n_par + self.n_parent
+        self.n_unit * self.stride() + self.n_par + self.n_skip * self.n_parent
     }
 
     #[inline(always)]
@@ -96,9 +101,10 @@ impl Shape {
         start..start + self.n_par
     }
 
+    /// Skip `k`'s weights, one per parent, see [`Conditioner::skips`].
     #[inline(always)]
-    pub(super) fn skip(&self) -> std::ops::Range<usize> {
-        let start = self.n_unit * self.stride() + self.n_par;
+    pub(super) fn skip(&self, k: usize) -> std::ops::Range<usize> {
+        let start = self.n_unit * self.stride() + self.n_par + k * self.n_parent;
         start..start + self.n_parent
     }
 }
@@ -139,10 +145,10 @@ impl<'a, T: Copy> Params<'a, T> {
         &self.values[self.shape.b2()]
     }
 
-    /// The location skip's weights, one per parent.
+    /// Skip `k`'s weights, one per parent.
     #[inline(always)]
-    pub(super) fn skip(&self) -> &'a [T] {
-        &self.values[self.shape.skip()]
+    pub(super) fn skip(&self, k: usize) -> &'a [T] {
+        &self.values[self.shape.skip(k)]
     }
 }
 
@@ -179,8 +185,8 @@ impl<'a, T> ParamsMut<'a, T> {
     }
 
     #[inline(always)]
-    pub(super) fn skip(&mut self) -> &mut [T] {
-        &mut self.values[self.shape.skip()]
+    pub(super) fn skip(&mut self, k: usize) -> &mut [T] {
+        &mut self.values[self.shape.skip(k)]
     }
 }
 
@@ -267,12 +273,18 @@ impl Conditioner {
         n_unit: usize,
         n_par: usize,
         location: usize,
+        scale: Option<usize>,
         specs: Vec<LayerSpec>,
         squash: Option<f64>,
         activation: Activation,
     ) -> Result<Self> {
         if location >= n_par {
             bail!("location index {location} out of range for {n_par} parameters");
+        }
+        if let Some(scale) = scale {
+            if scale >= n_par || scale == location {
+                bail!("scale index {scale} out of range or equal to the location's");
+            }
         }
         if let Some(c) = squash {
             if !(c.is_finite() && c > 0.0) {
@@ -292,6 +304,8 @@ impl Conditioner {
             n_unit,
             n_par,
             location,
+            scale,
+            skips: std::iter::once(location).chain(scale).collect(),
             layers,
             squash,
             activation,
@@ -315,6 +329,7 @@ impl Conditioner {
             n_parent,
             n_unit: self.n_unit,
             n_par: self.n_par,
+            n_skip: self.skips.len(),
         }
     }
 
@@ -390,7 +405,9 @@ impl Conditioner {
             units.h2[u] = h2;
             axpy(simd, h, theta.w2(u), &mut units.pi);
         }
-        units.pi[self.location] += dot(simd, theta.skip(), &units.y_parents);
+        for (k, &field) in self.skips.iter().enumerate() {
+            units.pi[field] += dot(simd, theta.skip(k), &units.y_parents);
+        }
     }
 
     /// One variable's primal. Writes its edge values to `edge_a` and
@@ -407,7 +424,6 @@ impl Conditioner {
         edge_l: &mut [S::f64s],
         s: &mut Scratch<S>,
     ) -> (S::f64s, S::f64s, S::f64s) {
-        let loc = self.location;
         let (x, log_det) = transformer(simd, &self.layers, y_own, &units.pi, &[], 0, &mut s.jets);
         let ws = &s.jets;
         let (t, l) = (&ws.grad(&x)[1..], &ws.grad(&log_det)[1..]);
@@ -420,10 +436,13 @@ impl Conditioner {
             axpy(simd, dot(simd, w2, t) * units.h1[u], w1, edge_a);
             axpy(simd, dot(simd, w2, l) * units.h1[u], w1, edge_l);
         }
-        let edges = edge_a.iter_mut().zip(edge_l.iter_mut());
-        for (((a, l_out), &skip), &dz) in edges.zip(theta.skip()).zip(&units.dz) {
-            *a = *a * dz + t[loc] * skip;
-            *l_out = *l_out * dz + l[loc] * skip;
+        for ((a, l_out), &dz) in edge_a.iter_mut().zip(edge_l.iter_mut()).zip(&units.dz) {
+            *a = *a * dz;
+            *l_out = *l_out * dz;
+        }
+        for (k, &field) in self.skips.iter().enumerate() {
+            axpy(simd, t[field], theta.skip(k), edge_a);
+            axpy(simd, l[field], theta.skip(k), edge_l);
         }
         (ws.value(&x), ws.grad(&x)[0], ws.grad(&log_det)[0])
     }
@@ -451,7 +470,6 @@ impl Conditioner {
         s: &mut Scratch<S>,
     ) -> (S::f64s, S::f64s, S::f64s) {
         let n_z = 1 + self.n_par;
-        let loc = self.location;
         for (pi_dot, &b) in s.pi_dot.iter_mut().zip(v.b2()) {
             *pi_dot = S::f64s::splat(simd, b);
         }
@@ -461,7 +479,9 @@ impl Conditioner {
             axpy(simd, units.h[u], v.w2(u), &mut s.pi_dot);
             axpy(simd, units.h1[u] * a_dot, theta.w2(u), &mut s.pi_dot);
         }
-        s.pi_dot[loc] += dot(simd, v.skip(), &units.y_parents);
+        for (k, &field) in self.skips.iter().enumerate() {
+            s.pi_dot[field] += dot(simd, v.skip(k), &units.y_parents);
+        }
 
         s.dirs[0] = S::f64s::splat(simd, 0.0);
         s.dirs[1..n_z].copy_from_slice(&s.pi_dot);
@@ -494,11 +514,16 @@ impl Conditioner {
             axpy(simd, alpha_l, w1, edge_l);
             axpy(simd, p_l * h1, w1_dot, edge_l);
         }
-        let (skip, skip_dot) = (theta.skip(), v.skip());
-        for j in 0..edge_a.len() {
-            let dz = units.dz[j];
-            edge_a[j] = edge_a[j] * dz + t_dot[loc] * skip[j] + t[loc] * skip_dot[j];
-            edge_l[j] = edge_l[j] * dz + l_dot[loc] * skip[j] + l[loc] * skip_dot[j];
+        for ((a, l_out), &dz) in edge_a.iter_mut().zip(edge_l.iter_mut()).zip(&units.dz) {
+            *a = *a * dz;
+            *l_out = *l_out * dz;
+        }
+        for (k, &field) in self.skips.iter().enumerate() {
+            let (skip, skip_dot) = (theta.skip(k), v.skip(k));
+            axpy(simd, t_dot[field], skip, edge_a);
+            axpy(simd, t[field], skip_dot, edge_a);
+            axpy(simd, l_dot[field], skip, edge_l);
+            axpy(simd, l[field], skip_dot, edge_l);
         }
         (
             dot_lanes(simd, t, &s.pi_dot),
@@ -550,7 +575,6 @@ impl Conditioner {
         mut grad: ParamsMut<S::f64s>,
     ) {
         let n_z = 1 + self.n_par;
-        let loc = self.location;
         let zero = S::f64s::splat(simd, 0.0);
 
         // The units see the edge cotangents through `dz`.
@@ -574,8 +598,10 @@ impl Conditioner {
             axpy(simd, units.h1[u] * zeta_a, w2, &mut s.t_bar);
             axpy(simd, units.h1[u] * zeta_l, w2, &mut s.l_bar);
         }
-        s.t_bar[loc] += dot(simd, theta.skip(), cot.edge_a);
-        s.l_bar[loc] += dot(simd, theta.skip(), cot.edge_l);
+        for (k, &field) in self.skips.iter().enumerate() {
+            s.t_bar[field] += dot(simd, theta.skip(k), cot.edge_a);
+            s.l_bar[field] += dot(simd, theta.skip(k), cot.edge_l);
+        }
 
         // `T` along `(delta_bar, t_bar)` and `Lambda` along `(mu_bar,
         // l_bar)`: every second-order path into `pi` at once.
@@ -610,10 +636,12 @@ impl Conditioner {
         for (g, &p) in grad.b2().iter_mut().zip(&s.pi_bar) {
             *g += p;
         }
-        let g_skip = grad.skip();
-        axpy_lanes(simd, t[loc], cot.edge_a, g_skip);
-        axpy_lanes(simd, l[loc], cot.edge_l, g_skip);
-        axpy_lanes(simd, s.pi_bar[loc], &units.y_parents, g_skip);
+        for (k, &field) in self.skips.iter().enumerate() {
+            let g_skip = grad.skip(k);
+            axpy_lanes(simd, t[field], cot.edge_a, g_skip);
+            axpy_lanes(simd, l[field], cot.edge_l, g_skip);
+            axpy_lanes(simd, s.pi_bar[field], &units.y_parents, g_skip);
+        }
     }
 
     /// The transformer's gradients in `z = (y, pi)`, at `y` and `pi`, and its

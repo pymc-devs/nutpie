@@ -84,12 +84,15 @@ def merge_frozen(trainable, frozen):
 def mlp_unit_labels(one):
     """Label each parameter of a depth-1 MLP by hidden unit, in
     `jax.tree.leaves` order, so sub-blocks span layers. Skip weights of a
-    `LocationSkipMlp` get one extra label."""
+    `LocationSkipMlp` get one extra label, its scale skip's another."""
     from nutpie.triangular import LocationSkipMlp
 
     if isinstance(one, LocationSkipMlp):
         n_units = one.mlp.layers[0].weight.shape[0]
-        return mlp_unit_labels(one.mlp) + [np.full(one.skip.shape, n_units)]
+        skips = [np.full(one.skip.shape, n_units)]
+        if one.scale_skip is not None:
+            skips.append(np.full(one.scale_skip.shape, n_units + 1))
+        return mlp_unit_labels(one.mlp) + skips
     l1, l2 = one.layers
     W = l1.weight.shape[0]
     return [

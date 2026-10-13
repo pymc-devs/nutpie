@@ -154,6 +154,12 @@ def _transform_kwargs(layout, schedule, min_parallel_work):
         "layer_out": np.asarray(layout.layer_out, dtype=np.int64),
         "skip_weight": np.asarray(layout.skip_weight, dtype=np.float64),
         "skip_index": int(layout.skip_index),
+        "scale_skip_weight": (
+            None
+            if layout.scale_skip_index is None
+            else np.asarray(layout.scale_skip_weight, dtype=np.float64)
+        ),
+        "scale_skip_index": layout.scale_skip_index,
         "feature_degree": int(layout.feature_degree),
         "feature_params": np.asarray(layout.feature_params, dtype=np.float64).ravel(),
         "input_squash": layout.input_squash,

@@ -65,7 +65,8 @@ fn problem_squashed(squash: Option<f64>, activation: Activation, n_draw: usize) 
             scale: param(10, 0.1),
         }),
     ];
-    let conditioner = Conditioner::new(3, 11, 3, specs, squash, activation).unwrap();
+    // Scale skip into `PositiveAffine`'s scale.
+    let conditioner = Conditioner::new(3, 11, 3, Some(10), specs, squash, activation).unwrap();
     let mut problem = FisherResiduals::new(graph(), conditioner).unwrap();
     let mut rng = ChaCha8Rng::seed_from_u64(0);
     let n_var = problem.n_var();

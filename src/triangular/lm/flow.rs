@@ -179,6 +179,7 @@ impl TriangularFlow {
         let mut parent_indptr = vec![0i64];
         let mut parent_index = Vec::with_capacity(s.n_edge());
         let mut skip_weight = Vec::with_capacity(s.n_edge());
+        let mut scale_skip_weight = Vec::new();
         let mut blob = Vec::new();
         let mut blob_offset = vec![0i64];
         for i in 0..n {
@@ -186,7 +187,10 @@ impl TriangularFlow {
             let n_parent = theta.shape.n_parent;
             parent_index.extend(s.graph.entries(i).map(|(_, p)| p as i64));
             parent_indptr.push(parent_index.len() as i64);
-            skip_weight.extend_from_slice(theta.skip());
+            skip_weight.extend_from_slice(theta.skip(0));
+            if conditioner.scale.is_some() {
+                scale_skip_weight.extend_from_slice(theta.skip(1));
+            }
             // Per layer, the transposed `(n_in, n_out)` weight, then the
             // bias: see `TriangularLayout.blob`.
             for p in 0..n_parent {
@@ -223,6 +227,9 @@ impl TriangularFlow {
             &[n_unit as i64, n_par as i64],
             &skip_weight,
             conditioner.location as i64,
+            conditioner
+                .scale
+                .map(|scale| (scale_skip_weight.as_slice(), scale as i64)),
             0,
             &[],
             conditioner.squash,
@@ -279,6 +286,7 @@ impl PyTriangularFlow {
         permutation,
         loc,
         scale,
+        scale_index = None,
         input_squash = None,
         activation = "softplus",
     ))]
@@ -294,6 +302,7 @@ impl PyTriangularFlow {
         permutation: PyReadonlyArray1<'_, i64>,
         loc: PyReadonlyArray1<'_, f64>,
         scale: PyReadonlyArray1<'_, f64>,
+        scale_index: Option<usize>,
         input_squash: Option<f64>,
         activation: &str,
     ) -> Result<Self> {
@@ -302,6 +311,7 @@ impl PyTriangularFlow {
             n_unit,
             n_par,
             location_index,
+            scale_index,
             specs.clone(),
             input_squash,
             Activation::from_name(activation)?,
