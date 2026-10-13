@@ -3,7 +3,9 @@
 
 use smallvec::SmallVec;
 
-use super::{Contract2, Layer, LogGammaBound, Param, PositiveAffineSpec, TangentSasSpec};
+use super::{
+    AsymmetricSas, Contract2, Layer, LogGammaBound, Param, PositiveAffineSpec, TangentSasSpec,
+};
 
 impl LogGammaBound {
     #[inline(always)]
@@ -38,6 +40,7 @@ impl Layer {
         match self {
             Layer::Contract2(layer) => layer.transform(params, y),
             Layer::TangentSas(layer) => layer.transform(params, y),
+            Layer::AsymmetricSas(layer) => layer.transform(params, y),
             Layer::PositiveAffine(layer) => layer.transform(params, y),
         }
     }
@@ -47,6 +50,7 @@ impl Layer {
         match self {
             Layer::Contract2(layer) => layer.transform_with_tape(params, y),
             Layer::TangentSas(layer) => layer.transform_with_tape(params, y),
+            Layer::AsymmetricSas(layer) => layer.transform_with_tape(params, y),
             Layer::PositiveAffine(layer) => layer.transform_with_tape(params, y),
         }
     }
@@ -454,6 +458,98 @@ impl TangentSasSpec {
         );
 
         (nu + shape, ld, tape)
+    }
+}
+
+impl AsymmetricSas {
+    /// `w = scale_mod (y - c)`, the side's `alpha` and `d log gamma / d alpha`.
+    #[inline(always)]
+    fn side(&self, params: &[f64], y: f64) -> (f64, f64, f64, Option<Param>, f64, f64) {
+        let c = param_or(self.c, params, 0.0);
+        let a = param_or(self.a, params, 0.0);
+        let (scale, dscale) = exp_asinh_with_derivative(a);
+        let w = scale * (y - c);
+        let alpha = if w >= 0.0 {
+            self.alpha_pos
+        } else {
+            self.alpha_neg
+        };
+        let raw = param_or(alpha, params, 0.0);
+        let unbounded = raw.asinh();
+        let dunbounded = 1.0 / (1.0 + raw * raw).sqrt();
+        let (log_gamma, dlog_gamma) = match self.bound {
+            None => (unbounded, dunbounded),
+            Some(bound) => {
+                let (value, d) = bound.apply_with_derivative(unbounded);
+                (value, d * dunbounded)
+            }
+        };
+        (w, scale, dscale, alpha, log_gamma, dlog_gamma)
+    }
+
+    /// One layer of `AsymmetricSAS.transform_and_log_det`: with `w =
+    /// scale_mod (y - c)` and `gamma` that of `w`'s side,
+    ///
+    /// ```text
+    /// y_out = sinh(gamma asinh(w)) / gamma,
+    /// ld    = log scale_mod + logcosh(gamma asinh(w)) - 0.5 log1p(w^2).
+    /// ```
+    #[inline(always)]
+    fn transform(&self, params: &[f64], y: f64) -> (f64, f64) {
+        let (w, scale, _, _, log_gamma, _) = self.side(params, y);
+        let gamma = log_gamma.exp();
+        let arg = gamma * w.asinh();
+        let sinh_arg = arg.sinh();
+        let ld = scale.ln() + log_cosh_from_sinh(sinh_arg, arg) - log_cosh_asinh(w);
+        (sinh_arg / gamma, ld)
+    }
+
+    /// `transform` and its partials. With `R = sqrt(1 + w^2)`, `t =
+    /// asinh(w)` and `arg = gamma t`:
+    ///
+    /// ```text
+    /// dy/dw = cosh(arg) / R,                dld/dw = gamma tanh(arg) / R - w / R^2,
+    /// dy/dgamma = t cosh(arg) / gamma - y / gamma,   dld/dgamma = t tanh(arg),
+    /// ```
+    ///
+    /// with `dw/dy_in = scale_mod`, `dw/dc = -scale_mod`, `dw/da = w / sqrt(1
+    /// + a^2)` (and `log scale_mod` adds `1 / sqrt(1 + a^2)` to `dld/da`), and
+    /// `dgamma/dalpha = gamma dlog_gamma/dalpha` for the side's `alpha` only.
+    #[inline(always)]
+    fn transform_with_tape(&self, params: &[f64], y: f64) -> (f64, f64, LayerTape) {
+        let (w, scale, dscale, alpha, log_gamma, dlog_gamma) = self.side(params, y);
+        let gamma = log_gamma.exp();
+        let root = if w.abs() > 1e150 {
+            w.abs()
+        } else {
+            (1.0 + w * w).sqrt()
+        };
+        let t = w.asinh();
+        let arg = gamma * t;
+        let sinh_arg = arg.sinh();
+        let cosh_arg = (1.0 + sinh_arg * sinh_arg).sqrt();
+        let tanh_arg = tanh_from(sinh_arg, cosh_arg, arg);
+        let out = sinh_arg / gamma;
+        let ld = scale.ln() + log_cosh_from_sinh(sinh_arg, arg) - log_cosh_asinh(w);
+
+        let dy_dw = cosh_arg / root;
+        let dld_dw = gamma * tanh_arg / root - w / (root * root);
+        let mut tape = LayerTape::new(scale * dy_dw, scale * dld_dw);
+        tape.push(self.c, -scale * dy_dw, -scale * dld_dw);
+        // `dscale / scale = 1 / sqrt(1 + a^2)`, so `dw/da = w dscale / scale`.
+        let dlog_scale = dscale / scale;
+        tape.push(
+            self.a,
+            dy_dw * w * dlog_scale,
+            dlog_scale + dld_dw * w * dlog_scale,
+        );
+        let dgamma = gamma * dlog_gamma;
+        tape.push(
+            alpha,
+            (t * cosh_arg - out) / gamma * dgamma,
+            t * tanh_arg * dgamma,
+        );
+        (out, ld, tape)
     }
 }
 

@@ -714,12 +714,7 @@ class SparseTriangularMap(bijections.AbstractBijection):
         if transformer is None:
             from nutpie.normalizing_flow import make_transformer
 
-            transformer = make_transformer(
-                affine_transformer=False,
-                asymmetric_transformer=False,
-                contract_transformer=2,
-                # log_gamma_bounds=(-1, 1),
-            )
+            transformer = make_transformer("sas", 2)
         if transformer.shape != () or transformer.cond_shape is not None:
             raise ValueError(
                 "Only unconditional transformers with shape () are supported."

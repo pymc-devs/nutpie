@@ -39,11 +39,17 @@ def _draws(n_draw=16, seed=0):
 
 TRANSFORMERS = [
     {},
-    {"contract_transformer": 1},
-    {"contract_transformer": 2, "log_gamma_bounds": (-1.0, 1.0)},
-    {"tangent_sas_transformer": 1},
-    {"contract_transformer": 1, "tangent_sas_transformer": 1},
-    {"tangent_sas_transformer": 2, "tangent_sas_fix_b": True},
+    {"transformer": "affine"},
+    {"transformer": "sas", "transformer_layers": 2, "log_gamma_bounds": (-1.0, 1.0)},
+    {"transformer": "tangent_sas"},
+    {"transformer": "tangent_sas", "transformer_layers": 2},
+    {"transformer": "tangent_sas", "transformer_layers": 2, "tangent_sas_fix_b": True},
+    {"transformer": "asymmetric_sas"},
+    {
+        "transformer": "asymmetric_sas",
+        "transformer_layers": 3,
+        "log_gamma_bounds": (-1.0, 1.0),
+    },
 ]
 
 
@@ -86,8 +92,8 @@ def _jax_flow(seed=0, **kwargs):
     settings = {
         "nn_width": 4,
         "activation": jax.nn.softplus,
-        "contract_transformer": 1,
-        "tangent_sas_transformer": 1,
+        "transformer": "tangent_sas",
+        "transformer_layers": 2,
         **kwargs,
     }
     order = rng.permutation(DIM)
@@ -113,7 +119,8 @@ def _jax_flow(seed=0, **kwargs):
 FLOWS = [
     {},
     {"activation": jax.nn.gelu, "input_squash": 0.7, "log_gamma_bounds": (-1, 1)},
-    {"nn_width": 0, "tangent_sas_transformer": 0, "contract_transformer": 2},
+    {"nn_width": 0, "transformer": "sas", "transformer_layers": 2},
+    {"transformer": "asymmetric_sas", "transformer_layers": 2},
 ]
 
 
@@ -196,8 +203,8 @@ def test_built_flow_has_the_jax_structure():
     order = np.random.default_rng(3).permutation(DIM)
     settings = {
         "nn_width": 4,
-        "contract_transformer": 1,
-        "tangent_sas_transformer": 1,
+        "transformer": "sas",
+        "transformer_layers": 2,
         "log_gamma_bounds": (-1.0, 1.0),
         "input_squash": 1.0,
     }
@@ -248,7 +255,7 @@ def test_built_flow_inverts_and_fits():
         sparsity=_banded(DIM, order),
         order=order,
         nn_width=4,
-        tangent_sas_transformer=1,
+        transformer="tangent_sas",
         input_squash=1.0,
     )
 

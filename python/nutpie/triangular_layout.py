@@ -61,6 +61,20 @@ class TangentSASSpec:
 
 
 @dataclass(frozen=True)
+class AsymmetricSASSpec:
+    """One `AsymmetricSAS` layer."""
+
+    kind: ClassVar[str] = "asymmetric_sas"
+    FIELDS: ClassVar[tuple[str, ...]] = ("c", "a", "alpha_pos", "alpha_neg")
+
+    c: tuple[int, float] | None
+    a: tuple[int, float] | None
+    alpha_pos: tuple[int, float] | None
+    alpha_neg: tuple[int, float] | None
+    log_gamma_bounds: tuple[float, float] | None
+
+
+@dataclass(frozen=True)
 class PositiveAffineSpec:
     """One `PositiveAffine` layer."""
 
@@ -184,6 +198,7 @@ def _chain_layers(transformer):
     from flowjax import bijections
 
     from nutpie.normalizing_flow import (
+        AsymmetricSAS,
         Contract2,
         ElementwiseTransformer,
         PositiveAffine,
@@ -203,12 +218,16 @@ def _chain_layers(transformer):
             spec, extra = Contract2Spec, {"log_gamma_bounds": layer.log_gamma_bounds}
         elif isinstance(layer, TangentSAS):
             spec, extra = TangentSASSpec, {}
+        elif isinstance(layer, AsymmetricSAS):
+            spec = AsymmetricSASSpec
+            extra = {"log_gamma_bounds": layer.log_gamma_bounds}
         elif isinstance(layer, PositiveAffine):
             spec, extra = PositiveAffineSpec, {}
         else:
             raise NotImplementedError(
                 "The compiled transforms only support transformers built from "
-                "`Contract2`, `TangentSAS` and `PositiveAffine` layers, got "
+                "`Contract2`, `TangentSAS`, `AsymmetricSAS` and `PositiveAffine` "
+                "layers, got "
                 f"{type(layer).__name__}."
             )
         values = {}

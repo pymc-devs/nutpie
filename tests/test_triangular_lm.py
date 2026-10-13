@@ -43,6 +43,7 @@ def _setup(
     blanket="banded",
     bounds=None,
     tangent_sas=0,
+    asymmetric_sas=0,
     fix_b=False,
     squash=None,
     activation=jax.nn.softplus,
@@ -52,12 +53,14 @@ def _setup(
 ):
     jax.config.update("jax_enable_x64", True)
     rng = np.random.default_rng(seed)
+    if tangent_sas:
+        kind, layers = "tangent_sas", tangent_sas
+    elif asymmetric_sas:
+        kind, layers = "asymmetric_sas", asymmetric_sas
+    else:
+        kind, layers = "sas", 2
     transformer = make_transformer(
-        contract_transformer=0 if tangent_sas else 2,
-        asymmetric_transformer=False,
-        log_gamma_bounds=bounds,
-        tangent_sas_transformer=tangent_sas,
-        tangent_sas_fix_b=fix_b,
+        kind, layers, log_gamma_bounds=bounds, tangent_sas_fix_b=fix_b
     )
     tmap = SparseTriangularMap(
         jax.random.key(seed),
@@ -108,6 +111,9 @@ CASES = [
     {"squash": 0.7, "blanket": "random", "bounds": (-1.0, 1.0)},
     {"activation": jax.nn.gelu},
     {"activation": jax.nn.gelu, "squash": 0.7, "tangent_sas": 2},
+    {"asymmetric_sas": 1},
+    {"asymmetric_sas": 3, "blanket": "random"},
+    {"asymmetric_sas": 2, "bounds": (-1.0, 1.0), "squash": 0.7},
 ]
 
 
@@ -208,7 +214,8 @@ def _flow_problem(dim=7, n_draw=64, seed=0):
         nn_width=4,
         nn_depth=1,
         activation=jax.nn.softplus,
-        contract_transformer=2,
+        transformer="sas",
+        transformer_layers=2,
         n_buckets=2,
     )
     flow = flowjax.flows.Transformed(
@@ -499,7 +506,8 @@ def test_make_flow_passes_log_gamma_bounds():
         sparsity=_filled(_blanket(dim, "banded", rng), np.arange(dim)),
         nn_width=4,
         activation=jax.nn.softplus,
-        contract_transformer=2,
+        transformer="sas",
+        transformer_layers=2,
         log_gamma_bounds=(-1.0, 1.0),
     )
     flow = flowjax.flows.Transformed(

@@ -1500,6 +1500,89 @@ class TangentSAS(bijections.AbstractBijection):
         return x, log_det
 
 
+class AsymmetricSAS(bijections.AbstractBijection):
+    """Asymmetric sinh-arcsinh: a power law with its own exponent on either
+    side of zero,
+
+        w    = scale_mod * (x - c),
+        h(w) = sinh(gamma asinh(w)) / gamma,  gamma = gamma_+ (w >= 0),
+                                                       gamma_- (w < 0),
+
+    with ``scale_mod = exp(asinh(a))`` and ``gamma_pm = exp(asinh(alpha_pm))``,
+    so all zeros give the identity. ``h(w) ~ w**gamma`` on each side, and
+    ``h = w + (gamma**2 - 1) w**3 / 6 + O(w**5)``: ``h(0) = 0``, ``h'(0) = 1``
+    and ``h''(0) = 0`` from both sides, so ``h`` is ``C^2``. Only ``h'''``
+    jumps at zero (unless ``gamma_+ = gamma_-``).
+
+    ``c`` and ``a`` place the kink and the transition from the linear core to
+    the tails; a `None` one stays at zero, for a layer acting on a centred,
+    unit-scale input. `log_gamma_bounds` bounds both ``log gamma``, see
+    `Contract2`.
+    """
+
+    shape: tuple[int, ...]
+    c: Array | None
+    a: Array | None
+    alpha_pos: Array
+    alpha_neg: Array
+    cond_shape: tuple[int, ...] | None = None
+    log_gamma_bounds: tuple[float, float] | None = eqx.field(static=True, default=None)
+
+    def __init__(self, c, a, alpha_pos, alpha_neg, log_gamma_bounds=None):
+        if log_gamma_bounds is not None:
+            low, high = log_gamma_bounds
+            if not low < 0.0 < high:
+                raise ValueError(
+                    "log_gamma_bounds must satisfy low < 0 < high, got "
+                    f"{log_gamma_bounds}."
+                )
+            log_gamma_bounds = (float(low), float(high))
+        self.log_gamma_bounds = log_gamma_bounds
+        self.c = _optional(c)
+        self.a = _optional(a)
+        self.alpha_pos = jnp.array(alpha_pos)
+        self.alpha_neg = jnp.array(alpha_neg)
+        self.shape = ()
+
+    def _params(self):
+        """c, log scale_mod, log gamma_+, log gamma_-."""
+        zero = jnp.zeros(())
+        c = zero if self.c is None else self.c
+        log_scale = zero if self.a is None else jnp.arcsinh(self.a)
+        log_gammas = [jnp.arcsinh(self.alpha_pos), jnp.arcsinh(self.alpha_neg)]
+        if self.log_gamma_bounds is not None:
+            log_gammas = [
+                _bounded_log_gamma(lg, *self.log_gamma_bounds) for lg in log_gammas
+            ]
+        return c, log_scale, *log_gammas
+
+    def transform_and_log_det(
+        self, x: ArrayLike, condition: ArrayLike | None = None
+    ) -> tuple[Array, Array]:
+        """``log h'(w) = logcosh(gamma asinh(w)) - 0.5 log1p(w**2)``."""
+        c, log_scale, log_gamma_pos, log_gamma_neg = self._params()
+        w = jnp.exp(log_scale) * (x - c)
+        gamma = jnp.exp(jnp.where(w >= 0, log_gamma_pos, log_gamma_neg))
+        arg = gamma * jnp.arcsinh(w)
+        y = jnp.sinh(arg) / gamma
+        log_det = log_scale + _log_cosh(arg) - 0.5 * jnp.log1p(w * w)
+        return y, log_det
+
+    def inverse_and_log_det(
+        self, y: ArrayLike, condition: ArrayLike | None = None
+    ) -> tuple[Array, Array]:
+        """``asinh(w) = asinh(gamma y) / gamma``, with ``w`` and ``y`` of the
+        same sign; ``logcosh(asinh(gamma y)) = 0.5 log1p((gamma y)**2)`` and
+        ``0.5 log1p(w**2) = logcosh(asinh(w))``."""
+        c, log_scale, log_gamma_pos, log_gamma_neg = self._params()
+        gamma = jnp.exp(jnp.where(y >= 0, log_gamma_pos, log_gamma_neg))
+        q = gamma * y
+        t = jnp.arcsinh(q) / gamma
+        x = c + jnp.sinh(t) * jnp.exp(-log_scale)
+        log_det = _log_cosh(t) - log_scale - 0.5 * jnp.log1p(q * q)
+        return x, log_det
+
+
 class PositiveAffine(bijections.AbstractBijection):
     """``y = loc + scale_mod * x`` with ``scale_mod = scale + sqrt(1 +
     scale**2)``, so ``scale`` is unconstrained and zero is the identity."""
@@ -1659,156 +1742,134 @@ class ElementwiseTransformer(bijections.AbstractBijection):
         return self.chain.inverse_and_log_det(y, condition)
 
 
+TRANSFORMERS = ("affine", "sas", "tangent_sas", "asymmetric_sas", "asymmetric_affine")
+
+
 def make_transformer(
-    affine_transformer=False,
-    contract_transformer=True,
-    asymmetric_transformer=True,
+    transformer="sas",
+    layers=1,
+    *,
     log_gamma_bounds=None,
-    tangent_sas_transformer=0,
     tangent_sas_fix_b=False,
 ):
-    """Elementwise transformer as a chain of the requested layers.
-
-    Each argument is a *count*; ``True``/``False`` still work as 1/0. Layers
-    are chained in the order affine -> asymmetric -> contract -> tangent SAS,
-    and tangent SAS layers are followed by one `PositiveAffine`.
+    """Elementwise transformer of one kind, with `layers` layers.
 
     Parameters the chain makes redundant are disabled here rather than left
-    for the optimizer to find. Two additive shifts applied back to back
-    compose, so only their difference is identified: `Contract2` ends with
-    ``+ mu`` and starts with ``- nu``, so in a stack of ``n`` every interior
-    ``mu`` is exactly redundant with the following ``nu``. Keeping ``nu``
-    throughout and dropping all but the last ``mu`` gives ``4n + 1``
-    parameters at full rank.
-
-    The alternative of dropping ``nu`` everywhere is also full rank at ``4n``,
-    but measurably weaker: on 1-d targets it cost ~566x on Student-t5 and
-    ~48x on Student-t3 against the ``4n + 1`` form, which itself matches an
-    unrestricted ``5n`` chain to two significant figures (and at ``n = 3``
-    beats it -- removing exactly-flat directions helps the optimizer, the
-    same effect `lmopt.MARQUARDT_FLOOR` guards against).
-
-    A leading `bijections.Affine` also ends in a shift, so it makes the first
-    `Contract2`'s ``nu`` redundant in the same way and that one is dropped
-    too. The inverted `AsymmetricAffine` does *not*: inverting turns its
-    output shift into an input shift, leaving a following ``nu`` identified.
+    for the optimizer to find: two shifts or scales applied back to back
+    compose, so only one of them is identified.
 
     Args:
-        affine_transformer: Number of leading affine layers. More than one is
-            pointless -- consecutive affines compose to a single affine.
-        contract_transformer: Number of `Contract2` (sinh-arcsinh) layers.
-            ``alpha``, ``beta`` and ``sigma`` stay free on every layer: each
-            layer needs its own shape parameters, and concentrating them in
-            one layer forfeits most of what stacking buys (measured ~32x on
-            Student-t3, and a collapse from 3.5e-2 to 2.8 on a bimodal
-            target). ``alpha`` in particular sets the tail exponent
-            ``gamma``, which multiplies along the chain -- pin it to 1 and
-            the whole stack is asymptotically linear however deep it is.
-        asymmetric_transformer: Number of `AsymmetricAffine` layers, applied
-            inverted, with initial locations spread evenly over ``[-2, 2]``
-            (so a count of 3 reproduces the previous ``[-2, 0, 2]``).
-        log_gamma_bounds: Optional ``(low, high)`` bound on each `Contract2`
-            layer's ``log gamma``, see that class. Note the bound is per
-            layer and log gamma adds along a chain, so ``n`` layers bounded at
-            ``high`` reach ``n * high`` overall.
-        tangent_sas_transformer: Number of `TangentSAS` layers. If nonzero,
-            they are followed by a `PositiveAffine`, which holds the location.
-        tangent_sas_fix_b: Fix every `TangentSAS` layer's ``b`` at 1/2
-            instead of fitting it.
+        transformer: The kind:
+
+            - ``"affine"``: ``y = loc + exp(asinh(scale)) x`` (`PositiveAffine`).
+              Affines compose to an affine, so `layers` must be 1.
+            - ``"sas"``: sinh-arcsinh layers (`Contract2`). Every layer keeps
+              its shape parameters ``alpha`` and ``beta``, its scale
+              ``sigma`` and its input shift ``nu``; only the last has an output
+              shift ``mu``, since an interior ``mu`` is exactly redundant with
+              the next ``nu``. That is ``4n + 1`` parameters at full rank. The
+              alternative of dropping ``nu`` everywhere is also full rank at
+              ``4n``, but measurably weaker: on 1-d targets it cost ~566x on
+              Student-t5 and ~48x on Student-t3, while ``4n + 1`` matches an
+              unrestricted ``5n`` chain. Concentrating the shape parameters in
+              one layer forfeits most of what stacking buys (~32x on
+              Student-t3). The tail exponents ``gamma`` multiply along the
+              chain.
+            - ``"tangent_sas"``: `TangentSAS` layers, each the identity to first
+              order at its centre, followed by one `PositiveAffine` holding the
+              location and scale.
+            - ``"asymmetric_sas"``: `AsymmetricSAS` layers, a power law with its
+              own tail exponent on either side, followed by one
+              `PositiveAffine`. The first acts on the standard-normal base, so
+              its kink sits at zero; every later one has an input shift and
+              scale, to place its kink and the transition to its tails. That
+              is ``4n`` parameters.
+            - ``"asymmetric_affine"``: inverted `AsymmetricAffine` layers, with
+              initial locations spread evenly over ``[-2, 2]``. The chain has
+              no output shift, so no location.
+        layers: Number of layers of that kind.
+        log_gamma_bounds: Optional ``(low, high)`` bound on each layer's
+            ``log gamma``, for ``"sas"`` and ``"asymmetric_sas"``, see
+            `Contract2`. The bound is per layer and log gamma adds along a
+            chain, so ``n`` layers bounded at ``high`` reach ``n * high``.
+        tangent_sas_fix_b: Fix every `TangentSAS` layer's ``b`` at 1/2 instead
+            of fitting it.
 
     Returns:
         An `ElementwiseTransformer`, whose location is the last layer's output
-        shift: the trailing `PositiveAffine`'s ``loc``, the last `Contract2`'s
-        ``mu``, or the `Affine`'s ``loc`` when that is the only layer kind.
-        None if the chain ends in an inverted `AsymmetricAffine`.
+        shift, None for ``"asymmetric_affine"``.
     """
-    n_affine = int(affine_transformer)
-    n_contract = int(contract_transformer)
-    n_asymmetric = int(asymmetric_transformer)
-    n_tangent_sas = int(tangent_sas_transformer)
+    if transformer not in TRANSFORMERS:
+        raise ValueError(
+            f"unknown transformer {transformer!r}, expected one of {TRANSFORMERS}."
+        )
+    layers = int(layers)
+    if layers < 1:
+        raise ValueError("a transformer needs at least one layer.")
+    if transformer == "affine" and layers != 1:
+        raise ValueError("an affine transformer has exactly one layer.")
 
-    if min(n_affine, n_contract, n_asymmetric, n_tangent_sas) < 0:
-        raise ValueError("transformer counts must be non-negative.")
-    if n_affine + n_contract + n_asymmetric + n_tangent_sas == 0:
-        raise ValueError("make_transformer needs at least one layer.")
+    def zero():
+        return jnp.zeros(())
 
     elemwises = []
-
-    for _ in range(n_affine):
-        affine = bijections.Affine(jnp.zeros(()), jnp.ones(()))
-        scale = Parameterize(lambda x: x + jnp.sqrt(1 + x**2), jnp.zeros(()))
-        affine = eqx.tree_at(
-            where=lambda aff: aff.scale,
-            pytree=affine,
-            replace=scale,
-        )
-        elemwises.append(affine)
-
-    if n_asymmetric:
-        locs = (
-            [0.0] if n_asymmetric == 1 else list(np.linspace(-2.0, 2.0, n_asymmetric))
-        )
-        for loc in locs:
-            scale = Parameterize(lambda x: x + jnp.sqrt(1 + x**2), jnp.zeros(()))
-            theta = Parameterize(lambda x: x + jnp.sqrt(1 + x**2), jnp.zeros(()))
-
-            affine = AsymmetricAffine(
-                jnp.zeros(()) + loc,
-                jnp.ones(()),
-                jnp.ones(()),
-            )
-
-            affine = eqx.tree_at(
-                where=lambda aff: aff.scale,
-                pytree=affine,
-                replace=scale,
-            )
-            affine = eqx.tree_at(
-                where=lambda aff: aff.theta,
-                pytree=affine,
-                replace=theta,
-            )
-            elemwises.append(bijections.Invert(affine))
-
-    for index in range(n_contract):
-        is_last = index == n_contract - 1
-        # A preceding affine already ends in a free shift, so this layer's own
-        # input shift would only ever enter as the difference of the two.
-        shift_already_available = index == 0 and n_affine > 0
-        elemwises.append(
-            Contract2(
-                alpha=jnp.zeros(()),
-                beta=jnp.zeros(()),
-                sigma=jnp.zeros(()),
-                mu=jnp.zeros(()) if is_last else None,
-                nu=None if shift_already_available else jnp.zeros(()),
-                log_gamma_bounds=log_gamma_bounds,
-            )
-        )
-
-    if n_tangent_sas:
-        for _ in range(n_tangent_sas):
+    if transformer == "affine":
+        elemwises.append(PositiveAffine(zero(), zero()))
+    elif transformer == "sas":
+        for index in range(layers):
+            is_last = index == layers - 1
             elemwises.append(
-                TangentSAS(
-                    nu=jnp.zeros(()),
-                    eps=jnp.zeros(()),
-                    b=None if tangent_sas_fix_b else jnp.zeros(()),
-                    r=jnp.zeros(()),
+                Contract2(
+                    alpha=zero(),
+                    beta=zero(),
+                    sigma=zero(),
+                    mu=zero() if is_last else None,
+                    nu=zero(),
+                    log_gamma_bounds=log_gamma_bounds,
                 )
             )
-        elemwises.append(PositiveAffine(jnp.zeros(()), jnp.zeros(())))
+    elif transformer == "tangent_sas":
+        for _ in range(layers):
+            elemwises.append(
+                TangentSAS(
+                    nu=zero(),
+                    eps=zero(),
+                    b=None if tangent_sas_fix_b else zero(),
+                    r=zero(),
+                )
+            )
+        elemwises.append(PositiveAffine(zero(), zero()))
+    elif transformer == "asymmetric_sas":
+        for index in range(layers):
+            interior = index > 0
+            elemwises.append(
+                AsymmetricSAS(
+                    c=zero() if interior else None,
+                    a=zero() if interior else None,
+                    alpha_pos=zero(),
+                    alpha_neg=zero(),
+                    log_gamma_bounds=log_gamma_bounds,
+                )
+            )
+        elemwises.append(PositiveAffine(zero(), zero()))
+    else:
+        locs = [0.0] if layers == 1 else list(np.linspace(-2.0, 2.0, layers))
+        for loc in locs:
+            scale = Parameterize(lambda x: x + jnp.sqrt(1 + x**2), zero())
+            theta = Parameterize(lambda x: x + jnp.sqrt(1 + x**2), zero())
+            affine = AsymmetricAffine(zero() + loc, jnp.ones(()), jnp.ones(()))
+            affine = eqx.tree_at(lambda aff: aff.scale, affine, scale)
+            affine = eqx.tree_at(lambda aff: aff.theta, affine, theta)
+            elemwises.append(bijections.Invert(affine))
 
     # The location is the last layer's output shift, which nothing after it
-    # undoes. `Contract2` ends in ``+ mu`` and the affines in ``+ loc``; the
-    # inverted `AsymmetricAffine` has only an *input* shift, so a chain ending
-    # in one has no location.
+    # undoes: `PositiveAffine`'s ``loc`` or `Contract2`'s ``mu``. The inverted
+    # `AsymmetricAffine` has only an *input* shift.
     last = elemwises[-1]
     if isinstance(last, PositiveAffine):
         location_field = (len(elemwises) - 1, "loc")
     elif isinstance(last, Contract2):
         location_field = (len(elemwises) - 1, "mu")
-    elif isinstance(last, bijections.Affine):
-        location_field = (len(elemwises) - 1, "loc")
     else:
         location_field = None
     return ElementwiseTransformer(bijections.Chain(elemwises), location_field)
@@ -1823,9 +1884,8 @@ def make_twin_flow_scan(
     nn_width=None,
     nn_depth=None,
     num_householder=1,
-    affine_transformer=False,
-    contract_transformer=True,
-    asymmetric_transformer=True,
+    transformer="sas",
+    transformer_layers=1,
     activation,
 ):
     if nn_width is None:
@@ -1837,15 +1897,11 @@ def make_twin_flow_scan(
         keys = jax.random.split(key, 4)
 
         def make_coupling(key):
-            transformer = make_transformer(
-                affine_transformer=affine_transformer,
-                contract_transformer=contract_transformer,
-                asymmetric_transformer=asymmetric_transformer,
-            )
+            elementwise = make_transformer(transformer, transformer_layers)
 
             coupling = bijections.Coupling(
                 key=key,
-                transformer=transformer,
+                transformer=elementwise,
                 untransformed_dim=n_dim // 2,
                 dim=n_dim,
                 nn_width=nn_width,
@@ -1903,9 +1959,8 @@ def make_flow_scan(
     mvscale=False,
     num_householder=1,
     twin_layers=False,
-    affine_transformer=False,
-    contract_transformer=True,
-    asymmetric_transformer=True,
+    transformer="sas",
+    transformer_layers=1,
     sandwich_householder=False,
     activation,
     reuse_embed=True,
@@ -1922,12 +1977,9 @@ def make_flow_scan(
         nn_depth = 1
 
     # Just to get at the size
-    transformer = make_transformer(
-        affine_transformer=affine_transformer,
-        contract_transformer=contract_transformer,
-        asymmetric_transformer=asymmetric_transformer,
+    size = MaskedCoupling.conditioner_output_size(
+        dim, make_transformer(transformer, transformer_layers)
     )
-    size = MaskedCoupling.conditioner_output_size(dim, transformer)
 
     key, key1 = jax.random.split(key)
     embed = eqx.nn.Sequential(
@@ -1979,11 +2031,7 @@ def make_flow_scan(
 
     def make_layer(key, mask, embed, embed_back):
         _key1, key2, key3, key4, _key5 = jax.random.split(key, 5)
-        transformer = make_transformer(
-            affine_transformer=affine_transformer,
-            contract_transformer=contract_transformer,
-            asymmetric_transformer=asymmetric_transformer,
-        )
+        elementwise = make_transformer(transformer, transformer_layers)
         inner = eqx.nn.MLP(
             n_embed,
             n_deembed,
@@ -2012,7 +2060,7 @@ def make_flow_scan(
 
         coupling = MaskedCoupling(
             key=key3,
-            transformer=transformer,
+            transformer=elementwise,
             untransformed_mask=mask,
             dim=dim,
             conditioner=conditioner,
@@ -2206,10 +2254,8 @@ def make_sparse_triangular_map(
     nn_depth=None,
     activation,
     location_skip=True,
-    affine_transformer=False,
-    contract_transformer=False,
-    asymmetric_transformer=False,
-    tangent_sas_transformer=0,
+    transformer="sas",
+    transformer_layers=1,
     tangent_sas_fix_b=False,
     log_gamma_bounds=None,
     feature_degree=None,
@@ -2248,11 +2294,8 @@ def make_sparse_triangular_map(
             ``i`` in ``order``.
         location_skip: Linear map from each variable's parents straight to
             its transformer location, see `SparseTriangularMap`.
-        affine_transformer, contract_transformer, asymmetric_transformer,
-        tangent_sas_transformer, tangent_sas_fix_b, log_gamma_bounds:
-            The elementwise transformer, see `make_transformer`. If all
-            counts are zero, `SparseTriangularMap`'s own default transformer
-            is used.
+        transformer, transformer_layers, tangent_sas_fix_b, log_gamma_bounds:
+            The elementwise transformer, see `make_transformer`.
         feature_degree: Degree of the `HermiteFeatures` the conditioners see
             instead of the raw parents, see `SparseTriangularMap`. None for
             the raw parents.
@@ -2285,26 +2328,17 @@ def make_sparse_triangular_map(
     # precedes variable `j` whenever `i < j`) can be used unchanged.
     sparsity_sorted = sparsity[np.ix_(order, order)]
 
-    transformer = None
-    if (
-        affine_transformer
-        or contract_transformer
-        or asymmetric_transformer
-        or tangent_sas_transformer
-    ):
-        transformer = make_transformer(
-            affine_transformer=affine_transformer,
-            contract_transformer=contract_transformer,
-            asymmetric_transformer=asymmetric_transformer,
-            tangent_sas_transformer=tangent_sas_transformer,
-            tangent_sas_fix_b=tangent_sas_fix_b,
-            log_gamma_bounds=log_gamma_bounds,
-        )
+    elementwise = make_transformer(
+        transformer,
+        transformer_layers,
+        tangent_sas_fix_b=tangent_sas_fix_b,
+        log_gamma_bounds=log_gamma_bounds,
+    )
 
     layer = SparseTriangularMap(
         key,
         blanket=sparsity_sorted,
-        transformer=transformer,
+        transformer=elementwise,
         n_buckets=n_buckets,
         n_level_segments=n_level_segments,
         nn_width=nn_width,
@@ -2549,10 +2583,8 @@ def make_flow(
     mvscale=False,
     num_householder=1,
     twin_layers=False,
-    affine_transformer=False,
-    contract_transformer=False,
-    asymmetric_transformer=False,
-    tangent_sas_transformer=0,
+    transformer="sas",
+    transformer_layers=1,
     tangent_sas_fix_b=False,
     log_gamma_bounds=None,
     sandwich_householder=False,
@@ -2633,9 +2665,8 @@ def make_flow(
             num_householder=num_householder,
             twin_layers=twin_layers,
             activation=activation,
-            affine_transformer=affine_transformer,
-            contract_transformer=contract_transformer,
-            asymmetric_transformer=asymmetric_transformer,
+            transformer=transformer,
+            transformer_layers=transformer_layers,
             reuse_embed=reuse_embed,
             sandwich_householder=sandwich_householder,
         )
@@ -2646,24 +2677,23 @@ def make_flow(
         if nn_depth is None:
             nn_depth = 1
 
-        if contract_transformer:
-            transformer = Contract2(
-                jnp.zeros(()),
-                jnp.zeros(()),
-                jnp.zeros(()),
-                jnp.zeros(()),
-                jnp.zeros(()),
+        if transformer != "sas" or transformer_layers != 1:
+            raise ValueError(
+                "kind='flowjax_coupling' only supports one 'sas' transformer layer."
             )
-        else:
-            transformer = None
-
         inner = flowjax.flows.coupling_flow(
             key,
             base_dist=base_dist,
             flow_layers=n_layers,
             nn_width=nn_width,
             nn_depth=nn_depth,
-            transformer=transformer,
+            transformer=Contract2(
+                jnp.zeros(()),
+                jnp.zeros(()),
+                jnp.zeros(()),
+                jnp.zeros(()),
+                jnp.zeros(()),
+            ),
             nn_activation=activation,
         )
         inner = inner.bijection
@@ -2676,8 +2706,8 @@ def make_flow(
             nn_width=nn_width,
             nn_depth=nn_depth,
             num_householder=num_householder,
-            affine_transformer=affine_transformer,
-            contract_transformer=contract_transformer,
+            transformer=transformer,
+            transformer_layers=transformer_layers,
             activation=activation,
         )
     elif kind == "triangular":
@@ -2699,10 +2729,8 @@ def make_flow(
             nn_depth=nn_depth,
             activation=activation,
             location_skip=location_skip,
-            affine_transformer=affine_transformer,
-            contract_transformer=contract_transformer,
-            asymmetric_transformer=asymmetric_transformer,
-            tangent_sas_transformer=tangent_sas_transformer,
+            transformer=transformer,
+            transformer_layers=transformer_layers,
             tangent_sas_fix_b=tangent_sas_fix_b,
             log_gamma_bounds=log_gamma_bounds,
             feature_degree=feature_degree,

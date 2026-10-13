@@ -1877,10 +1877,8 @@ def make_transform_adapter(
     twin_layers=False,
     activation=None,
     max_epochs=60,
-    affine_transformer=False,
-    contract_transformer=1,
-    asymmetric_transformer=False,
-    tangent_sas_transformer=0,
+    transformer="sas",
+    transformer_layers=1,
     tangent_sas_fix_b=False,
     log_gamma_bounds=None,
     input_squash=None,
@@ -1945,8 +1943,13 @@ def make_transform_adapter(
     fit run to its training-loss stopping rule. ``val_fraction=0`` trains on
     everything and compares flows on the training draws.
 
-    ``log_gamma_bounds`` bounds each `Contract2` layer's tail exponent,
-    ``log gamma``. ``gamma`` is an exponent (``T(x) ~ |x|**gamma``), so
+    ``transformer`` is the elementwise transformer of every conditional,
+    ``"affine"``, ``"sas"``, ``"tangent_sas"``, ``"asymmetric_sas"`` or
+    ``"asymmetric_affine"``, with ``transformer_layers`` layers of it; see
+    `normalizing_flow.make_transformer` for how each one stacks.
+
+    ``log_gamma_bounds`` bounds each ``"sas"`` or ``"asymmetric_sas"``
+    layer's tail exponent, ``log gamma``. ``gamma`` is an exponent (``T(x) ~ |x|**gamma``), so
     without a bound a conditioner whose output grows linearly away from the
     training draws makes the map blow up polynomially with a growing power
     there; ``(-1, 1)`` allows tails at most ``e`` times heavier or lighter
@@ -1990,8 +1993,7 @@ def make_transform_adapter(
             "nn_depth": nn_depth not in (None, 1),
             "location_skip": not location_skip,
             "feature_degree": feature_degree is not None,
-            "affine_transformer": bool(affine_transformer),
-            "asymmetric_transformer": bool(asymmetric_transformer),
+            "transformer": transformer == "asymmetric_affine",
             "extension_windows": bool(extension_windows),
         }
         unsupported = [name for name, bad in unsupported.items() if bad]
@@ -1999,8 +2001,8 @@ def make_transform_adapter(
             raise ValueError(
                 "rust_flow=True needs coupling_type='triangular', "
                 "method='lm-rust', depth-1 conditioners with the location skip, "
-                "and no parent features, affine or asymmetric layers or "
-                f"extension windows; got {', '.join(unsupported)}."
+                "a transformer other than 'asymmetric_affine', and no parent "
+                f"features or extension windows; got {', '.join(unsupported)}."
             )
         return partial(
             TriangularFlowAdapter,
@@ -2021,8 +2023,8 @@ def make_transform_adapter(
             nn_width=nn_width,
             activation="softplus" if activation is None else activation,
             zero_init=zero_init,
-            contract_transformer=contract_transformer,
-            tangent_sas_transformer=tangent_sas_transformer,
+            transformer=transformer,
+            transformer_layers=transformer_layers,
             tangent_sas_fix_b=tangent_sas_fix_b,
             log_gamma_bounds=log_gamma_bounds,
             input_squash=input_squash,
@@ -2064,10 +2066,8 @@ def make_transform_adapter(
             num_householder=num_householder,
             twin_layers=twin_layers,
             activation=activation,
-            affine_transformer=affine_transformer,
-            contract_transformer=contract_transformer,
-            asymmetric_transformer=asymmetric_transformer,
-            tangent_sas_transformer=tangent_sas_transformer,
+            transformer=transformer,
+            transformer_layers=transformer_layers,
             tangent_sas_fix_b=tangent_sas_fix_b,
             log_gamma_bounds=log_gamma_bounds,
             input_squash=input_squash,
