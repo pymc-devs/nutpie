@@ -59,9 +59,9 @@ impl PyFisherResiduals {
         conditioners: &Bound<'_, PyAny>,
         scale_index: Option<usize>,
     ) -> Result<Self> {
-        let configs: Vec<LayerConfig> = pythonize::depythonize(transformer)?;
+        let configs: Vec<LayerConfig> = crate::pyjson::from_py(transformer)?;
         let transformer = LayerChain::new(configs, n_par, Some(location_index), scale_index)?;
-        let conditioners: Vec<ConditionerConfig> = pythonize::depythonize(conditioners)?;
+        let conditioners: Vec<ConditionerConfig> = crate::pyjson::from_py(conditioners)?;
         let conditional =
             Conditional::new(Conditioners::new(&conditioners, &transformer)?, transformer)?;
         Ok(Self {

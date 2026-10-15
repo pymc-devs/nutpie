@@ -373,9 +373,9 @@ impl PyTriangularFlow {
         theta: Option<PyReadonlyArray1<'_, f64>>,
         seed: u64,
     ) -> Result<Self> {
-        let config: TransformerConfig = pythonize::depythonize(transformer)?;
+        let config: TransformerConfig = crate::pyjson::from_py(transformer)?;
         let transformer = config.build()?;
-        let configs: Vec<ConditionerConfig> = pythonize::depythonize(conditioners)?;
+        let configs: Vec<ConditionerConfig> = crate::pyjson::from_py(conditioners)?;
         let conditional =
             Conditional::new(Conditioners::new(&configs, &transformer)?, transformer)?;
         let graph = Pattern::from_i64(parent_indptr.as_slice()?, parent_index.as_slice()?)?;
@@ -502,7 +502,7 @@ impl PyTriangularFlow {
     /// in a new flow, drawn from `seed`.
     #[pyo3(signature = (conditioners, seed = 0))]
     fn with_conditioners(&self, conditioners: &Bound<'_, PyAny>, seed: u64) -> Result<Self> {
-        let configs: Vec<ConditionerConfig> = pythonize::depythonize(conditioners)?;
+        let configs: Vec<ConditionerConfig> = crate::pyjson::from_py(conditioners)?;
         Ok(Self {
             inner: self.inner.with_conditioners(&configs, seed)?,
         })

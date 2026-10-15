@@ -464,13 +464,18 @@ pub(crate) fn py_transformer_layout<'py>(
 ) -> Result<pyo3::Bound<'py, pyo3::types::PyDict>> {
     use pyo3::types::{PyDict, PyDictMethods};
 
-    let config: TransformerConfig = pythonize::depythonize(config)?;
+    let config: TransformerConfig = crate::pyjson::from_py(config)?;
     let chain = config.build()?;
     let out = PyDict::new(py);
     out.set_item("n_coefs", chain.n_coefs())?;
     out.set_item("location", chain.location_coef())?;
     out.set_item("scale", chain.scale_coef())?;
     out.set_item("shape", chain.shape_coefs().collect::<Vec<_>>())?;
-    out.set_item("layers", pythonize::pythonize(py, chain.configs())?)?;
+    let layers = chain
+        .configs()
+        .iter()
+        .map(|layer| layer.to_pydict(py))
+        .collect::<pyo3::PyResult<Vec<_>>>()?;
+    out.set_item("layers", layers)?;
     Ok(out)
 }

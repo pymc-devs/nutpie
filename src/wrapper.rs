@@ -32,7 +32,6 @@ use pyo3::{
     types::{PyDict, PyList},
 };
 use pyo3_arrow::PyRecordBatch;
-use pythonize::{depythonize, pythonize};
 use rand::{rng, Rng};
 use serde_json::Value as JsonValue;
 
@@ -494,13 +493,13 @@ fn update_nuts_from_nested_dict(
 ) -> PyResult<()> {
     match inner {
         NutsSettingsKind::Diag(settings) => {
-            *settings = depythonize(value).map_err(|err| PyValueError::new_err(err.to_string()))?;
+            *settings = crate::pyjson::from_py(value).map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
         NutsSettingsKind::LowRank(settings) => {
-            *settings = depythonize(value).map_err(|err| PyValueError::new_err(err.to_string()))?;
+            *settings = crate::pyjson::from_py(value).map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
         NutsSettingsKind::Flow(settings) => {
-            *settings = depythonize(value).map_err(|err| PyValueError::new_err(err.to_string()))?;
+            *settings = crate::pyjson::from_py(value).map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
     }
     Ok(())
@@ -512,13 +511,13 @@ fn update_mclmc_from_nested_dict(
 ) -> PyResult<()> {
     match inner {
         MclmcSettingsKind::Diag(settings) => {
-            *settings = depythonize(value).map_err(|err| PyValueError::new_err(err.to_string()))?;
+            *settings = crate::pyjson::from_py(value).map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
         MclmcSettingsKind::LowRank(settings) => {
-            *settings = depythonize(value).map_err(|err| PyValueError::new_err(err.to_string()))?;
+            *settings = crate::pyjson::from_py(value).map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
         MclmcSettingsKind::Flow(settings) => {
-            *settings = depythonize(value).map_err(|err| PyValueError::new_err(err.to_string()))?;
+            *settings = crate::pyjson::from_py(value).map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
     }
     Ok(())
@@ -839,7 +838,7 @@ impl PyNutsSettings {
             "adaptation": adaptation,
             "settings": settings,
         });
-        let obj = pythonize(py, &value).map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let obj = crate::pyjson::to_py(py, &value).map_err(|err| PyValueError::new_err(err.to_string()))?;
         Ok(obj.unbind())
     }
 }
@@ -895,7 +894,7 @@ impl PyMclmcSettings {
             "adaptation": adaptation,
             "settings": settings,
         });
-        let obj = pythonize(py, &value).map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let obj = crate::pyjson::to_py(py, &value).map_err(|err| PyValueError::new_err(err.to_string()))?;
         Ok(obj.unbind())
     }
 }
