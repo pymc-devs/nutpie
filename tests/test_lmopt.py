@@ -16,6 +16,8 @@ from nutpie.lmopt import (
     marquardt_floors,
 )
 
+pytestmark = pytest.mark.flow
+
 
 @pytest.fixture(autouse=True)
 def x64():

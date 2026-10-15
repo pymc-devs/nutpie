@@ -6,6 +6,8 @@ import pytest
 from nutpie.flow_diagnostics import conditioner_capacity, fisher_influence
 from nutpie.triangular_flow import build_triangular_flow
 
+pytestmark = pytest.mark.flow
+
 
 def affine_flow(rng, dim=4):
     """A dense flow with an affine transformer, a constant and a linear
