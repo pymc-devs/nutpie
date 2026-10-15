@@ -454,6 +454,7 @@ fn every_kind_passes_the_harness() {
     let transformer = TransformerConfig::TangentSas {
         layers: 2,
         fix_b: false,
+        scale_squash: Some(1.0),
     }
     .build()
     .unwrap();
@@ -475,7 +476,11 @@ fn every_kind_passes_the_harness() {
 
 #[test]
 fn configs_are_checked() {
-    let affine = TransformerConfig::Affine.build().unwrap();
+    let affine = TransformerConfig::Affine {
+        scale_squash: Some(1.0),
+    }
+    .build()
+    .unwrap();
     let parse = |json: &str| serde_json::from_str::<Vec<ConditionerConfig>>(json);
     let build = |json: &str| Conditioners::new(&parse(json).unwrap(), &affine);
     // An affine transformer has no shape coefficients.
@@ -531,6 +536,7 @@ fn weights_carry_over() {
     let transformer = TransformerConfig::Sas {
         layers: 2,
         log_gamma_bounds: None,
+        scale_squash: Some(1.0),
     }
     .build()
     .unwrap();
@@ -617,10 +623,13 @@ fn weights_carry_over() {
 #[test]
 fn coordinates_change_the_location_exactly() {
     for config in [
-        TransformerConfig::Affine,
+        TransformerConfig::Affine {
+            scale_squash: Some(1.0),
+        },
         TransformerConfig::Sas {
             layers: 2,
             log_gamma_bounds: None,
+            scale_squash: Some(2.5),
         },
     ] {
         let transformer = config.build().unwrap();
@@ -650,6 +659,43 @@ fn coordinates_change_the_location_exactly() {
         );
         let expected = transformer.shifted_location_coef(before[location], own.0, own.1);
         assert!((after[location] - expected).abs() < 1e-12, "{config:?}");
+        let expected = transformer.rescaled_scale_coef(before[scale], own.0);
+        assert!((after[scale] - expected).abs() < 1e-12, "{config:?}");
+    }
+}
+
+#[test]
+fn coordinates_change_a_linear_log_scale_exactly() {
+    for config in [
+        TransformerConfig::Affine { scale_squash: None },
+        TransformerConfig::Sas {
+            layers: 2,
+            log_gamma_bounds: None,
+            scale_squash: None,
+        },
+    ] {
+        let transformer = config.build().unwrap();
+        let conditioners = build(
+            r#"[{"kind": "constant", "target": "all"},
+                {"kind": "linear", "target": ["location", "scale"]}]"#,
+            &transformer,
+        );
+        let n_parent = 2;
+        let mut rng = ChaCha8Rng::seed_from_u64(2);
+        let weights = normal(&mut rng, conditioners.n_weights(n_parent), 1.0);
+        let (own, parents) = ((1.7, -0.3), [(0.6, 0.4), (2.5, -1.1)]);
+        let mut moved = weights.clone();
+        conditioners.change_coordinates(&transformer, own, &parents, &mut moved);
+
+        let v = [0.9, -0.2];
+        let v_new: Vec<f64> = v
+            .iter()
+            .zip(&parents)
+            .map(|(v, (a, b))| a * v + b)
+            .collect();
+        let before = coefs_at(&conditioners, &weights, &v);
+        let after = coefs_at(&conditioners, &moved, &v_new);
+        let scale = transformer.scale_coef().unwrap();
         let expected = transformer.rescaled_scale_coef(before[scale], own.0);
         assert!((after[scale] - expected).abs() < 1e-12, "{config:?}");
     }

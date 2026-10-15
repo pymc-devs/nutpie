@@ -287,6 +287,35 @@ def test_built_flow_inverts_and_fits():
     assert after < before
 
 
+@pytest.mark.parametrize("scale_squash", [None, 2.5])
+@pytest.mark.parametrize("transformer", ["affine", "sas", "asymmetric_sas"])
+def test_scale_squash_inverts(transformer, scale_squash):
+    """With a scale squash other than the default, the forward transform and
+    the inverse the fit uses still agree."""
+    x, g = _draws(n_draw=64)
+    order = np.random.default_rng(4).permutation(DIM)
+    flow = build_triangular_flow(
+        0,
+        x,
+        g,
+        sparsity=_banded(DIM, order),
+        order=order,
+        transformer=transformer,
+        scale_squash=scale_squash,
+        conditioners=default_conditioners(4),
+    )
+    flow = flow.with_theta(0.3 * np.random.default_rng(6).normal(size=flow.n_params))
+
+    native = flow.flow_transform()
+    z = np.random.default_rng(5).normal(size=DIM)
+    y, log_det = native.transform_and_log_det(z)
+    grad_y = -y
+    ours_log_det, back, grad_z = flow.inv_transform(y, grad_y)
+    np.testing.assert_allclose(back, z, rtol=1e-10, atol=1e-10)
+    np.testing.assert_allclose(ours_log_det, log_det, rtol=1e-10, atol=1e-10)
+    np.testing.assert_allclose(grad_z, native.pullback(grad_y), rtol=1e-9, atol=1e-10)
+
+
 def test_native_transform_with_any_conditioners():
     """The sampler's transform of a flow with two MLPs (one on part of the
     coefficients, gelu, squashed) and a linear scale conditioner: its draws
@@ -349,16 +378,24 @@ def test_with_affine_restandardizes():
         flow.with_affine(loc, np.zeros(DIM))
 
 
-@pytest.mark.parametrize("transformer", ["affine", "sas"])
-def test_with_affine_keeps_a_gaussian_flow(transformer):
-    """Without MLPs or linear scale weights, `with_affine` moves the
-    conditioners so that the flow stays the same function: the same Fisher
-    divergence and the same draws back in the base space."""
+@pytest.mark.parametrize(
+    ("transformer", "scale_squash"),
+    [("affine", 1.0), ("sas", 1.0), ("affine", None), ("sas", None)],
+)
+def test_with_affine_keeps_a_gaussian_flow(transformer, scale_squash):
+    """Without MLPs, `with_affine` moves the conditioners so that the flow
+    stays the same function: the same Fisher divergence and the same draws
+    back in the base space. With the default scale squash only without
+    linear scale weights; without a squash the log scale is linear in them,
+    so they move too."""
     x, g = _draws()
     order = np.random.default_rng(3).permutation(DIM)
     conditioners = [
         {"kind": "constant", "target": "all"},
-        {"kind": "linear", "target": "location"},
+        {
+            "kind": "linear",
+            "target": "location" if scale_squash == 1.0 else ["location", "scale"],
+        },
     ]
     flow = build_triangular_flow(
         0,
@@ -367,6 +404,7 @@ def test_with_affine_keeps_a_gaussian_flow(transformer):
         sparsity=_banded(DIM, order),
         order=order,
         transformer=transformer,
+        scale_squash=scale_squash,
         conditioners=conditioners,
     )
     rng = np.random.default_rng(5)

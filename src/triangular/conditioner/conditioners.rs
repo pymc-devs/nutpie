@@ -358,7 +358,9 @@ impl Conditioners {
     /// `parents`. Moves the location's constant and linear weights so that
     /// the location follows exactly (given a constant on it), and the
     /// scale's constant so that the scale does where nothing else feeds it.
-    /// The MLPs, and the linear weights into anything but the location,
+    /// Without a `scale_squash`, where the log scale is linear in the scale
+    /// coefficient, the scale's linear weights move too, so that a linear
+    /// log scale follows exactly. The MLPs, and the other linear weights,
     /// keep their values.
     pub(crate) fn change_coordinates(
         &self,
@@ -392,13 +394,29 @@ impl Conditioners {
                 }
             }
         }
+        // The same for a log scale: `w_j v_j = (w_j / a_j) v_j' - w_j b_j /
+        // a_j`, without the factor `a`, which only adds `log a`.
+        let mut scale_shift = 0.0;
+        if let (Some((c, range)), Some(scale), true) = (
+            &linear,
+            transformer.scale_coef(),
+            transformer.linear_log_scale(),
+        ) {
+            if let Some(j) = c.outputs().coefs().iter().position(|&k| k == scale) {
+                let row = &mut weights[range.clone()][j * n_parent..(j + 1) * n_parent];
+                for (w, &(a_p, b_p)) in row.iter_mut().zip(parents) {
+                    scale_shift += *w * b_p / a_p;
+                    *w /= a_p;
+                }
+            }
+        }
         if let Some((c, range)) = &constant {
             let values = &mut weights[range.clone()];
             for (value, &k) in values.iter_mut().zip(c.outputs().coefs()) {
                 if Some(k) == transformer.location_coef() {
                     *value = transformer.shifted_location_coef(*value, a, b) - shift;
                 } else if Some(k) == transformer.scale_coef() {
-                    *value = transformer.rescaled_scale_coef(*value, a);
+                    *value = transformer.rescaled_scale_coef(*value, a) - scale_shift;
                 }
             }
         }

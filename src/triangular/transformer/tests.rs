@@ -14,34 +14,67 @@ use crate::triangular::transformer::jet::{packed_len, JetArena};
 fn kinds() -> Vec<TransformerConfig> {
     use TransformerConfig::*;
     vec![
-        Affine,
+        Affine {
+            scale_squash: Some(1.0),
+        },
+        Affine { scale_squash: None },
+        Affine {
+            scale_squash: Some(3.0),
+        },
         Sas {
             layers: 1,
             log_gamma_bounds: None,
+            scale_squash: Some(1.0),
         },
         Sas {
             layers: 2,
             log_gamma_bounds: Some((-1.5, 2.0)),
+            scale_squash: Some(1.0),
         },
         Sas {
             layers: 3,
             log_gamma_bounds: None,
+            scale_squash: Some(1.0),
         },
         TangentSas {
             layers: 1,
             fix_b: false,
+            scale_squash: Some(1.0),
         },
         TangentSas {
             layers: 2,
             fix_b: true,
+            scale_squash: Some(1.0),
         },
         AsymmetricSas {
             layers: 1,
             log_gamma_bounds: None,
+            scale_squash: Some(1.0),
         },
         AsymmetricSas {
             layers: 3,
             log_gamma_bounds: Some((-1.0, 1.0)),
+            scale_squash: Some(1.0),
+        },
+        Sas {
+            layers: 2,
+            log_gamma_bounds: None,
+            scale_squash: None,
+        },
+        TangentSas {
+            layers: 1,
+            fix_b: false,
+            scale_squash: None,
+        },
+        AsymmetricSas {
+            layers: 2,
+            log_gamma_bounds: None,
+            scale_squash: None,
+        },
+        Sas {
+            layers: 1,
+            log_gamma_bounds: None,
+            scale_squash: Some(2.5),
         },
     ]
 }
@@ -368,22 +401,33 @@ fn every_kind_passes_the_harness() {
 fn kinds_have_their_documented_coefficients() {
     use TransformerConfig::*;
     let n_coefs = |config: TransformerConfig| config.build().unwrap().n_coefs;
-    assert_eq!(n_coefs(Affine), 2);
+    assert_eq!(
+        n_coefs(Affine {
+            scale_squash: Some(1.0)
+        }),
+        2
+    );
     // alpha, beta, sigma, mu, nu; interior layers drop mu.
     let sas = |layers| Sas {
         layers,
         log_gamma_bounds: None,
+        scale_squash: Some(1.0),
     };
     assert_eq!(n_coefs(sas(1)), 5);
     assert_eq!(n_coefs(sas(3)), 13);
     // nu, eps, b, r per layer, and the affine.
-    let tangent = |layers, fix_b| TangentSas { layers, fix_b };
+    let tangent = |layers, fix_b| TangentSas {
+        layers,
+        fix_b,
+        scale_squash: Some(1.0),
+    };
     assert_eq!(n_coefs(tangent(2, false)), 10);
     assert_eq!(n_coefs(tangent(2, true)), 8);
     // alpha_pos, alpha_neg, c and a after the first, and the affine.
     let asymmetric = |layers| AsymmetricSas {
         layers,
         log_gamma_bounds: None,
+        scale_squash: Some(1.0),
     };
     assert_eq!(n_coefs(asymmetric(1)), 4);
     assert_eq!(n_coefs(asymmetric(3)), 12);
@@ -395,20 +439,36 @@ fn configs_deserialize_from_their_kind() {
     let parse = |json: &str| serde_json::from_str::<TransformerConfig>(json);
     assert_eq!(
         parse(r#"{"kind": "affine"}"#).unwrap(),
-        TransformerConfig::Affine
+        TransformerConfig::Affine {
+            scale_squash: Some(1.0)
+        }
+    );
+    assert_eq!(
+        parse(r#"{"kind": "affine", "scale_squash": null}"#).unwrap(),
+        TransformerConfig::Affine { scale_squash: None }
+    );
+    assert_eq!(
+        parse(r#"{"kind": "sas", "scale_squash": 2.5}"#).unwrap(),
+        TransformerConfig::Sas {
+            layers: 1,
+            log_gamma_bounds: None,
+            scale_squash: Some(2.5),
+        }
     );
     assert_eq!(
         parse(r#"{"kind": "sas"}"#).unwrap(),
         TransformerConfig::Sas {
             layers: 1,
-            log_gamma_bounds: None
+            log_gamma_bounds: None,
+            scale_squash: Some(1.0),
         }
     );
     assert_eq!(
         parse(r#"{"kind": "tangent_sas", "layers": 2, "fix_b": true}"#).unwrap(),
         TransformerConfig::TangentSas {
             layers: 2,
-            fix_b: true
+            fix_b: true,
+            scale_squash: Some(1.0),
         }
     );
     assert!(parse(r#"{"kind": "sas", "layer": 2}"#).is_err());

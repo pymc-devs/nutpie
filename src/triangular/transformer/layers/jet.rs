@@ -8,7 +8,8 @@
 use fearless_simd::prelude::*;
 
 use super::{
-    AsymmetricSas, Contract2, Layer, LogGammaBound, Param, PositiveAffineConfig, TangentSasConfig,
+    AsymmetricSas, Contract2, Layer, LogGammaBound, Param, PositiveAffineConfig, ScaleSquash,
+    TangentSasConfig,
 };
 use crate::triangular::transformer::jet::{Jet, JetArena};
 
@@ -60,6 +61,20 @@ fn log_gamma<S: Simd>(ws: &mut JetArena<S>, alpha: Jet, bound: Option<LogGammaBo
     }
 }
 
+/// A scale field's `log scale = c asinh(s / c)`, see [`ScaleSquash`].
+#[inline(always)]
+fn log_scale<S: Simd>(ws: &mut JetArena<S>, s: Jet, squash: ScaleSquash) -> Jet {
+    match squash {
+        None => s,
+        Some(1.0) => ws.asinh(s),
+        Some(c) => {
+            let t = ws.scale(s, 1.0 / c);
+            let t = ws.asinh(t);
+            ws.scale(t, c)
+        }
+    }
+}
+
 impl Contract2 {
     /// `Contract2.inverse_and_log_det`.
     #[inline(always)]
@@ -68,7 +83,9 @@ impl Contract2 {
             .get(ws, self.alpha)
             .map(|alpha| log_gamma(ws, alpha, self.bound));
         let log_delta = fields.get(ws, self.beta).map(|beta| ws.asinh(beta));
-        let log_sigma = fields.get(ws, self.sigma).map(|sigma| ws.asinh(sigma));
+        let log_sigma = fields
+            .get(ws, self.sigma)
+            .map(|sigma| log_scale(ws, sigma, self.scale_squash));
 
         let centred = match fields.get(ws, self.mu) {
             Some(mu) => ws.sub(x, mu),
@@ -241,7 +258,8 @@ impl AsymmetricSas {
 }
 
 /// `PositiveAffine.inverse_and_log_det`: `x = (y - loc) / scale_mod`, and
-/// `1 / scale_mod = positive(-scale)`.
+/// `1 / scale_mod = positive(-scale)` for the default squash `c = 1`, else
+/// `exp(-log scale_mod)`.
 #[inline(always)]
 fn positive_affine_inverse<S: Simd>(
     layer: &PositiveAffineConfig,
@@ -255,11 +273,17 @@ fn positive_affine_inverse<S: Simd>(
     };
     match fields.get(ws, layer.scale) {
         Some(scale) => {
-            let factor = ws.copy(&scale);
-            let factor = ws.neg(factor);
-            let factor = ws.positive(factor);
+            let (factor, ld) = if layer.scale_squash == Some(1.0) {
+                let factor = ws.copy(&scale);
+                let factor = ws.neg(factor);
+                (ws.positive(factor), ws.asinh(scale))
+            } else {
+                let ld = log_scale(ws, scale, layer.scale_squash);
+                let factor = ws.copy(&ld);
+                let factor = ws.neg(factor);
+                (ws.exp(factor), ld)
+            };
             let out = ws.mul(centred, factor);
-            let ld = ws.asinh(scale);
             (out, ws.neg(ld))
         }
         None => (centred, fields.get_or_zero(ws, None)),

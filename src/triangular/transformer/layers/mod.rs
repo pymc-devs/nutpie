@@ -36,6 +36,10 @@ pub(crate) struct Contract2Config {
     pub(crate) mu: Option<Param>,
     pub(crate) nu: Option<Param>,
     pub(crate) log_gamma_bounds: Option<(f64, f64)>,
+    /// `log sigma_mod = c asinh(sigma / c)`, `sigma` itself for `None`, see
+    /// [`ScaleSquash`].
+    #[serde(default = "unit_squash")]
+    pub(crate) scale_squash: ScaleSquash,
 }
 
 /// `nutpie.normalizing_flow.TangentSAS`, with its raw (unconstrained) fields.
@@ -62,6 +66,21 @@ pub(crate) struct AsymmetricSasConfig {
 pub(crate) struct PositiveAffineConfig {
     pub(crate) loc: Option<Param>,
     pub(crate) scale: Option<Param>,
+    /// `log scale_mod = c asinh(scale / c)`, `scale` itself for `None`, see
+    /// [`ScaleSquash`].
+    #[serde(default = "unit_squash")]
+    pub(crate) scale_squash: ScaleSquash,
+}
+
+/// The width `c` of a scale field's map `log scale = c asinh(s / c)`: linear
+/// in `s` within about `c` of zero and logarithmic beyond, so that a scale
+/// conditioner growing linearly away from the draws makes the scale grow
+/// only polynomially there. `None` is the unsquashed `log scale = s`, which
+/// a linear scale conditioner keeps linear.
+pub(crate) type ScaleSquash = Option<f64>;
+
+pub(crate) fn unit_squash() -> ScaleSquash {
+    Some(1.0)
 }
 
 /// One transformer layer, tagged by `kind` (see
@@ -111,6 +130,9 @@ impl LayerConfig {
                     ],
                 )?;
                 dict.set_item("log_gamma_bounds", c.log_gamma_bounds)?;
+                if c.scale_squash != unit_squash() {
+                    dict.set_item("scale_squash", c.scale_squash)?;
+                }
             }
             LayerConfig::TangentSas(t) => params(
                 "tangent_sas",
@@ -129,7 +151,10 @@ impl LayerConfig {
                 dict.set_item("log_gamma_bounds", t.log_gamma_bounds)?;
             }
             LayerConfig::PositiveAffine(a) => {
-                params("positive_affine", &[("loc", a.loc), ("scale", a.scale)])?
+                params("positive_affine", &[("loc", a.loc), ("scale", a.scale)])?;
+                if a.scale_squash != unit_squash() {
+                    dict.set_item("scale_squash", a.scale_squash)?;
+                }
             }
         }
         Ok(dict)
@@ -183,6 +208,7 @@ pub(crate) struct Contract2 {
     mu: Option<Param>,
     nu: Option<Param>,
     bound: Option<LogGammaBound>,
+    scale_squash: ScaleSquash,
 }
 
 impl Contract2 {
@@ -198,6 +224,7 @@ impl Contract2 {
             mu: config.mu,
             nu: config.nu,
             bound,
+            scale_squash: config.scale_squash,
         })
     }
 }
