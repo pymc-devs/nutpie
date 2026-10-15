@@ -180,7 +180,7 @@ jobs:
           pip install nutpie --no-index --no-deps --find-links dist --force-reinstall
           pip install nutpie pytest
           python -c "import nutpie; print(nutpie.__version__)"
-          python -m pytest
+          python -m pytest -rs
 
   # pyarrow doesn't currently seem to work on musllinux
   #musllinux:
