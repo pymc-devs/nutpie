@@ -112,6 +112,8 @@ jobs:
 
   build_emscripten:
     runs-on: ${{ matrix.platform.runner }}
+    env:
+      PYODIDE_EMSCRIPTEN_VERSION: "3.1.74"
     strategy:
       matrix:
         platform:
