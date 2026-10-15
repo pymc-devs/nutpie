@@ -36,7 +36,7 @@ mod tests;
 
 use fearless_simd::prelude::*;
 
-pub(crate) use conditioners::{Conditioners, Workspace};
+pub(crate) use conditioners::{Conditioners, DrawWorkspace, PackedVariable, Workspace};
 pub(crate) use config::{ConditionerConfig, Outputs};
 pub(crate) use constant::Constant;
 pub(crate) use linear::Linear;
@@ -162,6 +162,38 @@ pub(crate) trait Conditioner {
     /// target, and makes the outputs only this one targets start at zero.
     /// Leaves the rest of `out`, a new conditioner's weights, as it is.
     fn carry_weights(&self, from: &Self, n_parent: usize, from_weights: &[f64], out: &mut [f64]);
+
+    // ---- Sampler: one draw.
+
+    /// A variable's weights in the per-draw kernels' layout; built once per
+    /// transform.
+    type Packed: Send + Sync;
+    /// What `forward_draw` records for `pullback_parents_draw`, and the
+    /// kernels' working buffers.
+    type DrawState: Send;
+    fn pack(&self, n_parent: usize, weights: &[f64]) -> Self::Packed;
+    fn new_draw_state(&self, max_parent: usize) -> Self::DrawState;
+    /// `coefs += f(parents; weights)`. With `record`, keeps what
+    /// `pullback_parents_draw` needs.
+    fn forward_draw(
+        &self,
+        packed: &Self::Packed,
+        parents: &[f64],
+        state: &mut Self::DrawState,
+        record: bool,
+        coefs: &mut [f64],
+    );
+    /// `parents_bar[i] += C^T coefs_bar[i]` for a stack of two (`dy/dcoefs`
+    /// and `dlog_det/dcoefs`), after a recording `forward_draw` on `state`.
+    fn pullback_parents_draw(
+        &self,
+        packed: &Self::Packed,
+        state: &mut Self::DrawState,
+        coefs_bar: Stack<f64>,
+        parents_bar: StackMut<f64>,
+    );
+
+    // ---- LM: one tile of draws.
 
     fn new_tile_state<S: Simd>(&self, simd: S, max_parent: usize) -> Self::TileState<S>;
     fn new_scratch<S: Simd>(&self, simd: S, max_parent: usize) -> Self::Scratch<S>;

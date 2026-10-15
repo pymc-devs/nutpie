@@ -47,6 +47,25 @@ impl Conditioner for Constant {
         }
     }
 
+    type Packed = Vec<f64>;
+    type DrawState = ();
+
+    fn pack(&self, _: usize, weights: &[f64]) -> Vec<f64> {
+        weights.to_vec()
+    }
+
+    fn new_draw_state(&self, _: usize) {}
+
+    #[inline(always)]
+    fn forward_draw(&self, packed: &Vec<f64>, _: &[f64], _: &mut (), _: bool, coefs: &mut [f64]) {
+        for (&w, &k) in packed.iter().zip(self.outputs.coefs()) {
+            coefs[k] += w;
+        }
+    }
+
+    #[inline(always)]
+    fn pullback_parents_draw(&self, _: &Vec<f64>, _: &mut (), _: Stack<f64>, _: StackMut<f64>) {}
+
     fn new_tile_state<S: Simd>(&self, _: S, _: usize) {}
 
     fn new_scratch<S: Simd>(&self, _: S, _: usize) {}

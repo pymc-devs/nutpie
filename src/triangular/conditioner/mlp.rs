@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{At, Conditioner, Outputs, SparseCotangents, Stack, StackMut};
 use crate::simd_math;
+use crate::triangular::mlp_kernels::{self, BackpropMlp, EvalMlp};
 use crate::triangular::simd::{axpy, axpy_lanes, dot};
 
 /// The hidden units' activation.
@@ -36,10 +37,11 @@ pub(crate) enum Activation {
 }
 
 impl Activation {
-    pub(crate) fn name(self) -> &'static str {
+    /// The per-draw kernels' activation.
+    fn kernel(self) -> mlp_kernels::Activation {
         match self {
-            Self::Softplus => "softplus",
-            Self::GeluTanh => "gelu_tanh",
+            Self::Softplus => mlp_kernels::Activation::Softplus,
+            Self::GeluTanh => mlp_kernels::Activation::GeluTanh,
         }
     }
 
@@ -74,6 +76,31 @@ pub(crate) struct MlpTile<S: Simd> {
     h2: Vec<S::f64s>,
     /// The outputs, before they are added to the coefficients.
     out: Vec<S::f64s>,
+}
+
+/// A variable's MLP for the per-draw kernels ([`mlp_kernels::EvalMlp`]):
+/// per layer the input-major weights and the bias, `W1^T`, `b1`, `W2^T` and a
+/// zero output bias. Empty without parents.
+pub(crate) struct MlpPacked {
+    blob: Vec<f64>,
+}
+
+/// The per-draw kernels' buffers, and what a recording `forward_draw` keeps:
+/// the activations' derivatives and `dz`.
+pub(crate) struct MlpDraw {
+    inputs: Vec<f64>,
+    acc: Vec<f64>,
+    act_derivs: Vec<f64>,
+    seed_y: Vec<f64>,
+    seed_l: Vec<f64>,
+    next_y: Vec<f64>,
+    next_l: Vec<f64>,
+    out_y: Vec<f64>,
+    out_l: Vec<f64>,
+    dz: Vec<f64>,
+    /// Detected once, so the per-variable cost of picking a SIMD path is a
+    /// predictable branch.
+    arch: pulp::Arch,
 }
 
 /// Per-thread workspace; `a_dot`, `zeta` and `edge_z` carry work from one
@@ -128,18 +155,6 @@ impl Mlp {
             init_output_scale,
             hidden_ridge,
         })
-    }
-
-    pub(crate) fn n_unit(&self) -> usize {
-        self.n_unit
-    }
-
-    pub(crate) fn activation(&self) -> Activation {
-        self.activation
-    }
-
-    pub(crate) fn squash(&self) -> Option<f64> {
-        self.squash
     }
 
     #[inline(always)]
@@ -252,6 +267,124 @@ impl Conditioner for Mlp {
             for (j, j_from) in self.outputs.shared(&from.outputs) {
                 out_w2[j] = w2[j_from];
             }
+        }
+    }
+
+    type Packed = MlpPacked;
+    type DrawState = MlpDraw;
+
+    fn pack(&self, n_parent: usize, weights: &[f64]) -> MlpPacked {
+        if n_parent == 0 {
+            return MlpPacked { blob: Vec::new() };
+        }
+        let n_out = self.outputs.len();
+        let mut blob = Vec::with_capacity(self.n_unit * (n_parent + 1 + n_out) + n_out);
+        for p in 0..n_parent {
+            blob.extend((0..self.n_unit).map(|u| self.unit(weights, n_parent, u).0[p]));
+        }
+        blob.extend((0..self.n_unit).map(|u| self.unit(weights, n_parent, u).1));
+        for u in 0..self.n_unit {
+            blob.extend_from_slice(self.unit(weights, n_parent, u).2);
+        }
+        blob.extend(std::iter::repeat_n(0.0, n_out));
+        MlpPacked { blob }
+    }
+
+    fn new_draw_state(&self, max_parent: usize) -> MlpDraw {
+        let width = max_parent.max(self.n_unit).max(self.outputs.len()).max(1);
+        let buffer = || vec![0.0; width];
+        MlpDraw {
+            inputs: buffer(),
+            acc: buffer(),
+            act_derivs: vec![0.0; self.n_unit.max(1)],
+            seed_y: buffer(),
+            seed_l: buffer(),
+            next_y: buffer(),
+            next_l: buffer(),
+            out_y: vec![0.0; max_parent],
+            out_l: vec![0.0; max_parent],
+            dz: vec![0.0; max_parent],
+            arch: pulp::Arch::new(),
+        }
+    }
+
+    #[inline(always)]
+    fn forward_draw(
+        &self,
+        packed: &MlpPacked,
+        parents: &[f64],
+        state: &mut MlpDraw,
+        record: bool,
+        coefs: &mut [f64],
+    ) {
+        let n_parent = parents.len();
+        if n_parent == 0 {
+            return;
+        }
+        let n_out = self.outputs.len();
+        for ((input, dz), &y) in state.inputs.iter_mut().zip(&mut state.dz).zip(parents) {
+            (*input, *dz) = match self.squash {
+                None => (y, 1.0),
+                // `d/dy c asinh(y / c) = 1 / sqrt(1 + (y / c)^2)`.
+                Some(c) => (c * (y / c).asinh(), 1.0 / (y / c).hypot(1.0)),
+            };
+        }
+        let arch = state.arch;
+        arch.dispatch(EvalMlp {
+            weights: &packed.blob,
+            layer_out: &[self.n_unit, n_out],
+            activation: self.activation.kernel(),
+            n_in: n_parent,
+            inputs: &mut state.inputs,
+            acc: &mut state.acc,
+            act_derivs: record.then_some(&mut state.act_derivs[..]),
+        });
+        for (&value, &k) in state.acc[..n_out].iter().zip(self.outputs.coefs()) {
+            coefs[k] += value;
+        }
+    }
+
+    #[inline(always)]
+    fn pullback_parents_draw(
+        &self,
+        packed: &MlpPacked,
+        state: &mut MlpDraw,
+        coefs_bar: Stack<f64>,
+        mut parents_bar: StackMut<f64>,
+    ) {
+        assert_eq!(
+            coefs_bar.k(),
+            2,
+            "the per-draw pullback takes two cotangents"
+        );
+        let n_parent = parents_bar.get(0).len();
+        if n_parent == 0 {
+            return;
+        }
+        let n_out = self.outputs.len();
+        self.outputs
+            .gather(coefs_bar.get(0), &mut state.seed_y[..n_out]);
+        self.outputs
+            .gather(coefs_bar.get(1), &mut state.seed_l[..n_out]);
+        let arch = state.arch;
+        arch.dispatch(BackpropMlp {
+            weights: &packed.blob,
+            layer_out: &[self.n_unit, n_out],
+            n_in: n_parent,
+            act_derivs: &state.act_derivs,
+            seed_y: &mut state.seed_y,
+            seed_l: &mut state.seed_l,
+            next_y: &mut state.next_y,
+            next_l: &mut state.next_l,
+            out_y: &mut state.out_y[..n_parent],
+            out_l: &mut state.out_l[..n_parent],
+        });
+        let dz = &state.dz[..n_parent];
+        for ((out, &e), &dz) in parents_bar.get(0).iter_mut().zip(&state.out_y).zip(dz) {
+            *out += e * dz;
+        }
+        for ((out, &e), &dz) in parents_bar.get(1).iter_mut().zip(&state.out_l).zip(dz) {
+            *out += e * dz;
         }
     }
 

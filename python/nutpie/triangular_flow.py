@@ -23,6 +23,7 @@ import scipy.sparse as sp
 __all__ = [
     "build_triangular_flow",
     "default_conditioners",
+    "linear_conditioners",
     "diag_affine",
     "diag_from_gradients",
     "from_jax",
@@ -186,6 +187,47 @@ def default_conditioners(
             }
         )
     return conditioners
+
+
+def linear_conditioners(conditioners, transformer):
+    """The linear stage of `conditioners` for the transformer kind
+    `transformer` (see `transformer_kind`): the constant on its non-shape
+    targets and the linear conditioner on the location, with their ridges;
+    no MLPs. A fit with these moves only the Gaussian part of each
+    conditional."""
+    layout = transformer_layout(transformer)
+    roles = [layout["location"], layout["scale"]]
+    has_other = layout["n_coefs"] > len(layout["shape"]) + sum(
+        role is not None for role in roles
+    )
+    non_shape = [
+        name
+        for name, present in [
+            ("location", layout["location"] is not None),
+            ("scale", layout["scale"] is not None),
+            ("other", has_other),
+        ]
+        if present
+    ]
+
+    def targets(conditioner):
+        target = conditioner["target"]
+        return [target] if isinstance(target, str) else list(target)
+
+    out = []
+    for conditioner in conditioners:
+        kind = conditioner["kind"]
+        if kind == "constant":
+            wanted = targets(conditioner)
+            wanted = non_shape if "all" in wanted else wanted
+            kept = [t for t in wanted if t != "shape"]
+            if kept:
+                out.append({**conditioner, "target": kept})
+        elif kind == "linear":
+            wanted = targets(conditioner)
+            if "location" in wanted or "all" in wanted:
+                out.append({**conditioner, "target": "location"})
+    return out
 
 
 def _seed(seed):

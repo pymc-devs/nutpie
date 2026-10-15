@@ -19,10 +19,13 @@ import traceback
 import numpy as np
 
 from nutpie.triangular_flow import (
+    _seed,
     build_triangular_flow,
     default_conditioners,
     diag_affine,
     diag_from_gradients,
+    linear_conditioners,
+    transformer_kind,
 )
 
 _LOG_STOP_VALUE = -3.5
@@ -314,8 +317,19 @@ class TriangularFlowAdapter:
             "transformer_layers": transformer_layers,
             "tangent_sas_fix_b": tangent_sas_fix_b,
             "log_gamma_bounds": log_gamma_bounds,
-            "conditioners": conditioners,
         }
+        # The conditioners of the full fits, and of the linear stage, see
+        # `linear_fits`.
+        self._conditioners = conditioners
+        self._linear_conditioners = linear_conditioners(
+            conditioners,
+            transformer_kind(
+                transformer,
+                transformer_layers,
+                tangent_sas_fix_b=tangent_sas_fix_b,
+                log_gamma_bounds=log_gamma_bounds,
+            ),
+        )
         self._lm_settings = {
             "max_steps": max_epochs,
             "rtol": solver_rtol,
@@ -522,15 +536,19 @@ class TriangularFlowAdapter:
         fresh = self._flow is None
         if fresh:
             self._flow_fits = 0
-        # A flow's first `linear_fits` fits only move the linear part of its
+        # A flow's first `linear_fits` fits use only the linear part of its
         # conditioners, see `make_transform_adapter`.
         linear_fit = self._flow_fits < self._linear_fits
+        conditioners = (
+            self._linear_conditioners if linear_fit else self._conditioners
+        )
         if fresh:
             base = build_triangular_flow(
                 seed,
                 *train,
                 sparsity=self._sparsity,
                 order=self._order,
+                conditioners=conditioners,
                 **self._flow_settings,
             )
             self._report(
@@ -549,7 +567,9 @@ class TriangularFlowAdapter:
                     n_draws, f"{log_f}  fresh flow {_format_log_f(fresh_loss)}"
                 )
         else:
-            base = self._flow
+            # The current flow with this stage's conditioners: what both
+            # have carries over, the rest starts fresh.
+            base = self._flow.with_conditioners(conditioners, seed=_seed(seed))
 
         old_loss = np.log(self._fisher_divergence(self._flow, *eval_data))
         if (
@@ -586,7 +606,6 @@ class TriangularFlowAdapter:
             base.theta,
             val_problem=val_problem,
             early_stopping=self._early_stopping,
-            linear_fit=linear_fit,
             lam0=self._lm_lam,
             verbose=self._verbose >= 2,
             prefix=f"chain {self._chain} ",
@@ -638,7 +657,8 @@ class TriangularFlowAdapter:
             return
 
         # Early stopping went back to where the fit started, which for a
-        # refit is the current flow.
+        # refit is the current flow (with any new conditioners at their
+        # start).
         if not fresh and np.array_equal(theta, base.theta):
             report("keep flow, no step improved val")
             return

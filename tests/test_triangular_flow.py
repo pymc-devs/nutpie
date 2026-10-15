@@ -287,22 +287,177 @@ def test_built_flow_inverts_and_fits():
     assert after < before
 
 
+def test_native_transform_with_any_conditioners():
+    """The sampler's transform of a flow with two MLPs (one on part of the
+    coefficients, gelu, squashed) and a linear scale conditioner: its draws
+    map back exactly, and its pullback is the inverse's gradient map."""
+    x, g = _draws()
+    order = np.random.default_rng(8).permutation(DIM)
+    conditioners = [
+        {"kind": "constant", "target": "all"},
+        {"kind": "linear", "target": ["location", "scale"]},
+        {"kind": "mlp", "width": 3, "target": "all", "init_output_scale": 0.1},
+        {
+            "kind": "mlp",
+            "width": 2,
+            "target": ["scale", "shape"],
+            "activation": "gelu_tanh",
+            "input_squash": 0.8,
+            "init_output_scale": 0.1,
+        },
+    ]
+    flow = build_triangular_flow(
+        0,
+        x,
+        g,
+        sparsity=_banded(DIM, order),
+        order=order,
+        transformer="sas",
+        transformer_layers=2,
+        conditioners=conditioners,
+    )
+    # Moderate weights: a two-layer sinh-arcsinh with large tail coefficients
+    # overflows.
+    rng = np.random.default_rng(9)
+    flow = flow.with_theta(flow.theta + 0.05 * rng.normal(size=flow.n_params))
+    native = flow.flow_transform()
+    for _ in range(3):
+        z = rng.normal(size=DIM)
+        y, log_det = native.transform_and_log_det(z)
+        grad_y = rng.normal(size=DIM)
+        ours_log_det, back, grad_z = flow.inv_transform(y, grad_y)
+        np.testing.assert_allclose(back, z, rtol=1e-10, atol=1e-10)
+        np.testing.assert_allclose(ours_log_det, log_det, rtol=1e-10, atol=1e-10)
+        np.testing.assert_allclose(
+            native.pullback(grad_y), grad_z, rtol=1e-9, atol=1e-10
+        )
+
+
 def test_with_affine_restandardizes():
-    """`with_affine` keeps the conditioners and standardizes the draws with
-    the new affine: ``y = (x - loc) / scale`` and ``g_y = g * scale``, in the
-    triangular order."""
+    """`with_affine` standardizes the draws with the new affine: ``y = (x -
+    loc) / scale`` and ``g_y = g * scale``, in the triangular order."""
     x, g = _draws()
     order = np.random.default_rng(3).permutation(DIM)
     flow = build_triangular_flow(0, x, g, sparsity=_banded(DIM, order), order=order)
     rng = np.random.default_rng(4)
     loc, scale = rng.normal(size=DIM), np.exp(rng.normal(size=DIM))
     moved = flow.with_affine(loc, scale)
-    np.testing.assert_array_equal(moved.theta, flow.theta)
     y, gy = moved.undo_affine(x, g)
     np.testing.assert_allclose(y, ((x - loc) / scale)[:, order], rtol=1e-12)
     np.testing.assert_allclose(gy, (g * scale)[:, order], rtol=1e-12)
     with pytest.raises(RuntimeError, match="nonzero"):
         flow.with_affine(loc, np.zeros(DIM))
+
+
+@pytest.mark.parametrize("transformer", ["affine", "sas"])
+def test_with_affine_keeps_a_gaussian_flow(transformer):
+    """Without MLPs or linear scale weights, `with_affine` moves the
+    conditioners so that the flow stays the same function: the same Fisher
+    divergence and the same draws back in the base space."""
+    x, g = _draws()
+    order = np.random.default_rng(3).permutation(DIM)
+    conditioners = [
+        {"kind": "constant", "target": "all"},
+        {"kind": "linear", "target": "location"},
+    ]
+    flow = build_triangular_flow(
+        0,
+        x,
+        g,
+        sparsity=_banded(DIM, order),
+        order=order,
+        transformer=transformer,
+        conditioners=conditioners,
+    )
+    rng = np.random.default_rng(5)
+    flow = flow.with_theta(0.3 * rng.normal(size=flow.n_params))
+    loc, scale = rng.normal(size=DIM), np.exp(rng.normal(size=DIM))
+    moved = flow.with_affine(loc, scale)
+    np.testing.assert_allclose(
+        moved.fisher_divergence(x, g), flow.fisher_divergence(x, g), rtol=1e-10
+    )
+    for k in range(3):
+        ours = moved.inv_transform(x[k], g[k])
+        reference = flow.inv_transform(x[k], g[k])
+        for a, b in zip(ours, reference):
+            np.testing.assert_allclose(a, b, rtol=1e-10, atol=1e-12)
+
+
+def test_with_conditioners_carries_values():
+    """The same list carries everything; the linear stage and back keeps
+    the constant and linear values; new MLPs start as in a new flow."""
+    from nutpie.triangular_flow import linear_conditioners
+
+    x, g = _draws()
+    order = np.random.default_rng(3).permutation(DIM)
+    full = default_conditioners(4)
+    flow = build_triangular_flow(
+        0, x, g, sparsity=_banded(DIM, order), order=order, conditioners=full
+    )
+    rng = np.random.default_rng(6)
+    flow = flow.with_theta(0.3 * rng.normal(size=flow.n_params))
+    np.testing.assert_array_equal(flow.with_conditioners(full).theta, flow.theta)
+
+    linear = linear_conditioners(full, {"kind": "sas", "layers": 1})
+    staged = flow.with_conditioners(linear)
+    back = staged.with_conditioners(full, seed=1)
+    for i in range(DIM):
+        (c, c_end), (l, l_end), (m, m_end) = flow.weight_ranges(i)[:3]
+        (sc, sc_end), (sl, sl_end) = staged.weight_ranges(i)
+        (bc, bc_end), (bl, bl_end), (bm, bm_end) = back.weight_ranges(i)[:3]
+        # sas: alpha, beta, sigma, mu, nu; the scale is sigma (2), the
+        # location mu (3), the shape alpha and beta.
+        constant = np.asarray(flow.theta[c:c_end])
+        np.testing.assert_array_equal(staged.theta[sc:sc_end], constant[2:])
+        np.testing.assert_array_equal(back.theta[bc:bc_end][2:], constant[2:])
+        np.testing.assert_array_equal(back.theta[bc:bc_end][:2], 0.0)
+        n_parent = (l_end - l) // 2
+        # The linear rows in coefficient order: the scale, then the location.
+        location_row = flow.theta[l + n_parent : l_end]
+        np.testing.assert_array_equal(staged.theta[sl:sl_end], location_row)
+        np.testing.assert_array_equal(back.theta[bl + n_parent : bl_end], location_row)
+        np.testing.assert_array_equal(back.theta[bl : bl + n_parent], 0.0)
+        # The MLP comes back new (it has no weights without parents).
+        if n_parent:
+            assert not np.array_equal(back.theta[bm:bm_end], flow.theta[m:m_end])
+
+
+def test_linear_stage_fits_like_the_frozen_fit():
+    """A fit with the linear conditioners takes the same steps as one with
+    the full conditioners and everything else frozen, from a full flow whose
+    MLP outputs are zero."""
+    from nutpie.triangular_flow import linear_conditioners
+    from nutpie.triangular_lm import fit
+
+    x, g = _draws(n_draw=64)
+    order = np.random.default_rng(7).permutation(DIM)
+    full = default_conditioners(4, mlp_ridge=0.5, skip_ridge=0.2)
+    for c in full:
+        if c["kind"] == "mlp":
+            c["init_output_scale"] = 0.0
+    flow = build_triangular_flow(
+        0, x, g, sparsity=_banded(DIM, order), order=order, conditioners=full
+    )
+    linear = flow.with_conditioners(
+        linear_conditioners(full, {"kind": "sas", "layers": 1})
+    )
+    settings = {"n_steps": 5, "verbose": False, "max_block_size": 10_000}
+
+    problem = flow.residuals(x, g)
+    theta_full, _, hist_full = fit(
+        problem, flow.theta, frozen=problem.nonlinear_param_mask, **settings
+    )
+    theta_linear, _, hist_linear = fit(
+        linear.residuals(x, g), linear.theta, **settings
+    )
+    for ours, ref in zip(hist_linear, hist_full):
+        assert ours["accept"] == ref["accept"]
+        np.testing.assert_allclose(ours["lam_out"], ref["lam_out"], rtol=1e-8)
+    np.testing.assert_allclose(
+        linear.with_theta(theta_linear).fisher_divergence(x, g),
+        flow.with_theta(theta_full).fisher_divergence(x, g),
+        rtol=1e-8,
+    )
 
 
 @pytest.mark.parametrize("refit_diag", [False, True])

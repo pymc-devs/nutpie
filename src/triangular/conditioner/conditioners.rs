@@ -36,6 +36,21 @@ pub(crate) struct Workspace<S: Simd> {
     )>,
 }
 
+/// A variable's conditioners' weights in the per-draw kernels' layout, see
+/// [`Conditioner::pack`]. The constant's has no parent dependence, so the
+/// parent pullback skips it.
+pub(crate) struct PackedVariable {
+    constant: Option<<Constant as Conditioner>::Packed>,
+    linear: Option<<Linear as Conditioner>::Packed>,
+    mlps: Vec<<Mlp as Conditioner>::Packed>,
+}
+
+/// The per-draw states of a variable's conditioners; the constant and the
+/// linear conditioner have none.
+pub(crate) struct DrawWorkspace {
+    mlps: Vec<<Mlp as Conditioner>::DrawState>,
+}
+
 /// Which of a flow's conditioners another's carry their weights over from,
 /// see [`Conditioners::carry_plan`].
 pub(crate) struct CarryPlan {
@@ -252,8 +267,7 @@ impl Conditioners {
         let mut taken = vec![false; old.mlps.len()];
         for (k, mlp) in self.mlps.iter().enumerate() {
             let mut matches = old.mlps.iter().enumerate().filter(|(_, from)| {
-                mlp.same_structure(from)
-                    && mlp.outputs().shared(from.outputs()).next().is_some()
+                mlp.same_structure(from) && mlp.outputs().shared(from.outputs()).next().is_some()
             });
             let found = matches.next().map(|(m, _)| m);
             if matches.next().is_some() {
@@ -290,7 +304,12 @@ impl Conditioners {
         if let Some(c) = &self.constant {
             if plan.constant {
                 let from_c = old.constant.as_ref().expect("planned");
-                c.carry_weights(from_c, n_parent, &from[old_ranges[old_next].clone()], &mut out[ranges[next].clone()]);
+                c.carry_weights(
+                    from_c,
+                    n_parent,
+                    &from[old_ranges[old_next].clone()],
+                    &mut out[ranges[next].clone()],
+                );
             }
             next += 1;
         }
@@ -300,7 +319,12 @@ impl Conditioners {
         if let Some(c) = &self.linear {
             if plan.linear {
                 let from_c = old.linear.as_ref().expect("planned");
-                c.carry_weights(from_c, n_parent, &from[old_ranges[old_next].clone()], &mut out[ranges[next].clone()]);
+                c.carry_weights(
+                    from_c,
+                    n_parent,
+                    &from[old_ranges[old_next].clone()],
+                    &mut out[ranges[next].clone()],
+                );
             }
             next += 1;
         }
@@ -368,6 +392,85 @@ impl Conditioners {
                     *value = transformer.rescaled_scale_coef(*value, a);
                 }
             }
+        }
+    }
+
+    /// A variable's weights in the per-draw kernels' layout.
+    pub(crate) fn pack(&self, n_parent: usize, weights: &[f64]) -> PackedVariable {
+        let ranges = self.weight_ranges(n_parent);
+        let mut ranges = ranges.into_iter();
+        let mut next = |len| {
+            let range = ranges.next().expect("a range per conditioner");
+            debug_assert_eq!(range.len(), len);
+            &weights[range]
+        };
+        PackedVariable {
+            constant: self
+                .constant
+                .as_ref()
+                .map(|c| c.pack(n_parent, next(c.n_weights(n_parent)))),
+            linear: self
+                .linear
+                .as_ref()
+                .map(|c| c.pack(n_parent, next(c.n_weights(n_parent)))),
+            mlps: self
+                .mlps
+                .iter()
+                .map(|c| c.pack(n_parent, next(c.n_weights(n_parent))))
+                .collect(),
+        }
+    }
+
+    pub(crate) fn draw_workspace(&self, max_parent: usize) -> DrawWorkspace {
+        DrawWorkspace {
+            mlps: self
+                .mlps
+                .iter()
+                .map(|c| c.new_draw_state(max_parent))
+                .collect(),
+        }
+    }
+
+    /// `coefs = sum_c f_c(parents; weights_c)` at one draw; with `record`,
+    /// keeping what [`Self::pullback_parents_draw`] needs.
+    #[inline(always)]
+    pub(crate) fn forward_draw(
+        &self,
+        packed: &PackedVariable,
+        parents: &[f64],
+        work: &mut DrawWorkspace,
+        record: bool,
+        coefs: &mut [f64],
+    ) {
+        coefs.fill(0.0);
+        if let (Some(c), Some(packed)) = (&self.constant, &packed.constant) {
+            c.forward_draw(packed, parents, &mut (), record, coefs);
+        }
+        if let (Some(c), Some(packed)) = (&self.linear, &packed.linear) {
+            c.forward_draw(packed, parents, &mut (), record, coefs);
+        }
+        for ((c, packed), state) in self.mlps.iter().zip(&packed.mlps).zip(&mut work.mlps) {
+            c.forward_draw(packed, parents, state, record, coefs);
+        }
+    }
+
+    /// `parents_bar[i] += C^T coefs_bar[i]` at one draw, for the stack of
+    /// `dy/dcoefs` and `dlog_det/dcoefs`, after a recording
+    /// [`Self::forward_draw`].
+    #[inline(always)]
+    pub(crate) fn pullback_parents_draw(
+        &self,
+        packed: &PackedVariable,
+        work: &mut DrawWorkspace,
+        coefs_bar: Stack<f64>,
+        mut parents_bar: StackMut<f64>,
+    ) {
+        let n_parent = parents_bar.get(0).len();
+        if let (Some(c), Some(packed)) = (&self.linear, &packed.linear) {
+            c.pullback_parents_draw(packed, &mut (), coefs_bar, parents_bar.sub(0..n_parent));
+        }
+        for ((c, packed), state) in self.mlps.iter().zip(&packed.mlps).zip(&mut work.mlps) {
+            c.pullback_parents_draw(packed, state, coefs_bar, parents_bar.sub(0..n_parent));
         }
     }
 

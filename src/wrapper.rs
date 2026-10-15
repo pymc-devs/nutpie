@@ -1906,7 +1906,7 @@ pub fn _lib(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::triangular::flow::PyTriangularFlow>()?;
     m.add_class::<crate::triangular::lm::optimizer::PyLmOptimizer>()?;
     m.add_function(wrap_pyfunction!(
-        crate::triangular::sampler::activation_for_testing,
+        crate::triangular::mlp_kernels::activation_for_testing,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
