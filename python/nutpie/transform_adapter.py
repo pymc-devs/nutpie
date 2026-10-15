@@ -1484,7 +1484,7 @@ class TransformAdapter:
                 multiple=self._draw_multiple,
                 rng=np.random.default_rng(seed),
             )
-            if len(train_idx) < 10:
+            if len(train_idx) < 128:
                 self._report(
                     n_draws,
                     f"keep flow, only {len(train_idx)} draws to train on "
@@ -1896,11 +1896,11 @@ def make_transform_adapter(
     twin_layers=False,
     activation=None,
     max_epochs=60,
-    transformer="sas",
+    transformer="asymmetric_sas",
     transformer_layers=1,
     tangent_sas_fix_b=False,
     log_gamma_bounds=None,
-    scale_squash=3.0,
+    scale_squash=8.0,
     input_squash=None,
     reuse_embed=True,
     order=None,
@@ -1928,7 +1928,7 @@ def make_transform_adapter(
     lm_line_search=True,
     lm_forcing="model",
     lm_exact_blocks=True,
-    lm_max_exact_block_size=512,
+    lm_max_exact_block_size=256,
     lm_lmp_size=8,
     lm_lmp_tol=1e-8,
     native_flow=True,

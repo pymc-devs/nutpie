@@ -1244,26 +1244,40 @@ def sample(
         The maximum depth of the tree for each draw. The maximum
         number of gradient evaluations for each draw will
         be 2 ^ maxdepth.
-    walnuts: bool, default=False
+    walnuts: bool | dict, default=False
         Use WALNUTS (within-orbit adaptive step sizes) instead of plain
         NUTS: each leapfrog step is split into smaller micro steps if
-        needed to keep the energy error below ``walnuts_max_error``.
+        needed to keep the energy error below ``max_energy_error``.
         Only for ``sampler="nuts"``, and not supported together with
         ``microcanonical_trajectory``. *Experimental.*
-    walnuts_max_error: float > 0, default=0.5
-        Maximum error of the Hamiltonian within a macro step.
-    walnuts_max_step_halvings: int, default=5
-        Maximum number of times the micro step size is halved. If the
-        macro step is still not within tolerance, it counts as a
-        divergence.
-    walnuts_min_micro_steps: int > 0, default=1
-        Number of micro steps in the first attempt of each macro step.
-    walnuts_energy_criterion: {"max_min", "endpoint"}, default="max_min"
-        How the energy error of a macro step is measured: ``"max_min"``
-        uses ``max H - min H`` over all micro steps, ``"endpoint"`` uses
-        ``|H(end) - H(start)|``.
 
-        Setting any of the ``walnuts_*`` options enables WALNUTS.
+        ``True`` uses the default options; a dict enables WALNUTS with
+        these options, for instance ``walnuts={"max_energy_error": 0.3}``:
+
+        - ``max_energy_error`` (float > 0, default 0.5): Maximum error of
+          the Hamiltonian within a macro step.
+        - ``early_max_energy_error`` (float or None, default inf): Used
+          instead of ``max_energy_error`` in the early warmup phase.
+        - ``max_step_halvings`` (int, default 8): Maximum number of times
+          the micro step size is halved. If the macro step is still not
+          within tolerance, it counts as a divergence.
+        - ``min_micro_steps`` (int > 0, default 1): Number of micro steps
+          in the first attempt of each macro step.
+        - ``target_macro_steps`` (float or None, default None): If set,
+          adapt ``min_micro_steps`` during tuning, with
+          ``min_micro_steps`` as the lower bound.
+        - ``max_min_micro_steps`` (int, default 4096): Upper bound for the
+          adapted ``min_micro_steps``.
+        - ``energy_criterion`` (``"max_min"`` or ``"endpoint"``, default
+          ``"max_min"``): How the energy error of a macro step is
+          measured: ``"max_min"`` uses ``max H - min H`` over all micro
+          steps, ``"endpoint"`` uses ``|H(end) - H(start)|``.
+        - ``reversibility_check`` (``"always"``, ``"not_in_early_and_main"``
+          or ``"never"``, default ``"always"``): In which warmup phases
+          halved macro steps are checked for reversibility. Skipping the
+          check saves the backward integrations; ``"never"`` gives biased
+          draws, ``"not_in_early_and_main"`` still checks in the final
+          step size window and during sampling.
     return_raw_trace: bool, default=False
         Return the raw trace object (an apache arrow structure)
         instead of converting to arviz.

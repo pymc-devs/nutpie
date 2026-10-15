@@ -22,8 +22,8 @@ use numpy::{PyArray1, PyReadonlyArray1};
 use nuts_rs::{
     ArrowConfig, ArrowTrace, ChainProgress, DiagMclmcSettings, DiagNutsSettings, FlowMclmcSettings,
     FlowNutsSettings, KineticEnergyKind, LowRankMclmcSettings, LowRankNutsSettings,
-    MclmcTrajectoryKind, Model, ProgressCallback, Sampler, SamplerWaitResult, StepSizeAdaptMethod,
-    WalnutsEnergyCriterion,
+    MclmcTrajectoryKind, Model, ProgressCallback, ReversibilityCheck, Sampler, SamplerWaitResult,
+    StepSizeAdaptMethod, WalnutsEnergyCriterion, WalnutsOptions,
 };
 use pyo3::{
     exceptions::{PyAttributeError, PyTimeoutError, PyValueError},
@@ -475,6 +475,20 @@ macro_rules! try_shared_euclidean_adapt_update {
                 set_all_settings_field!($self, $enum_name, max_energy_error = value);
                 true
             }
+            "gradient_clipping" => {
+                let value: Option<f64> = $value.extract()?;
+                set_all_settings_field!($self, $enum_name, adapt_options.gradient_clipping = value);
+                true
+            }
+            "early_gradient_clipping" => {
+                let value: Option<f64> = $value.extract()?;
+                set_all_settings_field!(
+                    $self,
+                    $enum_name,
+                    adapt_options.early_gradient_clipping = value
+                );
+                true
+            }
             _ => false,
         }
     }};
@@ -485,6 +499,71 @@ fn random_seed(seed: Option<u64>) -> u64 {
         let mut rng = rng();
         rng.next_u64()
     })
+}
+
+/// WALNUTS options from the `walnuts` setting: `True` enables WALNUTS and
+/// keeps the current options, `False` or `None` disables it, and a dict
+/// enables it with the given options on top of the defaults.
+fn walnuts_from_py(
+    value: &Bound<'_, PyAny>,
+    current: Option<WalnutsOptions>,
+) -> PyResult<Option<WalnutsOptions>> {
+    if value.is_none() {
+        return Ok(None);
+    }
+    if let Ok(enable) = value.extract::<bool>() {
+        return Ok(enable.then(|| current.unwrap_or_default()));
+    }
+    let Ok(options) = value.cast::<PyDict>() else {
+        return Err(PyValueError::new_err(
+            "walnuts must be a bool, None or a dict of WALNUTS options",
+        ));
+    };
+    let mut walnuts = WalnutsOptions::default();
+    for (key, value) in options.iter() {
+        let key: String = key.extract()?;
+        match key.as_str() {
+            "max_energy_error" => walnuts.max_energy_error = value.extract()?,
+            "early_max_energy_error" => walnuts.early_max_energy_error = value.extract()?,
+            "max_step_halvings" => walnuts.max_step_halvings = value.extract()?,
+            "min_micro_steps" => walnuts.min_micro_steps = value.extract()?,
+            "max_min_micro_steps" => walnuts.max_min_micro_steps = value.extract()?,
+            "target_macro_steps" => walnuts.target_macro_steps = value.extract()?,
+            "energy_criterion" => {
+                let value: String = value.extract()?;
+                walnuts.energy_criterion = match value.as_str() {
+                    "max_min" => WalnutsEnergyCriterion::MaxMin,
+                    "endpoint" => WalnutsEnergyCriterion::Endpoint,
+                    _ => {
+                        return Err(PyValueError::new_err(format!(
+                            "Unknown walnuts energy_criterion: {value}. \
+                             Expected 'max_min' or 'endpoint'."
+                        )))
+                    }
+                };
+            }
+            "reversibility_check" => {
+                let value: String = value.extract()?;
+                walnuts.reversibility_check = match value.as_str() {
+                    "always" => ReversibilityCheck::Always,
+                    "after_main" => ReversibilityCheck::AfterMain,
+                    "never" => ReversibilityCheck::Never,
+                    _ => {
+                        return Err(PyValueError::new_err(format!(
+                            "Unknown walnuts reversibility_check: {value}. \
+                             Expected 'always', 'after_main' or 'never'."
+                        )))
+                    }
+                };
+            }
+            _ => {
+                return Err(PyValueError::new_err(format!(
+                    "Unknown WALNUTS option: {key}"
+                )))
+            }
+        }
+    }
+    Ok(Some(walnuts))
 }
 
 fn update_nuts_from_nested_dict(
@@ -619,48 +698,20 @@ impl PyNutsSettings {
                 set_all_settings_field!(self, NutsSettingsKind, extra_doublings = value);
             }
             "walnuts" => {
-                let value: bool = value.extract()?;
                 with_all_settings_mut!(self, NutsSettingsKind, settings => {
-                    settings.walnuts = if value {
-                        Some(settings.walnuts.unwrap_or_default())
-                    } else {
-                        None
-                    };
+                    settings.adapt_options.walnuts =
+                        walnuts_from_py(value, settings.adapt_options.walnuts)?;
                 });
             }
-            "walnuts_max_step_halvings" => {
-                let value: u64 = value.extract()?;
-                with_all_settings_mut!(self, NutsSettingsKind, settings => {
-                    settings.walnuts.get_or_insert_default().max_step_halvings = value;
-                });
-            }
-            "walnuts_max_error" => {
-                let value: f64 = value.extract()?;
-                with_all_settings_mut!(self, NutsSettingsKind, settings => {
-                    settings.walnuts.get_or_insert_default().max_error = value;
-                });
-            }
-            "walnuts_min_micro_steps" => {
-                let value: u64 = value.extract()?;
-                with_all_settings_mut!(self, NutsSettingsKind, settings => {
-                    settings.walnuts.get_or_insert_default().min_micro_steps = value;
-                });
-            }
-            "walnuts_energy_criterion" => {
-                let value: String = value.extract()?;
-                let value = match value.as_str() {
-                    "max_min" => WalnutsEnergyCriterion::MaxMin,
-                    "endpoint" => WalnutsEnergyCriterion::Endpoint,
-                    _ => {
-                        return Err(PyValueError::new_err(format!(
-                            "Unknown walnuts_energy_criterion: {value}. \
-                             Expected 'max_min' or 'endpoint'."
-                        )))
-                    }
+            name if name.starts_with("walnuts_") => {
+                let key = match name.strip_prefix("walnuts_").unwrap() {
+                    "max_error" => "max_energy_error",
+                    key => key,
                 };
-                with_all_settings_mut!(self, NutsSettingsKind, settings => {
-                    settings.walnuts.get_or_insert_default().energy_criterion = value;
-                });
+                return Err(PyAttributeError::new_err(format!(
+                    "Unknown settings attribute: {name}. WALNUTS options are passed \
+                     as a dict, for instance walnuts={{\"{key}\": ...}}",
+                )));
             }
             _ => {
                 if try_shared_euclidean_adapt_update!(self, NutsSettingsKind, name, value) {
@@ -673,7 +724,8 @@ impl PyNutsSettings {
                                 set_all_settings_field!(
                                     self,
                                     NutsSettingsKind,
-                                    trajectory_kind = KineticEnergyKind::Microcanonical
+                                    adapt_options.trajectory_kind =
+                                        KineticEnergyKind::Microcanonical
                                 );
                             }
                         }
@@ -683,7 +735,7 @@ impl PyNutsSettings {
                                 set_all_settings_field!(
                                     self,
                                     NutsSettingsKind,
-                                    trajectory_kind = KineticEnergyKind::ExactNormal
+                                    adapt_options.trajectory_kind = KineticEnergyKind::ExactNormal
                                 );
                             }
                         }

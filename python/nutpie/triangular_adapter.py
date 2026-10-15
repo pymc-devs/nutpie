@@ -517,7 +517,7 @@ class TriangularFlowAdapter:
             multiple=self._draw_multiple,
             rng=np.random.default_rng(seed),
         )
-        if len(train_idx) < 10:
+        if len(train_idx) < 128:
             self._report(
                 n_draws,
                 f"keep flow, only {len(train_idx)} draws to train on "
