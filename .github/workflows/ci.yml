@@ -39,11 +39,12 @@ jobs:
             3.12
             3.13
             3.14
+            3.15
       - name: Build wheels
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           target: ${{ matrix.platform.target }}
-          args: --release --out dist --interpreter 3.12 3.13 3.14 --zig
+          args: --release --out dist --interpreter 3.12 3.13 3.14 3.15 --zig
           sccache: false
           manylinux: auto
           before-script-linux: |
@@ -66,7 +67,7 @@ jobs:
       matrix:
         target: [x86_64, aarch64]
         suite: [stan, pymc, flow]
-        python-version: ["3.12", "3.13", "3.14"]
+        python-version: ["3.12", "3.13", "3.14", "3.15"]
         include:
           - target: x86_64
             runner: ubuntu-22.04
@@ -265,6 +266,7 @@ jobs:
             3.12
             3.13
             3.14
+            3.15
           architecture: x64
       - name: Install uv
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
@@ -284,7 +286,7 @@ jobs:
           LIBCLANG_PATH: ${{ runner.temp }}/llvm/lib
         with:
           target: x64
-          args: --release --out dist --interpreter 3.12 3.13 3.14
+          args: --release --out dist --interpreter 3.12 3.13 3.14 3.15
           sccache: false
       - name: Upload wheels
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -301,7 +303,7 @@ jobs:
       fail-fast: false
       matrix:
         suite: [stan, pymc, flow]
-        python-version: ["3.12", "3.13", "3.14"]
+        python-version: ["3.12", "3.13", "3.14", "3.15"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -361,6 +363,7 @@ jobs:
             3.12
             3.13
             3.14
+            3.15
       - name: Install uv
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
@@ -372,7 +375,7 @@ jobs:
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           target: ${{ matrix.platform.target }}
-          args: --release --out dist --interpreter 3.12 3.13 3.14 --zig
+          args: --release --out dist --interpreter 3.12 3.13 3.14 3.15 --zig
           sccache: false
       - name: Upload wheels
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -390,7 +393,7 @@ jobs:
       matrix:
         target: [x86_64, aarch64]
         suite: [stan, pymc, flow]
-        python-version: ["3.12", "3.13", "3.14"]
+        python-version: ["3.12", "3.13", "3.14", "3.15"]
         include:
           - target: x86_64
             runner: macos-15-intel
@@ -585,5 +588,5 @@ jobs:
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: |
-            wasm-wheels/*.whl
+            wasm-wheels-*/*.whl
           prerelease: ${{ contains(github.ref, 'alpha') || contains(github.ref, 'beta') }}
