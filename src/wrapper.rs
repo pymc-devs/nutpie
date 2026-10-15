@@ -1882,6 +1882,18 @@ impl PyTransformAdapt {
 /// A Python module implemented in Rust.
 #[pymodule(gil_used = false)]
 pub fn _lib(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Without threads (wasm), rayon's global pool fails to spawn its workers
+    // on first use and panics: emscripten reports `WouldBlock`, not the
+    // `Unsupported` rayon would fall back on. Make the importing thread the
+    // pool's only worker, so parallel iterators run inline.
+    #[cfg(not(feature = "parallel"))]
+    {
+        // Fails only if the pool already exists.
+        let _ = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .use_current_thread()
+            .build_global();
+    }
     m.add_class::<PySampler>()?;
     m.add_class::<PyMcModel>()?;
     m.add_class::<LogpFunc>()?;
