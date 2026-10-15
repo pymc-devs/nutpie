@@ -334,7 +334,7 @@ pub(crate) fn build_transform(
     schedule: &str,
 ) -> Result<TriangularTransform<LayoutModel>> {
     // A layout probed from a JAX map; the skips carry their own indices.
-    let configs: Vec<LayerConfig> = pythonize::depythonize(transformer)?;
+    let configs: Vec<LayerConfig> = crate::pyjson::from_py(transformer)?;
     let n_coefs = layer_out
         .last()
         .and_then(|&n| usize::try_from(n).ok())

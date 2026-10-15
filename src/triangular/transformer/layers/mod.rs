@@ -10,10 +10,12 @@ pub(crate) mod jet;
 pub(crate) mod scalar;
 
 use anyhow::{bail, Result};
-use serde::{Deserialize, Serialize};
+use pyo3::prelude::*;
+use pyo3::types::PyDict;
+use serde::Deserialize;
 
 /// `field = coefs[index] + offset`.
-#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 pub(crate) struct Param {
     pub(crate) index: usize,
     pub(crate) offset: f64,
@@ -26,7 +28,7 @@ impl Param {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 pub(crate) struct Contract2Config {
     pub(crate) alpha: Option<Param>,
     pub(crate) beta: Option<Param>,
@@ -37,7 +39,7 @@ pub(crate) struct Contract2Config {
 }
 
 /// `nutpie.normalizing_flow.TangentSAS`, with its raw (unconstrained) fields.
-#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 pub(crate) struct TangentSasConfig {
     pub(crate) nu: Option<Param>,
     pub(crate) eps: Option<Param>,
@@ -46,7 +48,7 @@ pub(crate) struct TangentSasConfig {
 }
 
 /// `nutpie.normalizing_flow.AsymmetricSAS`, with its raw fields.
-#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 pub(crate) struct AsymmetricSasConfig {
     pub(crate) c: Option<Param>,
     pub(crate) a: Option<Param>,
@@ -56,7 +58,7 @@ pub(crate) struct AsymmetricSasConfig {
 }
 
 /// `nutpie.normalizing_flow.PositiveAffine`, with its raw fields.
-#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 pub(crate) struct PositiveAffineConfig {
     pub(crate) loc: Option<Param>,
     pub(crate) scale: Option<Param>,
@@ -64,13 +66,74 @@ pub(crate) struct PositiveAffineConfig {
 
 /// One transformer layer, tagged by `kind` (see
 /// `nutpie.triangular_layout.transformer_dicts`).
-#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum LayerConfig {
     Contract2(Contract2Config),
     TangentSas(TangentSasConfig),
     AsymmetricSas(AsymmetricSasConfig),
     PositiveAffine(PositiveAffineConfig),
+}
+
+/// `Param` as the dict `{"index", "offset"}` that `transformer_dicts` writes,
+/// or `None`.
+fn param_to_py<'py>(py: Python<'py>, param: Option<Param>) -> PyResult<Bound<'py, PyAny>> {
+    let Some(Param { index, offset }) = param else {
+        return Ok(py.None().into_bound(py));
+    };
+    let dict = PyDict::new(py);
+    dict.set_item("index", index)?;
+    dict.set_item("offset", offset)?;
+    Ok(dict.into_any())
+}
+
+impl LayerConfig {
+    /// The layer as the dict `transformer_dicts` writes, tagged by `kind`.
+    pub(crate) fn to_pydict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let dict = PyDict::new(py);
+        let mut params = |kind: &str, fields: &[(&str, Option<Param>)]| -> PyResult<()> {
+            dict.set_item("kind", kind)?;
+            for &(name, param) in fields {
+                dict.set_item(name, param_to_py(py, param)?)?;
+            }
+            Ok(())
+        };
+        match *self {
+            LayerConfig::Contract2(c) => {
+                params(
+                    "contract2",
+                    &[
+                        ("alpha", c.alpha),
+                        ("beta", c.beta),
+                        ("sigma", c.sigma),
+                        ("mu", c.mu),
+                        ("nu", c.nu),
+                    ],
+                )?;
+                dict.set_item("log_gamma_bounds", c.log_gamma_bounds)?;
+            }
+            LayerConfig::TangentSas(t) => params(
+                "tangent_sas",
+                &[("nu", t.nu), ("eps", t.eps), ("b", t.b), ("r", t.r)],
+            )?,
+            LayerConfig::AsymmetricSas(t) => {
+                params(
+                    "asymmetric_sas",
+                    &[
+                        ("c", t.c),
+                        ("a", t.a),
+                        ("alpha_pos", t.alpha_pos),
+                        ("alpha_neg", t.alpha_neg),
+                    ],
+                )?;
+                dict.set_item("log_gamma_bounds", t.log_gamma_bounds)?;
+            }
+            LayerConfig::PositiveAffine(a) => {
+                params("positive_affine", &[("loc", a.loc), ("scale", a.scale)])?
+            }
+        }
+        Ok(dict)
+    }
 }
 
 impl LayerConfig {

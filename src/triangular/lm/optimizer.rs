@@ -33,7 +33,7 @@ use faer::linalg::solvers::Solve;
 use faer::{Mat, MatMut, Side};
 use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
-use serde::Serialize;
+use pyo3::types::PyDict;
 
 use super::{FisherResiduals, GnBlock, Linearization, PyFisherResiduals};
 
@@ -204,15 +204,12 @@ impl Lmp {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct StepInfo {
-    #[serde(rename = "F")]
     f: f64,
-    #[serde(rename = "F_new")]
     f_new: f64,
     /// The ridge's part of `F_new`.
     ridge_new: f64,
-    #[serde(rename = "F_out")]
     f_out: f64,
     accept: bool,
     rho: f64,
@@ -234,6 +231,66 @@ pub struct StepInfo {
     nonfinite_blocks: usize,
     failed_inverses: usize,
     lmp_rank: usize,
+}
+
+impl StepInfo {
+    /// The info as the dict `lmopt.step` documents. `f`, `f_new` and `f_out`
+    /// are `F`, `F_new` and `F_out` there.
+    fn into_dict<'py>(self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        // Destructured, so that a new field is a compile error here.
+        let Self {
+            f,
+            f_new,
+            ridge_new,
+            f_out,
+            accept,
+            rho,
+            rho_full,
+            actual,
+            pred,
+            lam_in,
+            lam_out,
+            lam_nu,
+            n_cg,
+            cg_eta,
+            cg_converged,
+            grad_norm,
+            step_norm,
+            full_step_norm,
+            finite,
+            rebuilt_blocks,
+            step_length,
+            nonfinite_blocks,
+            failed_inverses,
+            lmp_rank,
+        } = self;
+        let dict = PyDict::new(py);
+        dict.set_item("F", f)?;
+        dict.set_item("F_new", f_new)?;
+        dict.set_item("ridge_new", ridge_new)?;
+        dict.set_item("F_out", f_out)?;
+        dict.set_item("accept", accept)?;
+        dict.set_item("rho", rho)?;
+        dict.set_item("rho_full", rho_full)?;
+        dict.set_item("actual", actual)?;
+        dict.set_item("pred", pred)?;
+        dict.set_item("lam_in", lam_in)?;
+        dict.set_item("lam_out", lam_out)?;
+        dict.set_item("lam_nu", lam_nu)?;
+        dict.set_item("n_cg", n_cg)?;
+        dict.set_item("cg_eta", cg_eta)?;
+        dict.set_item("cg_converged", cg_converged)?;
+        dict.set_item("grad_norm", grad_norm)?;
+        dict.set_item("step_norm", step_norm)?;
+        dict.set_item("full_step_norm", full_step_norm)?;
+        dict.set_item("finite", finite)?;
+        dict.set_item("rebuilt_blocks", rebuilt_blocks)?;
+        dict.set_item("step_length", step_length)?;
+        dict.set_item("nonfinite_blocks", nonfinite_blocks)?;
+        dict.set_item("failed_inverses", failed_inverses)?;
+        dict.set_item("lmp_rank", lmp_rank)?;
+        Ok(dict)
+    }
 }
 
 pub struct LmOptimizer {
@@ -949,9 +1006,9 @@ impl PyLmOptimizer {
     }
 
     /// One LM step; returns its info as a dict (see `lmopt.step`).
-    fn step<'py>(&mut self, py: Python<'py>) -> Result<Bound<'py, PyAny>> {
+    fn step<'py>(&mut self, py: Python<'py>) -> Result<Bound<'py, PyDict>> {
         let info = py.detach(|| self.inner.step())?;
-        Ok(pythonize::pythonize(py, &info)?)
+        Ok(info.into_dict(py)?)
     }
 
     /// The current (last accepted) parameters.
