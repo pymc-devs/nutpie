@@ -1,18 +1,19 @@
-//! The elementwise transformer layers: their specs as Python describes them,
-//! and the prepared layers both evaluations share.
+//! The elementwise transformer layers: their configs, and the prepared layers
+//! both evaluations share. The transformers of [`crate::triangular::transformer`]
+//! are chains of them.
 //!
-//! [`scalar`] runs the chain forward on `f64` with first derivatives, for the
-//! transform. [`jet`] runs it inverted on jets with second-order derivatives in
-//! the transformer parameters, for the LM fit.
+//! [`scalar`] runs a chain forward on `f64` with first derivatives, for the
+//! sampler. [`jet`] runs it inverted on jets with second-order derivatives in
+//! the coefficients, for the LM fit.
 
 pub(crate) mod jet;
 pub(crate) mod scalar;
 
 use anyhow::{bail, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-/// `field = conditioner_output[index] + offset`.
-#[derive(Debug, Clone, Copy, Deserialize)]
+/// `field = coefs[index] + offset`.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
 pub(crate) struct Param {
     pub(crate) index: usize,
     pub(crate) offset: f64,
@@ -25,8 +26,8 @@ impl Param {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
-pub(crate) struct Contract2Spec {
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+pub(crate) struct Contract2Config {
     pub(crate) alpha: Option<Param>,
     pub(crate) beta: Option<Param>,
     pub(crate) sigma: Option<Param>,
@@ -36,8 +37,8 @@ pub(crate) struct Contract2Spec {
 }
 
 /// `nutpie.normalizing_flow.TangentSAS`, with its raw (unconstrained) fields.
-#[derive(Debug, Clone, Copy, Deserialize)]
-pub(crate) struct TangentSasSpec {
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+pub(crate) struct TangentSasConfig {
     pub(crate) nu: Option<Param>,
     pub(crate) eps: Option<Param>,
     pub(crate) b: Option<Param>,
@@ -45,8 +46,8 @@ pub(crate) struct TangentSasSpec {
 }
 
 /// `nutpie.normalizing_flow.AsymmetricSAS`, with its raw fields.
-#[derive(Debug, Clone, Copy, Deserialize)]
-pub(crate) struct AsymmetricSasSpec {
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+pub(crate) struct AsymmetricSasConfig {
     pub(crate) c: Option<Param>,
     pub(crate) a: Option<Param>,
     pub(crate) alpha_pos: Option<Param>,
@@ -55,31 +56,31 @@ pub(crate) struct AsymmetricSasSpec {
 }
 
 /// `nutpie.normalizing_flow.PositiveAffine`, with its raw fields.
-#[derive(Debug, Clone, Copy, Deserialize)]
-pub(crate) struct PositiveAffineSpec {
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+pub(crate) struct PositiveAffineConfig {
     pub(crate) loc: Option<Param>,
     pub(crate) scale: Option<Param>,
 }
 
 /// One transformer layer, tagged by `kind` (see
 /// `nutpie.triangular_layout.transformer_dicts`).
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub(crate) enum LayerSpec {
-    Contract2(Contract2Spec),
-    TangentSas(TangentSasSpec),
-    AsymmetricSas(AsymmetricSasSpec),
-    PositiveAffine(PositiveAffineSpec),
+pub(crate) enum LayerConfig {
+    Contract2(Contract2Config),
+    TangentSas(TangentSasConfig),
+    AsymmetricSas(AsymmetricSasConfig),
+    PositiveAffine(PositiveAffineConfig),
 }
 
-impl LayerSpec {
+impl LayerConfig {
     /// The parameters the layer reads.
     pub(crate) fn params(&self) -> impl Iterator<Item = Param> {
         let fields = match *self {
-            LayerSpec::Contract2(c) => [c.alpha, c.beta, c.sigma, c.mu, c.nu],
-            LayerSpec::TangentSas(t) => [t.nu, t.eps, t.b, t.r, None],
-            LayerSpec::AsymmetricSas(t) => [t.c, t.a, t.alpha_pos, t.alpha_neg, None],
-            LayerSpec::PositiveAffine(a) => [a.loc, a.scale, None, None, None],
+            LayerConfig::Contract2(c) => [c.alpha, c.beta, c.sigma, c.mu, c.nu],
+            LayerConfig::TangentSas(t) => [t.nu, t.eps, t.b, t.r, None],
+            LayerConfig::AsymmetricSas(t) => [t.c, t.a, t.alpha_pos, t.alpha_neg, None],
+            LayerConfig::PositiveAffine(a) => [a.loc, a.scale, None, None, None],
         };
         fields.into_iter().flatten()
     }
@@ -122,17 +123,17 @@ pub(crate) struct Contract2 {
 }
 
 impl Contract2 {
-    fn new(spec: Contract2Spec) -> Result<Self> {
-        let bound = match spec.log_gamma_bounds {
+    fn new(config: Contract2Config) -> Result<Self> {
+        let bound = match config.log_gamma_bounds {
             None => None,
             Some((low, high)) => Some(LogGammaBound::new(low, high)?),
         };
         Ok(Self {
-            alpha: spec.alpha,
-            beta: spec.beta,
-            sigma: spec.sigma,
-            mu: spec.mu,
-            nu: spec.nu,
+            alpha: config.alpha,
+            beta: config.beta,
+            sigma: config.sigma,
+            mu: config.mu,
+            nu: config.nu,
             bound,
         })
     }
@@ -148,16 +149,16 @@ pub(crate) struct AsymmetricSas {
 }
 
 impl AsymmetricSas {
-    fn new(spec: AsymmetricSasSpec) -> Result<Self> {
-        let bound = match spec.log_gamma_bounds {
+    fn new(config: AsymmetricSasConfig) -> Result<Self> {
+        let bound = match config.log_gamma_bounds {
             None => None,
             Some((low, high)) => Some(LogGammaBound::new(low, high)?),
         };
         Ok(Self {
-            c: spec.c,
-            a: spec.a,
-            alpha_pos: spec.alpha_pos,
-            alpha_neg: spec.alpha_neg,
+            c: config.c,
+            a: config.a,
+            alpha_pos: config.alpha_pos,
+            alpha_neg: config.alpha_neg,
             bound,
         })
     }
@@ -167,18 +168,18 @@ impl AsymmetricSas {
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Layer {
     Contract2(Contract2),
-    TangentSas(TangentSasSpec),
+    TangentSas(TangentSasConfig),
     AsymmetricSas(AsymmetricSas),
-    PositiveAffine(PositiveAffineSpec),
+    PositiveAffine(PositiveAffineConfig),
 }
 
 impl Layer {
-    pub(crate) fn new(spec: LayerSpec) -> Result<Self> {
-        Ok(match spec {
-            LayerSpec::Contract2(spec) => Layer::Contract2(Contract2::new(spec)?),
-            LayerSpec::TangentSas(spec) => Layer::TangentSas(spec),
-            LayerSpec::AsymmetricSas(spec) => Layer::AsymmetricSas(AsymmetricSas::new(spec)?),
-            LayerSpec::PositiveAffine(spec) => Layer::PositiveAffine(spec),
+    pub(crate) fn new(config: LayerConfig) -> Result<Self> {
+        Ok(match config {
+            LayerConfig::Contract2(config) => Layer::Contract2(Contract2::new(config)?),
+            LayerConfig::TangentSas(config) => Layer::TangentSas(config),
+            LayerConfig::AsymmetricSas(config) => Layer::AsymmetricSas(AsymmetricSas::new(config)?),
+            LayerConfig::PositiveAffine(config) => Layer::PositiveAffine(config),
         })
     }
 

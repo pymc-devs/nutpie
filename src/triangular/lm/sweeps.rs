@@ -4,10 +4,10 @@
 use fearless_simd::prelude::*;
 use fearless_simd_macros::simd;
 
-use super::conditioner::{Cotangent, ParamsMut, Scratch, UnitState};
-use super::simd::store;
+use super::local::{Cotangent, LocalScratch, LocalState};
 use super::tiles::{Data, LinearTile, LinearTileMut, Linearization, Tiled};
 use super::FisherResiduals;
+use crate::triangular::simd::store;
 
 /// One tile's draws and linearization, as vectors.
 pub(super) struct Tile<S: Simd> {
@@ -39,8 +39,8 @@ struct TangentWork<S: Simd> {
 /// Per-thread scratch for the sweeps over one tile.
 pub(super) struct TileScratch<S: Simd> {
     tile: Tile<S>,
-    units: UnitState<S>,
-    local: Scratch<S>,
+    units: LocalState<S>,
+    local: LocalScratch<S>,
     primal: PrimalWork<S>,
     tangent: TangentWork<S>,
     /// `J^{-1}` of the residual cotangents, per variable.
@@ -52,8 +52,8 @@ pub(super) struct TileScratch<S: Simd> {
 /// Per-thread scratch for [`FisherResiduals::pullback_variable`]: one
 /// variable's edges and parameters.
 pub(super) struct VariableScratch<S: Simd> {
-    units: UnitState<S>,
-    local: Scratch<S>,
+    units: LocalState<S>,
+    local: LocalScratch<S>,
     /// `A_bar` and `L_bar`, per parent.
     cot_a: Vec<S::f64s>,
     cot_l: Vec<S::f64s>,
@@ -65,8 +65,8 @@ impl<S: Simd> VariableScratch<S> {
     pub(super) fn new(simd: S, problem: &FisherResiduals) -> Self {
         let max_parent = problem.graph.max_parent();
         Self {
-            units: problem.unit_state(simd),
-            local: problem.conditioner.scratch(simd),
+            units: problem.local_state(simd),
+            local: problem.conditional.scratch(simd, max_parent),
             cot_a: Vec::with_capacity(max_parent),
             cot_l: Vec::with_capacity(max_parent),
             grad: Vec::with_capacity(problem.param_offset.max_len()),
@@ -86,8 +86,10 @@ impl<S: Simd> TileScratch<S> {
                 g: by_var(),
                 lin: LinearTile::new(simd, n_var, n_edge),
             },
-            units: problem.unit_state(simd),
-            local: problem.conditioner.scratch(simd),
+            units: problem.local_state(simd),
+            local: problem
+                .conditional
+                .scratch(simd, problem.graph.max_parent()),
             primal: PrimalWork {
                 edge_l: by_edge(),
                 grad_log_det: by_var(),
@@ -192,9 +194,9 @@ impl FisherResiduals {
         for i in 0..n_var {
             self.gather_parents(i, y, &mut units.y_parents);
             let theta_i = self.params_of(theta, i);
-            self.conditioner.evaluate(simd, theta_i, units);
+            self.conditional.evaluate(simd, theta_i, units);
             let edges = self.graph.edges(i);
-            let (x_i, delta_i, mu_i) = self.conditioner.local_primal(
+            let (x_i, delta_i, mu_i) = self.conditional.local_primal(
                 simd,
                 theta_i,
                 units,
@@ -267,9 +269,9 @@ impl FisherResiduals {
         for i in 0..n_var {
             self.gather_parents(i, y, &mut units.y_parents);
             let theta_i = self.params_of(&lin.theta, i);
-            self.conditioner.evaluate(simd, theta_i, units);
+            self.conditional.evaluate(simd, theta_i, units);
             let edges = self.graph.edges(i);
-            let (xd, delta_dot, mu_dot) = self.conditioner.local_pushforward(
+            let (xd, delta_dot, mu_dot) = self.conditional.local_pushforward(
                 simd,
                 theta_i,
                 self.params_of(v, i),
@@ -337,7 +339,6 @@ impl FisherResiduals {
         out: &mut [f64],
     ) {
         let scale = lin.data.scale();
-        let shape = self.shape(i);
         let theta_i = self.params_of(&lin.theta, i);
         let VariableScratch {
             units,
@@ -347,7 +348,7 @@ impl FisherResiduals {
             grad,
         } = ws;
         grad.clear();
-        grad.resize(shape.size(), S::f64s::splat(simd, 0.0));
+        grad.resize(theta_i.len(), S::f64s::splat(simd, 0.0));
 
         for tile in 0..lin.data.n_tile() {
             let (w_i, z_i) = (lin.w.value(simd, tile, i), z.value(simd, tile, i));
@@ -367,15 +368,15 @@ impl FisherResiduals {
                 edge_a: cot_a,
                 edge_l: cot_l,
             };
-            self.conditioner.evaluate(simd, theta_i, units);
-            self.conditioner.local_pullback(
+            self.conditional.evaluate(simd, theta_i, units);
+            self.conditional.local_pullback(
                 simd,
                 theta_i,
                 units,
                 &cot,
                 lin.data.y.value(simd, tile, i),
                 local,
-                ParamsMut::new(grad, shape),
+                grad,
             );
         }
         for (out, g) in out.iter_mut().zip(grad.iter()) {

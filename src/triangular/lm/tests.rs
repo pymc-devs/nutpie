@@ -5,12 +5,15 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution, StandardNormal};
 
-use super::conditioner::{Activation, Conditioner};
 use super::FisherResiduals;
-use crate::triangular::layers::{
-    Contract2Spec, LayerSpec, Param, PositiveAffineSpec, TangentSasSpec,
-};
+use crate::triangular::conditional::Conditional;
+use crate::triangular::conditioner::config::{RidgeConfig, RidgeGroups, Target, Targets};
+use crate::triangular::conditioner::{Activation, ConditionerConfig, Conditioners};
 use crate::triangular::pattern::{Pattern, Ragged};
+use crate::triangular::transformer::layers::{
+    Contract2Config, LayerConfig, Param, PositiveAffineConfig, TangentSasConfig,
+};
+use crate::triangular::transformer::LayerChain;
 
 const N_DRAW: usize = 16;
 
@@ -35,7 +38,9 @@ fn param(index: usize, offset: f64) -> Option<Param> {
 }
 
 /// `Contract2` (bounded), `TangentSAS` and `PositiveAffine`, eleven
-/// parameters, the location in `Contract2`'s `mu`.
+/// coefficients, the location in `Contract2`'s `mu` and the scale in
+/// `PositiveAffine`'s; every kind of conditioner, two MLPs, and a ridge on
+/// every group.
 fn problem(squash: Option<f64>, activation: Activation) -> FisherResiduals {
     problem_squashed(squash, activation, N_DRAW)
 }
@@ -45,8 +50,8 @@ pub(super) fn problem_with(n_draw: usize) -> FisherResiduals {
 }
 
 fn problem_squashed(squash: Option<f64>, activation: Activation, n_draw: usize) -> FisherResiduals {
-    let specs = vec![
-        LayerSpec::Contract2(Contract2Spec {
+    let configs = vec![
+        LayerConfig::Contract2(Contract2Config {
             alpha: param(0, 0.1),
             beta: param(1, 0.0),
             sigma: param(2, -0.2),
@@ -54,20 +59,59 @@ fn problem_squashed(squash: Option<f64>, activation: Activation, n_draw: usize) 
             nu: param(4, 0.3),
             log_gamma_bounds: Some((-1.5, 2.0)),
         }),
-        LayerSpec::TangentSas(TangentSasSpec {
+        LayerConfig::TangentSas(TangentSasConfig {
             nu: param(5, 0.0),
             eps: param(6, 0.1),
             b: param(7, 0.2),
             r: param(8, -0.1),
         }),
-        LayerSpec::PositiveAffine(PositiveAffineSpec {
+        LayerConfig::PositiveAffine(PositiveAffineConfig {
             loc: param(9, 0.0),
             scale: param(10, 0.1),
         }),
     ];
-    // Scale skip into `PositiveAffine`'s scale.
-    let conditioner = Conditioner::new(3, 11, 3, Some(10), specs, squash, activation).unwrap();
-    let mut problem = FisherResiduals::new(graph(), conditioner).unwrap();
+    let transformer = LayerChain::new(configs, 11, Some(3), Some(10)).unwrap();
+    let groups = |location, scale, shape, other, hidden| {
+        RidgeConfig::Groups(RidgeGroups {
+            location,
+            scale,
+            shape,
+            other,
+            hidden,
+        })
+    };
+    let conditioners = [
+        ConditionerConfig::Constant {
+            target: Targets::One(Target::All),
+            ridge: groups(0.0, 0.0, 0.5, 0.0, 0.0),
+        },
+        ConditionerConfig::Linear {
+            target: Targets::Many(vec![Target::Location, Target::Scale]),
+            ridge: groups(0.3, 0.2, 0.0, 0.0, 0.0),
+        },
+        ConditionerConfig::Mlp {
+            width: 3,
+            target: Targets::One(Target::All),
+            activation,
+            input_squash: squash,
+            init_output_scale: 1.0,
+            ridge: groups(0.7, 0.7, 1.2, 0.7, 0.7),
+        },
+        ConditionerConfig::Mlp {
+            width: 2,
+            target: Targets::Many(vec![Target::Scale, Target::Shape]),
+            activation: Activation::Softplus,
+            input_squash: None,
+            init_output_scale: 1.0,
+            ridge: RidgeConfig::All(0.1),
+        },
+    ];
+    let conditional = Conditional::new(
+        Conditioners::new(&conditioners, &transformer).unwrap(),
+        transformer,
+    )
+    .unwrap();
+    let mut problem = FisherResiduals::new(graph(), conditional).unwrap();
     let mut rng = ChaCha8Rng::seed_from_u64(0);
     let n_var = problem.n_var();
     let y = normal(&mut rng, n_draw * n_var, 1.0);

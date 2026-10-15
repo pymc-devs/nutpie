@@ -9,13 +9,15 @@ use fearless_simd::{dispatch, prelude::*};
 use fearless_simd_macros::simd;
 use rayon::prelude::*;
 
-use super::conditioner::{DenseCurvature, Params, ParamsMut, UnitState};
+use super::local::LocalState;
 #[cfg(doc)]
 use super::selected_inverse::SelectedInverseLayout;
-use super::simd::{axpy, axpy_lanes, dot};
 use super::tiles::Linearization;
 use super::FisherResiduals;
-use crate::triangular::jet::{packed_len, JetArena};
+use crate::triangular::conditioner::{SparseCotangents, Stack, StackMut};
+use crate::triangular::simd::axpy_lanes;
+use crate::triangular::transformer::jet::{packed_len, JetArena};
+use crate::triangular::transformer::{Transformer, TransformerDerivatives};
 
 /// Draws per matrix product when accumulating the exact blocks.
 const BLOCK_DRAW_BATCH: usize = 32;
@@ -30,12 +32,12 @@ pub(crate) struct GnBlock {
 /// Per-thread scratch for [`FisherResiduals::variable_blocks`]. The matrices
 /// are column-major.
 struct BlockScratch<S: Simd> {
-    units: UnitState<S>,
+    units: LocalState<S>,
     jets: JetArena<S>,
     /// The Jacobian rows of one tile, `n_theta` per column.
     rows: Vec<S::f64s>,
     edge_a: Vec<S::f64s>,
-    curvature: DenseCurvature<S>,
+    derivatives: TransformerDerivatives<S>,
     seeds: SeedProducts<S>,
 }
 
@@ -47,14 +49,13 @@ struct SeedProducts<S: Simd> {
     /// `H_T[pi, pi] C` and `H_Lambda[pi, pi] C`, `(n_par, n_p)`.
     hess_t_jac: Vec<S::f64s>,
     hess_l_jac: Vec<S::f64s>,
-    /// Every seed's `pi_bar`, `(n_par, n_col)`, and `W2^T pi_bar`,
-    /// `(n_unit, n_col)`.
+    /// Every seed's `pi_bar`, `(n_par, n_col)`.
     pi_bar: Vec<S::f64s>,
-    unit_bar: Vec<S::f64s>,
-    /// `p_t` and `p_l` per unit, and one seed's `c_a t + c_l l`.
-    unit_t: Vec<S::f64s>,
-    unit_l: Vec<S::f64s>,
-    edge_dir: Vec<S::f64s>,
+    /// `(t, l)`.
+    tl: Vec<S::f64s>,
+    /// Every seed's edge and its `(c_a, c_l)`, see [`SeedCotangent`].
+    edges: Vec<Option<usize>>,
+    edge_values: Vec<S::f64s>,
 }
 
 /// One Jacobian row of variable `i`'s residuals in its parameters
@@ -182,20 +183,19 @@ impl FisherResiduals {
             .into_par_iter()
             .map_init(
                 || BlockScratch {
-                    units: self.unit_state(simd),
+                    units: self.local_state(simd),
                     jets: JetArena::new(simd),
                     rows: Vec::new(),
                     edge_a: Vec::with_capacity(self.graph.max_parent()),
-                    curvature: DenseCurvature::new(simd, self.conditioner.n_par),
+                    derivatives: TransformerDerivatives::new(simd, self.conditional.n_coefs()),
                     seeds: SeedProducts {
                         pi_jac: Vec::new(),
                         hess_t_jac: Vec::new(),
                         hess_l_jac: Vec::new(),
                         pi_bar: Vec::new(),
-                        unit_bar: Vec::new(),
-                        unit_t: vec![zero; self.conditioner.n_unit],
-                        unit_l: vec![zero; self.conditioner.n_unit],
-                        edge_dir: vec![zero; self.conditioner.n_par],
+                        tl: Vec::new(),
+                        edges: Vec::new(),
+                        edge_values: Vec::new(),
                     },
                 },
                 |b, i| self.variable_blocks(simd, lin, &stores, n_store, i, max_block_size, b),
@@ -208,19 +208,27 @@ impl FisherResiduals {
     /// (`n_theta = |theta_i|` each): `a = dx_i/dtheta_i`, then the `n_s = 1 +
     /// n_p` rows of `B' = B + alpha a` (see [`Self::variable_blocks`]);
     /// `n_col` in all.
+    ///
+    /// Each Jacobian row is the local pullback (see `local_pullback`) of one
+    /// seed `(x_bar, delta_bar, mu_bar)` plus, for an edge `j`, the one-hot
+    /// cotangents `c_a e_j` on `A[i, :]` and `c_l e_j` on `L[i, :]`. These
+    /// reach `t` and `l` as `t_bar = c_a C e_j` and `l_bar = c_l C e_j`, so
+    /// all seeds together need `C` and `H[pi, pi] C` once, and the
+    /// conditioners' weight pullback of the whole stack of seeds.
     #[simd]
     fn block_rows<S: Simd>(
         &self,
         simd: S,
         i: usize,
-        theta: Params<f64>,
+        theta: &[f64],
         tile: usize,
         lin: &Linearization,
         b: &mut BlockScratch<S>,
     ) {
-        let shape = theta.shape;
-        let n_theta = shape.size();
-        let (n_p, n_s) = (shape.n_parent, shape.n_parent + 1);
+        let n_theta = theta.len();
+        let n_p = self.graph.n_parent(i);
+        let n_s = n_p + 1;
+        let n_par = self.conditional.n_coefs();
         let zero = S::f64s::splat(simd, 0.0);
 
         let BlockScratch {
@@ -228,17 +236,16 @@ impl FisherResiduals {
             jets,
             rows,
             edge_a,
-            curvature,
+            derivatives,
             seeds:
                 SeedProducts {
                     pi_jac,
                     hess_t_jac,
                     hess_l_jac,
                     pi_bar,
-                    unit_bar,
-                    unit_t,
-                    unit_l,
-                    edge_dir,
+                    tl,
+                    edges,
+                    edge_values,
                 },
         } = b;
         let y = &lin.data.y;
@@ -252,42 +259,31 @@ impl FisherResiduals {
         let w_i = lin.w.value(simd, tile, i);
         let delta_i = lin.delta.value(simd, tile, i);
 
-        self.conditioner.evaluate(simd, theta, units);
-        self.conditioner
-            .dense_curvature(simd, y_own, &units.pi, jets, curvature);
-        let DenseCurvature {
-            grad_t,
-            grad_l,
-            hess_t,
-            hess_l,
-        } = &*curvature;
-        let (n_unit, n_par) = (shape.n_unit, shape.n_par);
-        let skips = &self.conditioner.skips;
+        self.conditional.evaluate(simd, theta, units);
+        self.conditional
+            .transformer
+            .derivatives_tile(simd, jets, &units.pi, y_own, derivatives);
+        let TransformerDerivatives {
+            grad_x: grad_t,
+            grad_log_det: grad_l,
+            hess_x: hess_t,
+            hess_log_det: hess_l,
+            ..
+        } = &*derivatives;
         let (t, l) = (&grad_t[1..], &grad_l[1..]);
-
-        // Each Jacobian row is the local pullback (see `local_pullback`) of
-        // one seed `(x_bar, delta_bar, mu_bar)` plus, for an edge `j`, the
-        // one-hot cotangents `c_a e_j` on `A[i, :]` and `c_l e_j` on
-        // `L[i, :]`. Through the units these collapse onto the columns of
-        // `C = dpi/dy_parents = W2 diag(h') W1 diag(dz) + sum_k e_k s_k^T`,
-        // over the skips `s_k` into their fields `e_k`: `t_bar
-        // = c_a C e_j` and `l_bar = c_l C e_j`. So all seeds together need
-        // the products `C`, `H[pi, pi] C` and `W2^T pi_bar`.
         let seed = |col| Seed::of_column(col).cotangent(simd, w_i);
+        let conditioners = &self.conditional.conditioners;
 
         pi_jac.clear();
         pi_jac.resize(n_par * n_p, zero);
-        for u in 0..n_unit {
-            let (w1, w2) = (theta.w1(u), theta.w2(u));
-            let columns = pi_jac.chunks_exact_mut(n_par).zip(w1).zip(&units.dz);
-            for ((column, &w1), &dz) in columns {
-                axpy(simd, units.h1[u] * dz * w1, w2, column);
-            }
-        }
-        for (k, &field) in skips.iter().enumerate() {
-            for (column, &skip) in pi_jac.chunks_exact_mut(n_par).zip(theta.skip(k)) {
-                column[field] += skip;
-            }
+        if n_p > 0 {
+            conditioners.add_parent_jacobian_tile(
+                simd,
+                theta,
+                &units.y_parents,
+                &mut units.work,
+                pi_jac,
+            );
         }
 
         // `H[pi, pi] C`, from the packed lower triangles.
@@ -316,80 +312,47 @@ impl FisherResiduals {
         let n_col = 1 + n_s;
         pi_bar.clear();
         pi_bar.resize(n_col * n_par, zero);
+        edges.clear();
+        edge_values.clear();
         for (col, pi) in pi_bar.chunks_exact_mut(n_par).enumerate() {
             let cot = seed(col);
             for (m, value) in pi.iter_mut().enumerate() {
                 let r = packed_len(1 + m);
                 *value = cot.x * t[m] + cot.delta * hess_t[r] + cot.mu * hess_l[r];
             }
-            if let Some((j, c_a, c_l)) = cot.edge {
-                let column = j * n_par..(j + 1) * n_par;
-                axpy_lanes(simd, c_a, &hess_t_jac[column.clone()], pi);
-                axpy_lanes(simd, c_l, &hess_l_jac[column], pi);
+            match cot.edge {
+                Some((j, c_a, c_l)) => {
+                    let column = j * n_par..(j + 1) * n_par;
+                    axpy_lanes(simd, c_a, &hess_t_jac[column.clone()], pi);
+                    axpy_lanes(simd, c_l, &hess_l_jac[column], pi);
+                    edges.push(Some(j));
+                    edge_values.extend([c_a, c_l]);
+                }
+                None => {
+                    edges.push(None);
+                    edge_values.extend([zero, zero]);
+                }
             }
         }
 
-        unit_bar.clear();
-        unit_bar.resize(n_col * n_unit, zero);
-        for u in 0..n_unit {
-            let w2 = theta.w2(u);
-            unit_t[u] = dot(simd, w2, t);
-            unit_l[u] = dot(simd, w2, l);
-            for (col, pi) in pi_bar.chunks_exact(n_par).enumerate() {
-                unit_bar[col * n_unit + u] = dot(simd, w2, pi);
-            }
-        }
-
+        tl.clear();
+        tl.extend_from_slice(t);
+        tl.extend_from_slice(l);
         rows.clear();
         rows.resize(n_col * n_theta, zero);
-        let columns = rows
-            .chunks_exact_mut(n_theta)
-            .zip(pi_bar.chunks_exact(n_par));
-        for (col, (out, pi)) in columns.enumerate() {
-            let mut out = ParamsMut::new(out, shape);
-            let edge = seed(col).edge;
-            if let Some((_, c_a, c_l)) = edge {
-                for ((dir, &t), &l) in edge_dir.iter_mut().zip(t).zip(l) {
-                    *dir = c_a * t + c_l * l;
-                }
-            }
-            for u in 0..n_unit {
-                let (h, h1) = (units.h[u], units.h1[u]);
-                let mut a_bar = h1 * unit_bar[col * n_unit + u];
-                let out_w2 = out.w2(u);
-                for (out, &pi) in out_w2.iter_mut().zip(pi) {
-                    *out = h * pi;
-                }
-                // The edge cotangents' paths through `W1[u, j]`, which reach
-                // `A[i, j]` and `L[i, j]` through `dz[j]`.
-                let mut w1_direct = None;
-                if let Some((j, c_a, c_l)) = edge {
-                    let w1_dz = units.dz[j] * theta.w1(u)[j];
-                    let p = c_a * unit_t[u] + c_l * unit_l[u];
-                    a_bar += units.h2[u] * p * w1_dz;
-                    axpy_lanes(simd, h1 * w1_dz, &edge_dir[..], out_w2);
-                    w1_direct = Some((j, h1 * p * units.dz[j]));
-                }
-                let out_w1 = out.w1(u);
-                for (out, &z) in out_w1.iter_mut().zip(&units.z_parents) {
-                    *out = a_bar * z;
-                }
-                if let Some((j, value)) = w1_direct {
-                    out_w1[j] += value;
-                }
-                *out.b1(u) = a_bar;
-            }
-            out.b2().copy_from_slice(pi);
-            for (k, &field) in skips.iter().enumerate() {
-                let out_skip = out.skip(k);
-                for (out, &y) in out_skip.iter_mut().zip(&units.y_parents) {
-                    *out = pi[field] * y;
-                }
-                if let Some((j, c_a, c_l)) = edge {
-                    out_skip[j] += c_a * t[field] + c_l * l[field];
-                }
-            }
-        }
+        conditioners.pullback_weights_stack_tile(
+            simd,
+            theta,
+            &units.y_parents,
+            &mut units.work,
+            &SparseCotangents {
+                coefs_bar: Stack::new(pi_bar, n_col),
+                pulled_coefs_bar: Stack::new(tl, 2),
+                edges,
+                edge_values: Stack::new(edge_values, n_col),
+            },
+            StackMut::new(rows, n_col),
+        );
 
         // Row `i` of `J` is `alpha = (delta_i, A[i, P(i)])` on `S_i`, so
         // `e_i = J^{-T} E_i alpha` and the direct part folds into the
@@ -427,11 +390,10 @@ impl FisherResiduals {
         max_block_size: usize,
         b: &mut BlockScratch<S>,
     ) -> Vec<GnBlock> {
-        let shape = self.shape(i);
-        let n_theta = shape.size();
-        let n_p = shape.n_parent;
-        let n_s = n_p + 1;
         let theta = self.params_of(&lin.theta, i);
+        let n_theta = theta.len();
+        let n_p = self.graph.n_parent(i);
+        let n_s = n_p + 1;
 
         let mut blocks: Vec<GnBlock> = (0..n_theta)
             .step_by(max_block_size)

@@ -10,8 +10,8 @@ use crate::{
     progress::{IndicatifHandler, ProgressHandler, RawCallbackHandler},
     pyfunc::PyModel,
     pymc::{ExpandFunc, LogpFunc, PyMcModel},
-    triangular::lm::PyTriangularFlow,
-    triangular::transform::FlowTransform,
+    triangular::flow::PyTriangularFlow,
+    triangular::sampler::FlowTransform,
 };
 
 #[cfg(feature = "stan")]
@@ -1900,13 +1900,17 @@ pub fn _lib(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyVariable>()?;
     m.add_class::<PyStorage>()?;
     m.add_class::<PyTrace>()?;
-    m.add_class::<crate::triangular::transform::PySparseTriangularTransform>()?;
-    m.add_class::<crate::triangular::transform::PyFlowTransform>()?;
+    m.add_class::<crate::triangular::sampler::PySparseTriangularTransform>()?;
+    m.add_class::<crate::triangular::sampler::PyFlowTransform>()?;
     m.add_class::<crate::triangular::lm::PyFisherResiduals>()?;
-    m.add_class::<crate::triangular::lm::PyTriangularFlow>()?;
+    m.add_class::<crate::triangular::flow::PyTriangularFlow>()?;
     m.add_class::<crate::triangular::lm::optimizer::PyLmOptimizer>()?;
     m.add_function(wrap_pyfunction!(
-        crate::triangular::transform::activation_for_testing,
+        crate::triangular::sampler::activation_for_testing,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        crate::triangular::transformer::py_transformer_layout,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(

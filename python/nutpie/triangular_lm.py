@@ -7,8 +7,12 @@ operators `lmopt` needs: ``J v``, ``J^T r``, ``J^T J v`` and the exact
 Gauss-Newton blocks.
 
 Parameters live in a flat vector with one contiguous slice per variable, no
-buckets and no padding (see the Rust module). `pack_params` and
-`unpack_params` convert from and to the JAX map.
+buckets and no padding (see the Rust module), for the conditioners of
+`jax_conditioners`: a constant (the JAX output bias), a linear conditioner
+(the skips) and an MLP (the JAX MLP without its output bias). `pack_params`
+and `unpack_params` convert from and to the JAX map. A variable without
+parents has no MLP weights in Rust: its JAX MLP's output is a constant,
+which `pack_params` folds into the constant and `unpack_params` zeroes.
 
 Usage::
 
@@ -30,6 +34,7 @@ __all__ = [
     "check_supported",
     "fisher_divergence",
     "fit",
+    "jax_conditioners",
     "make_residuals",
     "map_data",
     "pack_params",
@@ -86,10 +91,14 @@ def _parents(tmap):
     return parents
 
 
-def _pack(tmap, conditioners):
+def _pack(tmap, conditioners, *, fold_roots, root_w2=None):
     """The flat parameter vector of `conditioners` (shaped like
-    ``tmap.conditioners``), in the Rust layout."""
+    ``tmap.conditioners``), in the Rust layout of `jax_conditioners`. With
+    `fold_roots`, a variable without parents gets its MLP's constant output
+    in its constant; `root_w2` collects those variables' output weights."""
     (dim,) = tmap.shape
+    location = int(tmap.conditioners[0].location_index)
+    scale = tmap.conditioners[0].scale_index
     slices = [None] * dim
     for bucket, conditioner in enumerate(conditioners):
         first, second = conditioner.mlp.layers
@@ -105,21 +114,30 @@ def _pack(tmap, conditioners):
         )
         members = np.asarray(tmap.bucket_members[bucket])
         parent_indices = np.asarray(tmap.bucket_parent_indices[bucket])
+        n_unit = w1.shape[1]
         for local, variable in enumerate(members):
             n_parent = int(np.sum(parent_indices[local] < dim))
-            # Real parents fill the leading input slots.
-            units = np.concatenate(
-                [
-                    w1[local][:, :n_parent],
-                    b1[local][:, None],
-                    w2[local].T,
-                ],
-                axis=1,
-            )
-            skips = [skip[local, :n_parent]]
-            if scale_skip is not None:
-                skips.append(scale_skip[local, :n_parent])
-            slices[int(variable)] = np.concatenate([units.ravel(), b2[local], *skips])
+            constant = b2[local]
+            if n_parent == 0:
+                if fold_roots and n_unit:
+                    hidden = np.asarray(conditioner.mlp.activation(b1[local]))
+                    constant = constant + w2[local] @ hidden
+                if root_w2 is not None:
+                    root_w2.append(w2[local].ravel())
+            # The linear conditioner's rows in coefficient order.
+            rows = [(location, skip[local, :n_parent])]
+            if scale is not None:
+                rows.append((int(scale), scale_skip[local, :n_parent]))
+            rows.sort(key=lambda row: row[0])
+            parts = [constant, *(row for _, row in rows)]
+            if n_parent:
+                # Real parents fill the leading input slots.
+                units = np.concatenate(
+                    [w1[local][:, :n_parent], b1[local][:, None], w2[local].T],
+                    axis=1,
+                )
+                parts.append(units.ravel())
+            slices[int(variable)] = np.concatenate(parts)
     return np.concatenate(slices)
 
 
@@ -133,28 +151,33 @@ def _flat_conditioners(tmap):
 
 
 def param_index(tmap):
-    """``index`` with ``pack_params(tmap) == flat[index]``, where `flat` is
-    the `ravel_pytree` of the conditioners' arrays."""
+    """``(index, roots)``: ``pack_params(tmap) == flat[index]`` where `flat`
+    is the `ravel_pytree` of the conditioners' arrays, but for the constants
+    of the variables without parents, and `roots` the entries of those
+    variables' MLP output weights."""
     flat, unravel = _flat_conditioners(tmap)
-    labels = _pack(tmap, unravel(np.arange(flat.size, dtype=np.float64)))
-    return labels.astype(np.int64)
+    labels = unravel(np.arange(flat.size, dtype=np.float64))
+    roots = []
+    index = _pack(tmap, labels, fold_roots=False, root_w2=roots)
+    roots = np.concatenate(roots) if roots else np.zeros(0)
+    return index.astype(np.int64), roots.astype(np.int64)
 
 
 def pack_params(tmap):
     """The conditioner parameters of `tmap` in the Rust layout."""
     check_supported(tmap)
-    return np.asarray(_pack(tmap, tmap.conditioners), dtype=np.float64)
+    return np.asarray(_pack(tmap, tmap.conditioners, fold_roots=True), dtype=np.float64)
 
 
 def unpack_params(tmap, theta, index=None):
-    """`tmap` with its conditioners set from `theta`. Differentiable in
-    `theta`; padded parent slots keep their (inert) values."""
+    """`tmap` with its conditioners set from `theta`, and the output weights
+    of variables without parents zero. Differentiable in `theta`; padded
+    parent slots keep their (inert) values. `index` is `param_index(tmap)`."""
     import equinox as eqx
 
     flat, unravel = _flat_conditioners(tmap)
-    if index is None:
-        index = param_index(tmap)
-    conditioners = unravel(flat.at[index].set(theta))
+    index, roots = param_index(tmap) if index is None else index
+    conditioners = unravel(flat.at[index].set(theta).at[roots].set(0.0))
     return eqx.tree_at(lambda m: m.conditioners, tmap, conditioners)
 
 
@@ -175,9 +198,29 @@ def map_data(flow, draws, grads):
     return tmap, np.asarray(y, dtype=np.float64), np.asarray(g, dtype=np.float64)
 
 
-def make_residuals(tmap, y=None, g=None):
+def jax_conditioners(
+    tmap, *, mlp_ridge=0.0, skip_ridge=0.0, scale_skip_ridge=0.0, shape_ridge=0.0
+):
+    """The Rust conditioners of `tmap`'s (see `default_conditioners`): its
+    MLP's width, activation and input squash, its skips, and the ridges."""
+    from nutpie.triangular_flow import default_conditioners
+
+    first, _ = tmap.conditioners[0].mlp.layers
+    return default_conditioners(
+        int(first.out_features),
+        _activation(tmap),
+        input_squash=tmap.input_squash,
+        scale_skip=tmap.conditioners[0].scale_index is not None,
+        mlp_ridge=mlp_ridge,
+        skip_ridge=skip_ridge,
+        scale_skip_ridge=scale_skip_ridge,
+        shape_ridge=shape_ridge,
+    )
+
+
+def make_residuals(tmap, y=None, g=None, **ridges):
     """A `FisherResiduals` for `tmap` (unwrapped), with data `y`, `g` if
-    given (see `map_data`)."""
+    given (see `map_data`), and the ridges of `jax_conditioners`."""
     from nutpie._lib import FisherResiduals
     from nutpie.triangular_layout import _probe_transformer, transformer_dicts
 
@@ -190,21 +233,18 @@ def make_residuals(tmap, y=None, g=None):
         np.concatenate(parents).astype(np.int64) if dim else np.zeros(0, np.int64)
     )
 
-    first, second = tmap.conditioners[0].mlp.layers
-    n_unit = int(first.out_features)
+    _, second = tmap.conditioners[0].mlp.layers
     n_par = int(second.out_features)
-    specs = _probe_transformer(tmap.transformer_constructor, n_par)
+    configs = _probe_transformer(tmap.transformer_constructor, n_par)
 
     problem = FisherResiduals(
         parent_indptr=parent_indptr,
         parent_index=parent_index,
-        n_unit=n_unit,
+        transformer=transformer_dicts(configs),
         n_par=n_par,
         location_index=int(tmap.conditioners[0].location_index),
         scale_index=tmap.conditioners[0].scale_index,
-        transformer=transformer_dicts(specs),
-        input_squash=tmap.input_squash,
-        activation=_activation(tmap),
+        conditioners=jax_conditioners(tmap, **ridges),
     )
     if y is not None:
         problem.set_data(

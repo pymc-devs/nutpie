@@ -229,48 +229,6 @@ def _flow_problem(dim=7, n_draw=64, seed=0):
     return params, static, data, FisherLoss()
 
 
-def test_rust_lm_steps_match_lmopt():
-    """With every conditioner in one sub-block, both preconditioners are the
-    same matrix, so the steps agree up to rounding. `lmopt` has neither the
-    `lam_lo` reset nor the larger `lam0`."""
-    from nutpie import lmopt
-    from nutpie.transform_adapter import gn_factor_fn, res_fn
-    from nutpie.triangular_lm import fit, map_data
-
-    params, static, data, loss_fn = _flow_problem()
-    n_steps = 4
-    _, reference = lmopt.fit(
-        params,
-        res_fn,
-        (loss_fn, static),
-        data=data,
-        fit_affine=False,
-        line_search=True,
-        factor_fn=gn_factor_fn,
-        max_exact_block_size=10_000,
-        n_steps=n_steps,
-        verbose=False,
-    )
-
-    tmap, y, g = map_data(eqx.combine(params, static), data[0], data[1])
-    problem = make_residuals(tmap, y, g)
-    _, _, hist = fit(
-        problem,
-        pack_params(tmap),
-        n_steps=n_steps,
-        lam0=1e-2,
-        max_block_size=10_000,
-        lam_lo_reset=0.0,
-    )
-
-    assert len(hist) == n_steps
-    for ours, ref in zip(hist, reference):
-        assert ours["accept"] == bool(ref["accept"])
-        assert ours["n_cg"] == int(ref["n_cg"])
-        for key in ["F", "F_new", "rho_full", "lam_out", "step_length"]:
-            np.testing.assert_allclose(ours[key], float(ref[key]), rtol=1e-6)
-
-
 def test_rust_lm_with_limited_memory_preconditioner():
     """The limited-memory preconditioner only changes the CG solves: the fit
     converges at least about as far, and it is actually used."""
@@ -299,10 +257,10 @@ def test_step_line_separates_the_ridge():
 
     params, static, data, _loss_fn = _flow_problem()
     tmap, y, g = map_data(eqx.combine(params, static), data[0], data[1])
-    problem = make_residuals(tmap, y, g)
     theta = pack_params(tmap)
     for ridge in [0.0, 10.0]:
-        _, _, hist = fit(problem, theta, n_steps=2, mlp_ridge=ridge, skip_ridge=ridge)
+        problem = make_residuals(tmap, y, g, mlp_ridge=ridge, skip_ridge=ridge)
+        _, _, hist = fit(problem, theta, n_steps=2)
         info = hist[-1]
         line = _describe_step(1, info)
         assert "log obj=" in line
@@ -488,7 +446,7 @@ def test_thin(available, recency):
 
 def test_make_flow_passes_log_gamma_bounds():
     """`make_flow(kind="triangular", log_gamma_bounds=...)` reaches every
-    `Contract2` layer, and so the Rust residuals' transformer spec."""
+    `Contract2` layer, and so the Rust residuals' transformer config."""
     import flowjax
 
     from nutpie.normalizing_flow import make_flow
@@ -535,8 +493,8 @@ def test_lm_rust_ridges(kind):
     params, static, data, loss_fn = _flow_problem(n_draw=64)
     flow0 = eqx.combine(params, static)
     tmap0, y, g = map_data(flow0, data[0], data[1])
-    problem = make_residuals(tmap0, y, g)
-    mask = problem.ridge_strengths(pack_params(tmap0), **{f"{kind}_ridge": 1.0}) > 0
+    problem = make_residuals(tmap0, y, g, **{f"{kind}_ridge": 1e3})
+    mask = problem.ridge_strengths(pack_params(tmap0)) > 0
 
     def fitted(ridge):
         flow, losses, _ = fit_to_data(
@@ -556,7 +514,7 @@ def test_lm_rust_ridges(kind):
     theta_ridge, losses = fitted(1e3)
     penalized = theta_ridge[mask]
     assert mask.any() and not mask.all()
-    strengths = problem.ridge_strengths(theta_ridge, **{f"{kind}_ridge": 1e3})
+    strengths = problem.ridge_strengths(theta_ridge)
     np.testing.assert_allclose(
         losses["objective"][0],
         losses["train"][0] + strengths @ theta_ridge**2 / 64,

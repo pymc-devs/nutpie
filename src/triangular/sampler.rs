@@ -1,4 +1,6 @@
-//! Forward-only `SparseTriangularMap::transform_and_log_det`.
+//! The sampler's transform: the flow's generative direction
+//! (`SparseTriangularMap::transform_and_log_det`) and the pullback of a
+//! gradient through it, for the leapfrog step.
 //!
 //! Ancestral sampling through the sparse triangular flow is the one genuinely
 //! sequential piece of a leapfrog step: a conditioner cannot run until the
@@ -32,9 +34,9 @@ use rayon::prelude::*;
 use serde::Deserialize;
 use smallvec::SmallVec;
 
-use super::layers::scalar::{transform_element, transform_element_with_grads};
-use super::layers::{Layer, LayerSpec};
 use super::pattern::{Children, Offsets, Pattern, Ragged};
+use super::transformer::layers::LayerConfig;
+use super::transformer::{AnyTransformer, LayerChain, Transformer};
 
 /// Scratch space for one conditioner evaluation. Sized for the common case
 /// (parent counts and hidden widths in the tens); wider maps spill to the heap.
@@ -895,6 +897,7 @@ struct Scratchpad {
     /// before they are chained to one per parent.
     feature_y: Scratch,
     feature_l: Scratch,
+    transformer: <AnyTransformer as Transformer>::Scratch,
 }
 
 impl Scratchpad {
@@ -916,6 +919,7 @@ impl Scratchpad {
             edge_l: SmallVec::from_elem(0.0, parents),
             feature_y: SmallVec::from_elem(0.0, parents * transform.feature_degree.max(1)),
             feature_l: SmallVec::from_elem(0.0, parents * transform.feature_degree.max(1)),
+            transformer: transform.transformer.new_scratch(),
         }
     }
 }
@@ -954,7 +958,7 @@ pub struct TriangularTransform {
     features: Vec<Cell>,
     feature_derivs: Vec<Cell>,
     activation: Activation,
-    layers: Vec<Layer>,
+    transformer: AnyTransformer,
     /// The variables of each level; concatenated, an evaluation order.
     levels: Ragged<u32>,
     /// For [`Schedule::Levels`]: whether each level is worth handing to the
@@ -1056,13 +1060,15 @@ impl TriangularTransform {
         }
 
         if !TAPE {
-            let result = transform_element(&self.layers, &pad.acc[..self.num_params], x);
+            let result = self
+                .transformer
+                .forward_draw(&pad.acc[..self.num_params], x);
             self.store_features(variable, result.0);
             return result;
         }
 
-        let (value, log_det, dy_dx, dld_dx) = transform_element_with_grads(
-            &self.layers,
+        let (value, log_det, dy_dx, dld_dx) = self.transformer.forward_draw_with_grads(
+            &mut pad.transformer,
             &pad.acc[..self.num_params],
             x,
             &mut pad.dy_dtheta,
@@ -1407,8 +1413,13 @@ fn build_transform(
     min_parallel_work: i64,
     schedule: &str,
 ) -> Result<TriangularTransform> {
-    let specs: Vec<LayerSpec> = pythonize::depythonize(transformer)?;
-    build_transform_from_specs(
+    // A layout probed from a JAX map; the skips carry their own indices.
+    let configs: Vec<LayerConfig> = pythonize::depythonize(transformer)?;
+    let n_coefs = layer_out
+        .last()
+        .and_then(|&n| usize::try_from(n).ok())
+        .ok_or_else(|| anyhow::anyhow!("conditioners must have at least one layer"))?;
+    build_transform_with(
         parent_indptr,
         parent_index,
         blob,
@@ -1421,7 +1432,7 @@ fn build_transform(
         feature_params,
         input_squash,
         activation,
-        specs,
+        LayerChain::new(configs, n_coefs, None, None)?,
         level_ptr,
         level_vars,
         level_work,
@@ -1430,10 +1441,10 @@ fn build_transform(
     )
 }
 
-/// [`build_transform`], with the transformer's layers already deserialized:
-/// for maps built in Rust (`nutpie.triangular_flow`).
+/// [`build_transform`], with the transformer already built: for maps built
+/// in Rust (`nutpie.triangular_flow`).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn build_transform_from_specs(
+pub(crate) fn build_transform_with(
     parent_indptr: &[i64],
     parent_index: &[i64],
     blob: &[f64],
@@ -1446,7 +1457,7 @@ pub(crate) fn build_transform_from_specs(
     feature_params: &[f64],
     input_squash: Option<f64>,
     activation: &str,
-    specs: Vec<LayerSpec>,
+    transformer: AnyTransformer,
     level_ptr: &[i64],
     level_vars: &[i64],
     level_work: &[i64],
@@ -1465,11 +1476,6 @@ pub(crate) fn build_transform_from_specs(
         from_tag(activation).map_err(|_| anyhow::anyhow!("unknown activation {activation:?}"))?;
     let schedule: Schedule =
         from_tag(schedule).map_err(|_| anyhow::anyhow!("unknown schedule {schedule:?}"))?;
-
-    let layers = specs
-        .into_iter()
-        .map(Layer::new)
-        .collect::<Result<Vec<_>>>()?;
 
     let parents: Pattern<u32> = Pattern::from_i64(parent_indptr, parent_index)?;
     let weights = Ragged::new(Offsets::from_i64(blob_offset)?, blob.to_vec())?;
@@ -1497,6 +1503,12 @@ pub(crate) fn build_transform_from_specs(
     let children = parents.children();
 
     let num_params = *layer_out.last().expect("checked non-empty");
+    if transformer.n_coefs() != num_params {
+        bail!(
+            "the conditioners have {num_params} outputs, the transformer {} coefficients",
+            transformer.n_coefs()
+        );
+    }
     if skip_weight.len() != parents.n_edge() {
         bail!("skip_weight must have one entry per parent_index entry");
     }
@@ -1564,7 +1576,7 @@ pub(crate) fn build_transform_from_specs(
         features: Cell::zeros(n_variables * feature_degree),
         feature_derivs: Cell::zeros(n_variables * feature_degree),
         activation,
-        layers,
+        transformer,
         levels,
         level_parallel,
         schedule,

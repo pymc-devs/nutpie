@@ -14,9 +14,9 @@ from typing import ClassVar
 import numpy as np
 
 __all__ = [
-    "Contract2Spec",
-    "PositiveAffineSpec",
-    "TangentSASSpec",
+    "Contract2Config",
+    "PositiveAffineConfig",
+    "TangentSASConfig",
     "TriangularLayout",
     "extract_layout",
     "transformer_dicts",
@@ -27,13 +27,13 @@ __all__ = [
 _TRANSFORMER_WORK_PER_LAYER = 100
 
 
-# Each spec field is `None` or ``(index, offset)``, meaning
+# Each config field is `None` or ``(index, offset)``, meaning
 # ``field = conditioner_output[index] + offset``. `kind` is the tag the Rust
 # side dispatches on, and `FIELDS` lists the probed fields.
 
 
 @dataclass(frozen=True)
-class Contract2Spec:
+class Contract2Config:
     """One `Contract2` layer."""
 
     kind: ClassVar[str] = "contract2"
@@ -48,7 +48,7 @@ class Contract2Spec:
 
 
 @dataclass(frozen=True)
-class TangentSASSpec:
+class TangentSASConfig:
     """One `TangentSAS` layer."""
 
     kind: ClassVar[str] = "tangent_sas"
@@ -61,7 +61,7 @@ class TangentSASSpec:
 
 
 @dataclass(frozen=True)
-class AsymmetricSASSpec:
+class AsymmetricSASConfig:
     """One `AsymmetricSAS` layer."""
 
     kind: ClassVar[str] = "asymmetric_sas"
@@ -75,7 +75,7 @@ class AsymmetricSASSpec:
 
 
 @dataclass(frozen=True)
-class PositiveAffineSpec:
+class PositiveAffineConfig:
     """One `PositiveAffine` layer."""
 
     kind: ClassVar[str] = "positive_affine"
@@ -85,14 +85,14 @@ class PositiveAffineSpec:
     scale: tuple[int, float] | None
 
 
-def transformer_dicts(specs) -> list[dict]:
-    """`specs` as the dicts the Rust constructors deserialize."""
+def transformer_dicts(configs) -> list[dict]:
+    """`configs` as the dicts the Rust constructors deserialize."""
     out = []
-    for spec in specs:
-        layer = {"kind": spec.kind}
-        for field in dataclasses.fields(spec):
-            value = getattr(spec, field.name)
-            if field.name in spec.FIELDS:
+    for config in configs:
+        layer = {"kind": config.kind}
+        for field in dataclasses.fields(config):
+            value = getattr(config, field.name)
+            if field.name in config.FIELDS:
                 # Rust's `Param` is a struct, so pass (index, offset) as a map.
                 value = (
                     None
@@ -150,7 +150,7 @@ class TriangularLayout:
     feature_params: np.ndarray
     input_squash: float | None
     activation: str
-    transformer: tuple[Contract2Spec | TangentSASSpec | PositiveAffineSpec, ...]
+    transformer: tuple[Contract2Config | TangentSASConfig | PositiveAffineConfig, ...]
     level_ptr: np.ndarray
     level_vars: np.ndarray
     level_work: np.ndarray
@@ -197,8 +197,8 @@ def _is_identity(fn) -> bool:
 
 
 def _chain_layers(transformer):
-    """The layers of a transformer, as ``(spec class, field values, extra
-    spec arguments)``."""
+    """The layers of a transformer, as ``(config class, field values, extra
+    config arguments)``."""
     from flowjax import bijections
 
     from nutpie.normalizing_flow import (
@@ -219,14 +219,17 @@ def _chain_layers(transformer):
     out = []
     for layer in layers:
         if isinstance(layer, Contract2):
-            spec, extra = Contract2Spec, {"log_gamma_bounds": layer.log_gamma_bounds}
+            config, extra = (
+                Contract2Config,
+                {"log_gamma_bounds": layer.log_gamma_bounds},
+            )
         elif isinstance(layer, TangentSAS):
-            spec, extra = TangentSASSpec, {}
+            config, extra = TangentSASConfig, {}
         elif isinstance(layer, AsymmetricSAS):
-            spec = AsymmetricSASSpec
+            config = AsymmetricSASConfig
             extra = {"log_gamma_bounds": layer.log_gamma_bounds}
         elif isinstance(layer, PositiveAffine):
-            spec, extra = PositiveAffineSpec, {}
+            config, extra = PositiveAffineConfig, {}
         else:
             raise NotImplementedError(
                 "The compiled transforms only support transformers built from "
@@ -235,10 +238,10 @@ def _chain_layers(transformer):
                 f"{type(layer).__name__}."
             )
         values = {}
-        for field in spec.FIELDS:
+        for field in config.FIELDS:
             value = getattr(layer, field)
             values[field] = None if value is None else float(np.asarray(value))
-        out.append((spec, values, extra))
+        out.append((config, values, extra))
     return out
 
 
@@ -286,8 +289,8 @@ def _probe_transformer(constructor, num_params):
                     )
                 index_map[layer][field] = (k, base_values[field])
 
-    specs = []
-    for layer, (fields, (spec, _values, extra)) in enumerate(zip(index_map, base)):
+    configs = []
+    for layer, (fields, (config, _values, extra)) in enumerate(zip(index_map, base)):
         for field, (index, _offset) in fields.items():
             if index is None:
                 raise NotImplementedError(
@@ -297,10 +300,10 @@ def _probe_transformer(constructor, num_params):
         bounds = extra.get("log_gamma_bounds")
         if bounds is not None:
             extra = {**extra, "log_gamma_bounds": tuple(map(float, bounds))}
-        specs.append(
-            spec(**{field: fields.get(field) for field in spec.FIELDS}, **extra)
+        configs.append(
+            config(**{field: fields.get(field) for field in config.FIELDS}, **extra)
         )
-    return tuple(specs)
+    return tuple(configs)
 
 
 def extract_layout(flow_map) -> TriangularLayout:

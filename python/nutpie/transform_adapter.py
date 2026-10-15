@@ -653,12 +653,18 @@ def _fit_lm_rust(
     flow = eqx.combine(params, static)
     draws, grads, *_ = data
     tmap, y, g = map_data(flow, draws, grads)
-    problem = make_residuals(tmap, y, g)
+    ridges = {
+        "mlp_ridge": mlp_ridge,
+        "skip_ridge": skip_ridge,
+        "scale_skip_ridge": scale_skip_ridge,
+        "shape_ridge": shape_ridge,
+    }
+    problem = make_residuals(tmap, y, g, **ridges)
     val_problem = None
     if val_data is not None:
         val_draws, val_grads, *_ = val_data
         _, val_y, val_g = map_data(flow, val_draws, val_grads)
-        val_problem = make_residuals(tmap, val_y, val_g)
+        val_problem = make_residuals(tmap, val_y, val_g, **ridges)
     theta, losses, lam, n_steps, n_accepted = _run_lm(
         problem,
         pack_params(tmap),
@@ -676,10 +682,6 @@ def _fit_lm_rust(
         should_stop=should_stop,
         val_problem=val_problem,
         early_stopping=early_stopping,
-        mlp_ridge=mlp_ridge,
-        skip_ridge=skip_ridge,
-        scale_skip_ridge=scale_skip_ridge,
-        shape_ridge=shape_ridge,
         linear_fit=linear_fit,
     )
 
@@ -1865,7 +1867,7 @@ def make_transform_adapter(
     window_size=512,
     show_progress=False,
     nn_depth=None,
-    nn_width=16,
+    nn_width=4,
     num_layers=8,
     num_diag_windows=9,
     learning_rate=5e-4,
@@ -1938,6 +1940,7 @@ def make_transform_adapter(
     linear_fits=1,
     refit_diag=False,
     rust_flow=True,
+    conditioners=None,
 ):
     """The adapter for `nutpie.sample`'s ``transform_adapt``.
 
@@ -2013,9 +2016,17 @@ def make_transform_adapter(
     it) is measured against the conditional's width, refreshed every LM
     step. All are ridges on the sum over the draws, so they weaken as the
     windows grow.
+
+    With ``rust_flow``, ``conditioners`` (a list of ``{"kind": ...}``
+    dicts, see `nutpie.triangular_flow.default_conditioners`) sets each
+    variable's conditioners and their ridges directly; then ``nn_width``,
+    ``activation``, ``input_squash``, ``scale_skip``, ``zero_init`` and the
+    ``lm_*_ridge`` arguments are not used.
     """
     if refit_diag and not rust_flow:
         raise ValueError("refit_diag is only supported with rust_flow=True.")
+    if conditioners is not None and not rust_flow:
+        raise ValueError("conditioners is only supported with rust_flow=True.")
     if rust_flow:
         from nutpie.triangular_adapter import TriangularFlowAdapter
 
@@ -2075,6 +2086,7 @@ def make_transform_adapter(
             lm_max_exact_block_size=lm_max_exact_block_size,
             lm_lmp_size=lm_lmp_size,
             lm_lmp_tol=lm_lmp_tol,
+            conditioners=conditioners,
         )
 
     if extension_windows is None:

@@ -1,28 +1,34 @@
-//! The inverted transformer chain on jets, see [`crate::triangular::jet`].
+//! The inverted layer chain on jets, see [`crate::triangular::transformer::jet`].
 //!
 //! Each layer's `*_inverse` mirrors its Python `inverse_and_log_det`, with
 //! the same variable names, and returns the jets of its output and log
-//! determinant. `ws` is the [`JetArena`] every jet lives in, and `fields`
-//! makes the layer's parameters, entries of `pi`, into jet inputs.
+//! determinant. `ws` is the [`JetArena`] every jet lives in, and `coefs`
+//! makes the layer's fields, entries of the coefficients, into jet inputs.
 
 use fearless_simd::prelude::*;
-use fearless_simd_macros::simd;
 
 use super::{
-    AsymmetricSas, Contract2, Layer, LogGammaBound, Param, PositiveAffineSpec, TangentSasSpec,
+    AsymmetricSas, Contract2, Layer, LogGammaBound, Param, PositiveAffineConfig, TangentSasConfig,
 };
-use crate::triangular::jet::{Jet, JetArena};
+use crate::triangular::transformer::jet::{Jet, JetArena};
 
-/// The transformer parameters `pi` of one variable as jet inputs.
-struct Fields<'a, S: Simd> {
-    pi: &'a [S::f64s],
+/// A transformer's coefficients as jet inputs: coefficient `k` is input `1 +
+/// k` of `z = (y, coefs)`, along the directions `dirs` (`1 + values.len()`
+/// entries each, none for full Hessians).
+pub(crate) struct CoefJets<'a, S: Simd> {
+    values: &'a [S::f64s],
     dirs: &'a [S::f64s],
 }
 
-impl<S: Simd> Fields<'_, S> {
+impl<'a, S: Simd> CoefJets<'a, S> {
+    #[inline(always)]
+    pub(crate) fn new(values: &'a [S::f64s], dirs: &'a [S::f64s]) -> Self {
+        Self { values, dirs }
+    }
+
     #[inline(always)]
     fn get(&self, ws: &mut JetArena<S>, param: Option<Param>) -> Option<Jet> {
-        param.map(|p| ws.variable(self.pi[p.index] + p.offset, 1 + p.index, self.dirs))
+        param.map(|p| ws.variable(self.values[p.index] + p.offset, 1 + p.index, self.dirs))
     }
 
     #[inline(always)]
@@ -57,7 +63,7 @@ fn log_gamma<S: Simd>(ws: &mut JetArena<S>, alpha: Jet, bound: Option<LogGammaBo
 impl Contract2 {
     /// `Contract2.inverse_and_log_det`.
     #[inline(always)]
-    fn inverse<S: Simd>(&self, ws: &mut JetArena<S>, fields: &Fields<S>, x: Jet) -> (Jet, Jet) {
+    fn inverse<S: Simd>(&self, ws: &mut JetArena<S>, fields: &CoefJets<S>, x: Jet) -> (Jet, Jet) {
         let log_gamma = fields
             .get(ws, self.alpha)
             .map(|alpha| log_gamma(ws, alpha, self.bound));
@@ -132,9 +138,9 @@ impl Contract2 {
 /// `1 / r = positive(-r_raw)`.
 #[inline(always)]
 fn tangent_sas_inverse<S: Simd>(
-    layer: &TangentSasSpec,
+    layer: &TangentSasConfig,
     ws: &mut JetArena<S>,
-    fields: &Fields<S>,
+    fields: &CoefJets<S>,
     x: Jet,
 ) -> (Jet, Jet) {
     let nu = fields.get_or_zero(ws, layer.nu);
@@ -192,7 +198,7 @@ impl AsymmetricSas {
     /// `q = gamma y` and `t = asinh(q) / gamma`, `x = c + sinh(t) /
     /// scale_mod` and `log_det = logcosh(t) - log scale_mod - 0.5 log1p(q^2)`.
     #[inline(always)]
-    fn inverse<S: Simd>(&self, ws: &mut JetArena<S>, fields: &Fields<S>, y: Jet) -> (Jet, Jet) {
+    fn inverse<S: Simd>(&self, ws: &mut JetArena<S>, fields: &CoefJets<S>, y: Jet) -> (Jet, Jet) {
         let alpha_pos = fields.get_or_zero(ws, self.alpha_pos);
         let log_gamma_pos = log_gamma(ws, alpha_pos, self.bound);
         let alpha_neg = fields.get_or_zero(ws, self.alpha_neg);
@@ -238,9 +244,9 @@ impl AsymmetricSas {
 /// `1 / scale_mod = positive(-scale)`.
 #[inline(always)]
 fn positive_affine_inverse<S: Simd>(
-    layer: &PositiveAffineSpec,
+    layer: &PositiveAffineConfig,
     ws: &mut JetArena<S>,
-    fields: &Fields<S>,
+    fields: &CoefJets<S>,
     x: Jet,
 ) -> (Jet, Jet) {
     let centred = match fields.get(ws, layer.loc) {
@@ -260,55 +266,24 @@ fn positive_affine_inverse<S: Simd>(
     }
 }
 
-/// `T(y; pi)` and `Lambda(y; pi) = log |dT/dy|` of the inverted transformer
-/// chain (each layer's `inverse_and_log_det`, last layer first), as jets in
-/// `z = (y, pi)` along the `k` directions `dirs`, `1 + pi.len()` entries each.
-/// Resets `ws`, so earlier jets in it are invalid afterwards.
-#[simd]
-pub(crate) fn transformer<S: Simd>(
-    simd: S,
-    layers: &[Layer],
-    y: S::f64s,
-    pi: &[S::f64s],
-    dirs: &[S::f64s],
-    k: usize,
-    ws: &mut JetArena<S>,
-) -> (Jet, Jet) {
-    ws.reset(1 + pi.len(), k);
-    evaluate_transformer(simd, layers, y, pi, dirs, ws)
-}
-
-/// [`transformer`] with full Hessians, see [`JetArena::reset_hessian`].
-#[simd]
-pub(crate) fn transformer_hessian<S: Simd>(
-    simd: S,
-    layers: &[Layer],
-    y: S::f64s,
-    pi: &[S::f64s],
-    ws: &mut JetArena<S>,
-) -> (Jet, Jet) {
-    ws.reset_hessian(1 + pi.len());
-    evaluate_transformer(simd, layers, y, pi, &[], ws)
-}
-
+/// `x = T(y; coefs)` and `Lambda = log |dT/dy|` of the inverted chain (each
+/// layer's `inverse_and_log_det`, last layer first), as jets.
 #[inline(always)]
-fn evaluate_transformer<S: Simd>(
-    simd: S,
+pub(crate) fn inverse_chain<S: Simd>(
     layers: &[Layer],
-    y: S::f64s,
-    pi: &[S::f64s],
-    dirs: &[S::f64s],
     ws: &mut JetArena<S>,
+    coefs: &CoefJets<S>,
+    y: Jet,
 ) -> (Jet, Jet) {
-    let fields = Fields { pi, dirs };
-    let mut x = ws.variable(y, 0, dirs);
-    let mut log_det = ws.constant(S::f64s::splat(simd, 0.0));
+    let mut x = y;
+    let zero = ws.splat(0.0);
+    let mut log_det = ws.constant(zero);
     for layer in layers.iter().rev() {
         let (out, ld) = match layer {
-            Layer::Contract2(layer) => layer.inverse(ws, &fields, x),
-            Layer::TangentSas(layer) => tangent_sas_inverse(layer, ws, &fields, x),
-            Layer::AsymmetricSas(layer) => layer.inverse(ws, &fields, x),
-            Layer::PositiveAffine(layer) => positive_affine_inverse(layer, ws, &fields, x),
+            Layer::Contract2(layer) => layer.inverse(ws, coefs, x),
+            Layer::TangentSas(layer) => tangent_sas_inverse(layer, ws, coefs, x),
+            Layer::AsymmetricSas(layer) => layer.inverse(ws, coefs, x),
+            Layer::PositiveAffine(layer) => positive_affine_inverse(layer, ws, coefs, x),
         };
         x = out;
         log_det = ws.add(log_det, ld);
