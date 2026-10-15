@@ -550,6 +550,13 @@ def compile_stan_model(
     if backend not in ("bridgestan", "stanli"):
         raise ValueError(f"Unknown Stan backend {backend!r}")
 
+    if not hasattr(_lib, "StanModel"):
+        raise ImportError(
+            "Stan support is not enabled in this build of nutpie: the Rust "
+            "extension was built without the `stan` feature (this is the case "
+            "on wasm)."
+        )
+
     if dims is None:
         dims = {}
     if coords is None:
