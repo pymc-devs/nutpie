@@ -3,6 +3,8 @@ import pytest
 import scipy.sparse as sp
 
 jax = pytest.importorskip("jax")
+# `nutpie.normalizing_flow` and equinox come with the `nnflow` extra.
+pytest.importorskip("flowjax")
 
 import equinox as eqx
 import jax.numpy as jnp
@@ -16,6 +18,8 @@ from nutpie.triangular_lm import (
     param_index,
     unpack_params,
 )
+
+pytestmark = pytest.mark.flow
 
 
 def _blanket(dim, kind, rng):

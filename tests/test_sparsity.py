@@ -6,6 +6,8 @@ import scipy.sparse
 
 from nutpie.sparsity import _canonicalize, check_hessian_sparsity, factorize
 
+pytestmark = pytest.mark.flow
+
 ORDERS = ["amd", "natural"] + (["metis"] if find_spec("pymetis") else [])
 
 

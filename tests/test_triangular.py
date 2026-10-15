@@ -2,12 +2,16 @@ import numpy as np
 import pytest
 
 jax = pytest.importorskip("jax")
+# `nutpie.normalizing_flow` and equinox come with the `nnflow` extra.
+pytest.importorskip("flowjax")
 
 import equinox as eqx
 import jax.numpy as jnp
 
 from nutpie.normalizing_flow import _scale_last_layer, make_transformer
 from nutpie.triangular import LocationSkipMlp, SparseTriangularMap
+
+pytestmark = pytest.mark.flow
 
 
 def _banded(dim):

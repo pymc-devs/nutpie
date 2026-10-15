@@ -5,6 +5,8 @@ import numpy as np
 import pytest
 
 jax = pytest.importorskip("jax")
+# `nutpie.normalizing_flow` and equinox come with the `nnflow` extra.
+pytest.importorskip("flowjax")
 
 import equinox as eqx
 import jax.numpy as jnp
@@ -17,6 +19,8 @@ from nutpie.triangular_flow import (
     transformer_kind,
     transformer_layout,
 )
+
+pytestmark = pytest.mark.flow
 
 DIM = 7
 
