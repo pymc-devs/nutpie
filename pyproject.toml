@@ -19,6 +19,7 @@ dependencies = [
   "pyarrow >= 12.0.0",
   "arro3-core >= 0.6.0",
   "pandas >= 2.0",
+  "scipy >= 1.11",
   "platformdirs >= 3.0.0",
   "xarray >= 2025.01.2",
   "arviz >= 0.23.0,<2.0",
@@ -38,16 +39,17 @@ Repository = "https://github.com/pymc-devs/nutpie"
 stan = ["bridgestan >= 2.7.0", "stanio >= 0.5.1"]
 stanli = ["stanli", "stanio >= 0.5.1"]
 pymc = ["pymc >= 5.20.1", "numba >= 0.60.0"]
-pymc-jax = ["pymc >= 5.20.1", "jax >= 0.4.27"]
+pymc-jax = ["pymc >= 5.20.1", "jax >= 0.4.27", "asdex >= 0.5.2"]
 nnflow = ["flowjax >= 17.1.0", "equinox >= 0.11.12", "optimistix >= 0.1.0"]
 dev = [
   "bridgestan >= 2.7.0",
   "stanio >= 0.5.1",
   "pymc >= 5.20.1",
-  "scipy >= 1.11",
   "numba >= 0.60.0",
   "jax >= 0.4.27",
+  "asdex >= 0.5.2",
   "flowjax >= 17.0.2",
+  "matplotlib >= 3.8.0",
   "optimistix >= 0.1.0",
   "pytest",
   "pytest-timeout",
@@ -59,9 +61,11 @@ all = [
   "pymc >= 5.20.1",
   "numba >= 0.60.0",
   "jax >= 0.4.27",
+  "asdex >= 0.5.2",
   "flowjax >= 17.1.0",
   "equinox >= 0.11.12",
   "optimistix >= 0.1.0",
+  "matplotlib >= 3.8.0",
 ]
 docs = [
   "bridgestan >= 2.7.0",
@@ -69,6 +73,7 @@ docs = [
   "pymc >= 5.20.1",
   "numba >= 0.60.0",
   "jax >= 0.4.27",
+  "asdex >= 0.5.2",
   "flowjax >= 17.1.0",
   "equinox >= 0.11.12",
   "optimistix >= 0.1.0",

@@ -42,6 +42,11 @@ jobs:
             3.15
       - name: Build wheels
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        env:
+          # Old glibc headers hide `siginfo_t` from the vendored METIS
+          # (GKlib defines a bare `_XOPEN_SOURCE`).
+          CFLAGS_x86_64_unknown_linux_gnu: "-D_GNU_SOURCE"
+          CFLAGS_aarch64_unknown_linux_gnu: "-D_GNU_SOURCE"
         with:
           target: ${{ matrix.platform.target }}
           args: --release --out dist --interpreter 3.12 3.13 3.14 3.15 --zig
@@ -102,7 +107,7 @@ jobs:
               pytest -m "stan and not flow" --arraydiff
               ;;
             pymc)
-              uv pip install 'nutpie[pymc]' jax --constraint .github/uv-constraints-main.txt
+              uv pip install 'nutpie[pymc,pymc-jax]' --constraint .github/uv-constraints-main.txt
               pytest -m "pymc and not flow" --arraydiff
               ;;
             flow)
@@ -158,7 +163,11 @@ jobs:
       - name: Build wheels
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         env:
-          CARGO_TARGET_WASM32_UNKNOWN_EMSCRIPTEN_RUSTFLAGS: "-C link-arg=-sSIDE_MODULE=2"
+          CARGO_TARGET_WASM32_UNKNOWN_EMSCRIPTEN_RUSTFLAGS: "-C link-arg=-sSIDE_MODULE=2 -C link-arg=-sSUPPORT_LONGJMP=wasm"
+          # The vendored METIS needs the flags Pyodide builds C extensions
+          # with: cc-rs does not use -fPIC on wasm, but a side module needs
+          # it, and GKlib's setjmp must use wasm exceptions like Pyodide.
+          CFLAGS_wasm32_unknown_emscripten: "-fPIC -fwasm-exceptions -sSUPPORT_LONGJMP=wasm"
         with:
           target: ${{ matrix.platform.target }}
           args: --release --no-default-features --out dist -i ${{ env.PYTHON_VERSION }}
@@ -333,7 +342,7 @@ jobs:
               pytest -m "stan and not flow" --arraydiff
               ;;
             pymc)
-              uv pip install "nutpie[pymc]" jax --constraint .github/uv-constraints-main.txt
+              uv pip install "nutpie[pymc,pymc-jax]" --constraint .github/uv-constraints-main.txt
               pytest -m "pymc and not flow" --arraydiff
               ;;
             flow)
@@ -433,7 +442,7 @@ jobs:
               pytest -m "stan and not flow" --arraydiff
               ;;
             pymc)
-              uv pip install 'nutpie[pymc]' jax --constraint .github/uv-constraints-main.txt
+              uv pip install 'nutpie[pymc,pymc-jax]' --constraint .github/uv-constraints-main.txt
               pytest -m "pymc and not flow" --arraydiff
               ;;
             flow)

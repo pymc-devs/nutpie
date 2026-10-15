@@ -2031,6 +2031,10 @@ pub fn _lib(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
+        crate::triangular::symbolic::py_metis_order,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
         crate::triangular::symbolic::py_symbolic_fill,
         m
     )?)?;

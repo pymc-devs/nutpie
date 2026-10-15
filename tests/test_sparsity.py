@@ -1,5 +1,3 @@
-from importlib.util import find_spec
-
 import numpy as np
 import pytest
 import scipy.sparse
@@ -8,7 +6,7 @@ from nutpie.sparsity import _canonicalize, check_hessian_sparsity, factorize
 
 pytestmark = pytest.mark.flow
 
-ORDERS = ["amd", "natural"] + (["metis"] if find_spec("pymetis") else [])
+ORDERS = ["amd", "natural", "metis"]
 
 
 def star(n):
@@ -89,7 +87,6 @@ def test_hub_last_fills_everything():
     assert factorization.max_parents == 5
 
 
-@pytest.mark.skipif(find_spec("pymetis") is None, reason="needs pymetis")
 def test_metis_path_levels():
     # Nested dissection trades fill for fewer levels
     metis = factorize(path(31), order="metis")
@@ -141,7 +138,6 @@ def test_summaries():
     assert ("b", "b") not in by_variable.index
 
 
-@pytest.mark.skipif(find_spec("matplotlib") is None, reason="needs matplotlib")
 def test_plot_spy():
     import matplotlib
 

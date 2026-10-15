@@ -45,6 +45,50 @@ pub fn amd_order(indptr: &[usize], indices: &[usize]) -> Result<Vec<usize>> {
     Ok(perm)
 }
 
+/// METIS nested dissection elimination order of a graph. Separators are
+/// eliminated last.
+pub fn metis_order(indptr: &[usize], indices: &[usize]) -> Result<Vec<usize>> {
+    use metis_sys::idx_t;
+
+    let n = check_graph(indptr, indices)?;
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let to_idx =
+        |x: usize| idx_t::try_from(x).map_err(|_| anyhow::anyhow!("Graph too large for METIS"));
+    let mut xadj = indptr
+        .iter()
+        .map(|&x| to_idx(x))
+        .collect::<Result<Vec<_>>>()?;
+    let mut adjncy = indices
+        .iter()
+        .map(|&x| to_idx(x))
+        .collect::<Result<Vec<_>>>()?;
+    let mut nvtxs = to_idx(n)?;
+    let mut options = [0 as idx_t; metis_sys::METIS_NOPTIONS as usize];
+    let mut perm = vec![0 as idx_t; n];
+    let mut iperm = vec![0 as idx_t; n];
+    // SAFETY: the graph is a valid CSR adjacency with `n` vertices, and
+    // `perm` and `iperm` have length `n`. METIS does not keep the pointers.
+    let status = unsafe {
+        metis_sys::METIS_SetDefaultOptions(options.as_mut_ptr());
+        metis_sys::METIS_NodeND(
+            &mut nvtxs,
+            xadj.as_mut_ptr(),
+            adjncy.as_mut_ptr(),
+            std::ptr::null_mut(),
+            options.as_mut_ptr(),
+            perm.as_mut_ptr(),
+            iperm.as_mut_ptr(),
+        )
+    };
+    if status != metis_sys::rstatus_et_METIS_OK {
+        bail!("METIS_NodeND failed with status {status}");
+    }
+    // `perm[k]` is the vertex eliminated at step k.
+    Ok(perm.into_iter().map(|x| x as usize).collect())
+}
+
 /// Off-diagonal pattern of the Cholesky factor, when the variables are
 /// eliminated in the order `elim`.
 ///
@@ -131,6 +175,18 @@ pub fn py_amd_order<'py>(
     indices: PyReadonlyArray1<'py, i64>,
 ) -> Result<Bound<'py, PyArray1<i64>>> {
     let order = amd_order(&to_usize(indptr)?, &to_usize(indices)?)?;
+    Ok(to_numpy(py, order))
+}
+
+/// METIS nested dissection elimination order of the graph with CSR
+/// adjacency `indptr`, `indices`.
+#[pyfunction(name = "metis_order")]
+pub fn py_metis_order<'py>(
+    py: Python<'py>,
+    indptr: PyReadonlyArray1<'py, i64>,
+    indices: PyReadonlyArray1<'py, i64>,
+) -> Result<Bound<'py, PyArray1<i64>>> {
+    let order = metis_order(&to_usize(indptr)?, &to_usize(indices)?)?;
     Ok(to_numpy(py, order))
 }
 
@@ -243,6 +299,26 @@ mod tests {
         sorted.sort_unstable();
         assert_eq!(sorted, (0..n).collect::<Vec<_>>());
         let pairs = symbolic_fill(&indptr, &indices, &order).unwrap();
+        assert_eq!(pairs.len(), n - 1);
+    }
+
+    #[test]
+    fn metis_is_permutation_and_bisects_path() {
+        let n = 31;
+        let edges: Vec<_> = (1..n).map(|j| (j - 1, j)).collect();
+        let (indptr, indices) = csr(n, &edges);
+        let order = metis_order(&indptr, &indices).unwrap();
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..n).collect::<Vec<_>>());
+        // The top-level separator of a path is in the middle, not at an end.
+        let last = *order.last().unwrap();
+        assert!(last > 0 && last < n - 1);
+
+        let edges: Vec<_> = (1..n).map(|j| (0, j)).collect();
+        let (indptr, indices) = csr(n, &edges);
+        let pairs =
+            symbolic_fill(&indptr, &indices, &metis_order(&indptr, &indices).unwrap()).unwrap();
         assert_eq!(pairs.len(), n - 1);
     }
 }

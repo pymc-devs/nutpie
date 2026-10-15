@@ -109,7 +109,7 @@ class CompiledModel:
         It consists of a variable order and the pattern of the Cholesky
         factor with that order. The triangular flow uses it to decide which
         earlier variables each variable may depend on. Requires
-        :meth:`with_hessian_sparsity` first. The METIS order needs pymetis.
+        :meth:`with_hessian_sparsity` first.
 
         Parameters
         ----------

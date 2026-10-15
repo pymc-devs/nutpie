@@ -63,20 +63,6 @@ def _adjacency(graph):
     return graph.indptr.astype(np.int64), graph.indices.astype(np.int64)
 
 
-def _metis_order(graph):
-    try:
-        import pymetis
-    except ImportError as err:
-        raise ImportError(
-            "The METIS order requires pymetis. Please install it with something "
-            "like 'pip install pymetis', or use `order='amd'`."
-        ) from err
-    indptr, indices = _adjacency(graph)
-    # The first array is the elimination order: separators come last.
-    elim, _ = pymetis.nested_dissection(adjacency=pymetis.CSRAdjacency(indptr, indices))
-    return np.asarray(elim, dtype=np.int64)
-
-
 def _elimination_order(graph, method):
     """Fill-reducing elimination order of a graph without the diagonal."""
     n = graph.shape[0]
@@ -86,7 +72,7 @@ def _elimination_order(graph, method):
     if n == 0:
         return np.arange(n)
     if method == "metis":
-        return _metis_order(graph)
+        return np.asarray(_lib.metis_order(*_adjacency(graph)))
     if method == "amd":
         return np.asarray(_lib.amd_order(*_adjacency(graph)))
     raise ValueError(f"Unknown order {method!r}. Expected one of {ORDER_METHODS}.")
