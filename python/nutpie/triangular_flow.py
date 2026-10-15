@@ -23,10 +23,10 @@ import scipy.sparse as sp
 __all__ = [
     "build_triangular_flow",
     "default_conditioners",
-    "linear_conditioners",
     "diag_affine",
     "diag_from_gradients",
     "from_jax",
+    "linear_conditioners",
     "transformer_kind",
     "transformer_layout",
 ]

@@ -44,6 +44,7 @@ dev = [
   "bridgestan >= 2.7.0",
   "stanio >= 0.5.1",
   "pymc >= 5.20.1",
+  "scipy >= 1.11",
   "numba >= 0.60.0",
   "jax >= 0.4.27",
   "flowjax >= 17.0.2",
@@ -96,8 +97,10 @@ features = ["pyo3/extension-module"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-m 'not slow'"
 markers = [
   "flow: tests for normalizing flows",
   "stan: tests for Stan models",
   "pymc: tests for PyMC models",
+  "slow: longer-running statistical tests (run with '-m slow')",
 ]

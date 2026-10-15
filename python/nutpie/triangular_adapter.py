@@ -539,9 +539,7 @@ class TriangularFlowAdapter:
         # A flow's first `linear_fits` fits use only the linear part of its
         # conditioners, see `make_transform_adapter`.
         linear_fit = self._flow_fits < self._linear_fits
-        conditioners = (
-            self._linear_conditioners if linear_fit else self._conditioners
-        )
+        conditioners = self._linear_conditioners if linear_fit else self._conditioners
         if fresh:
             base = build_triangular_flow(
                 seed,
