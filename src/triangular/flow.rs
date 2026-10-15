@@ -24,7 +24,7 @@ use rand_chacha::ChaCha8Rng;
 
 use crate::triangular::conditional::Conditional;
 use crate::triangular::conditioner::{ConditionerConfig, Conditioners};
-use crate::triangular::lm::{FisherResiduals, PyFisherResiduals};
+use crate::triangular::lm::{FisherResiduals, FisherSpeeds, PyFisherResiduals};
 use crate::triangular::mlp_kernels::from_tag;
 use crate::triangular::pattern::{Offsets, Pattern, Ragged};
 use crate::triangular::sampler::{
@@ -237,6 +237,28 @@ impl TriangularFlow {
     fn fisher_divergence(&self, positions: &[f64], gradients: &[f64]) -> Result<f64> {
         let (r, _) = self.problem(positions, gradients)?.residuals(&self.theta)?;
         Ok(r.iter().map(|r| r * r).sum())
+    }
+
+    /// The squared Fisher speeds of every edge over the draws, see
+    /// [`FisherResiduals::fisher_speeds`].
+    fn fisher_speeds(
+        &self,
+        positions: &[f64],
+        nodes: &[f64],
+        weights: &[f64],
+    ) -> Result<FisherSpeeds> {
+        let gradients = vec![0.0; positions.len()];
+        self.problem(positions, &gradients)?
+            .fisher_speeds(&self.theta, nodes, weights)
+    }
+
+    /// The gate eigenvalues over the draws, row-major `(n_var,
+    /// hidden_width)`, and `hidden_width`, see
+    /// [`FisherResiduals::gate_eigenvalues`].
+    fn gate_eigenvalues(&self, positions: &[f64], gradients: &[f64]) -> Result<(Vec<f64>, usize)> {
+        let problem = self.problem(positions, gradients)?;
+        let (_, lin) = problem.residuals(&self.theta)?;
+        Ok((problem.gate_eigenvalues(&lin)?, problem.hidden_width()))
     }
 
     /// One draw `y` and its gradient mapped back to the base space: `(z,
@@ -567,6 +589,70 @@ impl PyTriangularFlow {
             PyArray1::from_vec(py, z),
             PyArray1::from_vec(py, grad_z),
         ))
+    }
+
+    /// Per edge `(child, parent)`, in the triangular order, the squared
+    /// Fisher speeds of the child's conditional per unit of the parent,
+    /// averaged over the draws `positions` (`(n_draw, n_var)`, `n_draw` a
+    /// multiple of `FisherResiduals.simd_width()`): ``(child, parent,
+    /// location_skew, scale_tails)``. `nodes` and `weights` are a
+    /// Gauss-Hermite rule for the standard normal, the nodes symmetric about
+    /// zero and the weights summing to one. See `nutpie.flow_diagnostics`.
+    #[allow(clippy::type_complexity)]
+    fn fisher_speeds<'py>(
+        &self,
+        py: Python<'py>,
+        positions: PyReadonlyArray2<'py, f64>,
+        nodes: PyReadonlyArray1<'py, f64>,
+        weights: PyReadonlyArray1<'py, f64>,
+    ) -> Result<(
+        Bound<'py, PyArray1<i64>>,
+        Bound<'py, PyArray1<i64>>,
+        Bound<'py, PyArray1<f64>>,
+        Bound<'py, PyArray1<f64>>,
+    )> {
+        let positions = rows(&positions, "positions")?;
+        let (nodes, weights) = (nodes.as_slice()?, weights.as_slice()?);
+        let speeds = py.detach(|| self.inner.fisher_speeds(positions, nodes, weights))?;
+        let graph = &self.inner.graph;
+        let (child, parent): (Vec<i64>, Vec<i64>) = (0..graph.n_var())
+            .flat_map(|i| graph.entries(i).map(move |(_, p)| (i as i64, p as i64)))
+            .unzip();
+        Ok((
+            PyArray1::from_vec(py, child),
+            PyArray1::from_vec(py, parent),
+            PyArray1::from_vec(py, speeds.location_skew),
+            PyArray1::from_vec(py, speeds.scale_tails),
+        ))
+    }
+
+    /// How much of its MLPs' hidden units each variable's fit uses, over
+    /// the draws (`(n_draw, n_var)` each, `n_draw` a multiple of
+    /// `FisherResiduals.simd_width()`): ``(n_var, hidden_width)``, a row per
+    /// variable in the triangular order, decreasing. See
+    /// `nutpie.flow_diagnostics.conditioner_capacity`.
+    fn gate_eigenvalues<'py>(
+        &self,
+        py: Python<'py>,
+        positions: PyReadonlyArray2<'py, f64>,
+        gradients: PyReadonlyArray2<'py, f64>,
+    ) -> Result<Bound<'py, PyArray2<f64>>> {
+        let positions = rows(&positions, "positions")?;
+        let gradients = rows(&gradients, "gradients")?;
+        let (values, width) = py.detach(|| self.inner.gate_eigenvalues(positions, gradients))?;
+        Ok(PyArray1::from_vec(py, values).reshape([self.inner.n_var(), width])?)
+    }
+
+    /// Each variable's number of parents, in the triangular order.
+    #[getter]
+    fn n_parents<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<i64>> {
+        let graph = &self.inner.graph;
+        PyArray1::from_vec(
+            py,
+            (0..graph.n_var())
+                .map(|i| graph.n_parent(i) as i64)
+                .collect(),
+        )
     }
 
     /// The native transform for the sampler, see `FlowTransform`.

@@ -36,6 +36,15 @@ pub(crate) struct Workspace<S: Simd> {
     )>,
 }
 
+impl<S: Simd> Workspace<S> {
+    /// MLP `k`'s activations after a `forward_tile`, see [`MlpTile::hidden`].
+    ///
+    /// [`MlpTile::hidden`]: super::mlp::MlpTile::hidden
+    pub(crate) fn mlp_hidden(&self, k: usize) -> &[S::f64s] {
+        self.mlps[k].0.hidden()
+    }
+}
+
 /// A variable's conditioners' weights in the per-draw kernels' layout, see
 /// [`Conditioner::pack`]. The constant's has no parent dependence, so the
 /// parent pullback skips it.

@@ -78,6 +78,14 @@ pub(crate) struct MlpTile<S: Simd> {
     out: Vec<S::f64s>,
 }
 
+impl<S: Simd> MlpTile<S> {
+    /// The units' activations `h`, per unit. Stale for a variable without
+    /// parents, where `forward_tile` does nothing.
+    pub(crate) fn hidden(&self) -> &[S::f64s] {
+        &self.h
+    }
+}
+
 /// A variable's MLP for the per-draw kernels ([`mlp_kernels::EvalMlp`]):
 /// per layer the input-major weights and the bias, `W1^T`, `b1`, `W2^T` and a
 /// zero output bias. Empty without parents.
@@ -157,9 +165,14 @@ impl Mlp {
         })
     }
 
+    /// Weights per unit, `W1[u, :]`, `b1[u]` and `W2[:, u]`.
     #[inline(always)]
-    fn stride(&self, n_parent: usize) -> usize {
+    pub(crate) fn stride(&self, n_parent: usize) -> usize {
         n_parent + 1 + self.outputs.len()
+    }
+
+    pub(crate) fn n_unit(&self) -> usize {
+        self.n_unit
     }
 
     /// Unit `u`'s `(W1[u, :], b1[u], W2[:, u])` in `weights`.
