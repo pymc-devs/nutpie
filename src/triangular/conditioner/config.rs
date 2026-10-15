@@ -244,9 +244,16 @@ impl Outputs {
 
     /// The pairs `(j, j_other)` of outputs both write to the same
     /// coefficient.
-    pub(crate) fn shared<'a>(&'a self, other: &'a Outputs) -> impl Iterator<Item = (usize, usize)> + 'a {
+    pub(crate) fn shared<'a>(
+        &'a self,
+        other: &'a Outputs,
+    ) -> impl Iterator<Item = (usize, usize)> + 'a {
         self.coefs.iter().enumerate().filter_map(move |(j, k)| {
-            other.coefs.binary_search(k).ok().map(|j_other| (j, j_other))
+            other
+                .coefs
+                .binary_search(k)
+                .ok()
+                .map(|j_other| (j, j_other))
         })
     }
 

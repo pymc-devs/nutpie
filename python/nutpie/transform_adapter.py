@@ -1987,19 +1987,23 @@ def make_transform_adapter(
     ``None`` gives the MLPs the raw parents.
 
     With ``method="lm-rust"``, the first ``linear_fits`` fits of a new flow
-    hold what makes it nonlinear fixed (see `fit_to_data`'s
-    ``lm_linear_fit``): the conditioner MLPs' hidden units and the
-    transformer's shape fields. The MLP outputs start at zero
-    (``zero_init``), so these fit the flow without MLPs and with affine
-    transformers, which converges quickly; later fits start from it and use
-    the MLPs and the shape fields where the draws support them. A refit only replaces the flow if it does better on the
-    held-out draws, so the MLPs cannot make it worse there than this linear
-    start, up to the noise of those draws.
+    fit only what keeps its conditionals Gaussian. With ``rust_flow``, these
+    fits use the linear part of the conditioners alone
+    (`nutpie.triangular_flow.linear_conditioners`: the constant off the shape
+    coefficients and the linear conditioner on the location), and later
+    fits add the rest, the MLPs starting near zero; otherwise they hold the
+    rest fixed (see `fit_to_data`'s ``lm_linear_fit``). These fit the flow
+    without MLPs and with affine transformers, which converges quickly;
+    later fits start from it and use the MLPs and the shape coefficients
+    where the draws support them. A refit only replaces the flow if it does
+    better on the held-out draws, so the MLPs cannot make it worse there
+    than this linear start, up to the noise of those draws.
 
     With ``refit_diag`` (and ``rust_flow``), every refit first replaces the
     flow's diagonal affine by one fitted to that window's training draws,
     as a new flow gets, and then fits the conditioners from their current
-    parameters in those new coordinates. Otherwise the affine stays the one
+    parameters in those new coordinates (with the location's constant and
+    linear weights, and the scale's constant, moved to keep their meaning). Otherwise the affine stays the one
     the flow was created with, from the draws of its first window.
 
     The LM fit's ridges (see `fit_to_data`): ``lm_mlp_ridge`` penalizes the

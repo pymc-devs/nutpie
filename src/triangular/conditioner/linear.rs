@@ -68,6 +68,54 @@ impl Conditioner for Linear {
         }
     }
 
+    type Packed = Vec<f64>;
+    type DrawState = ();
+
+    fn pack(&self, _: usize, weights: &[f64]) -> Vec<f64> {
+        weights.to_vec()
+    }
+
+    fn new_draw_state(&self, _: usize) {}
+
+    #[inline(always)]
+    fn forward_draw(
+        &self,
+        packed: &Vec<f64>,
+        parents: &[f64],
+        _: &mut (),
+        _: bool,
+        coefs: &mut [f64],
+    ) {
+        if parents.is_empty() {
+            return;
+        }
+        for (w, k) in self.rows(packed, parents.len()) {
+            coefs[k] += w.iter().zip(parents).map(|(w, p)| w * p).sum::<f64>();
+        }
+    }
+
+    #[inline(always)]
+    fn pullback_parents_draw(
+        &self,
+        packed: &Vec<f64>,
+        _: &mut (),
+        coefs_bar: Stack<f64>,
+        mut parents_bar: StackMut<f64>,
+    ) {
+        for i in 0..coefs_bar.k() {
+            let (coefs_bar, out) = (coefs_bar.get(i), parents_bar.get(i));
+            if out.is_empty() {
+                return;
+            }
+            for (w, k) in self.rows(packed, out.len()) {
+                let c = coefs_bar[k];
+                for (out, &w) in out.iter_mut().zip(w) {
+                    *out += c * w;
+                }
+            }
+        }
+    }
+
     fn new_tile_state<S: Simd>(&self, _: S, _: usize) {}
 
     fn new_scratch<S: Simd>(&self, _: S, _: usize) {}

@@ -23,11 +23,14 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
 use crate::triangular::conditional::Conditional;
-use crate::triangular::conditioner::{Activation, Conditioner, ConditionerConfig, Conditioners};
+use crate::triangular::conditioner::{ConditionerConfig, Conditioners};
 use crate::triangular::lm::{FisherResiduals, PyFisherResiduals};
-use crate::triangular::pattern::{Offsets, Pattern};
-use crate::triangular::sampler::{build_transform_with, FlowTransform, PyFlowTransform};
-use crate::triangular::transformer::{Transformer, TransformerConfig};
+use crate::triangular::mlp_kernels::from_tag;
+use crate::triangular::pattern::{Offsets, Pattern, Ragged};
+use crate::triangular::sampler::{
+    ConditionalModel, FlowTransform, Map, PyFlowTransform, Schedule, TriangularTransform,
+};
+use crate::triangular::transformer::TransformerConfig;
 
 /// Rough cost of one transformer layer in multiply-adds, for scheduling the
 /// native transform's levels, as `nutpie.triangular_layout`.
@@ -268,141 +271,49 @@ impl TriangularFlow {
     }
 
     /// The native transform of this flow, for the sampler's leapfrog.
-    ///
-    /// Its kernel has one MLP on every coefficient with an output bias, and
-    /// linear skips into the location and the scale, so this supports at
-    /// most one MLP and a linear conditioner on the location and the scale:
-    /// the constant becomes the output bias, the MLP's missing outputs zero
-    /// weights.
     fn flow_transform(&self, schedule: &str, min_parallel_work: i64) -> Result<FlowTransform> {
         let n = self.n_var();
-        let (conditioners, transformer) = (
-            &self.conditional.conditioners,
-            &self.conditional.transformer,
-        );
-        let n_par = transformer.n_coefs();
-        if conditioners.mlps.len() > 1 {
-            bail!("the sampler's transform supports at most one MLP conditioner");
-        }
-        let mlp = conditioners.mlps.first();
-        let Some(location) = transformer.location_coef() else {
-            bail!("the sampler's transform needs a transformer with a location");
-        };
-        let linear_coefs = conditioners
-            .linear
-            .as_ref()
-            .map_or(&[][..], |c| c.outputs().coefs());
-        let scale = transformer
-            .scale_coef()
-            .filter(|k| linear_coefs.contains(k));
-        if linear_coefs
-            .iter()
-            .any(|&k| k != location && Some(k) != scale)
-        {
-            bail!("the sampler's transform supports linear conditioners on the location and the scale only");
-        }
-        let n_unit = mlp.map_or(0, |m| m.n_unit());
+        let schedule: Schedule =
+            from_tag(schedule).map_err(|_| anyhow::anyhow!("unknown schedule {schedule:?}"))?;
 
         let mut parent_indptr = vec![0i64];
         let mut parent_index = Vec::with_capacity(self.graph.n_edge());
-        let mut skip_weight = Vec::with_capacity(self.graph.n_edge());
-        let mut scale_skip_weight = Vec::new();
-        let mut blob = Vec::new();
-        let mut blob_offset = vec![0i64];
         for i in 0..n {
-            let theta = self.theta_of(i);
-            let n_parent = self.graph.n_parent(i);
             parent_index.extend(self.graph.entries(i).map(|(_, p)| p as i64));
             parent_indptr.push(parent_index.len() as i64);
-
-            let mut ranges = conditioners.weight_ranges(n_parent).into_iter();
-            let mut b2 = vec![0.0; n_par];
-            if let Some(c) = &conditioners.constant {
-                let weights = &theta[ranges.next().expect("a range per conditioner")];
-                for (&w, &k) in weights.iter().zip(c.outputs().coefs()) {
-                    b2[k] = w;
-                }
-            }
-            let (mut skip, mut scale_skip) = (vec![0.0; n_parent], vec![0.0; n_parent]);
-            if conditioners.linear.is_some() {
-                let weights = &theta[ranges.next().expect("a range per conditioner")];
-                for (j, &k) in linear_coefs.iter().enumerate() {
-                    let row = &weights[j * n_parent..(j + 1) * n_parent];
-                    if k == location {
-                        skip.copy_from_slice(row);
-                    } else {
-                        scale_skip.copy_from_slice(row);
-                    }
-                }
-            }
-            skip_weight.extend_from_slice(&skip);
-            if scale.is_some() {
-                scale_skip_weight.extend_from_slice(&scale_skip);
-            }
-
-            // Per layer, the transposed `(n_in, n_out)` weight, then the
-            // bias: see `TriangularLayout.blob`. Without parents the MLP has
-            // no weights, and the kernel's units have zero output weights.
-            let mut w2 = vec![0.0; n_unit * n_par];
-            let mut b1 = vec![0.0; n_unit];
-            if let Some(m) = mlp {
-                let weights = &theta[ranges.next().expect("a range per conditioner")];
-                if n_parent > 0 {
-                    for p in 0..n_parent {
-                        blob.extend((0..n_unit).map(|u| m.unit(weights, n_parent, u).0[p]));
-                    }
-                    for u in 0..n_unit {
-                        let (_, bias, out) = m.unit(weights, n_parent, u);
-                        b1[u] = bias;
-                        for (&w, &k) in out.iter().zip(m.outputs().coefs()) {
-                            w2[u * n_par + k] = w;
-                        }
-                    }
-                }
-            }
-            blob.extend_from_slice(&b1);
-            blob.extend_from_slice(&w2);
-            blob.extend_from_slice(&b2);
-            blob_offset.push(blob.len() as i64);
         }
+        let parents: Pattern<u32> = Pattern::from_i64(&parent_indptr, &parent_index)?;
 
         let level = self.levels();
         let n_levels = level.iter().max().map_or(0, |l| l + 1);
-        let mut level_vars: Vec<i64> = (0..n as i64).collect();
+        let mut level_vars: Vec<u32> = (0..n as u32).collect();
         level_vars.sort_by_key(|&i| level[i as usize]);
-        let mut level_ptr = vec![0i64; n_levels + 1];
+        let mut level_len = vec![0usize; n_levels];
         let mut level_work = vec![0i64; n_levels];
+        let layer_work =
+            TRANSFORMER_WORK_PER_LAYER * self.conditional.transformer.n_layers() as i64;
         for i in 0..n {
-            level_ptr[level[i] + 1] += 1;
-            level_work[level[i]] += blob_offset[i + 1] - blob_offset[i]
-                + TRANSFORMER_WORK_PER_LAYER * transformer.n_layers() as i64;
+            level_len[level[i]] += 1;
+            level_work[level[i]] += self.param_offset.row_len(i) as i64 + layer_work;
         }
-        for l in 0..n_levels {
-            level_ptr[l + 1] += level_ptr[l];
-        }
+        let levels = Ragged::new(Offsets::from_lens(level_len), level_vars)?;
 
-        let map = build_transform_with(
-            &parent_indptr,
-            &parent_index,
-            &blob,
-            &blob_offset,
-            &[n_unit as i64, n_par as i64],
-            &skip_weight,
-            location as i64,
-            scale.map(|scale| (scale_skip_weight.as_slice(), scale as i64)),
-            0,
-            &[],
-            mlp.and_then(|m| m.squash()),
-            mlp.map_or(Activation::default(), |m| m.activation()).name(),
-            transformer.clone(),
-            &level_ptr,
-            &level_vars,
+        let model = ConditionalModel::new(
+            self.conditional.clone(),
+            n,
+            |i| self.graph.n_parent(i),
+            |i| self.theta_of(i),
+        );
+        let map = TriangularTransform::new(
+            parents,
+            levels,
             &level_work,
             min_parallel_work,
             schedule,
+            model,
         )?;
         FlowTransform::new(
-            Some(map),
+            Some(Map::Conditional(map)),
             self.permutation.clone(),
             self.loc.clone(),
             self.scale.clone(),

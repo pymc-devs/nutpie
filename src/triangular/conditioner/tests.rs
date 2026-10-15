@@ -249,6 +249,40 @@ impl<C: Conditioner> Case<'_, C> {
             );
         }
 
+        // One draw, through the per-draw kernels, agrees with every lane.
+        let packed = c.pack(n_parent, &weights);
+        let mut draw = c.new_draw_state(n_parent);
+        let (coefs_lanes, pulled_lanes) = (lanes::<S>(&coefs), lanes::<S>(&pulled));
+        let cb_lanes = lanes::<S>(&coefs_bar);
+        let width = S::f64s::LEN;
+        for lane in 0..width {
+            let at_lane = |values: &[f64], n: usize| -> Vec<f64> {
+                (0..n).map(|k| values[k * width + lane]).collect()
+            };
+            let parents_lane = at_lane(&lanes::<S>(&parents), n_parent);
+            let mut coefs_draw = vec![0.0; n_coefs];
+            c.forward_draw(&packed, &parents_lane, &mut draw, true, &mut coefs_draw);
+            assert_close(
+                &what("forward draw"),
+                &coefs_draw,
+                &at_lane(&coefs_lanes, n_coefs),
+                1e-12,
+            );
+            let mut parents_bar = vec![0.0; K * n_parent];
+            c.pullback_parents_draw(
+                &packed,
+                &mut draw,
+                Stack::new(&at_lane(&cb_lanes, K * n_coefs), K),
+                StackMut::new(&mut parents_bar, K),
+            );
+            assert_close(
+                &what("pullback parents draw"),
+                &parents_bar,
+                &at_lane(&pulled_lanes, K * n_parent),
+                1e-12,
+            );
+        }
+
         // The tangent of the parent pullback, along `v` and `coefs_bar_dot`.
         let coefs_bar_dot = tile(simd, rng, K * n_coefs, 1.0);
         let mut tangent = zeros(simd, K * n_parent);
@@ -567,7 +601,10 @@ fn weights_carry_over() {
         }
     }
     // A different width is a new MLP, and two candidates are an error.
-    let wider = build(r#"[{"kind": "mlp", "width": 4, "target": "all"}]"#, &transformer);
+    let wider = build(
+        r#"[{"kind": "mlp", "width": 4, "target": "all"}]"#,
+        &transformer,
+    );
     assert!(wider.carry_plan(&full).unwrap().mlps == vec![None]);
     let twice = build(
         r#"[{"kind": "mlp", "width": 3, "target": "location"},
@@ -600,10 +637,17 @@ fn coordinates_change_the_location_exactly() {
         conditioners.change_coordinates(&transformer, own, &parents, &mut moved);
 
         let v = [0.9, -0.2];
-        let v_new: Vec<f64> = v.iter().zip(&parents).map(|(v, (a, b))| a * v + b).collect();
+        let v_new: Vec<f64> = v
+            .iter()
+            .zip(&parents)
+            .map(|(v, (a, b))| a * v + b)
+            .collect();
         let before = coefs_at(&conditioners, &weights, &v);
         let after = coefs_at(&conditioners, &moved, &v_new);
-        let (location, scale) = (transformer.location_coef().unwrap(), transformer.scale_coef().unwrap());
+        let (location, scale) = (
+            transformer.location_coef().unwrap(),
+            transformer.scale_coef().unwrap(),
+        );
         let expected = transformer.shifted_location_coef(before[location], own.0, own.1);
         assert!((after[location] - expected).abs() < 1e-12, "{config:?}");
         let expected = transformer.rescaled_scale_coef(before[scale], own.0);
