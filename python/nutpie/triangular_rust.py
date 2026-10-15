@@ -82,7 +82,7 @@ def compile_transform(
 def flow_transform_layout(
     bijection,
     *,
-    schedule="serial",
+    schedule="auto",
     min_parallel_work=DEFAULT_MIN_PARALLEL_WORK,
 ):
     """Arguments for the sampler's Rust `FlowTransform`, or `None` if the flow
@@ -90,8 +90,7 @@ def flow_transform_layout(
 
     Supports ``Chain([Chain([Sandwich(map, Permute)]), Affine])`` from
     ``make_flow(kind="triangular")``, and the diagonal-only
-    ``Chain([Affine])``. `schedule` defaults to ``"serial"`` since chains
-    already run in parallel.
+    ``Chain([Affine])``.
     """
     from flowjax import bijections
     from paramax import unwrap

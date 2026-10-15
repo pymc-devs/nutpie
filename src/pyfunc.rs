@@ -6,7 +6,6 @@ use nuts_rs::{
     CpuLogpFunc, CpuMath, HasDims, InitPositionError, LogpError, Model, Storable, Value,
 };
 use pyo3::{
-    exceptions::PyRuntimeError,
     pyclass, pymethods,
     types::{PyAnyMethods, PyDict, PyDictMethods, PyList, PyListMethods, PyNone},
     Bound, BoundObject, Py, PyAny, PyErr, Python,
@@ -17,7 +16,7 @@ use thiserror::Error;
 
 use crate::{
     common::{call_init_point_func, PyValue, PyVariable},
-    wrapper::{NativeFlow, PyTransformAdapt},
+    wrapper::{no_adapter, FlowAdapter, PyTransformAdapt},
 };
 
 #[pyclass(from_py_object)]
@@ -124,13 +123,12 @@ impl LogpError for PyLogpError {
 pub struct PyDensity {
     logp: Py<PyAny>,
     expand_func: Py<PyAny>,
-    transform_adapter: Option<PyTransformAdapt>,
+    flow: Option<FlowAdapter>,
     dim: usize,
     variables: Arc<Vec<PyVariable>>,
     dim_sizes: HashMap<String, u64>,
     coords: HashMap<String, Value>,
     unconstrained_names: Option<Vec<String>>,
-    native_flow: NativeFlow,
 }
 
 impl PyDensity {
@@ -146,17 +144,15 @@ impl PyDensity {
     ) -> Result<Self> {
         let logp_func = Python::attach(|py| logp_clone_func.call0(py))?;
         let expand_func = Python::attach(|py| expand_clone_func.call1(py, (0u64, 0u64, 0u64)))?;
-        let transform_adapter = transform_adapter.cloned();
         Ok(Self {
             logp: logp_func,
             expand_func,
-            transform_adapter,
+            flow: transform_adapter.cloned().map(FlowAdapter::new),
             dim,
             variables,
             dim_sizes,
             coords,
             unconstrained_names,
-            native_flow: NativeFlow::default(),
         })
     }
 }
@@ -209,35 +205,39 @@ impl Storable<PyDensity> for ExpandedVector {
     }
 }
 
+fn call_logp(logp: &Py<PyAny>, position: &[f64], grad: &mut [f64]) -> Result<f64, PyLogpError> {
+    Python::attach(|py| {
+        let pos_array = PyArray1::from_slice(py, position);
+        let result = logp.call1(py, (pos_array,));
+        match result {
+            Ok(val) => {
+                let val: Result<(f64, PyReadonlyArray1<f64>), _> = val.extract(py);
+                let Ok(val) = val else {
+                    return Err(PyLogpError::ReturnTypeError());
+                };
+                let (logp_val, grad_array) = val;
+                if !logp_val.is_finite() {
+                    return Err(PyLogpError::BadLogp(logp_val));
+                }
+                grad.copy_from_slice(
+                    // unsafty: We just allocated this array, and this is the only location
+                    // where we use the array.
+                    grad_array.as_slice().expect("Grad array is not contiguous"),
+                );
+                Ok(logp_val)
+            }
+            Err(err) => Err(PyLogpError::PyError(err)),
+        }
+    })
+}
+
 impl CpuLogpFunc for PyDensity {
     type LogpError = PyLogpError;
     type FlowParameters = Py<PyAny>;
     type ExpandedVector = ExpandedVector;
 
     fn logp(&mut self, position: &[f64], grad: &mut [f64]) -> Result<f64, Self::LogpError> {
-        Python::attach(|py| {
-            let pos_array = PyArray1::from_slice(py, position);
-            let result = self.logp.call1(py, (pos_array,));
-            match result {
-                Ok(val) => {
-                    let val: Result<(f64, PyReadonlyArray1<f64>), _> = val.extract(py);
-                    let Ok(val) = val else {
-                        return Err(PyLogpError::ReturnTypeError());
-                    };
-                    let (logp_val, grad_array) = val;
-                    if !logp_val.is_finite() {
-                        return Err(PyLogpError::BadLogp(logp_val));
-                    }
-                    grad.copy_from_slice(
-                        // unsafty: We just allocated this array, and this is the only location
-                        // where we use the array.
-                        grad_array.as_slice().expect("Grad array is not contiguous"),
-                    );
-                    Ok(logp_val)
-                }
-                Err(err) => Err(PyLogpError::PyError(err)),
-            }
-        })
+        call_logp(&self.logp, position, grad)
     }
 
     fn dim(&self) -> usize {
@@ -413,18 +413,14 @@ impl CpuLogpFunc for PyDensity {
         transformed_position: &mut [f64],
         transformed_gradient: &mut [f64],
     ) -> std::result::Result<f64, Self::LogpError> {
-        let logdet = self
-            .transform_adapter
-            .as_mut()
-            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?
-            .inv_transform_normalize(
-                params,
-                untransformed_position,
-                untransformed_gradient,
-                transformed_position,
-                transformed_gradient,
-            )?;
-        Ok(logdet)
+        let flow = self.flow.as_mut().ok_or_else(no_adapter)?;
+        Ok(flow.inv_transform_normalize(
+            params,
+            untransformed_position,
+            untransformed_gradient,
+            transformed_position,
+            transformed_gradient,
+        )?)
     }
 
     fn init_from_transformed_position(
@@ -436,41 +432,16 @@ impl CpuLogpFunc for PyDensity {
         transformed_gradient: &mut [f64],
         clip: Option<f64>,
     ) -> std::result::Result<(f64, f64), Self::LogpError> {
-        // Native path: only the model's logp runs in Python, the flow does
-        // not. `native_flow` is moved out so the logp closure can borrow `self`.
-        let adapter = self
-            .transform_adapter
-            .clone()
-            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?;
-        let mut native = std::mem::take(&mut self.native_flow);
-        let result = native.init_from_transformed_position(
-            &adapter,
+        let flow = self.flow.as_mut().ok_or_else(no_adapter)?;
+        flow.init_from_transformed_position(
             params,
             untransformed_position,
             untransformed_gradient,
             transformed_position,
             transformed_gradient,
             clip,
-            |y, grad| self.logp(y, grad),
-        );
-        self.native_flow = native;
-        if let Some(out) = result? {
-            return Ok(out);
-        }
-
-        let (logp, logdet) = self
-            .transform_adapter
-            .as_mut()
-            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?
-            .init_from_transformed_position(
-                params,
-                untransformed_position,
-                untransformed_gradient,
-                transformed_position,
-                transformed_gradient,
-                clip,
-            )?;
-        Ok((logp, logdet))
+            |position, gradient| call_logp(&self.logp, position, gradient),
+        )
     }
 
     fn init_from_untransformed_position(
@@ -482,19 +453,16 @@ impl CpuLogpFunc for PyDensity {
         transformed_gradient: &mut [f64],
         clip: Option<f64>,
     ) -> std::result::Result<(f64, f64), Self::LogpError> {
-        let (logp, logdet) = self
-            .transform_adapter
-            .as_mut()
-            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?
-            .init_from_untransformed_position(
-                params,
-                untransformed_position,
-                untransformed_gradient,
-                transformed_position,
-                transformed_gradient,
-                clip,
-            )?;
-        Ok((logp, logdet))
+        let flow = self.flow.as_mut().ok_or_else(no_adapter)?;
+        flow.init_from_untransformed_position(
+            params,
+            untransformed_position,
+            untransformed_gradient,
+            transformed_position,
+            transformed_gradient,
+            clip,
+            |position, gradient| call_logp(&self.logp, position, gradient),
+        )
     }
 
     fn update_transformation<'a, R: rand::Rng + ?Sized>(
@@ -505,18 +473,14 @@ impl CpuLogpFunc for PyDensity {
         untransformed_logp: impl ExactSizeIterator<Item = &'a f64>,
         params: &'a mut Py<PyAny>,
     ) -> std::result::Result<(), Self::LogpError> {
-        self.native_flow.invalidate();
-        self.transform_adapter
-            .as_mut()
-            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?
-            .update_transformation(
-                rng,
-                untransformed_positions,
-                untransformed_gradients,
-                untransformed_logp,
-                params,
-            )?;
-        Ok(())
+        let flow = self.flow.as_mut().ok_or_else(no_adapter)?;
+        Ok(flow.update_transformation(
+            rng,
+            untransformed_positions,
+            untransformed_gradients,
+            untransformed_logp,
+            params,
+        )?)
     }
 
     fn init_transformation<R: rand::Rng + ?Sized>(
@@ -526,13 +490,8 @@ impl CpuLogpFunc for PyDensity {
         untransformed_gradient: &[f64],
         chain: u64,
     ) -> std::result::Result<Py<PyAny>, Self::LogpError> {
-        self.native_flow.invalidate();
-        let trafo = self
-            .transform_adapter
-            .as_mut()
-            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?
-            .new_transformation(rng, untransformed_position, untransformed_gradient, chain)?;
-        Ok(trafo)
+        let flow = self.flow.as_mut().ok_or_else(no_adapter)?;
+        Ok(flow.init_transformation(rng, untransformed_position, untransformed_gradient, chain)?)
     }
 
     fn new_transformation<R: rand::Rng + ?Sized>(
@@ -548,12 +507,8 @@ impl CpuLogpFunc for PyDensity {
     }
 
     fn transformation_id(&self, params: &Py<PyAny>) -> std::result::Result<i64, Self::LogpError> {
-        let id = self
-            .transform_adapter
-            .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?
-            .transformation_id(params)?;
-        Ok(id)
+        let flow = self.flow.as_ref().ok_or_else(no_adapter)?;
+        Ok(flow.transformation_id(params)?)
     }
 }
 

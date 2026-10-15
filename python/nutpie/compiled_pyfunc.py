@@ -209,21 +209,15 @@ class PyFuncModel(CompiledModel):
             expand_fn = self._make_expand_func(seed1, seed2, chain)
             return partial(expand_fn, **self._shared_data)
 
-        if self._raw_logp_fn is not None:
-            outer_kwargs = {
-                **(self._transform_adapt_args or {}),
-                **(adapter_kwargs or {}),
-            }
+        outer_kwargs = {
+            **(self._transform_adapt_args or {}),
+            **(adapter_kwargs or {}),
+        }
 
-            def make_adapter(*args, **kwargs):
-                from nutpie.transform_adapter import make_transform_adapter
+        def make_adapter(*args, **kwargs):
+            from nutpie.transform_adapter import make_transform_adapter
 
-                return make_transform_adapter(**outer_kwargs)(
-                    *args, **kwargs, logp_fn=self._raw_logp_fn
-                )
-
-        else:
-            make_adapter = None
+            return make_transform_adapter(**outer_kwargs)(*args, **kwargs)
 
         return _lib.PyModel(
             make_logp_func,

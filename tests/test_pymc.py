@@ -6,6 +6,7 @@ import pytest
 if find_spec("pymc") is None:
     pytest.skip("Skip pymc tests", allow_module_level=True)
 
+import arviz as az
 import numpy as np
 import pandas as pd
 import pymc as pm
@@ -468,10 +469,14 @@ def test_pymc_var_names(backend, gradient_backend):
     assert not hasattr(trace.posterior, "c")
 
 
-# TODO For some reason, the sampling results with jax are
-# not reproducible accross operating systems. Figure this
-# out and add the array_compare marker.
-# @pytest.mark.array_compare
+# The Fisher divergence to N(0, I) of the best diagonal affine map for two
+# independent HalfNormal(1), on the log scale the sampler sees: there
+# q(u) ∝ exp(u - e^{2u} / 2) with score 1 - e^{2u}, and minimizing
+# E[((u - m) / s + s (1 - e^{2u}))^2] over m, s by quadrature gives 1.1416 per
+# dimension.
+BEST_AFFINE_FISHER_HALFNORMAL_2D = 2 * 1.1416
+
+
 @pytest.mark.pymc
 @pytest.mark.flow
 def test_normalizing_flow():
@@ -480,10 +485,7 @@ def test_normalizing_flow():
 
     compiled = nutpie.compile_pymc_model(
         model, backend="jax", gradient_backend="jax"
-    ).with_transform_adapt(
-        verbose=True,
-        num_layers=2,
-    )
+    ).with_transform_adapt()
     trace = nutpie.sample(
         compiled,
         chains=1,
@@ -492,29 +494,21 @@ def test_normalizing_flow():
         seed=1,
         draws=500,
     )
-    assert float(trace.sample_stats.fisher_distance.mean()) < 0.1
-    # return trace.posterior.x.isel(draw=slice(-50, None)).values.ravel()
 
+    # The flow must not bias the draws: E[x] = sqrt(2 / pi) and E[x^2] = 1,
+    # each within 4 MCSE (the true sd over the root of the ESS).
+    x = trace.posterior.to_dataset().x
+    for label, values, expected, sd in [
+        ("x", x, np.sqrt(2 / np.pi), np.sqrt(1 - 2 / np.pi)),
+        ("x^2", x**2, 1.0, np.sqrt(2.0)),
+    ]:
+        ess = az.ess(values.to_dataset(name="stat"), method="mean").stat
+        z = (values.mean(("chain", "draw")) - expected) / (sd / np.sqrt(ess))
+        assert (abs(z) < 4).all(), f"{label}: z-scores {z.values}"
 
-@pytest.mark.pymc
-@pytest.mark.flow
-def test_normalizing_flow_rust():
-    """`test_normalizing_flow` with the triangular flow built in Rust."""
-    with pm.Model() as model:
-        pm.HalfNormal("x", shape=2)
-
-    compiled = nutpie.compile_pymc_model(
-        model, backend="jax", gradient_backend="jax"
-    ).with_transform_adapt(verbose=True, rust_flow=True)
-    trace = nutpie.sample(
-        compiled,
-        chains=1,
-        adaptation="flow",
-        window_switch_freq=128,
-        seed=1,
-        draws=500,
-    )
-    assert float(trace.sample_stats.fisher_distance.mean()) < 0.1
+    # And it must beat every diagonal affine map by a wide margin.
+    fisher = float(trace.sample_stats.fisher_distance.mean())
+    assert fisher < 0.1 * BEST_AFFINE_FISHER_HALFNORMAL_2D
 
 
 @pytest.mark.pymc

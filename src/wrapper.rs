@@ -1594,9 +1594,9 @@ impl PyTrace {
     }
 }
 
-/// Soft-clip a model gradient in place, `clip * asinh(g / clip)`, as the
-/// Python side's `_init_from_transformed_position` does before pulling it back.
-pub fn soft_clip(gradient: &mut [f64], clip: Option<f64>) {
+/// Soft-clip a model gradient in place, `clip * asinh(g / clip)`, before it
+/// is pulled back through the flow.
+fn soft_clip(gradient: &mut [f64], clip: Option<f64>) {
     if let Some(clip) = clip {
         for g in gradient.iter_mut() {
             *g = clip * (*g / clip).asinh();
@@ -1604,19 +1604,26 @@ pub fn soft_clip(gradient: &mut [f64], clip: Option<f64>) {
     }
 }
 
-/// Per-chain native form of the adapter's flow, so a leapfrog step never
-/// calls into Python: only the model's own logp runs outside Rust, if it is a
-/// Python function at all.
+pub fn no_adapter() -> anyhow::Error {
+    anyhow!("No transformation adapter specified")
+}
+
+/// A chain's view of the model's transform adapter, implementing the flow
+/// methods of `CpuLogpFunc` for every backend: the model's logp is passed in
+/// and always evaluated by the caller, the adapter only maps positions and
+/// gradients.
 ///
-/// Keyed by the adapter object it came from, and must be `invalidate`d
-/// whenever that object's transformation is (re)initialized or updated.
-#[derive(Default)]
-pub struct NativeFlow {
-    cache: FlowCache,
+/// The leapfrog step (`init_from_transformed_position`) uses a native form of
+/// the adapter's flow if it has one, so that it never calls into Python. That
+/// form is keyed by the parameter object it came from, and dropped whenever the
+/// transformation is (re)initialized or updated.
+pub struct FlowAdapter {
+    adapter: PyTransformAdapt,
+    native: NativeFlow,
 }
 
 #[derive(Default)]
-enum FlowCache {
+enum NativeFlow {
     #[default]
     Stale,
     /// The adapter's current flow has no native form: use the Python path.
@@ -1624,20 +1631,43 @@ enum FlowCache {
     Ready(usize, FlowTransform),
 }
 
-impl NativeFlow {
-    pub fn invalidate(&mut self) {
-        self.cache = FlowCache::Stale;
+impl FlowAdapter {
+    pub fn new(adapter: PyTransformAdapt) -> Self {
+        Self {
+            adapter,
+            native: NativeFlow::Stale,
+        }
     }
 
-    /// `PyTransformAdapt::init_from_transformed_position`, natively: the
-    /// transformed position mapped to the untransformed one, `logp` there, and
-    /// its gradient pulled back, returning `(logp, logdet)` -- including the
-    /// optional soft clip of the model gradient. `Ok(None)` if the adapter's
-    /// flow has no native form; the caller then takes the Python path.
+    /// The native form of the flow in `params`, if it has one.
+    fn native(&mut self, params: &Py<PyAny>) -> Result<Option<&mut FlowTransform>> {
+        let key = params.as_ptr() as usize;
+        let current = matches!(
+            &self.native,
+            NativeFlow::Missing(k) | NativeFlow::Ready(k, _) if *k == key
+        );
+        if !current {
+            self.native = match self
+                .adapter
+                .flow_transform(params)
+                .context("Failed to build the native flow transform")?
+            {
+                Some(flow) => NativeFlow::Ready(key, flow),
+                None => NativeFlow::Missing(key),
+            };
+        }
+        Ok(match &mut self.native {
+            NativeFlow::Ready(_, flow) => Some(flow),
+            _ => None,
+        })
+    }
+
+    /// Map the transformed position to the untransformed one, evaluate `logp`
+    /// there, and pull its (optionally soft-clipped) gradient back. Returns
+    /// `(logp, logdet)`.
     #[allow(clippy::too_many_arguments)]
     pub fn init_from_transformed_position<E: From<anyhow::Error>>(
         &mut self,
-        adapter: &PyTransformAdapt,
         params: &Py<PyAny>,
         untransformed_position: &mut [f64],
         untransformed_gradient: &mut [f64],
@@ -1645,30 +1675,118 @@ impl NativeFlow {
         transformed_gradient: &mut [f64],
         clip: Option<f64>,
         logp: impl FnOnce(&[f64], &mut [f64]) -> std::result::Result<f64, E>,
-    ) -> std::result::Result<Option<(f64, f64)>, E> {
-        let key = params.as_ptr() as usize;
-        let current = matches!(
-            &self.cache,
-            FlowCache::Missing(k) | FlowCache::Ready(k, _) if *k == key
-        );
-        if !current {
-            self.cache = match adapter
-                .flow_transform(params)
-                .context("Failed to build the native flow transform")?
-            {
-                Some(flow) => FlowCache::Ready(key, flow),
-                None => FlowCache::Missing(key),
-            };
+    ) -> std::result::Result<(f64, f64), E> {
+        if let Some(flow) = self.native(params)? {
+            let logdet =
+                flow.transform_and_log_det(transformed_position, untransformed_position)?;
+            let logp = logp(untransformed_position, untransformed_gradient)?;
+            soft_clip(untransformed_gradient, clip);
+            flow.pullback(untransformed_gradient, transformed_gradient)?;
+            return Ok((logp, logdet));
         }
-        let FlowCache::Ready(_, flow) = &mut self.cache else {
-            return Ok(None);
-        };
 
-        let logdet = flow.transform_and_log_det(transformed_position, untransformed_position)?;
+        let part1 = self
+            .adapter
+            .init_from_transformed_position_part1(
+                params,
+                untransformed_position,
+                transformed_position,
+            )
+            .context("Failed init_from_transformed_position_part1")?;
         let logp = logp(untransformed_position, untransformed_gradient)?;
         soft_clip(untransformed_gradient, clip);
-        flow.pullback(untransformed_gradient, transformed_gradient)?;
-        Ok(Some((logp, logdet)))
+        let logdet = self
+            .adapter
+            .init_from_transformed_position_part2(
+                params,
+                part1,
+                untransformed_gradient,
+                transformed_gradient,
+            )
+            .context("Failed init_from_transformed_position_part2")?;
+        Ok((logp, logdet))
+    }
+
+    /// Evaluate `logp` at the untransformed position and map position and
+    /// (optionally soft-clipped) gradient to the transformed space. Returns
+    /// `(logp, logdet)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn init_from_untransformed_position<E: From<anyhow::Error>>(
+        &mut self,
+        params: &Py<PyAny>,
+        untransformed_position: &[f64],
+        untransformed_gradient: &mut [f64],
+        transformed_position: &mut [f64],
+        transformed_gradient: &mut [f64],
+        clip: Option<f64>,
+        logp: impl FnOnce(&[f64], &mut [f64]) -> std::result::Result<f64, E>,
+    ) -> std::result::Result<(f64, f64), E> {
+        let logp = logp(untransformed_position, untransformed_gradient)?;
+        soft_clip(untransformed_gradient, clip);
+        let logdet = self
+            .inv_transform_normalize(
+                params,
+                untransformed_position,
+                untransformed_gradient,
+                transformed_position,
+                transformed_gradient,
+            )
+            .context("Failed inv_transform_normalize in init_from_untransformed_position")?;
+        Ok((logp, logdet))
+    }
+
+    pub fn inv_transform_normalize(
+        &mut self,
+        params: &Py<PyAny>,
+        untransformed_position: &[f64],
+        untransformed_gradient: &[f64],
+        transformed_position: &mut [f64],
+        transformed_gradient: &mut [f64],
+    ) -> Result<f64> {
+        self.adapter.inv_transform_normalize(
+            params,
+            untransformed_position,
+            untransformed_gradient,
+            transformed_position,
+            transformed_gradient,
+        )
+    }
+
+    pub fn update_transformation<'a, R: rand::Rng + ?Sized>(
+        &'a mut self,
+        rng: &mut R,
+        untransformed_positions: impl ExactSizeIterator<Item = &'a [f64]>,
+        untransformed_gradients: impl ExactSizeIterator<Item = &'a [f64]>,
+        untransformed_logp: impl ExactSizeIterator<Item = &'a f64>,
+        params: &'a mut Py<PyAny>,
+    ) -> Result<()> {
+        self.native = NativeFlow::Stale;
+        self.adapter
+            .update_transformation(
+                rng,
+                untransformed_positions,
+                untransformed_gradients,
+                untransformed_logp,
+                params,
+            )
+            .context("Failed to update the transformation")
+    }
+
+    pub fn init_transformation<R: rand::Rng + ?Sized>(
+        &mut self,
+        rng: &mut R,
+        untransformed_position: &[f64],
+        untransformed_gradient: &[f64],
+        chain: u64,
+    ) -> Result<Py<PyAny>> {
+        self.native = NativeFlow::Stale;
+        self.adapter
+            .new_transformation(rng, untransformed_position, untransformed_gradient, chain)
+            .context("Could not create the transformation")
+    }
+
+    pub fn transformation_id(&self, params: &Py<PyAny>) -> Result<i64> {
+        self.adapter.transformation_id(params)
     }
 }
 
@@ -1740,42 +1858,6 @@ impl PyTransformAdapt {
         })
     }
 
-    pub fn init_from_transformed_position(
-        &mut self,
-        params: &Py<PyAny>,
-        untransformed_position: &mut [f64],
-        untransformed_gradient: &mut [f64],
-        transformed_position: &[f64],
-        transformed_gradient: &mut [f64],
-        clip: Option<f64>,
-    ) -> Result<(f64, f64)> {
-        Python::attach(|py| {
-            let transformed_position = PyArray1::from_slice(py, transformed_position);
-
-            let output = params
-                .getattr(py, intern!(py, "init_from_transformed_position"))?
-                .call1(py, (transformed_position, clip))?;
-            let (
-                logp,
-                logdet,
-                untransformed_position_out,
-                untransformed_gradient_out,
-                transformed_gradient_out,
-            ): (
-                f64,
-                f64,
-                PyReadonlyArray1<f64>,
-                PyReadonlyArray1<f64>,
-                PyReadonlyArray1<f64>,
-            ) = output.extract(py)?;
-
-            untransformed_position.copy_from_slice(untransformed_position_out.as_slice()?);
-            untransformed_gradient.copy_from_slice(untransformed_gradient_out.as_slice()?);
-            transformed_gradient.copy_from_slice(transformed_gradient_out.as_slice()?);
-            Ok((logp, logdet))
-        })
-    }
-
     pub fn init_from_transformed_position_part1(
         &mut self,
         params: &Py<PyAny>,
@@ -1814,46 +1896,6 @@ impl PyTransformAdapt {
 
             transformed_gradient.copy_from_slice(transformed_gradient_out.as_slice()?);
             Ok(logdet)
-        })
-    }
-
-    pub fn init_from_untransformed_position(
-        &mut self,
-        params: &Py<PyAny>,
-        untransformed_position: &[f64],
-        untransformed_gradient: &mut [f64],
-        transformed_position: &mut [f64],
-        transformed_gradient: &mut [f64],
-        clip: Option<f64>,
-    ) -> Result<(f64, f64)> {
-        Python::attach(|py| {
-            let untransformed_position = PyArray1::from_slice(py, untransformed_position);
-
-            let output = params
-                .getattr(py, intern!(py, "init_from_untransformed_position"))
-                .context("No attribute init_from_untransformed_position")?
-                .call1(py, (untransformed_position, clip))
-                .context("Failed adapter.init_from_untransformed_position")?;
-            let (
-                logp,
-                logdet,
-                untransformed_gradient_out,
-                transformed_position_out,
-                transformed_gradient_out,
-            ): (
-                f64,
-                f64,
-                PyReadonlyArray1<f64>,
-                PyReadonlyArray1<f64>,
-                PyReadonlyArray1<f64>,
-            ) = output
-                .extract(py)
-                .context("Unexpected return value of init_from_untransformed_position")?;
-
-            untransformed_gradient.copy_from_slice(untransformed_gradient_out.as_slice()?);
-            transformed_position.copy_from_slice(transformed_position_out.as_slice()?);
-            transformed_gradient.copy_from_slice(transformed_gradient_out.as_slice()?);
-            Ok((logp, logdet))
         })
     }
 

@@ -6,7 +6,6 @@ use nuts_rs::{
     CpuLogpFunc, CpuMath, HasDims, InitPositionError, LogpError, Model, Storable, Value,
 };
 use pyo3::{
-    exceptions::PyRuntimeError,
     pyclass, pymethods,
     types::{PyAnyMethods, PyDict, PyDictMethods, PyNone},
     BoundObject, Py, PyAny, PyErr, PyResult, Python,
@@ -17,7 +16,7 @@ use thiserror::Error;
 
 use crate::{
     common::{call_init_point_func, PyValue, PyVariable},
-    wrapper::{soft_clip, NativeFlow, PyTransformAdapt},
+    wrapper::{no_adapter, FlowAdapter, PyTransformAdapt},
 };
 
 type UserData = *const std::ffi::c_void;
@@ -184,8 +183,7 @@ impl LogpError for PyMcLogpError {
 
 pub struct PyMcModelRef {
     model: Arc<PyMcModel>,
-    transform_adapter: Option<PyTransformAdapt>,
-    native_flow: NativeFlow,
+    flow: Option<FlowAdapter>,
 }
 
 impl CpuLogpFunc for PyMcModelRef {
@@ -202,23 +200,7 @@ impl CpuLogpFunc for PyMcModelRef {
     }
 
     fn logp(&mut self, position: &[f64], gradient: &mut [f64]) -> Result<f64, Self::LogpError> {
-        let mut logp = 0f64;
-        let logp_ptr = (&mut logp) as *mut f64;
-        assert!(position.len() == self.model.dim);
-        assert!(gradient.len() == self.model.dim);
-        let retcode = unsafe {
-            (self.model.density.func)(
-                self.model.dim,
-                position.as_ptr(),
-                gradient.as_mut_ptr(),
-                logp_ptr,
-                self.model.density.user_data_ptr,
-            )
-        };
-        if retcode == 0 {
-            return Ok(logp);
-        }
-        Err(PyMcLogpError::ErrorCode(retcode))
+        self.model.logp(position, gradient)
     }
 
     fn expand_vector<R>(
@@ -299,18 +281,14 @@ impl CpuLogpFunc for PyMcModelRef {
         transformed_position: &mut [f64],
         transformed_gradient: &mut [f64],
     ) -> std::result::Result<f64, Self::LogpError> {
-        let logdet = self
-            .transform_adapter
-            .as_mut()
-            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?
-            .inv_transform_normalize(
-                params,
-                untransformed_position,
-                untransformed_gradient,
-                transformed_position,
-                transformed_gradient,
-            )?;
-        Ok(logdet)
+        let flow = self.flow.as_mut().ok_or_else(no_adapter)?;
+        Ok(flow.inv_transform_normalize(
+            params,
+            untransformed_position,
+            untransformed_gradient,
+            transformed_position,
+            transformed_gradient,
+        )?)
     }
 
     fn init_from_transformed_position(
@@ -322,59 +300,16 @@ impl CpuLogpFunc for PyMcModelRef {
         transformed_gradient: &mut [f64],
         clip: Option<f64>,
     ) -> std::result::Result<(f64, f64), Self::LogpError> {
-        // Native path: flow and the compiled logp both in Rust, no Python.
-        // `native_flow` is moved out so the logp closure can borrow `self`.
-        let adapter = self
-            .transform_adapter
-            .clone()
-            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?;
-        let mut native = std::mem::take(&mut self.native_flow);
-        let result = native.init_from_transformed_position(
-            &adapter,
+        let flow = self.flow.as_mut().ok_or_else(no_adapter)?;
+        flow.init_from_transformed_position(
             params,
             untransformed_position,
             untransformed_gradient,
             transformed_position,
             transformed_gradient,
             clip,
-            |y, grad| self.logp(y, grad),
-        );
-        self.native_flow = native;
-        if let Some(out) = result? {
-            return Ok(out);
-        }
-
-        // The flow has no native form (e.g. the diagonal-only one of the early
-        // windows): transform in Python, but the logp stays the compiled one
-        // here -- the adapter is built without a `logp_fn` for these models.
-        let adapter = self
-            .transform_adapter
-            .as_mut()
-            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?;
-        let part1 = adapter
-            .init_from_transformed_position_part1(
-                params,
-                untransformed_position,
-                transformed_position,
-            )
-            .context("Failed init_from_transformed_position_part1")?;
-
-        let logp = self.logp(untransformed_position, untransformed_gradient)?;
-        soft_clip(untransformed_gradient, clip);
-
-        let adapter = self
-            .transform_adapter
-            .as_mut()
-            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?;
-        let logdet = adapter
-            .init_from_transformed_position_part2(
-                params,
-                part1,
-                untransformed_gradient,
-                transformed_gradient,
-            )
-            .context("Failed init_from_transformed_position_part2")?;
-        Ok((logp, logdet))
+            |position, gradient| self.model.logp(position, gradient),
+        )
     }
 
     fn init_from_untransformed_position(
@@ -386,23 +321,16 @@ impl CpuLogpFunc for PyMcModelRef {
         transformed_gradient: &mut [f64],
         clip: Option<f64>,
     ) -> std::result::Result<(f64, f64), Self::LogpError> {
-        // As in `init_from_transformed_position`: the compiled logp here, only
-        // the transform in Python.
-        let logp = self.logp(untransformed_position, untransformed_gradient)?;
-        soft_clip(untransformed_gradient, clip);
-        let logdet = self
-            .transform_adapter
-            .as_mut()
-            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?
-            .inv_transform_normalize(
-                params,
-                untransformed_position,
-                untransformed_gradient,
-                transformed_position,
-                transformed_gradient,
-            )
-            .context("Failed inv_transform_normalize in init_from_untransformed_position")?;
-        Ok((logp, logdet))
+        let flow = self.flow.as_mut().ok_or_else(no_adapter)?;
+        flow.init_from_untransformed_position(
+            params,
+            untransformed_position,
+            untransformed_gradient,
+            transformed_position,
+            transformed_gradient,
+            clip,
+            |position, gradient| self.model.logp(position, gradient),
+        )
     }
 
     fn update_transformation<'a, R: rand::Rng + ?Sized>(
@@ -413,18 +341,14 @@ impl CpuLogpFunc for PyMcModelRef {
         untransformed_logp: impl ExactSizeIterator<Item = &'a f64>,
         params: &'a mut Py<PyAny>,
     ) -> std::result::Result<(), Self::LogpError> {
-        self.native_flow.invalidate();
-        self.transform_adapter
-            .as_mut()
-            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?
-            .update_transformation(
-                rng,
-                untransformed_positions,
-                untransformed_gradients,
-                untransformed_logp,
-                params,
-            )?;
-        Ok(())
+        let flow = self.flow.as_mut().ok_or_else(no_adapter)?;
+        Ok(flow.update_transformation(
+            rng,
+            untransformed_positions,
+            untransformed_gradients,
+            untransformed_logp,
+            params,
+        )?)
     }
 
     fn init_transformation<R: rand::Rng + ?Sized>(
@@ -434,13 +358,8 @@ impl CpuLogpFunc for PyMcModelRef {
         untransformed_gradient: &[f64],
         chain: u64,
     ) -> std::result::Result<Py<PyAny>, Self::LogpError> {
-        self.native_flow.invalidate();
-        let trafo = self
-            .transform_adapter
-            .as_mut()
-            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?
-            .new_transformation(rng, untransformed_position, untransformed_gradient, chain)?;
-        Ok(trafo)
+        let flow = self.flow.as_mut().ok_or_else(no_adapter)?;
+        Ok(flow.init_transformation(rng, untransformed_position, untransformed_gradient, chain)?)
     }
 
     fn new_transformation<R: rand::Rng + ?Sized>(
@@ -456,12 +375,8 @@ impl CpuLogpFunc for PyMcModelRef {
     }
 
     fn transformation_id(&self, params: &Py<PyAny>) -> std::result::Result<i64, Self::LogpError> {
-        let id = self
-            .transform_adapter
-            .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?
-            .transformation_id(params)?;
-        Ok(id)
+        let flow = self.flow.as_ref().ok_or_else(no_adapter)?;
+        Ok(flow.transformation_id(params)?)
     }
 }
 
@@ -554,14 +469,35 @@ impl PyMcModel {
     */
 }
 
+impl PyMcModel {
+    fn logp(&self, position: &[f64], gradient: &mut [f64]) -> Result<f64, PyMcLogpError> {
+        let mut logp = 0f64;
+        let logp_ptr = (&mut logp) as *mut f64;
+        assert!(position.len() == self.dim);
+        assert!(gradient.len() == self.dim);
+        let retcode = unsafe {
+            (self.density.func)(
+                self.dim,
+                position.as_ptr(),
+                gradient.as_mut_ptr(),
+                logp_ptr,
+                self.density.user_data_ptr,
+            )
+        };
+        if retcode == 0 {
+            return Ok(logp);
+        }
+        Err(PyMcLogpError::ErrorCode(retcode))
+    }
+}
+
 impl Model for PyMcModel {
     type Math = CpuMath<PyMcModelRef>;
 
     fn math<R: Rng + ?Sized>(self: Arc<PyMcModel>, _rng: &mut R) -> Result<Self::Math> {
         Ok(CpuMath::new(PyMcModelRef {
             model: self.clone(),
-            transform_adapter: self.transform_adapter.clone(),
-            native_flow: NativeFlow::default(),
+            flow: self.transform_adapter.clone().map(FlowAdapter::new),
         }))
     }
 

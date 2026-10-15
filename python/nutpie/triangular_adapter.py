@@ -6,8 +6,7 @@ uses, the Rust LM run and its report.
 gives the sampler. It does what `transform_adapter.TransformAdapter` does
 with ``coupling_type="triangular"`` and ``method="lm-rust"``, but holds a
 `nutpie.triangular_flow.TriangularFlow` instead of a JAX flow: no JAX on the
-way from the draws to the sampler's native transform. JAX is only needed for
-a model's ``logp_fn``, if the sampler asks the adapter to evaluate it.
+way from the draws to the sampler's native transform.
 
 Importing this module does not import JAX.
 """
@@ -212,13 +211,6 @@ def _affine_fisher_divergence(loc, scale, positions, gradients):
     return float((residual * residual).sum(1).mean())
 
 
-def _soft_clip(gradient, clip):
-    """``clip * asinh(gradient / clip)``, or `gradient` without a clip."""
-    if clip is None:
-        return gradient
-    return clip * np.arcsinh(gradient / clip)
-
-
 class TriangularFlowAdapter:
     """The sampler's flow adapter with a triangular flow built in Rust.
 
@@ -236,7 +228,6 @@ class TriangularFlowAdapter:
         gradient,
         chain,
         *,
-        logp_fn,
         sparsity,
         order,
         verbose,
@@ -287,8 +278,6 @@ class TriangularFlowAdapter:
                 "The triangular flow needs a `sparsity` (a boolean Markov-blanket "
                 "adjacency matrix of shape (n_dim, n_dim))."
             )
-        self._logp_fn = logp_fn
-        self._value_and_grad = None
         self._sparsity = sparsity
         self._order = order
         self._chain = chain
@@ -412,39 +401,6 @@ class TriangularFlowAdapter:
             return part1, gradient * self._scale
         native, log_det = part1
         return log_det, np.asarray(native.pullback(gradient))
-
-    def init_from_transformed_position(self, transformed_position, clip):
-        """``(logp, log_det, y, grad_y, grad_z)`` at a base-space position,
-        with the model's ``logp_fn``."""
-        y, part1 = self.init_from_transformed_position_part1(transformed_position)
-        logp, grad_y = self._logp_and_grad(y)
-        grad_y = _soft_clip(grad_y, clip)
-        log_det, grad_z = self.init_from_transformed_position_part2(part1, grad_y)
-        return logp, log_det, y, grad_y, grad_z
-
-    def init_from_untransformed_position(self, untransformed_position, clip):
-        """``(logp, log_det, grad_y, z, grad_z)`` at a draw, with the model's
-        ``logp_fn``."""
-        y = np.asarray(untransformed_position, dtype=np.float64)
-        logp, grad_y = self._logp_and_grad(y)
-        grad_y = _soft_clip(grad_y, clip)
-        log_det, z, grad_z = self.inv_transform(y, grad_y)
-        return logp, log_det, grad_y, z, grad_z
-
-    def _logp_and_grad(self, y):
-        if self._logp_fn is None:
-            raise NotImplementedError(
-                "This model has no logp_fn for the adapter to evaluate; the "
-                "sampler uses the native flow instead."
-            )
-        if self._value_and_grad is None:
-            import jax
-
-            self._value_and_grad = jax.jit(
-                jax.value_and_grad(lambda x: self._logp_fn(x)[0])
-            )
-        logp, grad = self._value_and_grad(y)
-        return float(logp), np.asarray(grad, dtype=np.float64)
 
     # -------------------------------------------------------------- update
 

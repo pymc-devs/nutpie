@@ -1124,30 +1124,7 @@ def fit_flow(key, bijection, loss_fn, draws, grads, logps, val=None, **kwargs):
 
 
 @eqx.filter_jit
-def _init_from_transformed_position(logp_fn, bijection, transformed_position, clip):
-    bijection = unwrap(bijection)
-    (untransformed_position, logdet), pull_grad = jax.vjp(
-        bijection.transform_and_log_det, transformed_position
-    )
-    logp, untransformed_gradient = jax.value_and_grad(lambda x: logp_fn(x)[0])(
-        untransformed_position
-    )
-
-    if clip is not None:
-        untransformed_gradient = clip * jnp.arcsinh(untransformed_gradient / clip)
-
-    (transformed_gradient,) = pull_grad((untransformed_gradient, 1.0))
-    return (
-        logp,
-        logdet,
-        untransformed_position,
-        untransformed_gradient,
-        transformed_gradient,
-    )
-
-
-@eqx.filter_jit
-def _init_from_transformed_position_part1(logp_fn, bijection, transformed_position):
+def _init_from_transformed_position_part1(bijection, transformed_position):
     bijection = unwrap(bijection)
     (untransformed_position, logdet) = bijection.transform_and_log_det(
         transformed_position
@@ -1173,26 +1150,6 @@ def _init_from_transformed_position_part2(
 
 
 @eqx.filter_jit
-def _init_from_untransformed_position(logp_fn, bijection, untransformed_position, clip):
-    logp, untransformed_gradient = jax.value_and_grad(lambda x: logp_fn(x)[0])(
-        untransformed_position
-    )
-    if clip is not None:
-        untransformed_gradient = clip * jnp.arcsinh(untransformed_gradient / clip)
-
-    logdet, transformed_position, transformed_gradient = _inv_transform(
-        bijection, untransformed_position, untransformed_gradient
-    )
-    return (
-        logp,
-        logdet,
-        untransformed_gradient,
-        transformed_position,
-        transformed_gradient,
-    )
-
-
-@eqx.filter_jit
 def _inv_transform(bijection, untransformed_position, untransformed_gradient):
     bijection = unwrap(bijection)
     transformed_position, transformed_gradient, logdet = inverse_gradient_and_val(
@@ -1209,7 +1166,6 @@ class TransformAdapter:
         gradient,
         chain,
         *,
-        logp_fn,
         make_flow_fn,
         verbose,
         window_size,
@@ -1267,7 +1223,6 @@ class TransformAdapter:
     ):
         from nutpie._lib import FisherResiduals
 
-        self._logp_fn = logp_fn
         self._make_flow_fn = make_flow_fn
         self._chain = chain
         # 0: silent, 1: one line per window, 2: also the LM iterations
@@ -1774,24 +1729,6 @@ class TransformAdapter:
             print(traceback.format_exc())
             raise
 
-    def init_from_transformed_position(self, transformed_position, clip):
-        try:
-            logp, logdet, *arrays = _init_from_transformed_position(
-                self._logp_fn,
-                self._bijection,
-                jnp.array(transformed_position),
-                clip,
-            )
-            return (
-                float(logp),
-                float(logdet),
-                *[np.array(val, dtype="float64") for val in arrays],
-            )
-        except Exception as e:
-            print(e)
-            print(traceback.format_exc())
-            raise
-
     def flow_transform_layout(self):
         """The current flow's layout for the sampler's native leapfrog
         transform, or `None` to keep using JAX (see
@@ -1807,7 +1744,6 @@ class TransformAdapter:
         try:
             transformed_position = jnp.array(transformed_position)
             logdet, untransformed_position = _init_from_transformed_position_part1(
-                self._logp_fn,
                 self._bijection,
                 transformed_position,
             )
@@ -1832,18 +1768,6 @@ class TransformAdapter:
                 untransformed_gradient,
             )
             return float(logdet), *[np.array(val, dtype="float64") for val in arrays]
-        except Exception as e:
-            print(e)
-            print(traceback.format_exc())
-            raise
-
-    def init_from_untransformed_position(self, untransformed_position, clip):
-        try:
-            logp, logdet, *arrays = _init_from_untransformed_position(
-                self._logp_fn, self._bijection, jnp.array(untransformed_position), clip
-            )
-            arrays = [np.array(val, dtype="float64") for val in arrays]
-            return float(logp), float(logdet), *arrays
         except Exception as e:
             print(e)
             print(traceback.format_exc())

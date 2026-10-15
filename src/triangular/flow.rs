@@ -358,9 +358,9 @@ pub struct PyTriangularFlow {
 }
 
 impl PyTriangularFlow {
-    /// The sampler's native transform, one chain's: serial.
+    /// The sampler's native transform.
     pub(crate) fn native_transform(&self) -> Result<FlowTransform> {
-        self.inner.flow_transform("serial", 20_000)
+        self.inner.flow_transform("auto", 20_000)
     }
 }
 
@@ -656,7 +656,7 @@ impl PyTriangularFlow {
     }
 
     /// The native transform for the sampler, see `FlowTransform`.
-    #[pyo3(signature = (schedule = "serial", min_parallel_work = 20_000))]
+    #[pyo3(signature = (schedule = "auto", min_parallel_work = 20_000))]
     fn flow_transform(&self, schedule: &str, min_parallel_work: i64) -> Result<PyFlowTransform> {
         Ok(PyFlowTransform::from_flow(
             self.inner.flow_transform(schedule, min_parallel_work)?,

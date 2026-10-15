@@ -243,7 +243,7 @@ class CompiledPyMCModel(CompiledModel):
         def make_adapter(*args, **kwargs):
             from nutpie.transform_adapter import make_transform_adapter
 
-            return make_transform_adapter(**outer_kwargs)(*args, **kwargs, logp_fn=None)
+            return make_transform_adapter(**outer_kwargs)(*args, **kwargs)
 
         return _lib.PyMcModel(
             logp_fn,

@@ -527,7 +527,7 @@ def test_rust_flow_adapter(refit_diag, diag_restart_margin):
         nn_width=4,
         refit_diag=refit_diag,
         diag_restart_margin=diag_restart_margin,
-    )(0, x[0], g[0], 0, logp_fn=None, sparsity=sparsity, order=np.arange(dim))
+    )(0, x[0], g[0], 0, sparsity=sparsity, order=np.arange(dim))
     for n_draws in [20, 40]:
         adapter.update(n_draws, list(x[:n_draws]), list(g[:n_draws]), np.zeros(n_draws))
         assert isinstance(adapter.flow_transform_layout(), dict)
@@ -571,7 +571,7 @@ def test_rust_flow_adapter_diag_restart(capsys):
         nn_width=4,
         diag_restart_margin=-np.inf,
         verbose=1,
-    )(0, x[0], g[0], 0, logp_fn=None, sparsity=~np.eye(dim, dtype=bool), order=None)
+    )(0, x[0], g[0], 0, sparsity=~np.eye(dim, dtype=bool), order=None)
     for _ in range(3):
         adapter.update(400, list(x), list(g), np.zeros(400))
     out = capsys.readouterr().out
@@ -605,7 +605,7 @@ def test_rust_flow_adapter_diagonal_estimate():
             nn_width=4,
             lm_preconditioner=preconditioner,
             lm_diagonal_probes=2,
-        )(0, x[0], g[0], 0, logp_fn=None, sparsity=~np.eye(dim, dtype=bool), order=None)
+        )(0, x[0], g[0], 0, sparsity=~np.eye(dim, dtype=bool), order=None)
 
     fitted = adapter("diagonal_estimate")
     for _ in range(2):
