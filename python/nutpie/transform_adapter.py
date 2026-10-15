@@ -1900,6 +1900,7 @@ def make_transform_adapter(
     transformer_layers=1,
     tangent_sas_fix_b=False,
     log_gamma_bounds=None,
+    scale_squash=3.0,
     input_squash=None,
     reuse_embed=True,
     order=None,
@@ -1978,6 +1979,15 @@ def make_transform_adapter(
     there; ``(-1, 1)`` allows tails at most ``e`` times heavier or lighter
     per layer. ``None`` leaves it unbounded.
 
+    ``scale_squash`` (with ``rust_flow``) is the width ``c`` of the map from
+    the transformer's scale field ``s`` to its log scale, ``c * asinh(s /
+    c)``: linear within about ``c`` of zero, logarithmic beyond, so that a
+    scale growing linearly in the parents away from the draws gives a scale
+    growing only polynomially there. ``None`` makes the log scale ``s``
+    itself, so that with ``scale_skip`` it is linear in the parents, as in a
+    funnel (``x ~ N(0, exp(v / 2))``), which the default ``1`` cannot
+    represent beyond a narrow range of ``v``.
+
     ``input_squash`` makes the conditioner MLPs of a triangular flow see
     ``c * asinh(y / c)`` of each parent, so that away from the draws their
     outputs grow like ``log`` of the distance instead of linearly; the
@@ -2029,6 +2039,8 @@ def make_transform_adapter(
     """
     if refit_diag and not rust_flow:
         raise ValueError("refit_diag is only supported with rust_flow=True.")
+    if scale_squash != 1.0 and not rust_flow:
+        raise ValueError("scale_squash is only supported with rust_flow=True.")
     if conditioners is not None and not rust_flow:
         raise ValueError("conditioners is only supported with rust_flow=True.")
     if rust_flow:
@@ -2075,6 +2087,7 @@ def make_transform_adapter(
             transformer_layers=transformer_layers,
             tangent_sas_fix_b=tangent_sas_fix_b,
             log_gamma_bounds=log_gamma_bounds,
+            scale_squash=scale_squash,
             input_squash=input_squash,
             scale_skip=scale_skip,
             max_epochs=max_epochs,

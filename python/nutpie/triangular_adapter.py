@@ -253,6 +253,7 @@ class TriangularFlowAdapter:
         transformer_layers,
         tangent_sas_fix_b,
         log_gamma_bounds,
+        scale_squash,
         input_squash,
         scale_skip,
         max_epochs,
@@ -317,6 +318,7 @@ class TriangularFlowAdapter:
             "transformer_layers": transformer_layers,
             "tangent_sas_fix_b": tangent_sas_fix_b,
             "log_gamma_bounds": log_gamma_bounds,
+            "scale_squash": scale_squash,
         }
         # The conditioners of the full fits, and of the linear stage, see
         # `linear_fits`.
@@ -328,6 +330,7 @@ class TriangularFlowAdapter:
                 transformer_layers,
                 tangent_sas_fix_b=tangent_sas_fix_b,
                 log_gamma_bounds=log_gamma_bounds,
+                scale_squash=scale_squash,
             ),
         )
         self._lm_settings = {

@@ -60,9 +60,13 @@ def transformer_kind(
     *,
     tangent_sas_fix_b=False,
     log_gamma_bounds=None,
+    scale_squash=1.0,
 ):
     """The transformer as the Rust flow takes it, ``{"kind": ...}``, from
-    `make_transformer`'s arguments. `transformer_layout` gives its layout."""
+    `make_transformer`'s arguments. `transformer_layout` gives its layout.
+
+    `scale_squash` is the width ``c`` of the scale field's map to the log
+    scale, ``c * asinh(s / c)``, or ``None`` for ``s`` itself."""
     layers = int(transformer_layers)
     if transformer not in RUST_TRANSFORMERS:
         raise NotImplementedError(
@@ -72,12 +76,15 @@ def transformer_kind(
     if transformer == "affine":
         if layers != 1:
             raise ValueError("an affine transformer has exactly one layer.")
-        return {"kind": "affine"}
-    kind = {"kind": transformer, "layers": layers}
+        kind = {"kind": "affine"}
+    else:
+        kind = {"kind": transformer, "layers": layers}
     if transformer == "tangent_sas":
         kind["fix_b"] = bool(tangent_sas_fix_b)
-    elif log_gamma_bounds is not None:
+    elif transformer != "affine" and log_gamma_bounds is not None:
         kind["log_gamma_bounds"] = [float(b) for b in log_gamma_bounds]
+    if scale_squash != 1.0:
+        kind["scale_squash"] = None if scale_squash is None else float(scale_squash)
     return kind
 
 
@@ -246,6 +253,7 @@ def build_triangular_flow(
     transformer_layers=1,
     tangent_sas_fix_b=False,
     log_gamma_bounds=None,
+    scale_squash=1.0,
     conditioners=None,
 ):
     """A new triangular flow for the draws.
@@ -274,6 +282,7 @@ def build_triangular_flow(
         transformer_layers,
         tangent_sas_fix_b=tangent_sas_fix_b,
         log_gamma_bounds=log_gamma_bounds,
+        scale_squash=scale_squash,
     )
     if conditioners is None:
         conditioners = default_conditioners()

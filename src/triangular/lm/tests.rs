@@ -58,6 +58,7 @@ fn problem_squashed(squash: Option<f64>, activation: Activation, n_draw: usize) 
             mu: param(3, 0.0),
             nu: param(4, 0.3),
             log_gamma_bounds: Some((-1.5, 2.0)),
+            scale_squash: Some(1.0),
         }),
         LayerConfig::TangentSas(TangentSasConfig {
             nu: param(5, 0.0),
@@ -68,6 +69,7 @@ fn problem_squashed(squash: Option<f64>, activation: Activation, n_draw: usize) 
         LayerConfig::PositiveAffine(PositiveAffineConfig {
             loc: param(9, 0.0),
             scale: param(10, 0.1),
+            scale_squash: Some(1.0),
         }),
     ];
     let transformer = LayerChain::new(configs, 11, Some(3), Some(10)).unwrap();

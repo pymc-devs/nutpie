@@ -30,8 +30,8 @@ use crate::triangular::transformer::layers::scalar::{
     forward_chain, forward_chain_with_grads, LayerTape,
 };
 use crate::triangular::transformer::layers::{
-    AsymmetricSasConfig, Contract2Config, Layer, LayerConfig, Param, PositiveAffineConfig,
-    TangentSasConfig,
+    unit_squash, AsymmetricSasConfig, Contract2Config, Layer, LayerConfig, Param,
+    PositiveAffineConfig, ScaleSquash, TangentSasConfig,
 };
 
 pub(crate) trait Transformer {
@@ -52,6 +52,10 @@ pub(crate) trait Transformer {
     /// The scale coefficient that multiplies the output's scale by `factor`
     /// (positive), from its value `coef`.
     fn rescaled_scale_coef(&self, coef: f64, factor: f64) -> f64;
+    /// Whether the log of the output's scale is the scale coefficient
+    /// itself, up to a constant (no `scale_squash`), so that anything
+    /// linear in the scale coefficient is linear in the log scale.
+    fn linear_log_scale(&self) -> bool;
 
     /// Generative direction: `(y, log_det)`.
     fn forward_draw(&self, coefs: &[f64], x: f64) -> (f64, f64);
@@ -168,11 +172,20 @@ impl<S: Simd> TransformerDerivatives<S> {
 pub(crate) type AnyTransformer = LayerChain;
 
 /// A transformer as Python describes it, by `kind`.
+///
+/// The scale coefficient `s` multiplies the output by `exp(c asinh(s / c))`
+/// for `scale_squash = c` (default 1), or by `exp(s)` for `None`. A squashed
+/// log scale is only logarithmic in `s` beyond about `c`, so a linear scale
+/// skip makes it only logarithmic in the parents there; `None` keeps it
+/// linear, as a funnel needs.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum TransformerConfig {
     /// `loc + scale_mod * x`.
-    Affine,
+    Affine {
+        #[serde(default = "unit_squash")]
+        scale_squash: ScaleSquash,
+    },
     /// `layers` stacked `Contract2` (sinh-arcsinh) layers. Every interior
     /// output shift is redundant with the next layer's input shift, so only
     /// the last layer has one.
@@ -181,6 +194,8 @@ pub(crate) enum TransformerConfig {
         layers: usize,
         #[serde(default)]
         log_gamma_bounds: Option<(f64, f64)>,
+        #[serde(default = "unit_squash")]
+        scale_squash: ScaleSquash,
     },
     /// `layers` stacked `TangentSAS` layers and a trailing affine. With
     /// `fix_b`, every layer's `b` stays at its start.
@@ -189,6 +204,8 @@ pub(crate) enum TransformerConfig {
         layers: usize,
         #[serde(default)]
         fix_b: bool,
+        #[serde(default = "unit_squash")]
+        scale_squash: ScaleSquash,
     },
     /// `layers` stacked `AsymmetricSAS` layers and a trailing affine. The
     /// first acts on the standard-normal base, so it has no shift or scale.
@@ -197,6 +214,8 @@ pub(crate) enum TransformerConfig {
         layers: usize,
         #[serde(default)]
         log_gamma_bounds: Option<(f64, f64)>,
+        #[serde(default = "unit_squash")]
+        scale_squash: ScaleSquash,
     },
 }
 
@@ -225,7 +244,7 @@ impl TransformerConfig {
         let mut coefs = Coefs(0);
         let mut configs = Vec::new();
         let n_layers = match *self {
-            Self::Affine => 1,
+            Self::Affine { .. } => 1,
             Self::Sas { layers, .. }
             | Self::TangentSas { layers, .. }
             | Self::AsymmetricSas { layers, .. } => layers,
@@ -237,6 +256,7 @@ impl TransformerConfig {
             Self::Sas {
                 layers,
                 log_gamma_bounds,
+                scale_squash,
             } => {
                 let mut roles = (None, None);
                 for index in 0..layers {
@@ -253,12 +273,22 @@ impl TransformerConfig {
                         mu,
                         nu: coefs.next(),
                         log_gamma_bounds,
+                        // Only the last layer's `sigma` is the scale.
+                        scale_squash: if index == layers - 1 {
+                            scale_squash
+                        } else {
+                            unit_squash()
+                        },
                     }));
                     roles = (mu, sigma);
                 }
                 roles
             }
-            Self::TangentSas { layers, fix_b } => {
+            Self::TangentSas {
+                layers,
+                fix_b,
+                scale_squash,
+            } => {
                 for _ in 0..layers {
                     let (nu, eps) = (coefs.next(), coefs.next());
                     let b = if fix_b { None } else { coefs.next() };
@@ -269,11 +299,12 @@ impl TransformerConfig {
                         r: coefs.next(),
                     }));
                 }
-                affine(&mut coefs, &mut configs)
+                affine(&mut coefs, &mut configs, scale_squash)
             }
             Self::AsymmetricSas {
                 layers,
                 log_gamma_bounds,
+                scale_squash,
             } => {
                 for index in 0..layers {
                     let (c, a) = if index > 0 {
@@ -289,9 +320,9 @@ impl TransformerConfig {
                         log_gamma_bounds,
                     }));
                 }
-                affine(&mut coefs, &mut configs)
+                affine(&mut coefs, &mut configs, scale_squash)
             }
-            Self::Affine => affine(&mut coefs, &mut configs),
+            Self::Affine { scale_squash } => affine(&mut coefs, &mut configs, scale_squash),
         };
         LayerChain::new(
             configs,
@@ -303,11 +334,16 @@ impl TransformerConfig {
 }
 
 /// Appends the trailing `PositiveAffine`, returning its `(loc, scale)`.
-fn affine(coefs: &mut Coefs, configs: &mut Vec<LayerConfig>) -> (Option<Param>, Option<Param>) {
+fn affine(
+    coefs: &mut Coefs,
+    configs: &mut Vec<LayerConfig>,
+    scale_squash: ScaleSquash,
+) -> (Option<Param>, Option<Param>) {
     let (loc, scale) = (coefs.next(), coefs.next());
     configs.push(LayerConfig::PositiveAffine(PositiveAffineConfig {
         loc,
         scale,
+        scale_squash,
     }));
     (loc, scale)
 }
@@ -324,6 +360,8 @@ pub(crate) struct LayerChain {
     /// The offsets of the fields the location and the scale feed.
     location_offset: f64,
     scale_offset: f64,
+    /// The scale field's squash, see [`ScaleSquash`].
+    scale_squash: ScaleSquash,
     /// The coefficients of the fields that shape a layer beyond an affine
     /// map, see [`Layer::shape_params`].
     shape: Vec<usize>,
@@ -365,6 +403,30 @@ impl LayerChain {
                 .map_or(0.0, |p| p.offset)
         };
         let (location_offset, scale_offset) = (offset(location), offset(scale));
+        let scale_squash = configs
+            .iter()
+            .find_map(|config| match *config {
+                LayerConfig::Contract2(c) if c.sigma.map(|p| p.index) == scale => {
+                    Some(c.scale_squash)
+                }
+                LayerConfig::PositiveAffine(a) if a.scale.map(|p| p.index) == scale => {
+                    Some(a.scale_squash)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(unit_squash);
+        for config in &configs {
+            let squash = match *config {
+                LayerConfig::Contract2(c) => c.scale_squash,
+                LayerConfig::PositiveAffine(a) => a.scale_squash,
+                _ => continue,
+            };
+            if let Some(c) = squash {
+                if !(c.is_finite() && c > 0.0) {
+                    bail!("scale_squash must be positive and finite or None, got {c}");
+                }
+            }
+        }
         let mut shape: Vec<usize> = layers.iter().flat_map(Layer::shape_params).collect();
         shape.sort_unstable();
         shape.dedup();
@@ -376,6 +438,7 @@ impl LayerChain {
             scale,
             location_offset,
             scale_offset,
+            scale_squash,
             shape,
         })
     }
@@ -418,11 +481,19 @@ impl Transformer for LayerChain {
         a * field + b - self.location_offset
     }
 
-    /// The scale field `s` scales the last layer's output by `exp(asinh(s))`
-    /// (`Contract2`'s `sigma`, `PositiveAffine`'s `scale`).
+    /// The scale field `s` scales the last layer's output by
+    /// `exp(c asinh(s / c))`, or `exp(s)` without a squash (`Contract2`'s
+    /// `sigma`, `PositiveAffine`'s `scale`).
     fn rescaled_scale_coef(&self, coef: f64, factor: f64) -> f64 {
+        let Some(c) = self.scale_squash else {
+            return coef + factor.ln();
+        };
         let field = coef + self.scale_offset;
-        (field.asinh() + factor.ln()).sinh() - self.scale_offset
+        c * ((field / c).asinh() + factor.ln() / c).sinh() - self.scale_offset
+    }
+
+    fn linear_log_scale(&self) -> bool {
+        self.scale_squash.is_none()
     }
 
     #[inline(always)]

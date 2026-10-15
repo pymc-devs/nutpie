@@ -2,7 +2,8 @@
 //! tape needs.
 
 use super::{
-    AsymmetricSas, Contract2, Layer, LogGammaBound, Param, PositiveAffineConfig, TangentSasConfig,
+    AsymmetricSas, Contract2, Layer, LogGammaBound, Param, PositiveAffineConfig, ScaleSquash,
+    TangentSasConfig,
 };
 
 impl LogGammaBound {
@@ -88,6 +89,41 @@ fn exp_asinh_with_derivative(a: f64) -> (f64, f64) {
     };
     let value = if a >= 0.0 { a + root } else { 1.0 / (root - a) };
     (value, value / root)
+}
+
+/// The factor a scale field `s` multiplies by, `exp(c asinh(s / c))` for
+/// the squash `c` (see [`ScaleSquash`]), together with its log. `c = 1`
+/// takes `exp_asinh`'s closed form.
+#[inline(always)]
+fn scale_factor(s: f64, squash: ScaleSquash) -> (f64, f64) {
+    match squash {
+        None => (s.exp(), s),
+        Some(1.0) => (exp_asinh(s), s.asinh()),
+        Some(c) => {
+            let log = c * (s / c).asinh();
+            (log.exp(), log)
+        }
+    }
+}
+
+/// `scale_factor`, its derivative and its log.
+#[inline(always)]
+fn scale_factor_with_derivative(s: f64, squash: ScaleSquash) -> (f64, f64, f64) {
+    match squash {
+        None => {
+            let value = s.exp();
+            (value, value, s)
+        }
+        Some(1.0) => {
+            let (value, derivative) = exp_asinh_with_derivative(s);
+            (value, derivative, s.asinh())
+        }
+        Some(c) => {
+            let log = c * (s / c).asinh();
+            let value = log.exp();
+            (value, value / (s / c).hypot(1.0), log)
+        }
+    }
 }
 
 /// `log(cosh(asinh(s)))`, which is `0.5 * log1p(s*s)` since
@@ -245,10 +281,7 @@ impl Contract2 {
         let log_delta = self.beta.map_or(0.0, |p| p.get(params).asinh());
         let (sigma_mod, log_sigma) = match self.sigma {
             None => (1.0, 0.0),
-            Some(sigma) => {
-                let sigma_mod = exp_asinh(sigma.get(params));
-                (sigma_mod, sigma_mod.ln())
-            }
+            Some(sigma) => scale_factor(sigma.get(params), self.scale_squash),
         };
 
         let centred = match self.nu {
@@ -299,10 +332,7 @@ impl Contract2 {
         };
         let (sigma_mod, dsigma_mod, log_sigma) = match self.sigma {
             None => (1.0, 0.0, 0.0),
-            Some(sigma) => {
-                let (m, dm) = exp_asinh_with_derivative(sigma.get(params));
-                (m, dm, m.ln())
-            }
+            Some(sigma) => scale_factor_with_derivative(sigma.get(params), self.scale_squash),
         };
 
         let centred = match self.nu {
@@ -553,15 +583,16 @@ impl AsymmetricSas {
 }
 
 impl PositiveAffineConfig {
-    /// `y_out = loc + scale_mod * y`, `scale_mod = scale + sqrt(1 + scale^2)`.
+    /// `y_out = loc + scale_mod * y`, `scale_mod = exp(c asinh(scale / c))`,
+    /// which is `scale + sqrt(1 + scale^2)` for the default `c = 1`.
     #[inline(always)]
     fn transform(&self, params: &[f64], y: f64) -> (f64, f64) {
         let loc = param_or(self.loc, params, 0.0);
         match self.scale {
             None => (loc + y, 0.0),
             Some(p) => {
-                let scale = p.get(params);
-                (loc + exp_asinh(scale) * y, scale.asinh())
+                let (scale_mod, log_scale) = scale_factor(p.get(params), self.scale_squash);
+                (loc + scale_mod * y, log_scale)
             }
         }
     }
@@ -569,18 +600,14 @@ impl PositiveAffineConfig {
     #[inline(always)]
     fn transform_with_tape(&self, params: &[f64], y: f64) -> (f64, f64, LayerTape) {
         let loc = param_or(self.loc, params, 0.0);
-        let (scale, (scale_mod, dscale_mod)) = match self.scale {
-            None => (0.0, (1.0, 0.0)),
-            Some(p) => {
-                let scale = p.get(params);
-                (scale, exp_asinh_with_derivative(scale))
-            }
+        let (scale_mod, dscale_mod, log_scale) = match self.scale {
+            None => (1.0, 0.0, 0.0),
+            Some(p) => scale_factor_with_derivative(p.get(params), self.scale_squash),
         };
         let mut tape = LayerTape::new(scale_mod, 0.0);
         tape.push(self.loc, 1.0, 0.0);
-        // `log scale_mod = asinh(scale)`, whose derivative is
-        // `dscale_mod / scale_mod`.
+        // The derivative of `log scale_mod` is `dscale_mod / scale_mod`.
         tape.push(self.scale, y * dscale_mod, dscale_mod / scale_mod);
-        (loc + scale_mod * y, scale.asinh(), tape)
+        (loc + scale_mod * y, log_scale, tape)
     }
 }
