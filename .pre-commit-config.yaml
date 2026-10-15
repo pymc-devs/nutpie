@@ -27,3 +27,11 @@ repos:
     hooks:
     - id: zizmor
       args: [--min-severity=medium]
+
+  - repo: local
+    hooks:
+      - id: rustfmt
+        name: rustfmt
+        entry: cargo fmt
+        language: system
+        types: [rust]

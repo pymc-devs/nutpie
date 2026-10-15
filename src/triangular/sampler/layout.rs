@@ -225,7 +225,10 @@ impl VariableModel for LayoutModel {
             let (out_y, out_l) = if degree == 0 {
                 (&mut pad.edge_y[..n_in], &mut pad.edge_l[..n_in])
             } else {
-                (&mut pad.feature_y[..n_mlp_in], &mut pad.feature_l[..n_mlp_in])
+                (
+                    &mut pad.feature_y[..n_mlp_in],
+                    &mut pad.feature_l[..n_mlp_in],
+                )
             };
             self.arch.dispatch(BackpropMlp {
                 weights,
