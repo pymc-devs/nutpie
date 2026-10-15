@@ -59,6 +59,8 @@ pub(super) struct VariableScratch<S: Simd> {
     cot_l: Vec<S::f64s>,
     /// The variable's slice of the gradient, per lane.
     grad: Vec<S::f64s>,
+    /// One tile's contribution to `grad`, when it is squared.
+    tile_grad: Vec<S::f64s>,
 }
 
 impl<S: Simd> VariableScratch<S> {
@@ -70,6 +72,7 @@ impl<S: Simd> VariableScratch<S> {
             cot_a: Vec::with_capacity(max_parent),
             cot_l: Vec::with_capacity(max_parent),
             grad: Vec::with_capacity(problem.param_offset.max_len()),
+            tile_grad: Vec::with_capacity(problem.param_offset.max_len()),
         }
     }
 }
@@ -325,7 +328,8 @@ impl FisherResiduals {
 
     /// The second half: variable `i`'s local pullback, summed over the
     /// tiles in order and then over the lanes, into `out`, its slice of the
-    /// gradient.
+    /// gradient. With `squared`, each draw's pullback is squared before the
+    /// sum.
     #[simd]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn pullback_variable<S: Simd>(
@@ -335,6 +339,7 @@ impl FisherResiduals {
         r_bar: &Tiled,
         z: &Tiled,
         i: usize,
+        squared: bool,
         ws: &mut VariableScratch<S>,
         out: &mut [f64],
     ) {
@@ -346,9 +351,13 @@ impl FisherResiduals {
             cot_a,
             cot_l,
             grad,
+            tile_grad,
         } = ws;
+        let zero = S::f64s::splat(simd, 0.0);
         grad.clear();
-        grad.resize(theta_i.len(), S::f64s::splat(simd, 0.0));
+        grad.resize(theta_i.len(), zero);
+        tile_grad.clear();
+        tile_grad.resize(theta_i.len(), zero);
 
         for tile in 0..lin.data.n_tile() {
             let (w_i, z_i) = (lin.w.value(simd, tile, i), z.value(simd, tile, i));
@@ -369,15 +378,18 @@ impl FisherResiduals {
                 edge_l: cot_l,
             };
             self.conditional.evaluate(simd, theta_i, units);
-            self.conditional.local_pullback(
-                simd,
-                theta_i,
-                units,
-                &cot,
-                lin.data.y.value(simd, tile, i),
-                local,
-                grad,
-            );
+            let y_own = lin.data.y.value(simd, tile, i);
+            if squared {
+                tile_grad.fill(zero);
+                self.conditional
+                    .local_pullback(simd, theta_i, units, &cot, y_own, local, tile_grad);
+                for (g, t) in grad.iter_mut().zip(tile_grad.iter()) {
+                    *g = t.mul_add(*t, *g);
+                }
+            } else {
+                self.conditional
+                    .local_pullback(simd, theta_i, units, &cot, y_own, local, grad);
+            }
         }
         for (out, g) in out.iter_mut().zip(grad.iter()) {
             *out += g.reduce_sum();

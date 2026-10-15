@@ -140,6 +140,8 @@ def _run_lm(
     val_problem=None,
     early_stopping=True,
     linear_fit=False,
+    preconditioner="blocks",
+    diagonal_probes=1,
     prefix="",
 ):
     """The Rust LM fit of `problem` (a `FisherResiduals` with data) from
@@ -149,8 +151,10 @@ def _run_lm(
     `val_problem` holds the held-out draws for the validation loss and,
     with `early_stopping`, the early stopping. `linear_fit` holds what makes
     the conditioners and transformers nonlinear fixed (see
-    `FisherResiduals.nonlinear_param_mask`). The ridges are the problem's
-    conditioners'. Returns ``(theta, losses, lam, n_steps,
+    `FisherResiduals.nonlinear_param_mask`). `preconditioner` and
+    `diagonal_probes` go to `LmOptimizer`, see `make_transform_adapter`'s
+    ``lm_preconditioner``. The ridges are the problem's conditioners'.
+    Returns ``(theta, losses, lam, n_steps,
     n_accepted)``, with the losses at the returned `theta`: ``"objective"``
     (what LM minimised, with the regularizations), ``"train"`` and ``"val"``
     (Fisher divergences, ``val`` `None` without `val_problem`)."""
@@ -172,6 +176,8 @@ def _run_lm(
         max_block_size=max_exact_block_size,
         lmp_size=lmp_size,
         lmp_tol=lmp_tol,
+        preconditioner=preconditioner,
+        diagonal_probes=diagonal_probes,
         frozen=problem.nonlinear_param_mask if linear_fit else None,
         val_problem=val_problem,
         early_stopping=early_stopping,
@@ -270,6 +276,8 @@ class TriangularFlowAdapter:
         lm_max_exact_block_size,
         lm_lmp_size,
         lm_lmp_tol,
+        lm_preconditioner,
+        lm_diagonal_probes,
         conditioners=None,
     ):
         from nutpie._lib import FisherResiduals
@@ -345,6 +353,8 @@ class TriangularFlowAdapter:
             "max_exact_block_size": lm_max_exact_block_size,
             "lmp_size": lm_lmp_size,
             "lmp_tol": lm_lmp_tol,
+            "preconditioner": lm_preconditioner,
+            "diagonal_probes": lm_diagonal_probes,
         }
         # The Rust LM fit needs a multiple of its SIMD width of draws.
         self._draw_multiple = FisherResiduals.simd_width()

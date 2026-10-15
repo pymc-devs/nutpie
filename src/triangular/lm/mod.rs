@@ -71,6 +71,8 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Result};
 use fearless_simd::{dispatch, prelude::*, Level};
+use rand::{RngExt, SeedableRng};
+use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
 
 use crate::triangular::conditional::Conditional;
@@ -311,7 +313,7 @@ impl FisherResiduals {
 
     fn pullback_with<S: Simd>(&self, simd: S, lin: &Linearization, r_bar: &[f64]) -> Vec<f64> {
         let r_bar = Tiled::from_rows(r_bar, lin.data.n_draw, self.width);
-        self.sum_pullbacks(simd, lin, |tile, s| {
+        self.sum_pullbacks(simd, lin, false, |tile, s| {
             self.load_tile(simd, lin, tile, s);
             r_bar.load(simd, tile, &mut s.residual);
         })
@@ -329,14 +331,64 @@ impl FisherResiduals {
         lin: &Linearization,
         v: &[f64],
     ) -> Vec<f64> {
-        self.sum_pullbacks(simd, lin, |tile, s| {
+        self.sum_pullbacks(simd, lin, false, |tile, s| {
             self.load_tile(simd, lin, tile, s);
             self.pushforward_tile(simd, lin, v, s);
         })
     }
 
+    /// A Monte Carlo estimate of `diag(J^T J)`. Each of the `n_probes`
+    /// probes pulls back independent random signs `u` for every draw and
+    /// residual, and adds each draw's pullback squared: `E[(J_n^T u)^2] =
+    /// diag(J_n^T J_n)`, summed over the draws `n`. Averaged over the
+    /// probes; deterministic in `seed` and `stream`.
+    pub(crate) fn gauss_newton_diagonal_estimate(
+        &self,
+        lin: &Linearization,
+        n_probes: usize,
+        seed: u64,
+        stream: u64,
+    ) -> Result<Vec<f64>> {
+        if n_probes == 0 {
+            bail!("n_probes must be positive");
+        }
+        Ok(dispatch!(self.level, simd => {
+            self.gauss_newton_diagonal_estimate_with(simd, lin, n_probes, seed, stream)
+        }))
+    }
+
+    fn gauss_newton_diagonal_estimate_with<S: Simd>(
+        &self,
+        simd: S,
+        lin: &Linearization,
+        n_probes: usize,
+        seed: u64,
+        stream: u64,
+    ) -> Vec<f64> {
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        rng.set_stream(stream);
+        let n_draw = lin.data.n_draw;
+        let mut signs = vec![0.0; n_draw * self.n_residuals()];
+        let mut diagonal = vec![0.0; self.n_params()];
+        for _ in 0..n_probes {
+            for u in &mut signs {
+                *u = if rng.random::<bool>() { 1.0 } else { -1.0 };
+            }
+            let r_bar = Tiled::from_rows(&signs, n_draw, self.width);
+            let squares = self.sum_pullbacks(simd, lin, true, |tile, s| {
+                self.load_tile(simd, lin, tile, s);
+                r_bar.load(simd, tile, &mut s.residual);
+            });
+            for (d, q) in diagonal.iter_mut().zip(squares) {
+                *d += q / n_probes as f64;
+            }
+        }
+        diagonal
+    }
+
     /// `J^T r_bar` summed over the tiles, with `cotangent(tile, s)` loading
-    /// tile `tile` into `s` and leaving its `r_bar` in `s.residual`.
+    /// tile `tile` into `s` and leaving its `r_bar` in `s.residual`. With
+    /// `squared`, the sum of each draw's `J_n^T r_bar_n` squared instead.
     ///
     /// First, in parallel over the tiles, the triangular solve of each
     /// ([`Self::pullback_solve`]), keeping `r_bar` and `z` for all draws (only
@@ -351,6 +403,7 @@ impl FisherResiduals {
         &self,
         simd: S,
         lin: &Linearization,
+        squared: bool,
         cotangent: impl Fn(usize, &mut TileScratch<S>) + Sync,
     ) -> Vec<f64> {
         let (n_var, n_tile) = (self.n_var(), lin.data.n_tile());
@@ -383,7 +436,7 @@ impl FisherResiduals {
 
         grad_of_var.into_par_iter().enumerate().for_each_init(
             || VariableScratch::new(simd, self),
-            |ws, (i, out)| self.pullback_variable(simd, lin, &r_bar, &z, i, ws, out),
+            |ws, (i, out)| self.pullback_variable(simd, lin, &r_bar, &z, i, squared, ws, out),
         );
         grad
     }

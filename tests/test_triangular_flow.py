@@ -584,6 +584,40 @@ def test_rust_flow_adapter_diag_restart(capsys):
     assert flow.fisher_divergence(x[:64], g[:64]) < 1e-2
 
 
+def test_rust_flow_adapter_diagonal_estimate():
+    """With ``lm_preconditioner="diagonal_estimate"``, the LM fit still fits
+    a correlated normal; an unknown preconditioner is an error."""
+    from nutpie._lib import TriangularFlow
+    from nutpie.transform_adapter import make_transform_adapter
+
+    rng = np.random.default_rng(2)
+    dim = 5
+    root = rng.normal(size=(dim, dim))
+    cov = root @ root.T + np.eye(dim)
+    x = rng.multivariate_normal(np.zeros(dim), cov, size=400)
+    g = -x @ np.linalg.inv(cov)
+
+    def adapter(preconditioner):
+        return make_transform_adapter(
+            rust_flow=True,
+            num_diag_windows=0,
+            initial_skip=0,
+            nn_width=4,
+            lm_preconditioner=preconditioner,
+            lm_diagonal_probes=2,
+        )(0, x[0], g[0], 0, logp_fn=None, sparsity=~np.eye(dim, dtype=bool), order=None)
+
+    fitted = adapter("diagonal_estimate")
+    for _ in range(2):
+        fitted.update(400, list(x), list(g), np.zeros(400))
+    flow = fitted.flow_transform_layout()
+    assert isinstance(flow, TriangularFlow)
+    assert flow.fisher_divergence(x[:64], g[:64]) < 1e-2
+
+    with pytest.raises(Exception, match="unknown preconditioner"):
+        adapter("nope").update(400, list(x), list(g), np.zeros(400))
+
+
 def test_rust_flow_rejects_unsupported_settings():
     from nutpie.transform_adapter import make_transform_adapter
 

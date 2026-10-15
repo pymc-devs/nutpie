@@ -234,6 +234,43 @@ fn blocks_match_the_dense_gram() {
     }
 }
 
+/// The Monte Carlo diagonal is unbiased: with many probes it approaches the
+/// exact diagonal of `J^T J`, the one-by-one blocks.
+#[test]
+fn diagonal_estimate_converges_to_the_exact_diagonal() {
+    for (squash, activation) in CASES {
+        let problem = problem(squash, activation);
+        let mut rng = ChaCha8Rng::seed_from_u64(3);
+        let theta = normal(&mut rng, problem.n_params(), 0.3);
+        let (_, lin) = problem.residuals(&theta).unwrap();
+        let exact: Vec<f64> = problem
+            .gauss_newton_blocks(&lin, 1)
+            .unwrap()
+            .iter()
+            .map(|b| b.matrix[(0, 0)])
+            .collect();
+        let estimate = problem
+            .gauss_newton_diagonal_estimate(&lin, 4000, 5, 0)
+            .unwrap();
+        // The relative standard error is at most `sqrt(2 / 4000)`, about
+        // 2%, when a single draw carries an entry.
+        for (k, (e, x)) in estimate.iter().zip(&exact).enumerate() {
+            assert!(
+                (e - x).abs() <= 0.1 * x.abs() + 1e-12,
+                "parameter {k}: estimate {e}, exact {x}"
+            );
+        }
+        // Each stream draws new probes; the same stream the same ones.
+        let again = |stream| {
+            problem
+                .gauss_newton_diagonal_estimate(&lin, 1, 5, stream)
+                .unwrap()
+        };
+        assert_eq!(again(1), again(1));
+        assert_ne!(again(1), again(2));
+    }
+}
+
 #[test]
 fn reductions_do_not_depend_on_the_threads() {
     // Many tiles, so that the work is split between threads.

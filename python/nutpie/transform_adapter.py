@@ -1931,6 +1931,8 @@ def make_transform_adapter(
     lm_max_exact_block_size=256,
     lm_lmp_size=8,
     lm_lmp_tol=1e-8,
+    lm_preconditioner="blocks",
+    lm_diagonal_probes=1,
     native_flow=True,
     stop_event=None,
     forget_fraction=0.5,
@@ -2049,11 +2051,23 @@ def make_transform_adapter(
     variable's conditioners and their ridges directly; then ``nn_width``,
     ``activation``, ``input_squash``, ``scale_skip``, ``zero_init`` and the
     ``lm_*_ridge`` arguments are not used.
+
+    ``lm_preconditioner`` (with ``rust_flow``) is what the LM fit's CG
+    preconditioner and Marquardt diagonal come from: ``"blocks"``, the exact
+    Gauss-Newton blocks (split at ``lm_max_exact_block_size``), or
+    ``"diagonal_estimate"``, a Monte Carlo estimate of the diagonal of
+    ``J^T J`` from ``lm_diagonal_probes`` random-sign pullbacks. Each probe
+    costs about half a CG iteration and needs no selected inverse, so the
+    estimate is much cheaper than the blocks for large conditioners, but it
+    ignores the correlations within a conditioner and is noisy, about
+    ``sqrt(2 / n_draws)`` relative with one probe.
     """
     if refit_diag and not rust_flow:
         raise ValueError("refit_diag is only supported with rust_flow=True.")
     if diag_restart_margin is not None and not rust_flow:
         raise ValueError("diag_restart_margin is only supported with rust_flow=True.")
+    if lm_preconditioner != "blocks" and not rust_flow:
+        raise ValueError("lm_preconditioner is only supported with rust_flow=True.")
     if scale_squash != 1.0 and not rust_flow:
         raise ValueError("scale_squash is only supported with rust_flow=True.")
     if conditioners is not None and not rust_flow:
@@ -2119,6 +2133,8 @@ def make_transform_adapter(
             lm_max_exact_block_size=lm_max_exact_block_size,
             lm_lmp_size=lm_lmp_size,
             lm_lmp_tol=lm_lmp_tol,
+            lm_preconditioner=lm_preconditioner,
+            lm_diagonal_probes=lm_diagonal_probes,
             conditioners=conditioners,
         )
 

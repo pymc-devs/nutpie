@@ -51,6 +51,19 @@ enum Forcing {
     Model,
 }
 
+/// What the CG preconditioner, and the Marquardt diagonal `D`, are built
+/// from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Preconditioner {
+    /// The exact Gauss-Newton sub-blocks, see `max_block_size`.
+    Blocks,
+    /// A Monte Carlo estimate of the diagonal of `J^T J` from `probes`
+    /// random-sign pullbacks (see
+    /// [`FisherResiduals::gauss_newton_diagonal_estimate`]): about half a
+    /// `J^T J v` per probe, without the selected inverse.
+    DiagonalEstimate { probes: usize },
+}
+
 #[derive(Debug, Clone)]
 struct Settings {
     cg_max: usize,
@@ -73,6 +86,9 @@ struct Settings {
     lam_lo_reset: f64,
     ls_min_fraction: f64,
     forcing: Forcing,
+    preconditioner: Preconditioner,
+    /// Seed of the `Preconditioner::DiagonalEstimate` probes.
+    seed: u64,
     max_block_size: usize,
     rebuild_every: usize,
     /// CG directions kept for the limited-memory preconditioner; 0 disables
@@ -314,6 +330,9 @@ pub struct LmOptimizer {
     p_prev: Vec<f64>,
     blocks: Option<Blocks>,
     accepted_since_build: usize,
+    /// Blocks built so far: the stream of the next diagonal estimate's
+    /// probes, so that every build draws new ones.
+    n_builds: u64,
     /// The latest `lmp_size` CG directions, oldest first.
     lmp_pairs: VecDeque<Pair>,
 }
@@ -394,6 +413,9 @@ impl LmOptimizer {
         if settings.max_block_size == 0 || settings.rebuild_every == 0 {
             bail!("max_block_size and rebuild_every must be positive");
         }
+        if settings.preconditioner == (Preconditioner::DiagonalEstimate { probes: 0 }) {
+            bail!("the diagonal estimate needs at least one probe");
+        }
         let (r, lin) = problem.residuals(&theta)?;
         let ridge = Ridge::at(&problem, &lin);
         let n_params = theta.len();
@@ -412,6 +434,7 @@ impl LmOptimizer {
             p_prev: vec![0.0; n_params],
             blocks: None,
             accepted_since_build: settings.rebuild_every,
+            n_builds: 0,
             lmp_pairs: VecDeque::new(),
             settings,
         })
@@ -421,10 +444,29 @@ impl LmOptimizer {
         self.lin.as_ref().expect("the linearization at theta")
     }
 
-    fn build_blocks(&self) -> Result<Blocks> {
-        let mut blocks = self
-            .problem
-            .gauss_newton_blocks(self.lin(), self.settings.max_block_size)?;
+    fn build_blocks(&mut self) -> Result<Blocks> {
+        let mut blocks = match self.settings.preconditioner {
+            Preconditioner::Blocks => self
+                .problem
+                .gauss_newton_blocks(self.lin(), self.settings.max_block_size)?,
+            // One-by-one blocks: everything below works on them unchanged.
+            Preconditioner::DiagonalEstimate { probes } => self
+                .problem
+                .gauss_newton_diagonal_estimate(
+                    self.lin(),
+                    probes,
+                    self.settings.seed,
+                    self.n_builds,
+                )?
+                .into_iter()
+                .enumerate()
+                .map(|(start, h)| GnBlock {
+                    start,
+                    matrix: Mat::from_fn(1, 1, |_, _| h),
+                })
+                .collect(),
+        };
+        self.n_builds += 1;
 
         // Non-finite sub-blocks fall back to their finite diagonal; one would
         // otherwise spread through the global floor into every damping.
@@ -936,6 +978,9 @@ impl PyLmOptimizer {
         lam_lo_reset = 0.25,
         ls_min_fraction = 0.1,
         forcing = "residual",
+        preconditioner = "blocks",
+        diagonal_probes = 1,
+        seed = 0,
         max_block_size = 256,
         rebuild_every = 1,
         lmp_size = 0,
@@ -963,6 +1008,9 @@ impl PyLmOptimizer {
         lam_lo_reset: f64,
         ls_min_fraction: f64,
         forcing: &str,
+        preconditioner: &str,
+        diagonal_probes: usize,
+        seed: u64,
         max_block_size: usize,
         rebuild_every: usize,
         lmp_size: usize,
@@ -977,6 +1025,15 @@ impl PyLmOptimizer {
             "rho" => Forcing::Rho,
             "model" => Forcing::Model,
             other => bail!("unknown forcing {other:?}, expected 'residual', 'rho' or 'model'"),
+        };
+        let preconditioner = match preconditioner {
+            "blocks" => Preconditioner::Blocks,
+            "diagonal_estimate" => Preconditioner::DiagonalEstimate {
+                probes: diagonal_probes,
+            },
+            other => {
+                bail!("unknown preconditioner {other:?}, expected 'blocks' or 'diagonal_estimate'")
+            }
         };
         let settings = Settings {
             cg_max,
@@ -994,6 +1051,8 @@ impl PyLmOptimizer {
             lam_lo_reset,
             ls_min_fraction,
             forcing,
+            preconditioner,
+            seed,
             max_block_size,
             rebuild_every,
             lmp_size,
@@ -1062,6 +1121,8 @@ mod tests {
             lam_lo_reset: 0.25,
             ls_min_fraction: 0.1,
             forcing: Forcing::Residual,
+            preconditioner: Preconditioner::Blocks,
+            seed: 0,
             max_block_size: 8,
             rebuild_every: 1,
             lmp_size: 4,
@@ -1120,31 +1181,67 @@ mod tests {
         assert!(theta.iter().zip(&lm.theta).any(|(a, b)| a != b));
     }
 
-    /// Bit for bit the same fit on any number of threads.
+    /// Bit for bit the same fit on any number of threads, with either
+    /// preconditioner.
     #[test]
     fn steps_do_not_depend_on_the_threads() {
         let problem = problem_with(512);
         let mut rng = ChaCha8Rng::seed_from_u64(5);
         let theta = normal(&mut rng, problem.n_params(), 0.3);
-        let run = |threads: usize| {
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(threads)
-                .build()
-                .unwrap();
-            pool.install(|| {
-                let mut lm =
-                    LmOptimizer::new(problem.clone(), theta.clone(), 0.1, None, settings())
-                        .unwrap();
-                for _ in 0..5 {
-                    lm.step().unwrap();
-                }
-                (lm.theta, lm.lam)
-            })
-        };
-        let reference = run(1);
-        for threads in [2, 3, 8] {
-            assert!(run(threads) == reference, "{threads} threads");
+        for preconditioner in [
+            Preconditioner::Blocks,
+            Preconditioner::DiagonalEstimate { probes: 2 },
+        ] {
+            let settings = Settings {
+                preconditioner,
+                ..settings()
+            };
+            let run = |threads: usize| {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap();
+                pool.install(|| {
+                    let mut lm = LmOptimizer::new(
+                        problem.clone(),
+                        theta.clone(),
+                        0.1,
+                        None,
+                        settings.clone(),
+                    )
+                    .unwrap();
+                    for _ in 0..5 {
+                        lm.step().unwrap();
+                    }
+                    (lm.theta, lm.lam)
+                })
+            };
+            let reference = run(1);
+            for threads in [2, 3, 8] {
+                assert!(
+                    run(threads) == reference,
+                    "{preconditioner:?}, {threads} threads"
+                );
+            }
         }
+    }
+
+    /// With the diagonal estimate as the preconditioner, the steps still
+    /// lower the loss.
+    #[test]
+    fn diagonal_estimate_lowers_the_loss() {
+        let problem = problem_with(64);
+        let mut rng = ChaCha8Rng::seed_from_u64(8);
+        let theta = normal(&mut rng, problem.n_params(), 0.3);
+        let settings = Settings {
+            preconditioner: Preconditioner::DiagonalEstimate { probes: 1 },
+            ..settings()
+        };
+        let mut lm = LmOptimizer::new(problem, theta, 0.1, None, settings).unwrap();
+        let start = lm.objective();
+        let accepted = (0..10).filter(|_| lm.step().unwrap().accept).count();
+        assert!(accepted > 0);
+        assert!(lm.objective() < start);
     }
 
     /// `P A s = s` for every stored direction, whatever `M`, also when one
