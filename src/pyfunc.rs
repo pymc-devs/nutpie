@@ -17,8 +17,7 @@ use thiserror::Error;
 
 use crate::{
     common::{call_init_point_func, PyValue, PyVariable},
-    common::{PyValue, PyVariable},
-    wrapper::{NativeFlow, PyTransformAdapt},
+    wrapper::PyTransformAdapt,
 };
 
 #[pyclass(from_py_object)]

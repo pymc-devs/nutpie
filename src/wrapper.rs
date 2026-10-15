@@ -10,8 +10,10 @@ use crate::{
     progress::{IndicatifHandler, ProgressHandler, RawCallbackHandler},
     pyfunc::PyModel,
     pymc::{ExpandFunc, LogpFunc, PyMcModel},
-    stan::{StanLibrary, StanModel},
 };
+
+#[cfg(feature = "stan")]
+use crate::stan::{StanLibrary, StanModel};
 
 use anyhow::{anyhow, bail, Context, Result};
 use numpy::{PyArray1, PyReadonlyArray1};
@@ -1183,6 +1185,7 @@ impl PySampler {
         )
     }
 
+    #[cfg(feature = "stan")]
     #[staticmethod]
     fn from_stan(
         settings: PySamplerSettings,
@@ -1719,8 +1722,11 @@ pub fn _lib(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyMcModel>()?;
     m.add_class::<LogpFunc>()?;
     m.add_class::<ExpandFunc>()?;
-    m.add_class::<StanLibrary>()?;
-    m.add_class::<StanModel>()?;
+    #[cfg(feature = "stan")]
+    {
+        m.add_class::<StanLibrary>()?;
+        m.add_class::<StanModel>()?;
+    }
     m.add_class::<PyNutsSettings>()?;
     m.add_class::<PyMclmcSettings>()?;
     m.add_class::<PyChainProgress>()?;
