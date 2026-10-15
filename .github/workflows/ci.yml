@@ -112,21 +112,36 @@ jobs:
 
   build_emscripten:
     runs-on: ${{ matrix.platform.runner }}
-    env:
-      PYODIDE_EMSCRIPTEN_VERSION: "3.1.74"
     strategy:
       matrix:
         platform:
           - runner: ubuntu-22.04
             target: wasm32-unknown-emscripten
+        # Each Pyodide release is tied to one Python and Emscripten version,
+        # and the xbuildenv needs a host python of the same minor version.
+        # See https://pyodide.org/en/latest/development/abi.html
+        pyodide:
+          - xbuildenv: "0.29.5"
+            python: "3.13"
+          - xbuildenv: "314.0.7"
+            python: "3.14"
+          # Enable once the stable 315 release comes out.
+          # - xbuildenv: "315.0.0"
+          #   python: "3.15"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # pyodide-build needs a recent Python; the system python on the runner
+      # is too old and pip would silently resolve an ancient pyodide-build.
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.pyodide.python }}
       - run: pip install pyodide-build
       - name: Get Emscripten and Python version info
         shell: bash
         run: |
+          pyodide xbuildenv install ${{ matrix.pyodide.xbuildenv }}
           echo EMSCRIPTEN_VERSION=$(pyodide config get emscripten_version) >> $GITHUB_ENV
           echo PYTHON_VERSION=$(pyodide config get python_version | cut -d '.' -f 1-2) >> $GITHUB_ENV
           if v=$(pyodide config get pyemscripten_platform_version 2>/dev/null); then echo PYEMSCRIPTEN_PLATFORM_VERSION=$v >> $GITHUB_ENV; elif v=$(pyodide config get pyodide_abi_version 2>/dev/null); then echo PYODIDE_ABI_VERSION=$v >> $GITHUB_ENV; fi
@@ -137,10 +152,7 @@ jobs:
           actions-cache-folder: emsdk-cache
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: |
-            3.12
-            3.13
-            3.14
+          python-version: ${{ matrix.pyodide.python }}
       - run: pip install pyodide-build
       - name: Build wheels
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
@@ -154,7 +166,7 @@ jobs:
       - name: Upload wheels
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: wasm-wheels
+          name: wasm-wheels-${{ matrix.pyodide.python }}
           path: dist
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
