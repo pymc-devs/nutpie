@@ -447,9 +447,7 @@ def test_linear_stage_fits_like_the_frozen_fit():
     theta_full, _, hist_full = fit(
         problem, flow.theta, frozen=problem.nonlinear_param_mask, **settings
     )
-    theta_linear, _, hist_linear = fit(
-        linear.residuals(x, g), linear.theta, **settings
-    )
+    theta_linear, _, hist_linear = fit(linear.residuals(x, g), linear.theta, **settings)
     for ours, ref in zip(hist_linear, hist_full):
         assert ours["accept"] == ref["accept"]
         np.testing.assert_allclose(ours["lam_out"], ref["lam_out"], rtol=1e-8)
