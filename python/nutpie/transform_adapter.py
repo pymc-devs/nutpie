@@ -1940,6 +1940,7 @@ def make_transform_adapter(
     early_stopping=True,
     linear_fits=1,
     refit_diag=False,
+    diag_restart_margin=0.0,
     rust_flow=True,
     conditioners=None,
 ):
@@ -2016,6 +2017,18 @@ def make_transform_adapter(
     linear weights, and the scale's constant, moved to keep their meaning). Otherwise the affine stays the one
     the flow was created with, from the draws of its first window.
 
+    With ``diag_restart_margin`` (and ``rust_flow``), a refit starts from a
+    new flow, fitted as the first one, instead of the current flow if a
+    diagonal affine fitted to the window's draws beats the current flow by
+    more than ``diag_restart_margin`` in ``log F`` on the held-out draws:
+    then the flow's parameters from earlier windows do more harm than good,
+    for instance if the chain only reached the typical set after the flow
+    was built. The new flow replaces the current one only if it does better.
+    A negative margin also restarts flows the diagonal comes close to.
+    Flows that have only had their ``linear_fits`` are not restarted: they
+    do about as well as the diagonal by construction. ``None`` never
+    restarts.
+
     The LM fit's ridges (see `fit_to_data`): ``lm_mlp_ridge`` penalizes the
     conditioner MLPs' weights, with the flow without MLPs as its minimum;
     ``lm_skip_ridge`` the linear location skip, which needs it where a
@@ -2039,6 +2052,8 @@ def make_transform_adapter(
     """
     if refit_diag and not rust_flow:
         raise ValueError("refit_diag is only supported with rust_flow=True.")
+    if diag_restart_margin is not None and not rust_flow:
+        raise ValueError("diag_restart_margin is only supported with rust_flow=True.")
     if scale_squash != 1.0 and not rust_flow:
         raise ValueError("scale_squash is only supported with rust_flow=True.")
     if conditioners is not None and not rust_flow:
@@ -2078,6 +2093,7 @@ def make_transform_adapter(
             early_stopping=early_stopping,
             linear_fits=linear_fits,
             refit_diag=refit_diag,
+            diag_restart_margin=diag_restart_margin,
             debug_save_bijection=debug_save_bijection,
             stop_event=stop_event,
             nn_width=nn_width,

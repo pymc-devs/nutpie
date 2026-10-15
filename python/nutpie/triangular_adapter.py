@@ -244,6 +244,7 @@ class TriangularFlowAdapter:
         early_stopping,
         linear_fits,
         refit_diag,
+        diag_restart_margin,
         debug_save_bijection,
         stop_event,
         nn_width,
@@ -295,6 +296,7 @@ class TriangularFlowAdapter:
         self._early_stopping = early_stopping
         self._linear_fits = linear_fits
         self._refit_diag = refit_diag
+        self._diag_restart_margin = diag_restart_margin
         # LM fits of the current flow so far, see `linear_fits`.
         self._flow_fits = 0
         self._debug_save_bijection = debug_save_bijection
@@ -537,41 +539,6 @@ class TriangularFlowAdapter:
         log_f = "log F" if val is None else "log F val"
 
         fresh = self._flow is None
-        if fresh:
-            self._flow_fits = 0
-        # A flow's first `linear_fits` fits use only the linear part of its
-        # conditioners, see `make_transform_adapter`.
-        linear_fit = self._flow_fits < self._linear_fits
-        conditioners = self._linear_conditioners if linear_fit else self._conditioners
-        if fresh:
-            base = build_triangular_flow(
-                seed,
-                *train,
-                sparsity=self._sparsity,
-                order=self._order,
-                conditioners=conditioners,
-                **self._flow_settings,
-            )
-            self._report(
-                n_draws,
-                f"new flow: {_describe(base)}"
-                + (
-                    f", first {self._linear_fits} fit"
-                    f"{'' if self._linear_fits == 1 else 's'} linear"
-                    if self._linear_fits
-                    else ""
-                ),
-            )
-            if self._verbose >= 2:
-                fresh_loss = np.log(base.fisher_divergence(*eval_data))
-                self._report(
-                    n_draws, f"{log_f}  fresh flow {_format_log_f(fresh_loss)}"
-                )
-        else:
-            # The current flow with this stage's conditioners: what both
-            # have carries over, the rest starts fresh.
-            base = self._flow.with_conditioners(conditioners, seed=_seed(seed))
-
         old_loss = np.log(self._fisher_divergence(self._flow, *eval_data))
         if (
             np.isfinite(old_loss)
@@ -585,21 +552,97 @@ class TriangularFlowAdapter:
             )
             return
 
-        # A fresh flow's affine already comes from these draws.
-        refit_diag = self._refit_diag and not fresh
+        # The diagonal affine of these draws, where a new flow starts. If it
+        # beats the current flow by `diag_restart_margin`, the flow's
+        # parameters from earlier windows do more harm than good, for
+        # instance if the chain only reached the typical set after the flow
+        # was built: a new flow, fitted as the first one, replaces it then.
+        # Not while the flow has only had its linear fits: those do about as
+        # well as the diagonal by construction, and restarting them again
+        # and again would keep the flow linear.
+        diag_loss = np.log(_affine_fisher_divergence(*diag_affine(*train), *eval_data))
+        restart = (
+            not fresh
+            and self._diag_restart_margin is not None
+            and self._flow_fits > self._linear_fits
+            and diag_loss < old_loss - self._diag_restart_margin
+        )
+        if restart:
+            self._report(
+                n_draws,
+                f"{log_f}  current {_format_log_f(old_loss)}  "
+                f"diag {_format_log_f(diag_loss)}  -> new flow",
+            )
+        new_flow = fresh or restart
+
+        # A flow's first `linear_fits` fits use only the linear part of its
+        # conditioners, see `make_transform_adapter`.
+        flow_fits = 0 if new_flow else self._flow_fits
+        linear_fit = flow_fits < self._linear_fits
+        conditioners = self._linear_conditioners if linear_fit else self._conditioners
+        if new_flow:
+            base = self._new_flow(seed, train, eval_data, conditioners, n_draws, log_f)
+        else:
+            # The current flow with this stage's conditioners: what both
+            # have carries over, the rest starts fresh.
+            base = self._flow.with_conditioners(conditioners, seed=_seed(seed))
+
+        # A new flow's affine already comes from these draws.
+        refit_diag = self._refit_diag and not new_flow
         if refit_diag:
             base = base.with_affine(*diag_affine(*train))
 
-        # Header for the LM steps printed below; a fresh flow has its own.
-        if self._verbose >= 2 and not fresh:
+        # Header for the LM steps printed below; a new flow has its own.
+        if self._verbose >= 2 and not new_flow:
             self._report(
                 n_draws,
-                f"{log_f}  current {_format_log_f(old_loss)}  -> "
+                f"{log_f}  current {_format_log_f(old_loss)}  "
+                f"diag {_format_log_f(diag_loss)}  -> "
                 f"{'linear ' if linear_fit else ''}refit"
                 f"{', new diag' if refit_diag else ''}  ({draw_counts})",
             )
 
-        self._flow_fits += 1
+        replaced = self._refit(
+            base, new_flow, old_loss, diag_loss, train, val, eval_data, n_draws, log_f
+        )
+        # A restart that lost leaves the current flow, and its fits, as they
+        # were.
+        if replaced or not restart:
+            self._flow_fits = flow_fits + 1
+
+    def _new_flow(self, seed, train, eval_data, conditioners, n_draws, log_f):
+        """A new flow for the training draws, with `conditioners`."""
+        base = build_triangular_flow(
+            seed,
+            *train,
+            sparsity=self._sparsity,
+            order=self._order,
+            conditioners=conditioners,
+            **self._flow_settings,
+        )
+        self._report(
+            n_draws,
+            f"new flow: {_describe(base)}"
+            + (
+                f", first {self._linear_fits} fit"
+                f"{'' if self._linear_fits == 1 else 's'} linear"
+                if self._linear_fits
+                else ""
+            ),
+        )
+        if self._verbose >= 2:
+            fresh_loss = np.log(base.fisher_divergence(*eval_data))
+            self._report(n_draws, f"{log_f}  fresh flow {_format_log_f(fresh_loss)}")
+        return base
+
+    def _refit(
+        self, base, fresh, old_loss, diag_loss, train, val, eval_data, n_draws, log_f
+    ):
+        """Fit `base` to the training draws with the LM, and replace the
+        current flow, whose loss on `eval_data` is `old_loss`, if the fit
+        does better there. `fresh` if `base` is a new flow rather than the
+        current one. `diag_loss` is the diagonal affine's loss there, for
+        the report. Returns whether the flow was replaced."""
         problem = base.residuals(*train)
         val_problem = None if val is None else base.residuals(*val)
         theta, losses, lam, n_steps, n_accepted = _run_lm(
@@ -615,7 +658,7 @@ class TriangularFlowAdapter:
         )
         if self._should_stop():
             # Sampling was aborted, keep the flow as it is.
-            return
+            return False
 
         # Kept even if the fit is discarded below: the damping scale says
         # something about the problem, whether or not this fit won. But not
@@ -632,6 +675,7 @@ class TriangularFlowAdapter:
             self._report(
                 n_draws,
                 f"{log_f}  current {_format_log_f(old_loss)}  "
+                f"diag {_format_log_f(diag_loss)}  "
                 f"refit {_format_log_f(new_loss)}"
                 + (
                     ""
@@ -655,35 +699,36 @@ class TriangularFlowAdapter:
 
         if no_progress:
             report("keep flow, no LM step accepted")
-            return
+            return False
 
         # Early stopping went back to where the fit started, which for a
         # refit is the current flow (with any new conditioners at their
         # start).
         if not fresh and np.array_equal(theta, base.theta):
             report("keep flow, no step improved val")
-            return
+            return False
 
         if not np.isfinite(old_loss) and not np.isfinite(new_loss):
             report("reset to a diagonal flow, both are invalid")
             self._flow = None
             self._loc, self._scale = diag_affine(*train)
-            return
+            return False
 
         if not valid_new_logp():
             report("keep old flow, refit gives an invalid transform")
-            return
+            return False
 
         if not np.isfinite(new_loss):
             report("keep old flow, refit is invalid")
-            return
+            return False
 
         if new_loss > old_loss:
             report("keep old flow, refit is worse")
-            return
+            return False
 
         report("replace flow")
         self._flow = fit
+        return True
 
 
 def _describe(flow):

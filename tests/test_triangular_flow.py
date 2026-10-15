@@ -500,11 +500,13 @@ def test_linear_stage_fits_like_the_frozen_fit():
     )
 
 
+@pytest.mark.parametrize("diag_restart_margin", [None, 1.0])
 @pytest.mark.parametrize("refit_diag", [False, True])
-def test_rust_flow_adapter(refit_diag):
+def test_rust_flow_adapter(refit_diag, diag_restart_margin):
     """The Rust-path adapter: a diagonal affine for the first windows, then a
     triangular flow fitted to a correlated normal and refitted (with
-    `refit_diag`, in new coordinates), and its sampler interface consistent
+    `refit_diag`, in new coordinates, and with `diag_restart_margin`), and
+    its sampler interface consistent
     with that flow."""
     from nutpie._lib import TriangularFlow
     from nutpie.transform_adapter import make_transform_adapter
@@ -524,6 +526,7 @@ def test_rust_flow_adapter(refit_diag):
         initial_skip=0,
         nn_width=4,
         refit_diag=refit_diag,
+        diag_restart_margin=diag_restart_margin,
     )(0, x[0], g[0], 0, logp_fn=None, sparsity=sparsity, order=np.arange(dim))
     for n_draws in [20, 40]:
         adapter.update(n_draws, list(x[:n_draws]), list(g[:n_draws]), np.zeros(n_draws))
@@ -544,6 +547,41 @@ def test_rust_flow_adapter(refit_diag):
     )
     np.testing.assert_allclose(log_det_back, log_det, rtol=1e-10)
     np.testing.assert_allclose(grad_z_back, grad_z, rtol=1e-9, atol=1e-10)
+
+
+def test_rust_flow_adapter_diag_restart(capsys):
+    """With `diag_restart_margin`, a refit starts from a new flow if the
+    diagonal beats the current one by the margin, here always, but not
+    while the flow has only had its linear fit, and the new flow replaces it
+    only if it does better."""
+    from nutpie._lib import TriangularFlow
+    from nutpie.transform_adapter import make_transform_adapter
+
+    rng = np.random.default_rng(1)
+    dim = 4
+    root = rng.normal(size=(dim, dim))
+    cov = root @ root.T + np.eye(dim)
+    x = rng.multivariate_normal(np.zeros(dim), cov, size=400)
+    g = -x @ np.linalg.inv(cov)
+
+    adapter = make_transform_adapter(
+        rust_flow=True,
+        num_diag_windows=0,
+        initial_skip=0,
+        nn_width=4,
+        diag_restart_margin=-np.inf,
+        verbose=1,
+    )(0, x[0], g[0], 0, logp_fn=None, sparsity=~np.eye(dim, dtype=bool), order=None)
+    for _ in range(3):
+        adapter.update(400, list(x), list(g), np.zeros(400))
+    out = capsys.readouterr().out
+    # Not after the first flow's linear fit, only after its nonlinear one.
+    assert out.count("-> new flow") == 1
+    assert out.count("new flow:") == 2
+    flow = adapter.flow_transform_layout()
+    assert isinstance(flow, TriangularFlow)
+    # Only linear fits of a new flow, but a normal needs no more.
+    assert flow.fisher_divergence(x[:64], g[:64]) < 1e-2
 
 
 def test_rust_flow_rejects_unsupported_settings():
