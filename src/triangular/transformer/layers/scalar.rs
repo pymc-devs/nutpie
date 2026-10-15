@@ -1,10 +1,8 @@
-//! The transformer chain on `f64`, forward, with the derivatives the
-//! transform's tape needs.
-
-use smallvec::SmallVec;
+//! A chain of layers on `f64`, forward, with the derivatives the sampler's
+//! tape needs.
 
 use super::{
-    AsymmetricSas, Contract2, Layer, LogGammaBound, Param, PositiveAffineSpec, TangentSasSpec,
+    AsymmetricSas, Contract2, Layer, LogGammaBound, Param, PositiveAffineConfig, TangentSasConfig,
 };
 
 impl LogGammaBound {
@@ -121,10 +119,9 @@ fn log_cosh_from_sinh(sinh_v: f64, v: f64) -> f64 {
     }
 }
 
-/// The elementwise transformer chain, mirroring the JAX layers'
-/// `transform_and_log_det`.
+/// The chain forward, mirroring the JAX layers' `transform_and_log_det`.
 #[inline]
-pub(crate) fn transform_element(layers: &[Layer], params: &[f64], x: f64) -> (f64, f64) {
+pub(crate) fn forward_chain(layers: &[Layer], params: &[f64], x: f64) -> (f64, f64) {
     let mut y = x;
     let mut log_det = 0.0;
     for layer in layers {
@@ -140,7 +137,7 @@ pub(crate) fn transform_element(layers: &[Layer], params: &[f64], x: f64) -> (f6
 /// holds, for each parameter the layer actually has, its flat index and the
 /// layer's two partials with respect to it.
 #[derive(Clone, Copy)]
-struct LayerTape {
+pub(crate) struct LayerTape {
     /// `d y_out / d y_in`, which is also `exp(log_det)` for this layer.
     p_y_in: f64,
     /// `d log_det / d y_in`.
@@ -169,22 +166,24 @@ impl LayerTape {
     }
 }
 
-/// `transform_element`, plus every derivative the pullback needs.
+/// [`forward_chain`], plus every derivative the pullback needs, with the
+/// layers' tapes in `tapes`.
 ///
 /// Returns `(y, log_det, dy/dx, dlog_det/dx)` and fills `dy_dtheta` and
-/// `dld_dtheta` with the derivatives against the conditioner's outputs.
+/// `dld_dtheta` with the derivatives against the coefficients.
 ///
 /// `d y_out / d y_in` of each layer is `exp(log_det)` of that layer, so
 /// accumulating it along the chain gives the Jacobian diagonal for free, and
 /// more accurately than exponentiating a sum of logs.
-pub(crate) fn transform_element_with_grads(
+pub(crate) fn forward_chain_with_grads(
     layers: &[Layer],
+    tapes: &mut Vec<LayerTape>,
     params: &[f64],
     x: f64,
     dy_dtheta: &mut [f64],
     dld_dtheta: &mut [f64],
 ) -> (f64, f64, f64, f64) {
-    let mut tapes: SmallVec<[LayerTape; 4]> = SmallVec::new();
+    tapes.clear();
     let mut y = x;
     let mut log_det = 0.0;
 
@@ -358,7 +357,7 @@ impl Contract2 {
     }
 }
 
-impl TangentSasSpec {
+impl TangentSasConfig {
     /// One layer of `TangentSAS.transform_and_log_det`: with `w = b (y - nu)`
     /// and `arg = r asinh(w) + eps`,
     ///
@@ -553,7 +552,7 @@ impl AsymmetricSas {
     }
 }
 
-impl PositiveAffineSpec {
+impl PositiveAffineConfig {
     /// `y_out = loc + scale_mod * y`, `scale_mod = scale + sqrt(1 + scale^2)`.
     #[inline(always)]
     fn transform(&self, params: &[f64], y: f64) -> (f64, f64) {

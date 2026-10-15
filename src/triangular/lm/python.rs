@@ -4,10 +4,12 @@ use anyhow::{bail, Result};
 use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 
-use super::conditioner::{Activation, Conditioner};
-use super::{FisherResiduals, Linearization, RidgeStrengths};
-use crate::triangular::layers::LayerSpec;
+use super::{FisherResiduals, Linearization};
+use crate::triangular::conditional::Conditional;
+use crate::triangular::conditioner::{ConditionerConfig, Conditioners};
 use crate::triangular::pattern::Pattern;
+use crate::triangular::transformer::layers::LayerConfig;
+use crate::triangular::transformer::LayerChain;
 
 /// Residuals of the LM fit of a `SparseTriangularMap` and their derivatives,
 /// see `nutpie.triangular_lm`.
@@ -18,7 +20,7 @@ pub struct PyFisherResiduals {
 }
 
 impl PyFisherResiduals {
-    pub(super) fn from_inner(inner: FisherResiduals) -> Self {
+    pub(crate) fn from_inner(inner: FisherResiduals) -> Self {
         Self { inner, lin: None }
     }
 
@@ -32,44 +34,40 @@ impl PyFisherResiduals {
 
 #[pymethods]
 impl PyFisherResiduals {
+    /// The residuals of a map with the given parents, a transformer of
+    /// `transformer`'s layers (as `nutpie.triangular_layout.transformer_dicts`
+    /// writes them) on `n_par` coefficients with the location and the scale
+    /// at the given indices, and `conditioners` (``{"kind": ...}`` dicts).
     #[new]
     #[pyo3(signature = (
         *,
         parent_indptr,
         parent_index,
-        n_unit,
+        transformer,
         n_par,
         location_index,
-        transformer,
+        conditioners,
         scale_index = None,
-        input_squash = None,
-        activation = "softplus",
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         parent_indptr: PyReadonlyArray1<'_, i64>,
         parent_index: PyReadonlyArray1<'_, i64>,
-        n_unit: usize,
+        transformer: &Bound<'_, PyAny>,
         n_par: usize,
         location_index: usize,
-        transformer: &Bound<'_, PyAny>,
+        conditioners: &Bound<'_, PyAny>,
         scale_index: Option<usize>,
-        input_squash: Option<f64>,
-        activation: &str,
     ) -> Result<Self> {
-        let specs: Vec<LayerSpec> = pythonize::depythonize(transformer)?;
+        let configs: Vec<LayerConfig> = pythonize::depythonize(transformer)?;
+        let transformer = LayerChain::new(configs, n_par, Some(location_index), scale_index)?;
+        let conditioners: Vec<ConditionerConfig> = pythonize::depythonize(conditioners)?;
+        let conditional =
+            Conditional::new(Conditioners::new(&conditioners, &transformer)?, transformer)?;
         Ok(Self {
             inner: FisherResiduals::new(
                 Pattern::from_i64(parent_indptr.as_slice()?, parent_index.as_slice()?)?,
-                Conditioner::new(
-                    n_unit,
-                    n_par,
-                    location_index,
-                    scale_index,
-                    specs,
-                    input_squash,
-                    Activation::from_name(activation)?,
-                )?,
+                conditional,
             )?,
             lin: None,
         })
@@ -97,52 +95,46 @@ impl PyFisherResiduals {
         self.inner.n_draw()
     }
 
-    /// Per parameter, the strength `LmOptimizer`'s ridge with these
-    /// arguments puts on it at `theta`, before the division by ``n_draw``.
-    /// What moves a variable's location is scaled by the mean of its
-    /// ``(dx_i/dy_i)^2`` over the draws at `theta`.
-    #[pyo3(signature = (
-        theta,
-        *,
-        mlp_ridge = 0.0,
-        skip_ridge = 0.0,
-        scale_skip_ridge = 0.0,
-        shape_ridge = 0.0,
-    ))]
+    /// Per parameter, the strength `LmOptimizer`'s ridge puts on it at
+    /// `theta`, before the division by ``n_draw``. What feeds a variable's
+    /// location is scaled by the mean of its ``(dx_i/dy_i)^2`` over the
+    /// draws at `theta`.
     fn ridge_strengths<'py>(
         &self,
         py: Python<'py>,
         theta: PyReadonlyArray1<'py, f64>,
-        mlp_ridge: f64,
-        skip_ridge: f64,
-        scale_skip_ridge: f64,
-        shape_ridge: f64,
     ) -> Result<Bound<'py, PyArray1<f64>>> {
-        let strengths = RidgeStrengths {
-            mlp: mlp_ridge,
-            skip: skip_ridge,
-            scale_skip: scale_skip_ridge,
-            shape: shape_ridge,
-        };
-        strengths.check()?;
         let theta = theta.as_slice()?.to_vec();
         let (_, lin) = py.detach(|| self.inner.residuals(&theta))?;
-        let loc_scales = self.inner.loc_scales(&lin);
-        let classes = self.inner.ridge_classes();
-        let offsets = &self.inner.param_offset;
-        let values = (0..self.inner.n_var())
-            .flat_map(|var| offsets.range(var).map(move |k| (var, k)))
-            .map(|(var, k)| strengths.of(classes[k], loc_scales[var]))
-            .collect();
+        let values = self.inner.ridge_strengths(&self.inner.loc_scales(&lin));
         Ok(PyArray1::from_vec(py, values))
     }
 
-    /// Per parameter, whether it makes a conditioner or its transformer
-    /// nonlinear: the hidden units and the biases of the transformer's shape
-    /// fields. `LmOptimizer`'s ``frozen`` for a linear fit.
+    /// Per parameter, whether it makes its conditional nonlinear or
+    /// non-Gaussian: the MLPs' weights, the constant's into shape
+    /// coefficients and the linear conditioner's into anything but the
+    /// location. `LmOptimizer`'s ``frozen`` for a linear fit.
     #[getter]
     fn nonlinear_param_mask<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<bool>> {
         PyArray1::from_vec(py, self.inner.nonlinear_param_mask())
+    }
+
+    /// Variable `i`'s conditioners' ranges of the parameters, ``(start,
+    /// stop)`` each: the constant, the linear conditioner, then the MLPs in
+    /// list order, each only if there is one.
+    fn weight_ranges(&self, i: usize) -> Result<Vec<(usize, usize)>> {
+        if i >= self.inner.n_var() {
+            bail!("variable {i} out of range");
+        }
+        let start = self.inner.param_offset.start(i);
+        Ok(self
+            .inner
+            .conditional
+            .conditioners
+            .weight_ranges(self.inner.graph.n_parent(i))
+            .into_iter()
+            .map(|r| (start + r.start, start + r.end))
+            .collect())
     }
 
     /// Start of each variable's parameter slice, plus the total.

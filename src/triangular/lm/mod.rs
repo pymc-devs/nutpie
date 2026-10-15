@@ -11,15 +11,13 @@
 //! r = (x + w) / sqrt(n_draw),   J^T w = g - grad_y log_det,
 //! ```
 //!
-//! Supported conditioners: one hidden layer with softplus or `gelu_tanh`,
-//! optionally on squashed inputs, and the linear location skip. The transformer is a chain of `Contract2`, `TangentSAS` and
-//! `PositiveAffine` layers, evaluated in the density direction.
+//! The conditioners and the transformer are those of
+//! [`crate::triangular::conditioner`] and [`crate::triangular::transformer`],
+//! the transformer evaluated in the density direction.
 //!
-//! Parameters are laid out per variable, with no bucketing or padding.
-//! Variable `i`'s slice holds, for each hidden unit `u`, the unit's input
-//! weights `W1[u, :]`, its bias `b1[u]` and its output weights `W2[:, u]`,
-//! followed by `b2` and the skip weights `s`. Every kernel walks the
-//! conditioner unit by unit, so this keeps each unit's weights contiguous.
+//! Parameters are laid out per variable, with no bucketing or padding:
+//! variable `i`'s slice holds its conditioners' weights, in the layout of
+//! [`crate::triangular::conditioner::Conditioners`].
 //!
 //! Draws are processed in tiles of one native `f64` SIMD vector each
 //! (`fearless_simd`): every draw walks the same variables, parents and
@@ -28,9 +26,9 @@
 //!
 //! The [`Linearization`] at `theta` keeps only what the triangular solves
 //! need across variables (`A`, `delta`, `x`, `w`), and the data. Everything
-//! local to a variable -- the hidden units and the transformer's derivatives
-//! -- is recomputed by each operator, with one jet pass of the transformer per
-//! variable and tile.
+//! local to a variable -- the conditioners' states and the transformer's
+//! derivatives -- is recomputed by each operator, with one jet pass of the
+//! transformer per variable and tile.
 //!
 //! # Notation
 //!
@@ -42,21 +40,16 @@
 //! |---|---|
 //! | `y`, `g` | the map's inputs and the log density's gradient there (data) |
 //! | `y_parents` | `y[P(i)]` |
-//! | `W1`, `b1`, `W2`, `b2`, `s` | variable `i`'s conditioner parameters, `theta_i`; `s` is the location skip ([`conditioner::Params`]) |
-//! | `z_parents`, `dz` | what the units see of the parents, `c asinh(y / c)` with an input squash `c` and `y` without, and its derivative in `y` |
-//! | `a` | the hidden units' inputs, `W1 z_parents + b1` |
-//! | `h`, `h1`, `h2` | the activation and its first two derivatives at `a` (`h`, `h'`, `h''`) |
-//! | `pi` | the transformer parameters, `W2 h + b2 + e_loc s . y_parents`, `n_par` of them |
-//! | `loc` | the index of the transformer parameter the skip adds to |
+//! | `theta_i` | variable `i`'s conditioners' weights |
+//! | `pi` | the transformer coefficients, `sum_c f_c(y_parents; theta_c)`, `n_par` of them |
 //! | `T`, `Lambda` | the transformer `x_i = T(y_i; pi)` and `Lambda = log dT/dy_i` |
 //! | `x`, `delta`, `mu` | `T`, `dT/dy_i` and `dLambda/dy_i` at `y_i` |
 //! | `t`, `l` | `dT/dpi` and `dLambda/dpi`, `n_par` each |
 //! | `n_z`, `z` in jets | `1 + n_par`, the transformer's inputs `(y_i, pi)` |
-//! | `C` | `dpi/dy_parents`, `(n_par, n_p)` |
+//! | `C` | `dpi/dy_parents`, `(n_par, n_p)`, summed over the conditioners |
 //! | `A`, `L` (`edge_a`, `edge_l`) | per edge `(i, j)`: `dx_i/dy_j = t . C[:, j]` and `dLambda_i/dy_j = l . C[:, j]` |
 //! | `w` | the solution of `J^T w = g - grad_y log_det` |
 //! | `z` in the pullback | `J^{-1} r_bar` |
-//! | `p_t`, `p_l` | per unit `u`, `W2[:, u] . t` and `W2[:, u] . l` |
 //!
 //! A `_t`/`_l` pair is the same quantity for `T` and for `Lambda`, and an
 //! `_a`/`_l` pair the same for `A` and for `L`. A `_dot` suffix is a tangent
@@ -64,12 +57,10 @@
 //! cotangent (the pullback's adjoint).
 
 mod blocks;
-mod conditioner;
-mod flow;
+mod local;
 pub(crate) mod optimizer;
 mod python;
 mod selected_inverse;
-mod simd;
 mod sweeps;
 #[cfg(test)]
 mod tests;
@@ -81,86 +72,16 @@ use anyhow::{bail, Result};
 use fearless_simd::{dispatch, prelude::*, Level};
 use rayon::prelude::*;
 
+use crate::triangular::conditional::Conditional;
 use crate::triangular::pattern::{Offsets, Pattern};
+use crate::triangular::simd::{f64_width, store};
 pub(crate) use blocks::GnBlock;
-use conditioner::{Conditioner, Params, Shape, UnitState};
-pub(crate) use flow::PyTriangularFlow;
+use local::LocalState;
 pub(crate) use python::PyFisherResiduals;
 use selected_inverse::SelectedInverseLayout;
-use simd::{f64_width, store};
 use sweeps::{TileScratch, VariableScratch};
 pub(crate) use tiles::Linearization;
 use tiles::{Data, Tiled};
-
-/// Which of the optimizer's ridge strengths a parameter carries, see
-/// [`FisherResiduals::ridge_classes`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RidgeClass {
-    None,
-    /// The location skip `s`.
-    Skip,
-    /// The scale skip.
-    ScaleSkip,
-    /// `W1`, or `W2` into a field that is neither the location nor a shape
-    /// field.
-    Mlp,
-    /// `W2` into the location.
-    MlpLoc,
-    /// `b2` of a shape field.
-    Shape,
-    /// `W2` into a shape field.
-    MlpShape,
-}
-
-/// The ridge strengths of the optimizer's objective, per [`RidgeClass`]:
-/// `mlp` on the units' weights, `skip` on the location skip, `scale_skip` on
-/// the scale skip (unscaled: whatever the scale field's parameterization, it
-/// is already relative), and `shape` on what feeds the shape fields
-/// directly, `b2` and the units' `W2`.
-///
-/// What moves the location is weighed against the conditional's width: a
-/// shift `Delta` of the location moves `x_i` by `delta_i Delta`, so the skip
-/// and the units' `W2` into the location carry a factor `E[delta_i^2]`, the
-/// variable's [`FisherResiduals::loc_scales`]. For a Gaussian conditional
-/// that makes the skip's ridge one on the precision's Cholesky factor,
-/// `s / sigma_i`.
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct RidgeStrengths {
-    pub(crate) mlp: f64,
-    pub(crate) skip: f64,
-    pub(crate) scale_skip: f64,
-    pub(crate) shape: f64,
-}
-
-impl RidgeStrengths {
-    pub(crate) fn check(&self) -> Result<()> {
-        for (name, value) in [
-            ("mlp_ridge", self.mlp),
-            ("skip_ridge", self.skip),
-            ("scale_skip_ridge", self.scale_skip),
-            ("shape_ridge", self.shape),
-        ] {
-            if !(value.is_finite() && value >= 0.0) {
-                bail!("{name} must be finite and non-negative, got {value}");
-            }
-        }
-        Ok(())
-    }
-
-    /// The strength on a parameter of class `class` of a variable with loc
-    /// scale `loc_scale`.
-    pub(crate) fn of(&self, class: RidgeClass, loc_scale: f64) -> f64 {
-        match class {
-            RidgeClass::None => 0.0,
-            RidgeClass::Skip => self.skip * loc_scale,
-            RidgeClass::ScaleSkip => self.scale_skip,
-            RidgeClass::Mlp => self.mlp,
-            RidgeClass::MlpLoc => self.mlp * loc_scale,
-            RidgeClass::Shape => self.shape,
-            RidgeClass::MlpShape => self.mlp + self.shape,
-        }
-    }
-}
 
 #[derive(Clone)]
 pub(crate) struct FisherResiduals {
@@ -170,16 +91,16 @@ pub(crate) struct FisherResiduals {
     graph: Pattern,
     /// Each variable's slice of the flat parameter vector.
     pub(crate) param_offset: Offsets,
-    conditioner: Conditioner,
+    conditional: Conditional,
     inverse: SelectedInverseLayout,
     /// Shared with every [`Linearization`] made from it.
     data: Option<Arc<Data>>,
 }
 
 impl FisherResiduals {
-    fn new(graph: Pattern, conditioner: Conditioner) -> Result<Self> {
+    pub(crate) fn new(graph: Pattern, conditional: Conditional) -> Result<Self> {
         let param_offset = Offsets::from_lens(
-            (0..graph.n_var()).map(|i| conditioner.shape(graph.n_parent(i)).size()),
+            (0..graph.n_var()).map(|i| conditional.n_weights(graph.n_parent(i))),
         );
         let inverse = SelectedInverseLayout::new(&graph)?;
         Ok(Self {
@@ -187,7 +108,7 @@ impl FisherResiduals {
             width: Self::native_width(),
             graph,
             param_offset,
-            conditioner,
+            conditional,
             inverse,
             data: None,
         })
@@ -216,77 +137,42 @@ impl FisherResiduals {
         self.n_var()
     }
 
-    /// Per parameter, whether it makes a conditioner or its transformer
-    /// nonlinear: the hidden units (`W1`, `b1`, `W2`), the biases `b2` of
-    /// the shape fields and the scale skip. With these frozen at `W2 = 0`, the
-    /// shape fields at their affine start and the scale skip at zero, a fit
-    /// only moves the Gaussian part of each conditional: the location skip
-    /// and the affine fields' `b2`.
+    /// Per parameter, whether it makes its conditional nonlinear or
+    /// non-Gaussian (see [`Conditioners::nonlinear_mask`]): with these
+    /// frozen at an affine start, a fit only moves the Gaussian part of each
+    /// conditional.
+    ///
+    /// [`Conditioners::nonlinear_mask`]: crate::triangular::conditioner::Conditioners::nonlinear_mask
     pub(crate) fn nonlinear_param_mask(&self) -> Vec<bool> {
-        let shape_param = self.conditioner.shape_param_mask();
-        let mut mask = vec![false; self.n_params()];
+        let mut mask = Vec::with_capacity(self.n_params());
         for i in 0..self.n_var() {
-            let (start, shape) = (self.params(i).start, self.shape(i));
-            for u in 0..shape.n_unit {
-                for k in shape.w1(u).chain(shape.w2(u)) {
-                    mask[start + k] = true;
-                }
-                mask[start + shape.b1(u)] = true;
-            }
-            for (m, k) in shape.b2().enumerate() {
-                mask[start + k] = shape_param[m];
-            }
-            // A scale that depends on the parents is not linear either.
-            if self.conditioner.scale.is_some() {
-                for k in shape.skip(1) {
-                    mask[start + k] = true;
-                }
-            }
+            self.conditional
+                .conditioners
+                .nonlinear_mask(self.graph.n_parent(i), &mut mask);
         }
         mask
     }
 
-    /// Per parameter, which of the optimizer's ridge strengths it carries.
-    pub(crate) fn ridge_classes(&self) -> Vec<RidgeClass> {
-        let shape_param = self.conditioner.shape_param_mask();
-        let loc = self.conditioner.location;
-        let mut classes = vec![RidgeClass::None; self.n_params()];
-        for i in 0..self.n_var() {
-            let (start, shape) = (self.params(i).start, self.shape(i));
-            for u in 0..shape.n_unit {
-                for k in shape.w1(u) {
-                    classes[start + k] = RidgeClass::Mlp;
-                }
-                for (m, k) in shape.w2(u).enumerate() {
-                    classes[start + k] = if m == loc {
-                        RidgeClass::MlpLoc
-                    } else if shape_param[m] {
-                        RidgeClass::MlpShape
-                    } else {
-                        RidgeClass::Mlp
-                    };
-                }
-            }
-            for (m, k) in shape.b2().enumerate() {
-                if shape_param[m] {
-                    classes[start + k] = RidgeClass::Shape;
-                }
-            }
-            for k in shape.skip(0) {
-                classes[start + k] = RidgeClass::Skip;
-            }
-            if self.conditioner.scale.is_some() {
-                for k in shape.skip(1) {
-                    classes[start + k] = RidgeClass::ScaleSkip;
-                }
-            }
+    /// Per parameter, its conditioner's ridge strength, before the division
+    /// by `n_draw`, with what feeds variable `i`'s location scaled by
+    /// `loc_scales[i]`.
+    pub(crate) fn ridge_strengths(&self, loc_scales: &[f64]) -> Vec<f64> {
+        let mut out = Vec::with_capacity(self.n_params());
+        for (i, &loc_scale) in loc_scales.iter().enumerate() {
+            self.conditional.conditioners.ridge_strengths(
+                self.graph.n_parent(i),
+                loc_scale,
+                &mut out,
+            );
         }
-        classes
+        out
     }
 
     /// Per variable, `E[delta_i^2]` over the draws at `lin`: the squared
     /// inverse width of its conditional, which scales the ridge on what moves
-    /// its location (see [`RidgeStrengths`]).
+    /// its location. A shift `Delta` of the location moves `x_i` by `delta_i
+    /// Delta`; for a Gaussian conditional this makes the ridge on a linear
+    /// location weight one on the precision's Cholesky factor.
     pub(crate) fn loc_scales(&self, lin: &Linearization) -> Vec<f64> {
         lin.delta.mean_squares()
     }
@@ -296,12 +182,8 @@ impl FisherResiduals {
         self.data.as_ref().map_or(0, |data| data.n_draw)
     }
 
-    fn unit_state<S: Simd>(&self, simd: S) -> UnitState<S> {
-        self.conditioner.unit_state(simd, self.graph.max_parent())
-    }
-
-    fn shape(&self, i: usize) -> Shape {
-        self.conditioner.shape(self.graph.n_parent(i))
+    fn local_state<S: Simd>(&self, simd: S) -> LocalState<S> {
+        self.conditional.state(simd, self.graph.max_parent())
     }
 
     fn params(&self, i: usize) -> std::ops::Range<usize> {
@@ -309,8 +191,8 @@ impl FisherResiduals {
     }
 
     /// Variable `i`'s slice of `values`.
-    fn params_of<'a, T: Copy>(&self, values: &'a [T], i: usize) -> Params<'a, T> {
-        Params::new(&values[self.params(i)], self.shape(i))
+    fn params_of<'a, T>(&self, values: &'a [T], i: usize) -> &'a [T] {
+        &values[self.params(i)]
     }
 
     pub(crate) fn set_data(&mut self, y: Vec<f64>, g: Vec<f64>) -> Result<()> {

@@ -1,15 +1,16 @@
-"""Triangular flows built in Rust (`src/triangular/lm/flow.rs`), without JAX.
+"""Triangular flows built in Rust (`src/triangular/flow.rs`), without JAX.
 
-`build_triangular_flow` creates the flow `make_flow(kind="triangular")`
-builds in JAX: the diagonal affine from the draws, the sparse triangular map
-in the given order with one depth-1 MLP conditioner (with the location skip)
-per variable, and its transformer. The result is a `TriangularFlow`, which
-fits with `nutpie.triangular_lm.fit` on its ``residuals``, maps draws back
-with ``inv_transform`` and gives the sampler its native ``flow_transform``.
+`build_triangular_flow` creates a flow: the diagonal affine from the draws,
+the sparse triangular map in the given order, its transformer and each
+variable's conditioners (see `default_conditioners`, and
+`src/triangular/conditioner/`). The result is a `TriangularFlow`, which fits
+with `nutpie.triangular_lm.fit` on its ``residuals``, maps draws back with
+``inv_transform`` and gives the sampler its native ``flow_transform``.
 
-Same structure and parameterization as the JAX flow, but not the same
-random initialization: the random draws differ, and the map's output biases
-start at exactly zero.
+With `default_conditioners`, the flow works like the one
+`make_flow(kind="triangular")` builds in JAX, but its MLPs have no output
+bias (the constant conditioner is the only one) and no weights for a
+variable without parents.
 
 `from_jax` converts a JAX flow, e.g. to compare the two.
 """
@@ -19,20 +20,14 @@ from __future__ import annotations
 import numpy as np
 import scipy.sparse as sp
 
-from nutpie.triangular_layout import (
-    AsymmetricSASSpec,
-    Contract2Spec,
-    PositiveAffineSpec,
-    TangentSASSpec,
-    transformer_dicts,
-)
-
 __all__ = [
     "build_triangular_flow",
+    "default_conditioners",
     "diag_affine",
     "diag_from_gradients",
     "from_jax",
-    "transformer_spec",
+    "transformer_kind",
+    "transformer_layout",
 ]
 
 
@@ -58,88 +53,41 @@ def _activation_name(activation) -> str:
 RUST_TRANSFORMERS = ("affine", "sas", "tangent_sas", "asymmetric_sas")
 
 
-def transformer_spec(
+def transformer_kind(
     transformer="sas",
     transformer_layers=1,
     *,
     tangent_sas_fix_b=False,
     log_gamma_bounds=None,
 ):
-    """``(specs, n_par, location_index, scale_index)`` of
-    `make_transformer`'s chain, as `triangular_layout._probe_transformer`
-    finds them on the JAX transformer: the conditioner outputs feeding its
-    location and its scale field.
-
-    Conditioner output ``k`` feeds one field of one layer; the fields are
-    numbered in the order the JAX transformer's arrays flatten in, and every
-    field starts at zero, so its offset is zero.
-    """
+    """The transformer as the Rust flow takes it, ``{"kind": ...}``, from
+    `make_transformer`'s arguments. `transformer_layout` gives its layout."""
     layers = int(transformer_layers)
-    if layers < 1:
-        raise ValueError("a transformer needs at least one layer.")
     if transformer not in RUST_TRANSFORMERS:
         raise NotImplementedError(
             f"the Rust flow does not support the {transformer!r} transformer, "
             f"only {RUST_TRANSFORMERS}."
         )
-    if transformer == "affine" and layers != 1:
-        raise ValueError("an affine transformer has exactly one layer.")
-    n_contract = layers if transformer == "sas" else 0
-    n_tangent_sas = layers if transformer == "tangent_sas" else 0
-    n_asymmetric_sas = layers if transformer == "asymmetric_sas" else 0
-    if log_gamma_bounds is not None:
-        log_gamma_bounds = tuple(map(float, log_gamma_bounds))
+    if transformer == "affine":
+        if layers != 1:
+            raise ValueError("an affine transformer has exactly one layer.")
+        return {"kind": "affine"}
+    kind = {"kind": transformer, "layers": layers}
+    if transformer == "tangent_sas":
+        kind["fix_b"] = bool(tangent_sas_fix_b)
+    elif log_gamma_bounds is not None:
+        kind["log_gamma_bounds"] = [float(b) for b in log_gamma_bounds]
+    return kind
 
-    count = 0
 
-    def field():
-        nonlocal count
-        count += 1
-        return (count - 1, 0.0)
+def transformer_layout(kind):
+    """The layout of a transformer kind (see `transformer_kind`): its
+    ``n_coefs`` coefficients, the ``location``, ``scale`` and ``shape``
+    ones among them, and its ``layers`` as
+    `nutpie.triangular_layout.transformer_dicts` writes them."""
+    from nutpie._lib import transformer_layout as rust_layout
 
-    specs = []
-    location = None
-    for index in range(n_contract):
-        # Every interior `mu` is redundant with the next layer's `nu`, see
-        # `make_transformer`; the last layer keeps it.
-        alpha, beta, sigma = field(), field(), field()
-        mu = field() if index == n_contract - 1 else None
-        nu = field()
-        specs.append(
-            Contract2Spec(
-                alpha=alpha,
-                beta=beta,
-                sigma=sigma,
-                mu=mu,
-                nu=nu,
-                log_gamma_bounds=log_gamma_bounds,
-            )
-        )
-        location, scale = mu, sigma
-    for _ in range(n_tangent_sas):
-        nu, eps = field(), field()
-        b = None if tangent_sas_fix_b else field()
-        r = field()
-        specs.append(TangentSASSpec(nu=nu, eps=eps, b=b, r=r))
-    for index in range(n_asymmetric_sas):
-        # The first layer acts on the standard-normal base, see
-        # `make_transformer`.
-        c, a = (field(), field()) if index else (None, None)
-        alpha_pos, alpha_neg = field(), field()
-        specs.append(
-            AsymmetricSASSpec(
-                c=c,
-                a=a,
-                alpha_pos=alpha_pos,
-                alpha_neg=alpha_neg,
-                log_gamma_bounds=log_gamma_bounds,
-            )
-        )
-    if transformer != "sas":
-        loc, scale = field(), field()
-        specs.append(PositiveAffineSpec(loc=loc, scale=scale))
-        location = loc
-    return tuple(specs), count, location[0], scale[0]
+    return rust_layout(kind)
 
 
 def diag_from_gradients(positions, gradients):
@@ -185,6 +133,66 @@ def _parents(sparsity, order):
     return [np.flatnonzero(lower[k]).astype(np.int64) for k in range(dim)]
 
 
+def default_conditioners(
+    nn_width=16,
+    activation="softplus",
+    *,
+    input_squash=None,
+    scale_skip=True,
+    zero_init=True,
+    mlp_ridge=1.0,
+    skip_ridge=0.1,
+    scale_skip_ridge=1.0,
+    shape_ridge=10.0,
+):
+    """The conditioners of a flow like `make_flow(kind="triangular")`'s: a
+    constant on every coefficient, a linear conditioner on the location (and
+    the scale, with `scale_skip`), and an MLP of `nn_width` units on every
+    coefficient (none for ``nn_width=0``).
+
+    With `zero_init`, a new MLP's output weights start at ``1e-3`` times
+    their usual range, so the map starts close to the identity. The ridges:
+    `mlp_ridge` on the MLP's weights, `skip_ridge` on the linear location
+    weights, `scale_skip_ridge` on the linear scale weights, and
+    `shape_ridge` on what feeds the shape coefficients directly, the
+    constant and (on top of `mlp_ridge`) the MLP's output weights. What feeds
+    the location is weighed against the conditional's width, see
+    `FisherResiduals.ridge_strengths`."""
+    conditioners = [
+        {"kind": "constant", "target": "all", "ridge": {"shape": float(shape_ridge)}},
+        {
+            "kind": "linear",
+            "target": ["location", "scale"] if scale_skip else "location",
+            "ridge": {"location": float(skip_ridge), "scale": float(scale_skip_ridge)},
+        },
+    ]
+    if nn_width:
+        mlp = float(mlp_ridge)
+        conditioners.append(
+            {
+                "kind": "mlp",
+                "width": int(nn_width),
+                "target": "all",
+                "activation": _activation_name(activation),
+                "input_squash": None if input_squash is None else float(input_squash),
+                "init_output_scale": 1e-3 if zero_init else 1.0,
+                "ridge": {
+                    "hidden": mlp,
+                    "location": mlp,
+                    "scale": mlp,
+                    "shape": mlp + float(shape_ridge),
+                    "other": mlp,
+                },
+            }
+        )
+    return conditioners
+
+
+def _seed(seed):
+    """A `u64` seed for the Rust initialization from any numpy seed."""
+    return int(np.random.default_rng(seed).integers(2**63))
+
+
 def build_triangular_flow(
     seed,
     positions,
@@ -192,25 +200,19 @@ def build_triangular_flow(
     *,
     sparsity,
     order=None,
-    nn_width=16,
-    activation="softplus",
-    zero_init=True,
     transformer="sas",
     transformer_layers=1,
     tangent_sas_fix_b=False,
     log_gamma_bounds=None,
-    input_squash=None,
-    scale_skip=True,
+    conditioners=None,
 ):
-    """A new triangular flow for the draws, as `make_flow(kind="triangular",
-    n_layers=1, nn_depth=1, location_skip=True)` builds it.
+    """A new triangular flow for the draws.
 
-    The diagonal affine comes from the draws and their gradients. Each
-    conditioner's hidden layer is drawn uniformly in ``±1 / sqrt(fan_in)``,
-    like `equinox.nn.Linear`; with `zero_init` its output layer is scaled by
-    ``1e-3``, so the map starts close to the identity, as
-    `normalizing_flow.zero_init_conditioners`. The map's output biases and
-    the skips start at zero.
+    The diagonal affine comes from the draws and their gradients, the map's
+    parents from `sparsity` in `order`. `conditioners` is a list of
+    ``{"kind": ...}`` dicts, `default_conditioners()` if `None`; their
+    weights start as each kind does (see `default_conditioners`), drawn from
+    `seed`.
     """
     from nutpie._lib import TriangularFlow
 
@@ -225,49 +227,89 @@ def build_triangular_flow(
     if not np.array_equal(np.sort(order), np.arange(dim)):
         raise ValueError("order must be a permutation of range(dim).")
 
-    specs, n_par, location_index, scale_index = transformer_spec(
+    kind = transformer_kind(
         transformer,
         transformer_layers,
         tangent_sas_fix_b=tangent_sas_fix_b,
         log_gamma_bounds=log_gamma_bounds,
     )
-    n_skip = 2 if scale_skip else 1
+    if conditioners is None:
+        conditioners = default_conditioners()
     parents = _parents(sparsity, order)
-    n_unit = int(nn_width)
-
-    rng = np.random.default_rng(seed)
-    out_scale = 1e-3 if zero_init else 1.0
-    out_limit = 1 / np.sqrt(n_unit) if n_unit else 0.0
-    slices = []
-    for parents_k in parents:
-        n_parent = len(parents_k)
-        in_limit = 1 / np.sqrt(max(n_parent, 1))
-        units = []
-        for _ in range(n_unit):
-            units.append(rng.uniform(-in_limit, in_limit, size=n_parent + 1))
-            units.append(out_scale * rng.uniform(-out_limit, out_limit, size=n_par))
-        slices.extend(units)
-        slices.append(np.zeros(n_par + n_skip * n_parent))
-    theta = np.concatenate(slices) if slices else np.zeros(0)
-
     mean, diag = diag_affine(positions, gradients)
     parent_indptr = np.zeros(dim + 1, dtype=np.int64)
     np.cumsum([len(p) for p in parents], out=parent_indptr[1:])
     return TriangularFlow(
         parent_indptr=parent_indptr,
         parent_index=(np.concatenate(parents) if dim else np.zeros(0, dtype=np.int64)),
-        n_unit=n_unit,
-        n_par=n_par,
-        location_index=location_index,
-        scale_index=scale_index if scale_skip else None,
-        transformer=transformer_dicts(specs),
-        theta=theta,
+        transformer=kind,
+        conditioners=conditioners,
         permutation=order,
         loc=np.asarray(mean, dtype=np.float64),
         scale=np.asarray(diag, dtype=np.float64),
-        input_squash=None if input_squash is None else float(input_squash),
-        activation=_activation_name(activation),
+        seed=_seed(seed),
     )
+
+
+def _normalized(value):
+    """`value` with tuples as lists, to compare layer dicts."""
+    if isinstance(value, dict):
+        return {key: _normalized(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_normalized(item) for item in value]
+    return value
+
+
+def _jax_transformer_kind(tmap, n_par):
+    """The transformer kind of a JAX map, checked against the layers probed
+    from it: the same layers, fields, indices and offsets, and the
+    conditioners' skips into the kind's location and scale."""
+    from nutpie.triangular_layout import (
+        AsymmetricSASConfig,
+        Contract2Config,
+        PositiveAffineConfig,
+        TangentSASConfig,
+        _probe_transformer,
+        transformer_dicts,
+    )
+
+    configs = _probe_transformer(tmap.transformer_constructor, n_par)
+    *body, last = configs
+    types = {type(config) for config in body}
+    kind = None
+    if not body and isinstance(last, PositiveAffineConfig):
+        kind = {"kind": "affine"}
+    elif not body or len(types) == 1:
+        first = configs[0]
+        if isinstance(last, Contract2Config) and types <= {Contract2Config}:
+            kind = {"kind": "sas", "layers": len(configs)}
+        elif isinstance(last, PositiveAffineConfig) and types == {TangentSASConfig}:
+            kind = {
+                "kind": "tangent_sas",
+                "layers": len(body),
+                "fix_b": first.b is None,
+            }
+        elif isinstance(last, PositiveAffineConfig) and types == {AsymmetricSASConfig}:
+            kind = {"kind": "asymmetric_sas", "layers": len(body)}
+        bounds = getattr(first, "log_gamma_bounds", None)
+        if kind is not None and bounds is not None:
+            kind["log_gamma_bounds"] = list(bounds)
+    if kind is None:
+        raise NotImplementedError("The JAX transformer is not one of the Rust kinds.")
+
+    layout = transformer_layout(kind)
+    conditioner = tmap.conditioners[0]
+    scale_index = conditioner.scale_index
+    if (
+        layout["n_coefs"] != n_par
+        or _normalized(layout["layers"]) != _normalized(transformer_dicts(configs))
+        or layout["location"] != int(conditioner.location_index)
+        or (scale_index is not None and layout["scale"] != int(scale_index))
+    ):
+        raise NotImplementedError(
+            f"The JAX transformer does not match the Rust {kind['kind']!r} kind."
+        )
+    return kind, scale_index is not None
 
 
 def from_jax(bijection):
@@ -278,10 +320,8 @@ def from_jax(bijection):
 
     from nutpie._lib import TriangularFlow
     from nutpie.triangular import SparseTriangularMap
-    from nutpie.triangular_layout import _activation_name as layout_activation
-    from nutpie.triangular_layout import _probe_transformer
     from nutpie.triangular_lm import _parents as map_parents
-    from nutpie.triangular_lm import check_supported, pack_params
+    from nutpie.triangular_lm import check_supported, jax_conditioners, pack_params
 
     bijection = unwrap(bijection)
     inner, affine = bijection.bijections
@@ -298,25 +338,18 @@ def from_jax(bijection):
     check_supported(tmap)
     (dim,) = tmap.shape
     parents = map_parents(tmap)
-    first, second = tmap.conditioners[0].mlp.layers
-    n_par = int(second.out_features)
+    _, second = tmap.conditioners[0].mlp.layers
+    kind, _ = _jax_transformer_kind(tmap, int(second.out_features))
     parent_indptr = np.zeros(dim + 1, dtype=np.int64)
     np.cumsum([len(p) for p in parents], out=parent_indptr[1:])
     (permutation,) = inner.outer.permutation
     return TriangularFlow(
         parent_indptr=parent_indptr,
         parent_index=np.concatenate(parents).astype(np.int64),
-        n_unit=int(first.out_features),
-        n_par=n_par,
-        location_index=int(tmap.conditioners[0].location_index),
-        scale_index=tmap.conditioners[0].scale_index,
-        transformer=transformer_dicts(
-            _probe_transformer(tmap.transformer_constructor, n_par)
-        ),
+        transformer=kind,
+        conditioners=jax_conditioners(tmap),
         theta=pack_params(tmap),
         permutation=np.asarray(permutation, dtype=np.int64),
         loc=np.broadcast_to(np.asarray(affine.loc, np.float64), (dim,)).copy(),
         scale=np.broadcast_to(np.asarray(affine.scale, np.float64), (dim,)).copy(),
-        input_squash=tmap.input_squash,
-        activation=layout_activation(tmap.conditioners[0].mlp.activation),
     )

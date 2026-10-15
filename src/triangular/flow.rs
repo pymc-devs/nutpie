@@ -1,7 +1,7 @@
-//! A triangular flow held in Rust: the map's parents and conditioner, its
-//! parameters in the LM layout (see [`super`]), and the flow's permutation
-//! and diagonal affine, as `make_flow(kind="triangular")` builds them in JAX.
-//! Built and initialized by `nutpie.triangular_flow`.
+//! A triangular flow held in Rust: the map's parents and [`Conditional`], its
+//! conditioners' parameters in the LM layout (see [`crate::triangular::lm`]),
+//! and the flow's permutation and diagonal affine. Built by
+//! `nutpie.triangular_flow`.
 //!
 //! The flow is, as in [`FlowTransform`],
 //!
@@ -19,12 +19,15 @@ use numpy::{
     PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods,
 };
 use pyo3::prelude::*;
+use rand::SeedableRng;
+use rand_chacha::ChaCha8Rng;
 
-use super::conditioner::{Activation, Conditioner};
-use super::{FisherResiduals, PyFisherResiduals};
-use crate::triangular::layers::LayerSpec;
-use crate::triangular::pattern::Pattern;
-use crate::triangular::transform::{build_transform_from_specs, FlowTransform, PyFlowTransform};
+use crate::triangular::conditional::Conditional;
+use crate::triangular::conditioner::{Activation, Conditioner, ConditionerConfig, Conditioners};
+use crate::triangular::lm::{FisherResiduals, PyFisherResiduals};
+use crate::triangular::pattern::{Offsets, Pattern};
+use crate::triangular::sampler::{build_transform_with, FlowTransform, PyFlowTransform};
+use crate::triangular::transformer::{Transformer, TransformerConfig};
 
 /// Rough cost of one transformer layer in multiply-adds, for scheduling the
 /// native transform's levels, as `nutpie.triangular_layout`.
@@ -32,10 +35,12 @@ const TRANSFORMER_WORK_PER_LAYER: i64 = 100;
 
 #[derive(Clone)]
 pub(crate) struct TriangularFlow {
-    /// The map's structure, without data.
-    structure: FisherResiduals,
-    /// The transformer's layers, for the native transform.
-    specs: Vec<LayerSpec>,
+    /// The map's parents, in the triangular order.
+    graph: Pattern,
+    conditional: Conditional,
+    /// Each variable's slice of `theta`.
+    param_offset: Offsets,
+    /// The conditioners' parameters, in the LM layout.
     theta: Vec<f64>,
     permutation: Vec<usize>,
     loc: Vec<f64>,
@@ -43,20 +48,40 @@ pub(crate) struct TriangularFlow {
 }
 
 impl TriangularFlow {
+    /// The flow with conditioners' parameters `theta`, or new ones drawn
+    /// from `seed`.
     fn new(
-        structure: FisherResiduals,
-        specs: Vec<LayerSpec>,
-        theta: Vec<f64>,
+        graph: Pattern,
+        conditional: Conditional,
+        theta: Option<Vec<f64>>,
+        seed: u64,
         permutation: Vec<usize>,
         loc: Vec<f64>,
         scale: Vec<f64>,
     ) -> Result<Self> {
-        let n = structure.n_var();
-        if theta.len() != structure.n_params() {
+        let n = graph.n_var();
+        let param_offset =
+            Offsets::from_lens((0..n).map(|i| conditional.n_weights(graph.n_parent(i))));
+        let theta = match theta {
+            Some(theta) => theta,
+            None => {
+                let mut rng = ChaCha8Rng::seed_from_u64(seed);
+                let mut theta = vec![0.0; param_offset.total()];
+                for i in 0..n {
+                    conditional.conditioners.init_weights(
+                        graph.n_parent(i),
+                        &mut rng,
+                        &mut theta[param_offset.range(i)],
+                    );
+                }
+                theta
+            }
+        };
+        if theta.len() != param_offset.total() {
             bail!(
                 "theta has length {}, expected {}",
                 theta.len(),
-                structure.n_params()
+                param_offset.total()
             );
         }
         if permutation.len() != n || loc.len() != n || scale.len() != n {
@@ -72,8 +97,9 @@ impl TriangularFlow {
             bail!("scale must be finite and nonzero");
         }
         Ok(Self {
-            structure,
-            specs,
+            graph,
+            conditional,
+            param_offset,
             theta,
             permutation,
             loc,
@@ -82,12 +108,17 @@ impl TriangularFlow {
     }
 
     fn n_var(&self) -> usize {
-        self.structure.n_var()
+        self.graph.n_var()
+    }
+
+    /// Variable `i`'s slice of `theta`.
+    fn theta_of(&self, i: usize) -> &[f64] {
+        &self.theta[self.param_offset.range(i)]
     }
 
     /// Each variable's level: the longest parent chain ending at it.
     fn levels(&self) -> Vec<usize> {
-        let graph = &self.structure.graph;
+        let graph = &self.graph;
         let mut level = vec![0usize; self.n_var()];
         for i in 0..level.len() {
             level[i] = graph
@@ -97,6 +128,75 @@ impl TriangularFlow {
                 .unwrap_or(0);
         }
         level
+    }
+
+    /// The same flow with the diagonal affine `loc + scale * w`: the
+    /// standardized coordinates change, and the conditioners' weights with
+    /// them where that is exact (see [`Conditioners::change_coordinates`]).
+    fn with_affine(&self, loc: Vec<f64>, scale: Vec<f64>) -> Result<Self> {
+        let n = self.n_var();
+        if loc.len() != n || scale.len() != n {
+            bail!("loc and scale must each have one entry per variable");
+        }
+        if scale.iter().any(|s| !(s.is_finite() && *s != 0.0)) {
+            bail!("scale must be finite and nonzero");
+        }
+        // Variable `j` of the map, `v_j = (y_k - loc_k) / scale_k` with `k =
+        // permutation[j]`, becomes `a_j v_j + b_j`.
+        let change: Vec<(f64, f64)> = self
+            .permutation
+            .iter()
+            .map(|&k| {
+                let a = self.scale[k] / scale[k];
+                (a, (self.loc[k] - loc[k]) / scale[k])
+            })
+            .collect();
+        if change.iter().any(|&(a, _)| a <= 0.0) {
+            bail!("scale must keep its sign");
+        }
+        let mut out = self.clone();
+        let mut parents = Vec::with_capacity(self.graph.max_parent());
+        for i in 0..n {
+            parents.clear();
+            parents.extend(self.graph.parents(i).iter().map(|&p| change[p]));
+            out.conditional.conditioners.change_coordinates(
+                &self.conditional.transformer,
+                change[i],
+                &parents,
+                &mut out.theta[self.param_offset.range(i)],
+            );
+        }
+        out.loc = loc;
+        out.scale = scale;
+        Ok(out)
+    }
+
+    /// The same flow with the conditioners `configs`: what both have
+    /// carries over (see [`Conditioners::carry_plan`]), the rest starts as
+    /// new conditioners do, drawn from `seed`.
+    fn with_conditioners(&self, configs: &[ConditionerConfig], seed: u64) -> Result<Self> {
+        let transformer = self.conditional.transformer.clone();
+        let conditioners = Conditioners::new(configs, &transformer)?;
+        let plan = conditioners.carry_plan(&self.conditional.conditioners)?;
+        let mut out = Self::new(
+            self.graph.clone(),
+            Conditional::new(conditioners, transformer)?,
+            None,
+            seed,
+            self.permutation.clone(),
+            self.loc.clone(),
+            self.scale.clone(),
+        )?;
+        for i in 0..self.n_var() {
+            out.conditional.conditioners.carry_weights(
+                &self.conditional.conditioners,
+                &plan,
+                self.graph.n_parent(i),
+                self.theta_of(i),
+                &mut out.theta[out.param_offset.range(i)],
+            );
+        }
+        Ok(out)
     }
 
     /// Draws and their gradients, row-major `(n_draw, n_var)` each, with the
@@ -124,10 +224,7 @@ impl TriangularFlow {
 
     /// The LM residuals of the draws, see [`FisherResiduals`].
     fn problem(&self, positions: &[f64], gradients: &[f64]) -> Result<FisherResiduals> {
-        let mut problem = FisherResiduals::new(
-            self.structure.graph.clone(),
-            self.structure.conditioner.clone(),
-        )?;
+        let mut problem = FisherResiduals::new(self.graph.clone(), self.conditional.clone())?;
         let (y, g) = self.undo_affine(positions, gradients)?;
         problem.set_data(y, g)?;
         Ok(problem)
@@ -156,7 +253,7 @@ impl TriangularFlow {
         let (_, lin) = self
             .problem(&positions, &gradients)?
             .residuals(&self.theta)?;
-        let (x, w, delta) = (lin.x.to_rows(), lin.w.to_rows(), lin.delta.to_rows());
+        let (x, w, delta) = lin.x_w_delta_rows();
 
         let mut z = vec![0.0; n];
         let mut grad_z = vec![0.0; n];
@@ -171,36 +268,101 @@ impl TriangularFlow {
     }
 
     /// The native transform of this flow, for the sampler's leapfrog.
+    ///
+    /// Its kernel has one MLP on every coefficient with an output bias, and
+    /// linear skips into the location and the scale, so this supports at
+    /// most one MLP and a linear conditioner on the location and the scale:
+    /// the constant becomes the output bias, the MLP's missing outputs zero
+    /// weights.
     fn flow_transform(&self, schedule: &str, min_parallel_work: i64) -> Result<FlowTransform> {
-        let s = &self.structure;
-        let (n, conditioner) = (s.n_var(), &s.conditioner);
-        let (n_unit, n_par) = (conditioner.n_unit, conditioner.n_par);
+        let n = self.n_var();
+        let (conditioners, transformer) = (
+            &self.conditional.conditioners,
+            &self.conditional.transformer,
+        );
+        let n_par = transformer.n_coefs();
+        if conditioners.mlps.len() > 1 {
+            bail!("the sampler's transform supports at most one MLP conditioner");
+        }
+        let mlp = conditioners.mlps.first();
+        let Some(location) = transformer.location_coef() else {
+            bail!("the sampler's transform needs a transformer with a location");
+        };
+        let linear_coefs = conditioners
+            .linear
+            .as_ref()
+            .map_or(&[][..], |c| c.outputs().coefs());
+        let scale = transformer
+            .scale_coef()
+            .filter(|k| linear_coefs.contains(k));
+        if linear_coefs
+            .iter()
+            .any(|&k| k != location && Some(k) != scale)
+        {
+            bail!("the sampler's transform supports linear conditioners on the location and the scale only");
+        }
+        let n_unit = mlp.map_or(0, |m| m.n_unit());
 
         let mut parent_indptr = vec![0i64];
-        let mut parent_index = Vec::with_capacity(s.n_edge());
-        let mut skip_weight = Vec::with_capacity(s.n_edge());
+        let mut parent_index = Vec::with_capacity(self.graph.n_edge());
+        let mut skip_weight = Vec::with_capacity(self.graph.n_edge());
         let mut scale_skip_weight = Vec::new();
         let mut blob = Vec::new();
         let mut blob_offset = vec![0i64];
         for i in 0..n {
-            let theta = s.params_of(&self.theta, i);
-            let n_parent = theta.shape.n_parent;
-            parent_index.extend(s.graph.entries(i).map(|(_, p)| p as i64));
+            let theta = self.theta_of(i);
+            let n_parent = self.graph.n_parent(i);
+            parent_index.extend(self.graph.entries(i).map(|(_, p)| p as i64));
             parent_indptr.push(parent_index.len() as i64);
-            skip_weight.extend_from_slice(theta.skip(0));
-            if conditioner.scale.is_some() {
-                scale_skip_weight.extend_from_slice(theta.skip(1));
+
+            let mut ranges = conditioners.weight_ranges(n_parent).into_iter();
+            let mut b2 = vec![0.0; n_par];
+            if let Some(c) = &conditioners.constant {
+                let weights = &theta[ranges.next().expect("a range per conditioner")];
+                for (&w, &k) in weights.iter().zip(c.outputs().coefs()) {
+                    b2[k] = w;
+                }
             }
+            let (mut skip, mut scale_skip) = (vec![0.0; n_parent], vec![0.0; n_parent]);
+            if conditioners.linear.is_some() {
+                let weights = &theta[ranges.next().expect("a range per conditioner")];
+                for (j, &k) in linear_coefs.iter().enumerate() {
+                    let row = &weights[j * n_parent..(j + 1) * n_parent];
+                    if k == location {
+                        skip.copy_from_slice(row);
+                    } else {
+                        scale_skip.copy_from_slice(row);
+                    }
+                }
+            }
+            skip_weight.extend_from_slice(&skip);
+            if scale.is_some() {
+                scale_skip_weight.extend_from_slice(&scale_skip);
+            }
+
             // Per layer, the transposed `(n_in, n_out)` weight, then the
-            // bias: see `TriangularLayout.blob`.
-            for p in 0..n_parent {
-                blob.extend((0..n_unit).map(|u| theta.w1(u)[p]));
+            // bias: see `TriangularLayout.blob`. Without parents the MLP has
+            // no weights, and the kernel's units have zero output weights.
+            let mut w2 = vec![0.0; n_unit * n_par];
+            let mut b1 = vec![0.0; n_unit];
+            if let Some(m) = mlp {
+                let weights = &theta[ranges.next().expect("a range per conditioner")];
+                if n_parent > 0 {
+                    for p in 0..n_parent {
+                        blob.extend((0..n_unit).map(|u| m.unit(weights, n_parent, u).0[p]));
+                    }
+                    for u in 0..n_unit {
+                        let (_, bias, out) = m.unit(weights, n_parent, u);
+                        b1[u] = bias;
+                        for (&w, &k) in out.iter().zip(m.outputs().coefs()) {
+                            w2[u * n_par + k] = w;
+                        }
+                    }
+                }
             }
-            blob.extend((0..n_unit).map(|u| theta.b1(u)));
-            for u in 0..n_unit {
-                blob.extend_from_slice(theta.w2(u));
-            }
-            blob.extend_from_slice(theta.b2());
+            blob.extend_from_slice(&b1);
+            blob.extend_from_slice(&w2);
+            blob.extend_from_slice(&b2);
             blob_offset.push(blob.len() as i64);
         }
 
@@ -213,28 +375,26 @@ impl TriangularFlow {
         for i in 0..n {
             level_ptr[level[i] + 1] += 1;
             level_work[level[i]] += blob_offset[i + 1] - blob_offset[i]
-                + TRANSFORMER_WORK_PER_LAYER * self.specs.len() as i64;
+                + TRANSFORMER_WORK_PER_LAYER * transformer.n_layers() as i64;
         }
         for l in 0..n_levels {
             level_ptr[l + 1] += level_ptr[l];
         }
 
-        let map = build_transform_from_specs(
+        let map = build_transform_with(
             &parent_indptr,
             &parent_index,
             &blob,
             &blob_offset,
             &[n_unit as i64, n_par as i64],
             &skip_weight,
-            conditioner.location as i64,
-            conditioner
-                .scale
-                .map(|scale| (scale_skip_weight.as_slice(), scale as i64)),
+            location as i64,
+            scale.map(|scale| (scale_skip_weight.as_slice(), scale as i64)),
             0,
             &[],
-            conditioner.squash,
-            conditioner.activation.name(),
-            self.specs.clone(),
+            mlp.and_then(|m| m.squash()),
+            mlp.map_or(Activation::default(), |m| m.activation()).name(),
+            transformer.clone(),
             &level_ptr,
             &level_vars,
             &level_work,
@@ -273,50 +433,44 @@ impl PyTriangularFlow {
 
 #[pymethods]
 impl PyTriangularFlow {
+    /// A flow with the given parents (in the triangular order), transformer
+    /// (``{"kind": ...}``) and conditioners (a list of ``{"kind": ...}``),
+    /// its conditioners' parameters `theta` in the LM layout, or new ones
+    /// drawn from `seed`.
     #[new]
     #[pyo3(signature = (
         *,
         parent_indptr,
         parent_index,
-        n_unit,
-        n_par,
-        location_index,
         transformer,
-        theta,
+        conditioners,
         permutation,
         loc,
         scale,
-        scale_index = None,
-        input_squash = None,
-        activation = "softplus",
+        theta = None,
+        seed = 0,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         parent_indptr: PyReadonlyArray1<'_, i64>,
         parent_index: PyReadonlyArray1<'_, i64>,
-        n_unit: usize,
-        n_par: usize,
-        location_index: usize,
         transformer: &Bound<'_, PyAny>,
-        theta: PyReadonlyArray1<'_, f64>,
+        conditioners: &Bound<'_, PyAny>,
         permutation: PyReadonlyArray1<'_, i64>,
         loc: PyReadonlyArray1<'_, f64>,
         scale: PyReadonlyArray1<'_, f64>,
-        scale_index: Option<usize>,
-        input_squash: Option<f64>,
-        activation: &str,
+        theta: Option<PyReadonlyArray1<'_, f64>>,
+        seed: u64,
     ) -> Result<Self> {
-        let specs: Vec<LayerSpec> = pythonize::depythonize(transformer)?;
-        let conditioner = Conditioner::new(
-            n_unit,
-            n_par,
-            location_index,
-            scale_index,
-            specs.clone(),
-            input_squash,
-            Activation::from_name(activation)?,
-        )?;
+        let config: TransformerConfig = pythonize::depythonize(transformer)?;
+        let transformer = config.build()?;
+        let configs: Vec<ConditionerConfig> = pythonize::depythonize(conditioners)?;
+        let conditional =
+            Conditional::new(Conditioners::new(&configs, &transformer)?, transformer)?;
         let graph = Pattern::from_i64(parent_indptr.as_slice()?, parent_index.as_slice()?)?;
+        let theta = theta
+            .map(|theta| theta.as_slice().map(<[f64]>::to_vec))
+            .transpose()?;
         let permutation = permutation
             .as_slice()?
             .iter()
@@ -324,14 +478,32 @@ impl PyTriangularFlow {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(Self {
             inner: TriangularFlow::new(
-                FisherResiduals::new(graph, conditioner)?,
-                specs,
-                theta.as_slice()?.to_vec(),
+                graph,
+                conditional,
+                theta,
+                seed,
                 permutation,
                 loc.as_slice()?.to_vec(),
                 scale.as_slice()?.to_vec(),
             )?,
         })
+    }
+
+    /// Variable `i`'s conditioners' ranges of `theta`, ``(start, stop)``
+    /// each: the constant, the linear conditioner, then the MLPs in list
+    /// order, each only if there is one.
+    fn weight_ranges(&self, i: usize) -> Result<Vec<(usize, usize)>> {
+        let s = &self.inner;
+        if i >= s.n_var() {
+            bail!("variable {i} out of range");
+        }
+        let start = s.param_offset.start(i);
+        Ok(s.conditional
+            .conditioners
+            .weight_ranges(s.graph.n_parent(i))
+            .into_iter()
+            .map(|r| (start + r.start, start + r.end))
+            .collect())
     }
 
     #[getter]
@@ -341,13 +513,13 @@ impl PyTriangularFlow {
 
     #[getter]
     fn n_params(&self) -> usize {
-        self.inner.structure.n_params()
+        self.inner.param_offset.total()
     }
 
     /// The largest number of parents of any variable.
     #[getter]
     fn max_parents(&self) -> usize {
-        self.inner.structure.graph.max_parent()
+        self.inner.graph.max_parent()
     }
 
     /// The number of levels, the longest parent chain plus one.
@@ -396,25 +568,33 @@ impl PyTriangularFlow {
     }
 
     /// The same flow with the diagonal affine `loc + scale * w`, one entry
-    /// per variable. The conditioners keep their parameters, now in the new
-    /// standardized coordinates.
+    /// per variable. The conditioners' constant and linear weights on the
+    /// location, and their constant on the scale, follow the new
+    /// standardized coordinates; the rest keeps its values.
     fn with_affine(
         &self,
         loc: PyReadonlyArray1<'_, f64>,
         scale: PyReadonlyArray1<'_, f64>,
     ) -> Result<Self> {
-        let mut inner = self.inner.clone();
-        let (loc, scale) = (loc.as_slice()?, scale.as_slice()?);
-        let n = inner.loc.len();
-        if loc.len() != n || scale.len() != n {
-            bail!("loc and scale must each have one entry per variable");
-        }
-        if scale.iter().any(|s| !(s.is_finite() && *s != 0.0)) {
-            bail!("scale must be finite and nonzero");
-        }
-        inner.loc = loc.to_vec();
-        inner.scale = scale.to_vec();
-        Ok(Self { inner })
+        Ok(Self {
+            inner: self
+                .inner
+                .with_affine(loc.as_slice()?.to_vec(), scale.as_slice()?.to_vec())?,
+        })
+    }
+
+    /// The same flow with the conditioners `conditioners` (a list of
+    /// ``{"kind": ...}``): each one's weights carry over from the matching
+    /// current conditioner where they feed the same coefficients (an MLP
+    /// matches one with the same width, activation and input squash whose
+    /// targets overlap), new targets start at zero, and new conditioners as
+    /// in a new flow, drawn from `seed`.
+    #[pyo3(signature = (conditioners, seed = 0))]
+    fn with_conditioners(&self, conditioners: &Bound<'_, PyAny>, seed: u64) -> Result<Self> {
+        let configs: Vec<ConditionerConfig> = pythonize::depythonize(conditioners)?;
+        Ok(Self {
+            inner: self.inner.with_conditioners(&configs, seed)?,
+        })
     }
 
     /// Draws and gradients, `(n_draw, n_var)` each, with the diagonal affine

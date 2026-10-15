@@ -6,7 +6,7 @@ use std::sync::Arc;
 use fearless_simd::prelude::*;
 use fearless_simd_macros::simd;
 
-use super::simd::{load, store};
+use crate::triangular::simd::{load, store};
 
 /// `count` values per draw, in tiles of `width` draws: laid out `(n_tile,
 /// count, width)`, so a tile's values of one quantity (a variable or an edge)
@@ -148,6 +148,11 @@ pub(crate) struct Linearization {
 }
 
 impl Linearization {
+    /// `(x, w, delta)`, each `(n_draw, n_var)` row-major.
+    pub(crate) fn x_w_delta_rows(&self) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+        (self.x.to_rows(), self.w.to_rows(), self.delta.to_rows())
+    }
+
     pub(super) fn zeros(theta: &[f64], data: Arc<Data>, n_var: usize, n_edge: usize) -> Self {
         let (n_tile, width) = (data.n_tile(), data.y.width);
         Self {

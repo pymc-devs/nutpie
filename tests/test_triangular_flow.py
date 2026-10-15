@@ -9,7 +9,14 @@ jax = pytest.importorskip("jax")
 import equinox as eqx
 import jax.numpy as jnp
 
-from nutpie.triangular_flow import build_triangular_flow, from_jax, transformer_spec
+from nutpie.triangular_flow import (
+    _normalized,
+    build_triangular_flow,
+    default_conditioners,
+    from_jax,
+    transformer_kind,
+    transformer_layout,
+)
 
 DIM = 7
 
@@ -54,9 +61,9 @@ TRANSFORMERS = [
 
 
 @pytest.mark.parametrize("kwargs", TRANSFORMERS)
-def test_transformer_spec_matches_the_probe(kwargs):
-    """The spec written out by hand is the one probed from the JAX
-    transformer: the same layers, fields, indices, offsets and location."""
+def test_transformer_layout_matches_the_probe(kwargs):
+    """The Rust kind's layout is the one probed from the JAX transformer:
+    the same layers, fields, indices, offsets, location and scale."""
     from nutpie.normalizing_flow import make_sparse_triangular_map
     from nutpie.triangular_layout import _probe_transformer, transformer_dicts
 
@@ -73,11 +80,11 @@ def test_transformer_spec_matches_the_probe(kwargs):
     n_par = int(tmap.conditioners[0].mlp.layers[1].out_features)
     probed = transformer_dicts(_probe_transformer(tmap.transformer_constructor, n_par))
 
-    specs, ours_n_par, location, scale = transformer_spec(**kwargs)
-    assert ours_n_par == n_par
-    assert location == int(tmap.conditioners[0].location_index)
-    assert scale == int(tmap.conditioners[0].scale_index)
-    assert transformer_dicts(specs) == probed
+    layout = transformer_layout(transformer_kind(**kwargs))
+    assert layout["n_coefs"] == n_par
+    assert layout["location"] == int(tmap.conditioners[0].location_index)
+    assert layout["scale"] == int(tmap.conditioners[0].scale_index)
+    assert _normalized(layout["layers"]) == _normalized(probed)
 
 
 def _jax_flow(seed=0, **kwargs):
@@ -228,8 +235,12 @@ def test_built_flow_has_the_jax_structure():
         g,
         sparsity=_banded(DIM, order),
         order=order,
-        activation="softplus",
-        **settings,
+        transformer=settings["transformer"],
+        transformer_layers=settings["transformer_layers"],
+        log_gamma_bounds=settings["log_gamma_bounds"],
+        conditioners=default_conditioners(
+            settings["nn_width"], "softplus", input_squash=settings["input_squash"]
+        ),
     )
     assert flow.n_params == reference.n_params
     np.testing.assert_array_equal(flow.permutation, reference.permutation)
@@ -255,9 +266,8 @@ def test_built_flow_inverts_and_fits():
         g,
         sparsity=_banded(DIM, order),
         order=order,
-        nn_width=4,
         transformer="tangent_sas",
-        input_squash=1.0,
+        conditioners=default_conditioners(4, input_squash=1.0),
     )
 
     native = flow.flow_transform()

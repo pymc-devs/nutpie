@@ -17,11 +17,9 @@
 //! 5. Update `lam` (Nielsen) and the CG forcing term (Eisenstat-Walker),
 //!    unless CG stops on the quadratic model instead.
 //!
-//! The objective is `F = ||r||^2 + sum_k ridge_k theta_k^2`: an optional
-//! ridge, with strengths by the parameter's role ([`RidgeStrengths`], see
-//! `PyLmOptimizer`'s `mlp_ridge`, `skip_ridge`, `scale_skip_ridge` and
-//! `shape_ridge`), which adds
-//! `diag(ridge)` to `H = J^T J`. Every quantity below, `F`, the gradient `g`,
+//! The objective is `F = ||r||^2 + sum_k ridge_k theta_k^2`: a ridge with
+//! each conditioner's strengths ([`FisherResiduals::ridge_strengths`]), which
+//! adds `diag(ridge)` to `H = J^T J`. Every quantity below, `F`, the gradient `g`,
 //! `H` and its blocks, includes it.
 //!
 //! Optionally, some parameters are `frozen`: the step is restricted to the
@@ -37,10 +35,7 @@ use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 use serde::Serialize;
 
-use super::{
-    FisherResiduals, GnBlock, Linearization, PyFisherResiduals, RidgeClass, RidgeStrengths,
-};
-use crate::triangular::pattern::Offsets;
+use super::{FisherResiduals, GnBlock, Linearization, PyFisherResiduals};
 
 /// Marquardt floor, as a fraction of each conditioner's largest curvature.
 const MARQUARDT_FLOOR: f64 = 1e-4;
@@ -266,33 +261,35 @@ pub struct LmOptimizer {
     lmp_pairs: VecDeque<Pair>,
 }
 
-/// Per parameter, the ridge weight in `F`: its class's strength over
+/// Per parameter, the ridge weight in `F`: its conditioner's strength over
 /// `n_draw`. `||r||^2` is a mean over the draws, so this is a ridge of that
-/// strength on their sum: the more draws, the weaker it gets. Stored by
-/// class rather than as one `f64` per parameter.
+/// strength on their sum: the more draws, the weaker it gets.
 ///
-/// The location's weights carry each variable's `loc_scales`, refreshed at
+/// What feeds a variable's location carries its `loc_scales`, refreshed at
 /// the start of every step from the linearization there, and fixed within
 /// it: each step is an LM step on a quadratic ridge, with the widths it
 /// starts from.
 struct Ridge {
-    classes: Vec<RidgeClass>,
-    strengths: RidgeStrengths,
-    scale: f64,
-    offsets: Offsets,
-    loc_scales: Vec<f64>,
+    weights: Vec<f64>,
 }
 
 impl Ridge {
-    /// The weight of parameter `k`, of variable `var`.
+    fn at(problem: &FisherResiduals, lin: &Linearization) -> Self {
+        let scale = 1.0 / problem.n_draw() as f64;
+        let strengths = problem.ridge_strengths(&problem.loc_scales(lin));
+        Self {
+            weights: strengths.into_iter().map(|s| s * scale).collect(),
+        }
+    }
+
+    /// The weight of parameter `k`.
     #[inline(always)]
-    fn weight(&self, var: usize, k: usize) -> f64 {
-        self.strengths.of(self.classes[k], self.loc_scales[var]) * self.scale
+    fn weight(&self, k: usize) -> f64 {
+        self.weights[k]
     }
 
     fn iter(&self) -> impl Iterator<Item = f64> + '_ {
-        (0..self.offsets.n_rows())
-            .flat_map(move |var| self.offsets.range(var).map(move |k| self.weight(var, k)))
+        self.weights.iter().copied()
     }
 }
 
@@ -316,7 +313,6 @@ impl LmOptimizer {
         problem: FisherResiduals,
         theta: Vec<f64>,
         lam: f64,
-        ridge: RidgeStrengths,
         frozen: Option<Vec<bool>>,
         settings: Settings,
     ) -> Result<Self> {
@@ -341,15 +337,8 @@ impl LmOptimizer {
         if settings.max_block_size == 0 || settings.rebuild_every == 0 {
             bail!("max_block_size and rebuild_every must be positive");
         }
-        ridge.check()?;
         let (r, lin) = problem.residuals(&theta)?;
-        let ridge = Ridge {
-            classes: problem.ridge_classes(),
-            strengths: ridge,
-            scale: 1.0 / problem.n_draw() as f64,
-            offsets: problem.param_offset.clone(),
-            loc_scales: problem.loc_scales(&lin),
-        };
+        let ridge = Ridge::at(&problem, &lin);
         let n_params = theta.len();
         Ok(Self {
             problem,
@@ -404,9 +393,8 @@ impl LmOptimizer {
         }
         for block in &mut blocks {
             let size = block.matrix.nrows();
-            let var = self.problem.param_offset.row_of(block.start);
             for k in 0..size {
-                block.matrix[(k, k)] += self.ridge.weight(var, block.start + k);
+                block.matrix[(k, k)] += self.ridge.weight(block.start + k);
             }
             // A frozen parameter's row and column become the identity's, so
             // that the preconditioner keeps its component of every CG
@@ -643,7 +631,7 @@ impl LmOptimizer {
     fn step(&mut self) -> Result<StepInfo> {
         let s = self.settings.clone();
         let lam = self.lam;
-        self.ridge.loc_scales = self.problem.loc_scales(self.lin());
+        self.ridge = Ridge::at(&self.problem, self.lin());
 
         let rebuild = self.accepted_since_build >= s.rebuild_every;
         if rebuild || self.blocks.is_none() {
@@ -895,10 +883,6 @@ impl PyLmOptimizer {
         rebuild_every = 1,
         lmp_size = 0,
         lmp_tol = 1e-8,
-        mlp_ridge = 0.0,
-        skip_ridge = 0.0,
-        scale_skip_ridge = 0.0,
-        shape_ridge = 0.0,
         frozen = None,
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -926,10 +910,6 @@ impl PyLmOptimizer {
         rebuild_every: usize,
         lmp_size: usize,
         lmp_tol: f64,
-        mlp_ridge: f64,
-        skip_ridge: f64,
-        scale_skip_ridge: f64,
-        shape_ridge: f64,
         frozen: Option<PyReadonlyArray1<'_, bool>>,
     ) -> Result<Self> {
         let frozen = frozen
@@ -964,13 +944,7 @@ impl PyLmOptimizer {
         };
         let theta = theta.as_slice()?.to_vec();
         let problem = problem.inner.clone();
-        let ridge = RidgeStrengths {
-            mlp: mlp_ridge,
-            skip: skip_ridge,
-            scale_skip: scale_skip_ridge,
-            shape: shape_ridge,
-        };
-        let inner = py.detach(|| LmOptimizer::new(problem, theta, lam, ridge, frozen, settings))?;
+        let inner = py.detach(|| LmOptimizer::new(problem, theta, lam, frozen, settings))?;
         Ok(Self { inner })
     }
 
@@ -1038,43 +1012,17 @@ mod tests {
         }
     }
 
-    fn mlp_ridge(mlp: f64) -> RidgeStrengths {
-        RidgeStrengths {
-            mlp,
-            ..RidgeStrengths::default()
-        }
-    }
-
     /// With the ridge, each step's model prediction `pred` is the decrease of
     /// the quadratic model of the full objective: for a tiny step it matches
     /// the actual decrease, so `rho -> 1`.
     #[test]
     fn ridge_enters_the_model_consistently() {
         let problem = problem_with(64);
-        let classes = problem.ridge_classes();
-        for class in [
-            RidgeClass::None,
-            RidgeClass::Skip,
-            RidgeClass::ScaleSkip,
-            RidgeClass::Mlp,
-            RidgeClass::MlpLoc,
-            RidgeClass::Shape,
-            RidgeClass::MlpShape,
-        ] {
-            assert!(classes.contains(&class), "no {class:?}");
-        }
         let mut rng = ChaCha8Rng::seed_from_u64(6);
         let theta = normal(&mut rng, problem.n_params(), 0.3);
-        let strengths = RidgeStrengths {
-            mlp: 0.7,
-            skip: 0.3,
-            scale_skip: 0.2,
-            shape: 0.5,
-        };
         // A huge damping makes the step tiny, so GN's model is exact to
         // first order.
-        let mut lm =
-            LmOptimizer::new(problem, theta.clone(), 1e6, strengths, None, settings()).unwrap();
+        let mut lm = LmOptimizer::new(problem, theta.clone(), 1e6, None, settings()).unwrap();
         let penalized = lm.ridge.iter().filter(|&w| w > 0.0).count();
         assert!(penalized > 0 && penalized < theta.len());
         let ridge: f64 = lm.ridge.iter().zip(&theta).map(|(w, t)| w * t * t).sum();
@@ -1092,28 +1040,12 @@ mod tests {
         let problem = problem_with(64);
         let frozen = problem.nonlinear_param_mask();
         assert!(frozen.iter().any(|&f| f) && frozen.iter().any(|&f| !f));
-        // The shape fields' biases, and nothing feeding the affine ones
-        // linearly, are frozen.
-        for (class, &frozen) in problem.ridge_classes().iter().zip(&frozen) {
-            match class {
-                RidgeClass::Shape
-                | RidgeClass::ScaleSkip
-                | RidgeClass::Mlp
-                | RidgeClass::MlpLoc
-                | RidgeClass::MlpShape => {
-                    assert!(frozen)
-                }
-                RidgeClass::Skip => assert!(!frozen),
-                RidgeClass::None => {}
-            }
-        }
         let mut rng = ChaCha8Rng::seed_from_u64(7);
         let theta = normal(&mut rng, problem.n_params(), 0.3);
         let mut lm = LmOptimizer::new(
             problem,
             theta.clone(),
             0.1,
-            mlp_ridge(0.5),
             Some(frozen.clone()),
             settings(),
         )
@@ -1143,15 +1075,9 @@ mod tests {
                 .build()
                 .unwrap();
             pool.install(|| {
-                let mut lm = LmOptimizer::new(
-                    problem.clone(),
-                    theta.clone(),
-                    0.1,
-                    mlp_ridge(0.3),
-                    None,
-                    settings(),
-                )
-                .unwrap();
+                let mut lm =
+                    LmOptimizer::new(problem.clone(), theta.clone(), 0.1, None, settings())
+                        .unwrap();
                 for _ in 0..5 {
                     lm.step().unwrap();
                 }

@@ -20,6 +20,7 @@ import numpy as np
 
 from nutpie.triangular_flow import (
     build_triangular_flow,
+    default_conditioners,
     diag_affine,
     diag_from_gradients,
 )
@@ -135,10 +136,6 @@ def _run_lm(
     should_stop,
     val_problem=None,
     early_stopping=True,
-    mlp_ridge=0.0,
-    skip_ridge=0.0,
-    scale_skip_ridge=0.0,
-    shape_ridge=0.0,
     linear_fit=False,
     prefix="",
 ):
@@ -149,7 +146,8 @@ def _run_lm(
     `val_problem` holds the held-out draws for the validation loss and,
     with `early_stopping`, the early stopping. `linear_fit` holds what makes
     the conditioners and transformers nonlinear fixed (see
-    `FisherResiduals.nonlinear_param_mask`). Returns ``(theta, losses, lam, n_steps,
+    `FisherResiduals.nonlinear_param_mask`). The ridges are the problem's
+    conditioners'. Returns ``(theta, losses, lam, n_steps,
     n_accepted)``, with the losses at the returned `theta`: ``"objective"``
     (what LM minimised, with the regularizations), ``"train"`` and ``"val"``
     (Fisher divergences, ``val`` `None` without `val_problem`)."""
@@ -171,10 +169,6 @@ def _run_lm(
         max_block_size=max_exact_block_size,
         lmp_size=lmp_size,
         lmp_tol=lmp_tol,
-        mlp_ridge=mlp_ridge,
-        skip_ridge=skip_ridge,
-        scale_skip_ridge=scale_skip_ridge,
-        shape_ridge=shape_ridge,
         frozen=problem.nonlinear_param_mask if linear_fit else None,
         val_problem=val_problem,
         early_stopping=early_stopping,
@@ -185,13 +179,7 @@ def _run_lm(
     # Evaluated afresh: early stopping may have returned an earlier `theta`
     # than the last step's.
     r = problem.residuals(theta, linearize=False)
-    strengths = problem.ridge_strengths(
-        theta,
-        mlp_ridge=mlp_ridge,
-        skip_ridge=skip_ridge,
-        scale_skip_ridge=scale_skip_ridge,
-        shape_ridge=shape_ridge,
-    )
+    strengths = problem.ridge_strengths(theta)
     ridge = float(strengths @ theta**2) / problem.n_draw
     train = float(r @ r)
     losses = {
@@ -277,6 +265,7 @@ class TriangularFlowAdapter:
         lm_max_exact_block_size,
         lm_lmp_size,
         lm_lmp_tol,
+        conditioners=None,
     ):
         from nutpie._lib import FisherResiduals
 
@@ -308,16 +297,24 @@ class TriangularFlowAdapter:
         # Set by the main thread when sampling is aborted. The training runs
         # in a chain's thread, where Python never raises KeyboardInterrupt.
         self._stop_event = stop_event
+        if conditioners is None:
+            conditioners = default_conditioners(
+                nn_width,
+                activation,
+                input_squash=input_squash,
+                scale_skip=scale_skip,
+                zero_init=zero_init,
+                mlp_ridge=lm_mlp_ridge,
+                skip_ridge=lm_skip_ridge,
+                scale_skip_ridge=lm_scale_skip_ridge,
+                shape_ridge=lm_shape_ridge,
+            )
         self._flow_settings = {
-            "nn_width": nn_width,
-            "activation": activation,
-            "zero_init": zero_init,
             "transformer": transformer,
             "transformer_layers": transformer_layers,
             "tangent_sas_fix_b": tangent_sas_fix_b,
             "log_gamma_bounds": log_gamma_bounds,
-            "input_squash": input_squash,
-            "scale_skip": scale_skip,
+            "conditioners": conditioners,
         }
         self._lm_settings = {
             "max_steps": max_epochs,
@@ -329,10 +326,6 @@ class TriangularFlowAdapter:
             "max_exact_block_size": lm_max_exact_block_size,
             "lmp_size": lm_lmp_size,
             "lmp_tol": lm_lmp_tol,
-            "mlp_ridge": lm_mlp_ridge,
-            "skip_ridge": lm_skip_ridge,
-            "scale_skip_ridge": lm_scale_skip_ridge,
-            "shape_ridge": lm_shape_ridge,
         }
         # The Rust LM fit needs a multiple of its SIMD width of draws.
         self._draw_multiple = FisherResiduals.simd_width()
