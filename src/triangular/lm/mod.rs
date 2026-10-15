@@ -57,6 +57,7 @@
 //! cotangent (the pullback's adjoint).
 
 mod blocks;
+mod diagnostics;
 mod local;
 pub(crate) mod optimizer;
 mod python;
@@ -76,6 +77,7 @@ use crate::triangular::conditional::Conditional;
 use crate::triangular::pattern::{Offsets, Pattern};
 use crate::triangular::simd::{f64_width, store};
 pub(crate) use blocks::GnBlock;
+pub(crate) use diagnostics::FisherSpeeds;
 use local::LocalState;
 pub(crate) use python::PyFisherResiduals;
 use selected_inverse::SelectedInverseLayout;
