@@ -22,8 +22,11 @@ dependencies = [
   "platformdirs >= 3.0.0",
   "xarray >= 2025.01.2",
   "arviz >= 0.23.0,<2.0",
-  "obstore >= 0.8.0",
-  "zarr >= 3.1.0",
+  # The zarr store is not built on wasm, and obstore has no Pyodide wheel.
+  "obstore >= 0.8.0; sys_platform != 'emscripten'",
+  "zarr >= 3.1.0; sys_platform != 'emscripten'",
+  # The pyodide build of pyarrow imports `unix_timezones` but does not declare it.
+  "pyodide-unix-timezones; sys_platform == 'emscripten'",
 ]
 dynamic = ["version"]
 
@@ -88,6 +91,7 @@ python-source = "python"
 features = ["pyo3/extension-module"]
 
 [tool.pytest.ini_options]
+testpaths = ["tests"]
 markers = [
   "flow: tests for normalizing flows",
   "stan: tests for Stan models",

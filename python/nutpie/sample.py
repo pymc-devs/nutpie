@@ -564,8 +564,30 @@ if hasattr(_lib, "store"):
         | _lib.store.GCSStore
         | _lib.store.AzureStore
     )
+    _ZARR_AVAILABLE = True
 else:
     _ZarrStoreType = Any
+    _ZARR_AVAILABLE = False
+
+_ZARR_UNAVAILABLE_MESSAGE = (
+    "Zarr storage is not available in this build of nutpie "
+    "(it is not supported on wasm/Pyodide)."
+)
+
+
+class _UnavailableZarrStore:
+    """Stand-in for `nutpie.zarr_store` in builds without zarr support.
+
+    Raises an informative error on any use, instead of an opaque
+    `'NoneType' object has no attribute ...`. It is an `AttributeError`
+    so that `hasattr` and similar introspection keep working.
+    """
+
+    def __getattr__(self, name: str) -> Any:
+        raise AttributeError(_ZARR_UNAVAILABLE_MESSAGE)
+
+    def __repr__(self) -> str:
+        return "<nutpie.zarr_store: unavailable in this build>"
 
 
 class _BackgroundSampler:
@@ -1163,6 +1185,9 @@ def sample(
         updates["num_chains"] = chains
 
     settings.update(updates)
+
+    if zarr_store is not None and not _ZARR_AVAILABLE:
+        raise NotImplementedError(_ZARR_UNAVAILABLE_MESSAGE)
 
     if store_unconstrained:
         settings.store_unconstrained = True
