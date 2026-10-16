@@ -10,6 +10,8 @@ use crate::{
     progress::{IndicatifHandler, ProgressHandler, RawCallbackHandler},
     pyfunc::PyModel,
     pymc::{ExpandFunc, LogpFunc, PyMcModel},
+    triangular::flow::PyTriangularFlow,
+    triangular::sampler::FlowTransform,
 };
 
 #[cfg(feature = "stan")]
@@ -30,7 +32,6 @@ use pyo3::{
     types::{PyDict, PyList},
 };
 use pyo3_arrow::PyRecordBatch;
-use pythonize::{depythonize, pythonize};
 use rand::{rng, Rng};
 use serde_json::Value as JsonValue;
 
@@ -492,13 +493,13 @@ fn update_nuts_from_nested_dict(
 ) -> PyResult<()> {
     match inner {
         NutsSettingsKind::Diag(settings) => {
-            *settings = depythonize(value).map_err(|err| PyValueError::new_err(err.to_string()))?;
+            *settings = crate::pyjson::from_py(value).map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
         NutsSettingsKind::LowRank(settings) => {
-            *settings = depythonize(value).map_err(|err| PyValueError::new_err(err.to_string()))?;
+            *settings = crate::pyjson::from_py(value).map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
         NutsSettingsKind::Flow(settings) => {
-            *settings = depythonize(value).map_err(|err| PyValueError::new_err(err.to_string()))?;
+            *settings = crate::pyjson::from_py(value).map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
     }
     Ok(())
@@ -510,13 +511,13 @@ fn update_mclmc_from_nested_dict(
 ) -> PyResult<()> {
     match inner {
         MclmcSettingsKind::Diag(settings) => {
-            *settings = depythonize(value).map_err(|err| PyValueError::new_err(err.to_string()))?;
+            *settings = crate::pyjson::from_py(value).map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
         MclmcSettingsKind::LowRank(settings) => {
-            *settings = depythonize(value).map_err(|err| PyValueError::new_err(err.to_string()))?;
+            *settings = crate::pyjson::from_py(value).map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
         MclmcSettingsKind::Flow(settings) => {
-            *settings = depythonize(value).map_err(|err| PyValueError::new_err(err.to_string()))?;
+            *settings = crate::pyjson::from_py(value).map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
     }
     Ok(())
@@ -837,7 +838,7 @@ impl PyNutsSettings {
             "adaptation": adaptation,
             "settings": settings,
         });
-        let obj = pythonize(py, &value).map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let obj = crate::pyjson::to_py(py, &value).map_err(|err| PyValueError::new_err(err.to_string()))?;
         Ok(obj.unbind())
     }
 }
@@ -893,7 +894,7 @@ impl PyMclmcSettings {
             "adaptation": adaptation,
             "settings": settings,
         });
-        let obj = pythonize(py, &value).map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let obj = crate::pyjson::to_py(py, &value).map_err(|err| PyValueError::new_err(err.to_string()))?;
         Ok(obj.unbind())
     }
 }
@@ -1533,6 +1534,84 @@ impl PyTrace {
     }
 }
 
+/// Soft-clip a model gradient in place, `clip * asinh(g / clip)`, as the
+/// Python side's `_init_from_transformed_position` does before pulling it back.
+pub fn soft_clip(gradient: &mut [f64], clip: Option<f64>) {
+    if let Some(clip) = clip {
+        for g in gradient.iter_mut() {
+            *g = clip * (*g / clip).asinh();
+        }
+    }
+}
+
+/// Per-chain native form of the adapter's flow, so a leapfrog step never
+/// calls into Python: only the model's own logp runs outside Rust, if it is a
+/// Python function at all.
+///
+/// Keyed by the adapter object it came from, and must be `invalidate`d
+/// whenever that object's transformation is (re)initialized or updated.
+#[derive(Default)]
+pub struct NativeFlow {
+    cache: FlowCache,
+}
+
+#[derive(Default)]
+enum FlowCache {
+    #[default]
+    Stale,
+    /// The adapter's current flow has no native form: use the Python path.
+    Missing(usize),
+    Ready(usize, FlowTransform),
+}
+
+impl NativeFlow {
+    pub fn invalidate(&mut self) {
+        self.cache = FlowCache::Stale;
+    }
+
+    /// `PyTransformAdapt::init_from_transformed_position`, natively: the
+    /// transformed position mapped to the untransformed one, `logp` there, and
+    /// its gradient pulled back, returning `(logp, logdet)` -- including the
+    /// optional soft clip of the model gradient. `Ok(None)` if the adapter's
+    /// flow has no native form; the caller then takes the Python path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn init_from_transformed_position<E: From<anyhow::Error>>(
+        &mut self,
+        adapter: &PyTransformAdapt,
+        params: &Py<PyAny>,
+        untransformed_position: &mut [f64],
+        untransformed_gradient: &mut [f64],
+        transformed_position: &[f64],
+        transformed_gradient: &mut [f64],
+        clip: Option<f64>,
+        logp: impl FnOnce(&[f64], &mut [f64]) -> std::result::Result<f64, E>,
+    ) -> std::result::Result<Option<(f64, f64)>, E> {
+        let key = params.as_ptr() as usize;
+        let current = matches!(
+            &self.cache,
+            FlowCache::Missing(k) | FlowCache::Ready(k, _) if *k == key
+        );
+        if !current {
+            self.cache = match adapter
+                .flow_transform(params)
+                .context("Failed to build the native flow transform")?
+            {
+                Some(flow) => FlowCache::Ready(key, flow),
+                None => FlowCache::Missing(key),
+            };
+        }
+        let FlowCache::Ready(_, flow) = &mut self.cache else {
+            return Ok(None);
+        };
+
+        let logdet = flow.transform_and_log_det(transformed_position, untransformed_position)?;
+        let logp = logp(untransformed_position, untransformed_gradient)?;
+        soft_clip(untransformed_gradient, clip);
+        flow.pullback(untransformed_gradient, transformed_gradient)?;
+        Ok(Some((logp, logdet)))
+    }
+}
+
 #[pyclass(from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyTransformAdapt(Arc<Py<PyAny>>);
@@ -1765,6 +1844,31 @@ impl PyTransformAdapt {
         })
     }
 
+    /// The adapter's current flow as a native transform for the leapfrog
+    /// step, or `None` if it has none (see `TransformAdapter.flow_transform_layout`).
+    pub fn flow_transform(&self, params: &Py<PyAny>) -> Result<Option<FlowTransform>> {
+        Python::attach(|py| {
+            let layout = params
+                .getattr(py, intern!(py, "flow_transform_layout"))
+                .context("No attribute flow_transform_layout")?
+                .call0(py)
+                .context("Failed adapter.flow_transform_layout")?;
+            let layout = layout.bind(py);
+            // A flow built in Rust (`nutpie.triangular_flow`) hands over
+            // itself, with no layout to go through.
+            if let Ok(flow) = layout.extract::<PyRef<'_, PyTriangularFlow>>() {
+                return flow.native_transform().map(Some);
+            }
+            let layout: Option<Bound<'_, PyDict>> = layout
+                .extract()
+                .map_err(PyErr::from)
+                .context("flow_transform_layout must return a dict, a TriangularFlow or None")?;
+            layout
+                .map(|layout| FlowTransform::from_layout(&layout))
+                .transpose()
+        })
+    }
+
     pub fn transformation_id(&self, params: &Py<PyAny>) -> Result<i64> {
         Python::attach(|py| {
             let id: i64 = params
@@ -1778,6 +1882,18 @@ impl PyTransformAdapt {
 /// A Python module implemented in Rust.
 #[pymodule(gil_used = false)]
 pub fn _lib(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Without threads (wasm), rayon's global pool fails to spawn its workers
+    // on first use and panics: emscripten reports `WouldBlock`, not the
+    // `Unsupported` rayon would fall back on. Make the importing thread the
+    // pool's only worker, so parallel iterators run inline.
+    #[cfg(not(feature = "parallel"))]
+    {
+        // Fails only if the pool already exists.
+        let _ = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .use_current_thread()
+            .build_global();
+    }
     m.add_class::<PySampler>()?;
     m.add_class::<PyMcModel>()?;
     m.add_class::<LogpFunc>()?;
@@ -1795,6 +1911,27 @@ pub fn _lib(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyVariable>()?;
     m.add_class::<PyStorage>()?;
     m.add_class::<PyTrace>()?;
+    m.add_class::<crate::triangular::sampler::PySparseTriangularTransform>()?;
+    m.add_class::<crate::triangular::sampler::PyFlowTransform>()?;
+    m.add_class::<crate::triangular::lm::PyFisherResiduals>()?;
+    m.add_class::<crate::triangular::flow::PyTriangularFlow>()?;
+    m.add_class::<crate::triangular::lm::optimizer::PyLmOptimizer>()?;
+    m.add_function(wrap_pyfunction!(
+        crate::triangular::mlp_kernels::activation_for_testing,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        crate::triangular::transformer::py_transformer_layout,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        crate::triangular::symbolic::py_amd_order,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        crate::triangular::symbolic::py_symbolic_fill,
+        m
+    )?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     #[cfg(feature = "zarr")]
     {

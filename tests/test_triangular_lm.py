@@ -1,0 +1,557 @@
+import numpy as np
+import pytest
+import scipy.sparse as sp
+
+jax = pytest.importorskip("jax")
+# `nutpie.normalizing_flow` and equinox come with the `nnflow` extra.
+pytest.importorskip("flowjax")
+
+import equinox as eqx
+import jax.numpy as jnp
+
+from nutpie.normalizing_flow import make_transformer
+from nutpie.sparsity import _fill
+from nutpie.triangular import SparseTriangularMap
+from nutpie.triangular_lm import (
+    make_residuals,
+    pack_params,
+    param_index,
+    unpack_params,
+)
+
+pytestmark = pytest.mark.flow
+
+
+def _blanket(dim, kind, rng):
+    if kind == "banded":
+        blanket = np.zeros((dim, dim), dtype=bool)
+        for i in range(1, dim):
+            blanket[i, max(0, i - 2) : i] = True
+        return blanket
+    # A cycle without chords, which needs fill.
+    blanket = rng.random((dim, dim)) < 0.4
+    blanket[0, dim - 1] = blanket[1, 0] = True
+    return _filled(blanket, np.arange(dim))
+
+
+def _filled(blanket, order):
+    """`blanket` closed under elimination in the flow order `order`, as a
+    symbolic factorization fills it: the residuals require that."""
+    blanket = blanket | blanket.T
+    np.fill_diagonal(blanket, False)
+    return _fill(sp.csr_array(blanket), order).toarray()
+
+
+def _setup(
+    nn_width=3,
+    blanket="banded",
+    bounds=None,
+    tangent_sas=0,
+    asymmetric_sas=0,
+    fix_b=False,
+    squash=None,
+    activation=jax.nn.softplus,
+    dim=7,
+    n_draw=8,
+    seed=0,
+):
+    jax.config.update("jax_enable_x64", True)
+    rng = np.random.default_rng(seed)
+    if tangent_sas:
+        kind, layers = "tangent_sas", tangent_sas
+    elif asymmetric_sas:
+        kind, layers = "asymmetric_sas", asymmetric_sas
+    else:
+        kind, layers = "sas", 2
+    transformer = make_transformer(
+        kind, layers, log_gamma_bounds=bounds, tangent_sas_fix_b=fix_b
+    )
+    tmap = SparseTriangularMap(
+        jax.random.key(seed),
+        blanket=_blanket(dim, blanket, rng),
+        transformer=transformer,
+        n_buckets=3,
+        nn_width=nn_width,
+        nn_activation=activation,
+        input_squash=squash,
+    )
+    # Away from the zero init, so that every term is exercised.
+    arrays, static = eqx.partition(tmap.conditioners, eqx.is_inexact_array)
+    arrays = jax.tree.map(
+        lambda a: a + 0.15 * jnp.asarray(rng.normal(size=a.shape)), arrays
+    )
+    tmap = eqx.tree_at(lambda m: m.conditioners, tmap, eqx.combine(arrays, static))
+    y = rng.normal(size=(n_draw, dim))
+    g = -y + 0.3 * rng.normal(size=(n_draw, dim))
+    return tmap, y, g
+
+
+def _jax_residuals(tmap, y, g):
+    index = param_index(tmap)
+    n_draw = y.shape[0]
+
+    def residuals(theta):
+        flow_map = unpack_params(tmap, theta, index)
+
+        def one(y, g):
+            x, grad_x, _ = flow_map.inverse_gradient_and_val(y, g, 0.0)
+            return x + grad_x
+
+        return jax.vmap(one)(jnp.asarray(y), jnp.asarray(g)) / np.sqrt(n_draw)
+
+    return residuals
+
+
+CASES = [
+    {},
+    {"nn_width": 0},
+    {"blanket": "random"},
+    {"bounds": (-1.0, 1.0)},
+    {"tangent_sas": 2},
+    {"tangent_sas": 3, "blanket": "random"},
+    {"tangent_sas": 2, "fix_b": True},
+    # The draws are standard normal, so 0.7 is well away from the identity.
+    {"squash": 0.7},
+    {"squash": 0.7, "blanket": "random", "bounds": (-1.0, 1.0)},
+    {"activation": jax.nn.gelu},
+    {"activation": jax.nn.gelu, "squash": 0.7, "tangent_sas": 2},
+    {"asymmetric_sas": 1},
+    {"asymmetric_sas": 3, "blanket": "random"},
+    {"asymmetric_sas": 2, "bounds": (-1.0, 1.0), "squash": 0.7},
+]
+
+
+@pytest.mark.parametrize("case", CASES)
+def test_operators_match_jax(case):
+    tmap, y, g = _setup(**case)
+    problem = make_residuals(tmap, y, g)
+    theta = pack_params(tmap)
+    shape = (y.shape[0], problem.n_residuals)
+    reference = _jax_residuals(tmap, y, g)
+
+    r = problem.residuals(theta).reshape(shape)
+    np.testing.assert_allclose(r, reference(theta), rtol=1e-10, atol=1e-12)
+
+    rng = np.random.default_rng(1)
+    v = rng.normal(size=theta.shape)
+    r_bar = rng.normal(size=shape)
+    jv = problem.pushforward(v).reshape(shape)
+    jt_r = problem.pullback(r_bar.ravel())
+
+    _, jv_ref = jax.jvp(reference, (theta,), (v,))
+    _, vjp = jax.vjp(reference, theta)
+    np.testing.assert_allclose(jv, jv_ref, rtol=1e-9, atol=1e-11)
+    np.testing.assert_allclose(jt_r, vjp(r_bar)[0], rtol=1e-9, atol=1e-11)
+    np.testing.assert_allclose(np.vdot(jv, r_bar), np.vdot(v, jt_r), rtol=1e-10)
+
+    np.testing.assert_allclose(
+        problem.gauss_newton_product(v),
+        problem.pullback(jv.ravel()),
+        rtol=1e-10,
+        atol=1e-12,
+    )
+
+
+@pytest.mark.parametrize("max_block_size", [7, 1000])
+@pytest.mark.parametrize("case", CASES)
+def test_gauss_newton_blocks_match_dense_gram(case, max_block_size):
+    tmap, y, g = _setup(**case)
+    problem = make_residuals(tmap, y, g)
+    theta = pack_params(tmap)
+    problem.residuals(theta)
+
+    jac = jax.jacfwd(_jax_residuals(tmap, y, g))(theta)
+    jac = np.asarray(jac).reshape(-1, theta.size)
+    gram = jac.T @ jac
+
+    starts, sizes, data = problem.gauss_newton_blocks(max_block_size)
+    assert sizes.max() <= max_block_size
+    offset = 0
+    covered = np.zeros(theta.size, dtype=int)
+    for start, size in zip(starts, sizes):
+        block = data[offset : offset + size * size].reshape(size, size)
+        offset += size * size
+        covered[start : start + size] += 1
+        expected = gram[start : start + size, start : start + size]
+        # The blocks read `Sigma = (J^T J)^-1` from Takahashi's recurrence,
+        # whose error grows like `cond(J)^2 eps`. The random blanket gives
+        # some draws `cond(K) ~ 1e11`; with the banded one the worst draw has
+        # `cond(J) ~ 1e5`, which costs a few `1e-10`.
+        tol = 1e-5 if case.get("blanket") == "random" else 1e-9
+        np.testing.assert_allclose(
+            block, expected, rtol=0, atol=tol * np.abs(expected).max()
+        )
+    assert offset == data.size
+    assert np.all(covered == 1)
+
+
+def test_unpack_inverts_pack():
+    tmap, _, _ = _setup(blanket="random")
+    theta = pack_params(tmap)
+    shifted = unpack_params(tmap, theta + 1.0)
+    np.testing.assert_array_equal(pack_params(shifted), theta + 1.0)
+
+
+def _flow_problem(dim=7, n_draw=64, seed=0):
+    """A `make_flow(kind="triangular")` flow near its init, its data and a
+    `FisherLoss`."""
+    import flowjax
+
+    from nutpie.normalizing_flow import make_flow
+    from nutpie.transform_adapter import FisherLoss
+
+    jax.config.update("jax_enable_x64", True)
+    rng = np.random.default_rng(seed)
+    x = 0.5 + rng.normal(size=(n_draw, dim)) * np.exp(rng.normal(size=dim))
+    g = -(x - 0.5) / np.exp(2 * rng.normal(size=dim)) + 0.3 * rng.normal(
+        size=(n_draw, dim)
+    )
+    order = rng.permutation(dim)
+    bijection = make_flow(
+        seed,
+        x,
+        g,
+        n_layers=1,
+        kind="triangular",
+        sparsity=_filled(_blanket(dim, "banded", rng), order),
+        order=order,
+        nn_width=4,
+        nn_depth=1,
+        activation=jax.nn.softplus,
+        transformer="sas",
+        transformer_layers=2,
+        n_buckets=2,
+    )
+    flow = flowjax.flows.Transformed(
+        flowjax.distributions.StandardNormal((dim,)), bijection
+    )
+    params, static = eqx.partition(flow, eqx.is_inexact_array)
+    params = jax.tree.map(
+        lambda leaf: leaf + 0.05 * jnp.asarray(rng.normal(size=leaf.shape)), params
+    )
+    data = (jnp.asarray(x), jnp.asarray(g), jnp.zeros(n_draw))
+    return params, static, data, FisherLoss()
+
+
+def test_rust_lm_with_limited_memory_preconditioner():
+    """The limited-memory preconditioner only changes the CG solves: the fit
+    converges at least about as far, and it is actually used."""
+    from nutpie.triangular_lm import fit, map_data
+
+    params, static, data, _loss_fn = _flow_problem()
+    tmap, y, g = map_data(eqx.combine(params, static), data[0], data[1])
+    problem = make_residuals(tmap, y, g)
+    settings = {"n_steps": 30, "max_block_size": 8, "cg_tol": 1e-6, "verbose": False}
+
+    _, _, base = fit(problem, pack_params(tmap), **settings)
+    _, _, hist = fit(problem, pack_params(tmap), lmp_size=8, **settings)
+
+    assert hist[0]["lmp_rank"] == 0
+    assert all(0 < info["lmp_rank"] <= 8 for info in hist[1:])
+    assert hist[-1]["F_out"] < 0.1 * hist[0]["F"]
+    # It only changes the CG solves, so it must not cost the fit anything.
+    assert hist[-1]["F_out"] <= 1.1 * base[-1]["F_out"]
+
+
+def test_step_line_separates_the_ridge():
+    """Each step reports the ridge's part of ``F_new``, and the step line
+    shows the plain Fisher divergence next to the objective only with a
+    ridge."""
+    from nutpie.triangular_lm import _describe_step, fit, map_data
+
+    params, static, data, _loss_fn = _flow_problem()
+    tmap, y, g = map_data(eqx.combine(params, static), data[0], data[1])
+    theta = pack_params(tmap)
+    for ridge in [0.0, 10.0]:
+        problem = make_residuals(tmap, y, g, mlp_ridge=ridge, skip_ridge=ridge)
+        _, _, hist = fit(problem, theta, n_steps=2)
+        info = hist[-1]
+        line = _describe_step(1, info)
+        assert "log obj=" in line
+        assert ("log F=" in line) == (ridge > 0)
+        assert (info["ridge_new"] > 0) == (ridge > 0)
+        assert info["ridge_new"] < info["F_new"]
+
+
+def test_verbose_lines(capsys):
+    """Every verbose line of `fit` carries the prefix, the first is the start,
+    and ``eta`` is left out where it is constant."""
+    from nutpie.triangular_lm import fit, map_data
+
+    params, static, data, _loss_fn = _flow_problem(n_draw=96)
+    flow = eqx.combine(params, static)
+    tmap, y, g = map_data(flow, data[0][:64], data[1][:64])
+    _, val_y, val_g = map_data(flow, data[0][64:], data[1][64:])
+    problem = make_residuals(tmap, y, g)
+    val_problem = make_residuals(tmap, val_y, val_g)
+    for forcing in ["residual", "model"]:
+        fit(
+            problem,
+            pack_params(tmap),
+            n_steps=3,
+            verbose=True,
+            prefix="chain 3 ",
+            val_problem=val_problem,
+            forcing=forcing,
+        )
+        lines = capsys.readouterr().out.splitlines()
+        assert lines and all(line.startswith("chain 3 ") for line in lines)
+        assert "start" in lines[0] and "val=" in lines[0]
+        assert ("eta=" in lines[1]) == (forcing != "model")
+
+
+def test_lm_rust_method_updates_the_flow():
+    """`fit_to_data(method="lm-rust")` writes the fitted conditioners back:
+    the returned flow's loss is the one the fit reports."""
+    from nutpie.transform_adapter import fit_to_data
+
+    params, static, data, loss_fn = _flow_problem()
+    initial = float(jnp.sum(loss_fn.residuals(params, static, *data) ** 2))
+    flow, losses, _ = fit_to_data(
+        jax.random.key(0),
+        eqx.combine(params, static),
+        data,
+        loss_fn=loss_fn,
+        method="lm-rust",
+        max_epochs=5,
+        lm_min_loss=0.0,
+    )
+    fitted, _ = eqx.partition(flow, eqx.is_inexact_array)
+    r = loss_fn.residuals(fitted, static, *data)
+    assert losses["lm_steps"] == 5
+    assert losses["train"][0] < initial
+    np.testing.assert_allclose(float(jnp.sum(r**2)), losses["train"][0], rtol=1e-10)
+
+
+def test_lm_rust_validation_loss():
+    """`fit_to_data(method="lm-rust", val_x=...)` reports the Fisher
+    divergences of the train and held-out draws at the returned flow, without
+    the ridge."""
+    from nutpie.transform_adapter import fit_to_data
+
+    params, static, data, loss_fn = _flow_problem(n_draw=96)
+    train = tuple(a[:64] for a in data)
+    val = tuple(a[64:] for a in data)
+    for early_stopping in [True, False]:
+        flow, losses, _ = fit_to_data(
+            jax.random.key(0),
+            eqx.combine(params, static),
+            train,
+            val_x=val,
+            early_stopping=early_stopping,
+            loss_fn=loss_fn,
+            method="lm-rust",
+            max_epochs=8,
+            lm_min_loss=0.0,
+            lm_mlp_ridge=10.0,
+        )
+        fitted, _ = eqx.partition(flow, eqx.is_inexact_array)
+        # `FisherLoss.__call__` is the log of the plain Fisher divergence.
+        np.testing.assert_allclose(
+            np.log(losses["val"][0]), loss_fn(fitted, static, *val), rtol=1e-8
+        )
+        np.testing.assert_allclose(
+            np.log(losses["train"][0]),
+            loss_fn(fitted, static, *train),
+            rtol=1e-8,
+        )
+        assert losses["train"][0] < losses["objective"][0]
+
+
+@pytest.mark.parametrize("early_stopping", [True, False])
+def test_rust_lm_early_stopping(early_stopping):
+    """With early stopping, `fit` returns the parameters of the best
+    validation loss seen (the start included); without, the last ones."""
+    from nutpie.triangular_lm import fisher_divergence, fit, map_data
+
+    params, static, data, _ = _flow_problem(n_draw=48)
+    flow = eqx.combine(params, static)
+    tmap, y, g = map_data(flow, data[0][:16], data[1][:16])
+    _, val_y, val_g = map_data(flow, data[0][16:], data[1][16:])
+    problem = make_residuals(tmap, y, g)
+    val_problem = make_residuals(tmap, val_y, val_g)
+    theta0 = pack_params(tmap)
+
+    theta, _, hist = fit(
+        problem,
+        theta0,
+        n_steps=15,
+        verbose=False,
+        val_problem=val_problem,
+        early_stopping=early_stopping,
+        patience=3,
+    )
+    val_F = fisher_divergence(val_problem, theta)
+    if early_stopping:
+        best = min(
+            [fisher_divergence(val_problem, theta0)] + [h["val_F"] for h in hist]
+        )
+        np.testing.assert_allclose(val_F, best, rtol=1e-12)
+    else:
+        np.testing.assert_allclose(val_F, hist[-1]["val_F"], rtol=1e-12)
+
+
+def test_select_draws():
+    """Disjoint, in range, chronological, multiples of the SIMD width,
+    never upsampled, and the validation draws come in contiguous blocks."""
+    from nutpie.transform_adapter import _select_draws
+
+    settings = {
+        "max_draws": 512,
+        "recency": 1.0,
+        "val_fraction": 0.2,
+        "block_size": 16,
+        "multiple": 8,
+    }
+    for n_draws, start in [(257, 128), (2000, 1000), (140, 120)]:
+        train, val = _select_draws(
+            n_draws, start, rng=np.random.default_rng(0), **settings
+        )
+        both = np.concatenate([train, val])
+        assert len(np.unique(both)) == len(both)
+        assert both.min() >= start and both.max() < n_draws
+        assert len(both) <= min(n_draws - start, 512)
+        assert len(train) % 8 == 0 and len(val) % 8 == 0
+        if n_draws - start >= 100:
+            assert len(val) > 0
+        assert (np.diff(train) > 0).all() and (np.diff(val) > 0).all()
+        again = _select_draws(n_draws, start, rng=np.random.default_rng(0), **settings)
+        assert all((a == b).all() for a, b in zip((train, val), again))
+
+    # Without thinning, each held-out block is a run of consecutive draws.
+    _, val = _select_draws(
+        400, 0, rng=np.random.default_rng(1), **{**settings, "multiple": 1}
+    )
+    runs = np.split(val, np.flatnonzero(np.diff(val) != 1) + 1)
+    assert all(len(run) % 16 == 0 for run in runs)
+
+
+@pytest.mark.parametrize("available", [600, 1000, 5000])
+@pytest.mark.parametrize("recency", [0.0, 1.0, 3.0])
+def test_thin(available, recency):
+    """`max_draws` distinct sorted draws; even for `recency=0`, else denser
+    towards the newest, with the newest all taken where the density caps."""
+    from nutpie.transform_adapter import _thin
+
+    idx = _thin(available, 512, recency)
+    assert len(idx) == 512
+    assert (np.diff(idx) > 0).all()
+    assert idx.min() >= 0 and idx.max() < available
+    gaps = np.diff(idx)
+    if recency == 0:
+        assert gaps.max() - gaps.min() <= 1
+    else:
+        older, newer = np.array_split(gaps, 2)
+        assert newer.mean() < older.mean()
+        if recency == 3.0 and available == 600:
+            # Capped: the newest stretch is taken whole.
+            assert (gaps[-50:] == 1).all()
+
+
+def test_make_flow_passes_log_gamma_bounds():
+    """`make_flow(kind="triangular", log_gamma_bounds=...)` reaches every
+    `Contract2` layer, and so the Rust residuals' transformer config."""
+    import flowjax
+
+    from nutpie.normalizing_flow import make_flow
+    from nutpie.triangular_layout import _probe_transformer, transformer_dicts
+    from nutpie.triangular_lm import map_data
+
+    rng = np.random.default_rng(0)
+    dim = 5
+    x = rng.normal(size=(16, dim))
+    bijection = make_flow(
+        0,
+        x,
+        -x,
+        n_layers=1,
+        kind="triangular",
+        sparsity=_filled(_blanket(dim, "banded", rng), np.arange(dim)),
+        nn_width=4,
+        activation=jax.nn.softplus,
+        transformer="sas",
+        transformer_layers=2,
+        log_gamma_bounds=(-1.0, 1.0),
+    )
+    flow = flowjax.flows.Transformed(
+        flowjax.distributions.StandardNormal((dim,)), bijection
+    )
+    tmap, _, _ = map_data(flow, x, -x)
+    n_par = int(tmap.conditioners[0].mlp.layers[1].out_features)
+    layers = transformer_dicts(_probe_transformer(tmap.transformer_constructor, n_par))
+    bounds = [layer.get("log_gamma_bounds") for layer in layers]
+    bounds = [b for b in bounds if b is not None]
+    assert len(bounds) == 2
+    assert all(tuple(b) == (-1.0, 1.0) for b in bounds)
+
+
+@pytest.mark.parametrize("kind", ["mlp", "skip", "shape"])
+def test_lm_rust_ridges(kind):
+    """`lm_mlp_ridge`, `lm_skip_ridge` and `lm_shape_ridge` each shrink their
+    own parameters, and the reported objective is the Fisher divergence plus
+    the ridge, with the location's terms scaled by the widths at the fitted
+    flow."""
+    from nutpie.transform_adapter import fit_to_data
+    from nutpie.triangular_lm import make_residuals, map_data, pack_params
+
+    params, static, data, loss_fn = _flow_problem(n_draw=64)
+    flow0 = eqx.combine(params, static)
+    tmap0, y, g = map_data(flow0, data[0], data[1])
+    problem = make_residuals(tmap0, y, g, **{f"{kind}_ridge": 1e3})
+    mask = problem.ridge_strengths(pack_params(tmap0)) > 0
+
+    def fitted(ridge):
+        flow, losses, _ = fit_to_data(
+            jax.random.key(0),
+            flow0,
+            data,
+            loss_fn=loss_fn,
+            method="lm-rust",
+            max_epochs=15,
+            lm_min_loss=0.0,
+            **{f"lm_{kind}_ridge": ridge},
+        )
+        tmap, _, _ = map_data(flow, data[0], data[1])
+        return pack_params(tmap), losses
+
+    theta_free, _ = fitted(0.0)
+    theta_ridge, losses = fitted(1e3)
+    penalized = theta_ridge[mask]
+    assert mask.any() and not mask.all()
+    strengths = problem.ridge_strengths(theta_ridge)
+    np.testing.assert_allclose(
+        losses["objective"][0],
+        losses["train"][0] + strengths @ theta_ridge**2 / 64,
+        rtol=1e-10,
+    )
+    assert penalized @ penalized < 0.1 * theta_free[mask] @ theta_free[mask]
+
+
+def test_lm_rust_linear_fit():
+    """`lm_linear_fit` fits only the linear part of the conditioners: the
+    hidden units' weights and biases and the shape fields' biases come back
+    unchanged, the rest moves."""
+    from nutpie.transform_adapter import fit_to_data
+    from nutpie.triangular_lm import make_residuals, map_data, pack_params
+
+    params, static, data, loss_fn = _flow_problem(n_draw=64)
+    flow0 = eqx.combine(params, static)
+    tmap0, y, g = map_data(flow0, data[0], data[1])
+    mask = make_residuals(tmap0, y, g).nonlinear_param_mask
+    theta0 = pack_params(tmap0)
+
+    flow, losses, _ = fit_to_data(
+        jax.random.key(0),
+        flow0,
+        data,
+        loss_fn=loss_fn,
+        method="lm-rust",
+        max_epochs=5,
+        lm_min_loss=0.0,
+        lm_linear_fit=True,
+    )
+    tmap, _, _ = map_data(flow, data[0], data[1])
+    theta = pack_params(tmap)
+    np.testing.assert_array_equal(theta[mask], theta0[mask])
+    assert not np.allclose(theta[~mask], theta0[~mask])
+    assert losses["lm_accepted"] > 0

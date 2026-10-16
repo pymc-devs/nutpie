@@ -16,7 +16,13 @@ from numpy.typing import NDArray
 
 from nutpie import _lib
 from nutpie.compiled_pyfunc import SeedType, from_pyfunc
-from nutpie.sample import CompiledModel, _flatten_point, _wrap_init_point_fn
+from nutpie.sample import (
+    CompiledModel,
+    _check_reserved_names,
+    _flatten_point,
+    _wrap_init_point_fn,
+)
+from nutpie.sparsity import variables_from_layout
 
 try:
     from numba.extending import intrinsic
@@ -30,9 +36,6 @@ if TYPE_CHECKING:
     import numba.core.ccallback
     import pymc as pm
     from pytensor.tensor import TensorVariable, Variable
-
-
-_UNCONSTRAINED_PARAMETER = "unconstrained_parameter"
 
 
 def _rv_dict_to_flat_array_wrapper(
@@ -84,7 +87,7 @@ def address_as_void_pointer(typingctx, src):
     return sig, codegen
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class CompiledPyMCModel(CompiledModel):
     compiled_logp_func: "numba.core.ccallback.CFunc"
     compiled_expand_func: "numba.core.ccallback.CFunc"
@@ -149,6 +152,8 @@ class CompiledPyMCModel(CompiledModel):
             self,
             shared_data=shared_data,
             user_data=user_data,
+            _hessian_sparsity=None,
+            _factorization=None,
         )
 
     def with_init_point_fn(self, init_point_fn):
@@ -186,8 +191,9 @@ class CompiledPyMCModel(CompiledModel):
         extra_callback,
         extra_callback_rate,
         store,
+        stop_event=None,
     ):
-        model = self._make_model()
+        model = self._make_model(self._adapter_kwargs(settings, stop_event))
         return _lib.PySampler.from_pymc(
             settings,
             cores,
@@ -198,7 +204,7 @@ class CompiledPyMCModel(CompiledModel):
             store,
         )
 
-    def _make_model(self):
+    def _make_model(self, adapter_kwargs=None):
         expand_fn = _lib.ExpandFunc(
             self.n_dim,
             self.n_expanded,
@@ -224,9 +230,10 @@ class CompiledPyMCModel(CompiledModel):
             var_names, var_types, var_shapes, dim_sizes, dims
         )
 
-        outer_kwargs = self._transform_adapt_args
-        if outer_kwargs is None:
-            outer_kwargs = {}
+        outer_kwargs = {
+            **(self._transform_adapt_args or {}),
+            **(adapter_kwargs or {}),
+        }
 
         def make_adapter(*args, **kwargs):
             from nutpie.transform_adapter import make_transform_adapter
@@ -242,10 +249,36 @@ class CompiledPyMCModel(CompiledModel):
             coords,
             self._make_init_point_func(),
             make_adapter,
+            self._unconstrained_names,
         )
 
     def with_transform_adapt(self, **kwargs):
         return dataclasses.replace(self, _transform_adapt_args=kwargs)
+
+    def _detect_hessian_sparsity(self, **kwargs):
+        raise NotImplementedError(
+            "Detecting the Hessian sparsity is not available for the numba "
+            "backend yet. Use `backend='jax', gradient_backend='jax'`, or pass "
+            "the pattern with `with_hessian_sparsity(array)`."
+        )
+
+    def _unconstrained_variables(self):
+        return variables_from_layout(
+            *_unconstrained_layout(self.shape_info, self.n_dim)
+        )
+
+    def _repr_header(self):
+        return f"CompiledPyMCModel (numba, n_dim={self.n_dim})"
+
+    def _repr_items(self):
+        items = []
+        if self.shared_var_keys:
+            names = ", ".join(var.name for var in self.shared_var_keys)
+            items.append(("data", names))
+        if self._coords:
+            coords = ", ".join(f"{k} ({len(v)})" for k, v in self._coords.items())
+            items.append(("coords", coords))
+        return items + super()._repr_items()
 
 
 def _unconstrained_layout(shape_info, n_dim):
@@ -372,7 +405,9 @@ def _compile_pymc_model_numba(
 
         expand_numba = numba.cfunc(c_sig_expand, **kwargs)(expand_numba_raw)
 
-    dims, coords = _prepare_dims_and_coords(model, shape_info, reparameterized_names)
+    dims, coords, unconstrained_names = _prepare_dims_and_coords(
+        model, shape_info, reparameterized_names
+    )
 
     return CompiledPyMCModel(
         _n_dim=n_dim,
@@ -390,6 +425,7 @@ def _compile_pymc_model_numba(
         logp_func=logp_fn_pt,
         expand_func=expand_fn_pt,
         reparameterized_names=reparameterized_names,
+        _unconstrained_names=unconstrained_names,
     )
 
 
@@ -400,19 +436,15 @@ def _prepare_dims_and_coords(model, shape_info, reparameterized_names):
             vals = pd.RangeIndex(int(model.dim_lengths[name].eval()))
         coords[name] = pd.Index(vals)
 
-    if _UNCONSTRAINED_PARAMETER in coords:
-        raise ValueError(f"Model contains invalid name '{_UNCONSTRAINED_PARAMETER}'.")
-
-    names = []
+    unconstrained_names = []
     for base, _, shape in zip(*shape_info):
         if base not in [var.name for var in model.value_vars]:
             continue
         for idx in itertools.product(*[range(length) for length in shape]):
             if len(idx) == 0:
-                names.append(base)
+                unconstrained_names.append(base)
             else:
-                names.append(f"{base}_{'.'.join(str(i) for i in idx)}")
-    coords[_UNCONSTRAINED_PARAMETER] = pd.Index(names)
+                unconstrained_names.append(f"{base}_{'.'.join(str(i) for i in idx)}")
 
     names, _, shape_list = shape_info
 
@@ -430,7 +462,8 @@ def _prepare_dims_and_coords(model, shape_info, reparameterized_names):
         if shape_by_name.get(rv_name) == shape_by_name.get(value_name):
             dims[value_name] = rv_dims
 
-    return dims, coords
+    _check_reserved_names(coords, dims)
+    return dims, coords, unconstrained_names
 
 
 def _compile_pymc_model_jax(
@@ -528,7 +561,9 @@ def _compile_pymc_model_jax(
 
         return expand
 
-    dims, coords = _prepare_dims_and_coords(model, shape_info, reparameterized_names)
+    dims, coords, unconstrained_names = _prepare_dims_and_coords(
+        model, shape_info, reparameterized_names
+    )
 
     return from_pyfunc(
         ndim=n_dim,
@@ -544,6 +579,7 @@ def _compile_pymc_model_jax(
         coords=coords,
         raw_logp_fn=orig_logp_fn,
         reparameterized_names=reparameterized_names,
+        unconstrained_names=unconstrained_names,
     )
 
 

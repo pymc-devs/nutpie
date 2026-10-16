@@ -1,8 +1,9 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use std::{ffi::CString, path::PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use bridgestan::open_library;
 use itertools::Itertools;
 use numpy::{PyArray1, PyReadonlyArray1};
@@ -14,14 +15,16 @@ use pyo3::types::{PyDict, PyNone};
 use pyo3::{exceptions::PyValueError, pyclass, pymethods, PyResult};
 use pyo3::{prelude::*, BoundObject};
 use rand::prelude::Distribution;
-use rand::{rng, Rng};
+use rand::{rng, Rng, SeedableRng};
+use rand_chacha::ChaCha8Rng;
 use rand_distr::StandardNormal;
 use smallvec::{SmallVec, ToSmallVec};
 
 use thiserror::Error;
 
 use crate::common::{copy_init_point, ItemType, PyValue, PyVariable};
-use crate::wrapper::PyTransformAdapt;
+use crate::hessian_sparsity::{hessian_sparsity, HessianVectorProduct, SparsityOptions};
+use crate::wrapper::{soft_clip, NativeFlow, PyTransformAdapt};
 
 type InnerModel = bridgestan::Model<Arc<bridgestan::StanLibrary>>;
 
@@ -366,9 +369,108 @@ impl StanModel {
         self.inner.param_unc_num()
     }
 
+    /// Return a copy of the model that uses `transform_adapter` for the
+    /// normalizing flow adaptation.
+    pub fn with_transform_adapter(&self, transform_adapter: Py<PyAny>) -> Self {
+        Self {
+            transform_adapter: Some(PyTransformAdapt::new(transform_adapter)),
+            ..self.clone()
+        }
+    }
+
+    /// Names of the unconstrained parameters.
+    pub fn unconstrained_names(&self) -> Vec<String> {
+        match &self.unc_names {
+            Value::Strings(names) => names.clone(),
+            _ => unreachable!("Unconstrained names are strings"),
+        }
+    }
+
     #[pyo3(signature = (include_tp=false, include_gq=false))]
     pub fn param_num(&self, include_tp: bool, include_gq: bool) -> usize {
         self.inner.param_num(include_tp, include_gq)
+    }
+
+    /// Whether the model was compiled with autodiff Hessians
+    /// (`BRIDGESTAN_AD_HESSIAN=true`). Otherwise bridgestan uses finite
+    /// differences for Hessians.
+    #[getter]
+    pub fn ad_hessian(&self) -> bool {
+        self.inner
+            .info()
+            .to_string_lossy()
+            .contains("BRIDGESTAN_AD_HESSIAN=true")
+    }
+
+    /// Return the log density and the product of its Hessian with `v`.
+    #[pyo3(signature = (theta_unc, v, propto=true, jacobian=true))]
+    pub fn log_density_hessian_vector_product<'py>(
+        &self,
+        py: Python<'py>,
+        theta_unc: PyReadonlyArray1<'py, f64>,
+        v: PyReadonlyArray1<'py, f64>,
+        propto: bool,
+        jacobian: bool,
+    ) -> anyhow::Result<(f64, Bound<'py, PyArray1<f64>>)> {
+        self.check_ad_hessian()?;
+        let theta_unc = self.check_unc_len(theta_unc.as_slice()?)?;
+        let v = self.check_unc_len(v.as_slice()?)?;
+        let mut hvp = vec![0f64; self.inner.param_unc_num()];
+        let logp = self
+            .inner
+            .log_density_hessian_vector_product(theta_unc, v, propto, jacobian, &mut hvp)?;
+        Ok((logp, PyArray1::from_vec(py, hvp)))
+    }
+
+    /// Detect the sparsity pattern of the Hessian of the log density on the
+    /// unconstrained space.
+    ///
+    /// The pattern is the union of the patterns at `num_points` initial
+    /// points of the model, computed from autodiff Hessian-vector products.
+    /// See `crate::hessian_sparsity` for the algorithm. Returns the symmetric
+    /// pattern with a true diagonal in CSR format (`indptr`, `indices`), the
+    /// number of Hessian-vector products and the number of colours of the
+    /// verification stage.
+    #[pyo3(signature = (num_points=4, seed=None, bloom_size=None, num_hashes=3, max_tries=100))]
+    pub fn hessian_sparsity<'py>(
+        &self,
+        py: Python<'py>,
+        num_points: usize,
+        seed: Option<u64>,
+        bloom_size: Option<usize>,
+        num_hashes: usize,
+        max_tries: usize,
+    ) -> anyhow::Result<(
+        Bound<'py, PyArray1<i64>>,
+        Bound<'py, PyArray1<i64>>,
+        usize,
+        usize,
+    )> {
+        self.check_ad_hessian()?;
+        let seed = seed.unwrap_or_else(|| rng().next_u64());
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+
+        let points = self.hessian_points(py, &mut rng, num_points, max_tries)?;
+        let options = SparsityOptions {
+            bloom_size,
+            num_hashes,
+            seed: rng.next_u64(),
+        };
+        let inner = &self.inner;
+        let pattern = py.detach(|| {
+            let signals = SignalCheck::new();
+            hessian_sparsity(&StanHessian { inner }, &points, &options, || {
+                signals.check()
+            })
+        })?;
+
+        let (indptr, indices) = pattern.to_csr();
+        Ok((
+            PyArray1::from_vec(py, indptr),
+            PyArray1::from_vec(py, indices),
+            pattern.num_hvps,
+            pattern.num_colors,
+        ))
     }
 
     /// Return a copy of the model that generates initial points with
@@ -472,6 +574,7 @@ pub struct StanDensity {
     rng: bridgestan::Rng<Arc<bridgestan::StanLibrary>>,
     transform_adapter: Option<PyTransformAdapt>,
     expanded_buffer: Vec<f64>,
+    native_flow: NativeFlow,
 }
 
 #[derive(Debug, Error)]
@@ -632,6 +735,28 @@ impl CpuLogpFunc for StanDensity {
         transformed_gradient: &mut [f64],
         clip: Option<f64>,
     ) -> std::result::Result<(f64, f64), Self::LogpError> {
+        // Native path: no Python at all. `native_flow` is moved out for the
+        // call so the logp closure can borrow `self`.
+        let adapter = self
+            .transform_adapter
+            .clone()
+            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?;
+        let mut native = std::mem::take(&mut self.native_flow);
+        let result = native.init_from_transformed_position(
+            &adapter,
+            params,
+            untransformed_position,
+            untransformed_gradient,
+            transformed_position,
+            transformed_gradient,
+            clip,
+            |y, grad| self.logp(y, grad),
+        );
+        self.native_flow = native;
+        if let Some(out) = result? {
+            return Ok(out);
+        }
+
         let adapter = self
             .transform_adapter
             .as_mut()
@@ -646,7 +771,7 @@ impl CpuLogpFunc for StanDensity {
             .context("Failed init_from_transformed_position_part1")?;
 
         let logp = self.logp(untransformed_position, untransformed_gradient)?;
-        // TODO: softclip
+        soft_clip(untransformed_gradient, clip);
 
         let adapter = self
             .transform_adapter
@@ -676,7 +801,7 @@ impl CpuLogpFunc for StanDensity {
         let logp = self
             .logp(untransformed_position, untransformed_gradient)
             .context("Failed to call stan logp function")?;
-        // TODO: softclip
+        soft_clip(untransformed_gradient, clip);
 
         let logdet = self
             .transform_adapter
@@ -701,6 +826,7 @@ impl CpuLogpFunc for StanDensity {
         untransformed_logp: impl ExactSizeIterator<Item = &'a f64>,
         params: &'a mut Py<PyAny>,
     ) -> std::result::Result<(), Self::LogpError> {
+        self.native_flow.invalidate();
         self.transform_adapter
             .as_mut()
             .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?
@@ -722,6 +848,7 @@ impl CpuLogpFunc for StanDensity {
         untransformed_gradient: &[f64],
         chain: u64,
     ) -> std::result::Result<Py<PyAny>, Self::LogpError> {
+        self.native_flow.invalidate();
         let trafo = self
             .transform_adapter
             .as_mut()
@@ -839,6 +966,125 @@ impl<'model> DrawStorage for StanTrace<'model> {
 }
 */
 
+impl StanModel {
+    fn check_ad_hessian(&self) -> Result<()> {
+        if !self.ad_hessian() {
+            bail!(
+                "Automatic hessian sparsity detection requires hessian information.
+                 Compile with `nutpie.compile_stan_model(..., ad_hessian=True)`."
+            );
+        }
+        Ok(())
+    }
+
+    /// Generate `num_points` initial points with finite log density.
+    fn hessian_points<R: Rng + ?Sized>(
+        &self,
+        py: Python<'_>,
+        rng: &mut R,
+        num_points: usize,
+        max_tries: usize,
+    ) -> Result<Vec<Vec<f64>>> {
+        let n = self.inner.param_unc_num();
+        let mut points = Vec::with_capacity(num_points);
+        let mut last_error = None;
+        for _ in 0..num_points.saturating_mul(max_tries) {
+            if points.len() == num_points {
+                break;
+            }
+            py.check_signals()?;
+            let mut position = vec![0f64; n];
+            match self.init_position(rng, points.len() as u64, &mut position) {
+                Ok(()) => {}
+                Err(InitPositionError::Retry(err)) => {
+                    last_error = Some(err);
+                    continue;
+                }
+                Err(InitPositionError::Fatal(err)) => {
+                    return Err(err.context("Could not generate a point to evaluate the Hessian"));
+                }
+            }
+            let inner = &self.inner;
+            match py.detach(|| inner.log_density(&position, true, true)) {
+                Ok(logp) if logp.is_finite() => points.push(position),
+                Ok(logp) => last_error = Some(anyhow!("Log density is {logp}")),
+                Err(err) => last_error = Some(err.into()),
+            }
+        }
+        if points.len() < num_points {
+            let err = last_error.unwrap_or_else(|| anyhow!("No points were tried"));
+            return Err(err.context(format!(
+                "Found only {} of {num_points} points with finite log density \
+                 to evaluate the Hessian",
+                points.len()
+            )));
+        }
+        Ok(points)
+    }
+
+    fn check_unc_len<'a>(&self, values: &'a [f64]) -> Result<&'a [f64]> {
+        if values.len() != self.inner.param_unc_num() {
+            bail!(
+                "Array has length {} (expected {})",
+                values.len(),
+                self.inner.param_unc_num()
+            );
+        }
+        Ok(values)
+    }
+}
+
+/// How often the Hessian sparsity detection checks for a KeyboardInterrupt.
+const SIGNAL_CHECK_INTERVAL: Duration = Duration::from_millis(100);
+
+struct StanHessian<'a> {
+    inner: &'a InnerModel,
+}
+
+/// Lets Python handle signals at most every `SIGNAL_CHECK_INTERVAL`, since
+/// the detection runs without the GIL. A KeyboardInterrupt is returned as
+/// the plain `PyErr`, so that pyo3 raises it unchanged.
+struct SignalCheck {
+    last: Mutex<Instant>,
+}
+
+impl SignalCheck {
+    fn new() -> Self {
+        Self {
+            last: Mutex::new(Instant::now()),
+        }
+    }
+
+    /// Called from all detection threads; whichever finds the interval
+    /// elapsed checks, the others skip.
+    fn check(&self) -> Result<()> {
+        {
+            let Ok(mut last) = self.last.try_lock() else {
+                return Ok(());
+            };
+            if last.elapsed() < SIGNAL_CHECK_INTERVAL {
+                return Ok(());
+            }
+            *last = Instant::now();
+        }
+        Python::attach(|py| py.check_signals())?;
+        Ok(())
+    }
+}
+
+impl HessianVectorProduct for StanHessian<'_> {
+    fn dim(&self) -> usize {
+        self.inner.param_unc_num()
+    }
+
+    fn hvp(&self, point: &[f64], vector: &[f64], out: &mut [f64]) -> Result<()> {
+        self.inner
+            .log_density_hessian_vector_product(point, vector, true, true, out)
+            .context("Failed to compute Hessian-vector product")?;
+        Ok(())
+    }
+}
+
 impl Model for StanModel {
     type Math = CpuMath<StanDensity>;
 
@@ -877,6 +1123,7 @@ impl Model for StanModel {
             rng,
             transform_adapter: self.transform_adapter.clone(),
             expanded_buffer: vec![0f64; num_expanded],
+            native_flow: NativeFlow::default(),
         }))
     }
 

@@ -2,7 +2,227 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.16.11] - 2026-06-16
+## [0.17.0] - 2026-10-16
+
+### Bug Fixes
+
+- Incorrect layout for arrays of complex (Adrian Seyboldt)
+
+- Frozen models did not honer bound_checks (Adrian Seyboldt)
+
+- Disable stan support on wasm until bridgstan supports it (Adrian Seyboldt)
+
+- Disable zarr dependencies on wasm (Adrian Seyboldt)
+
+- Rebuild stan model after dim update (Adrian Seyboldt)
+
+- Incorrect sample_stats.unconstrained_parameter in stan models (Adrian Seyboldt)
+
+- Make triangular training deterministic (Adrian Seyboldt)
+
+- Better error message on stan usage without stan support (Adrian Seyboldt)
+
+- Use rust flow in triangular diagnostics (Adrian Seyboldt)
+
+- Manually enable empty rayon pool in wasm (Adrian Seyboldt)
+
+
+### Features
+
+- Update nuts-rs (Adrian Seyboldt)
+
+- User overrides for initial points (Adrian Seyboldt)
+
+- Support wasm builds (Adrian Seyboldt)
+
+- Add wasm build in github CI (Adrian Seyboldt)
+
+- Support walnuts (Adrian Seyboldt)
+
+- Improve progress info (Adrian Seyboldt)
+
+- Implement triangular transform (Adrian Seyboldt)
+
+- Implement triangular transform in numba and rust (Adrian Seyboldt)
+
+- Add linear shift shortcut in triangular (Adrian Seyboldt)
+
+- Add line search in triangular LM (Adrian Seyboldt)
+
+- Feat(flow)d axact preconditioning blocks in LM (Adrian Seyboldt)
+
+- Use rust triangular in leapfrogs and clean docs (Adrian Seyboldt)
+
+- Implement stan sparsity detection (Adrian Seyboldt)
+
+- Sparsity and factorization in compiled models (Adrian Seyboldt)
+
+- Better verbose output and optional cholesky jitter (Adrian Seyboldt)
+
+- Support KeyboardInterrupt in hessian calculation (Adrian Seyboldt)
+
+- Forward keyboard interrupts to flow training (Adrian Seyboldt)
+
+- Diagnostic plots for the fitted flows (Adrian Seyboldt)
+
+- Describe new flows in verbose mode (Adrian Seyboldt)
+
+- Improve flow_influence estimation (Adrian Seyboldt)
+
+- Add a little more verbose optimizer output (Adrian Seyboldt)
+
+- Add some optional diagnostics at verbose = 3 (Adrian Seyboldt)
+
+- Add flow nn_width capacity diagnostics (Adrian Seyboldt)
+
+- Add hermite features and predictor normalization (Adrian Seyboldt)
+
+- Implement fisher regularization (Adrian Seyboldt)
+
+- LM steps in rust (Adrian Seyboldt)
+
+- Improve numerical stability of exact lm blocks (Adrian Seyboldt)
+
+- Implement flow optimization in rust (Adrian Seyboldt)
+
+- Implement limited memory preconditioner (Adrian Seyboldt)
+
+- More robust diagonal early windows (Adrian Seyboldt)
+
+- Change flow defaults (Adrian Seyboldt)
+
+- Add tangent SAS transformer (Adrian Seyboldt)
+
+- Add option to disable b parameter of tangent sas (Adrian Seyboldt)
+
+- Support stanli as backend for stan models (Adrian Seyboldt)
+
+- Better initial diagonal (Adrian Seyboldt)
+
+- Use train/test split during training (Adrian Seyboldt)
+
+- Expose gamma bound (Adrian Seyboldt)
+
+- Optionally sinh squash MLP inputs (Adrian Seyboldt)
+
+- Implement l2 regularization (Adrian Seyboldt)
+
+- Gelu activation function (Adrian Seyboldt)
+
+- First fit of flow is linear only (Adrian Seyboldt)
+
+- Fit triangular flows without jax (Adrian Seyboldt)
+
+- Remove fisher regularization (Adrian Seyboldt)
+
+- Improve ridge penalty (Adrian Seyboldt)
+
+- Improve verbose output (Adrian Seyboldt)
+
+- Allow multiple linear fits and fix nonlinear-parameters (Adrian Seyboldt)
+
+- Restructure transformers and add asymmetric_sas (Adrian Seyboldt)
+
+- Add linear skip to scale parameter (Adrian Seyboldt)
+
+- Add refit_diag option (Adrian Seyboldt)
+
+- Implement scale_squash parameter (Adrian Seyboldt)
+
+
+### Miscellaneous Tasks
+
+- Update ruff with some reformatting (Adrian Seyboldt)
+
+- Update dependencies and bump version (Adrian Seyboldt)
+
+- Bump astral-sh/setup-uv from 8.2.0 to 9.0.0 (dependabot[bot])
+
+- Bump actions/attest from 4.1.0 to 4.2.1 (dependabot[bot])
+
+- Bump softprops/action-gh-release from 3.0.0 to 3.0.2 (dependabot[bot])
+
+- Bump actions/setup-python from 6.2.0 to 7.0.0 (dependabot[bot])
+
+- Bump actions/checkout from 6.0.3 to 7.0.1 (dependabot[bot])
+
+- Bump actions/attest from 4.2.1 to 4.2.2 (dependabot[bot])
+
+- Bump astral-sh/setup-uv from 9.0.0 to 10.0.1 (dependabot[bot])
+
+- Bump softprops/action-gh-release from 3.0.2 to 3.0.3 (dependabot[bot])
+
+- Bump astral-sh/setup-uv from 10.0.1 to 10.2.0 (dependabot[bot])
+
+- Bump actions/deploy-pages from 5.0.0 to 5.0.1 (dependabot[bot])
+
+- Update deps (Adrian Seyboldt)
+
+- Update pyo3 and drop pythonize dependency (Adrian Seyboldt)
+
+
+### Performance
+
+- Speed up flow LM fitting (Adrian Seyboldt)
+
+- Parallel stan sparsity detection (Adrian Seyboldt)
+
+- Change to thin lto (Adrian Seyboldt)
+
+- Iterate over draws in batches (Adrian Seyboldt)
+
+- Use dynamic jet size (Adrian Seyboldt)
+
+- Speed up triangular block_rows (Adrian Seyboldt)
+
+- Compute hessian of transformer directly (Adrian Seyboldt)
+
+- Precompute lookup tables (Adrian Seyboldt)
+
+- Reduce max memory usage (Adrian Seyboldt)
+
+- Use the new conditioner trait for sampling (Adrian Seyboldt)
+
+
+### Refactor
+
+- Restructure rust triangular code (Adrian Seyboldt)
+
+- Traits for Conditioner and Transformer (Adrian Seyboldt)
+
+
+### Styling
+
+- Some ruff fixes (Adrian Seyboldt)
+
+- Formatting fixes (Adrian Seyboldt)
+
+- Some ruff fixes (Adrian Seyboldt)
+
+
+### Testing
+
+- Add simple pyfunc tests (Adrian Seyboldt)
+
+- Add lmopt tests (Adrian Seyboldt)
+
+- More sampler accuracy tests (Adrian Seyboldt)
+
+
+### Ci
+
+- Remove dev pin for pytensor (Adrian Seyboldt)
+
+- Fix the emscripten version for now (Adrian Seyboldt)
+
+- Update reference draws (Adrian Seyboldt)
+
+- Require py3.11 for emscripten build (Adrian Seyboldt)
+
+- Mark flow tests (Adrian Seyboldt)
+
+
+## [0.16.11] - 2026-06-18
 
 ### Bug Fixes
 
@@ -716,8 +936,6 @@ All notable changes to this project will be documented in this file.
 
 ### Ci
 
-- Fix uploads of releases (Adrian Seyboldt)
-
 - Fix architectures in CI (Adrian Seyboldt)
 
 
@@ -740,6 +958,8 @@ All notable changes to this project will be documented in this file.
 
 
 ### Miscellaneous Tasks
+
+- Bump actions/download-artifact from 3 to 4 (dependabot[bot])
 
 - Bump actions/setup-python from 4 to 5 (dependabot[bot])
 
@@ -765,6 +985,11 @@ All notable changes to this project will be documented in this file.
 - Set the number of parallel chains dynamically (Adrian Seyboldt)
 
 
+### Ci
+
+- Fix uploads of releases (Adrian Seyboldt)
+
+
 ## [0.9.2] - 2024-02-19
 
 ### Bug Fixes
@@ -782,11 +1007,6 @@ All notable changes to this project will be documented in this file.
 ### Features
 
 - Handle missing libraries more robustly (#72) (Ben Mares)
-
-
-### Miscellaneous Tasks
-
-- Bump actions/download-artifact from 3 to 4 (dependabot[bot])
 
 
 ### Ci
