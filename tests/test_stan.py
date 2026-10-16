@@ -238,6 +238,28 @@ def test_stan_model_data():
 
 
 @pytest.mark.stan
+def test_stan_dims_after_with_data():
+    # with_dims/with_coords after with_data must reach the trace
+    model = """
+    parameters {
+        vector[2] b;
+    }
+    model {
+        b ~ normal(0, 1);
+    }
+    """
+    compiled = (
+        nutpie.compile_stan_model(code=model)
+        .with_data()
+        .with_dims(b=["idx"])
+        .with_coords(idx=["u", "v"])
+    )
+    trace = nutpie.sample(compiled, chains=1, tune=20, draws=10, progress_bar=False)
+    assert trace.posterior["b"].dims == ("chain", "draw", "idx")
+    assert list(trace.posterior["idx"].values) == ["u", "v"]
+
+
+@pytest.mark.stan
 def test_stan_memory_order():
     model = """
     data {

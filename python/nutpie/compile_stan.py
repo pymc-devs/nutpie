@@ -73,7 +73,7 @@ class CompiledStanModel(CompiledModel):
         else:
             coords_new = self.coords.copy()
         coords_new.update(coords)
-        return replace(self, _coords=coords_new)
+        return replace(self, _coords=coords_new)._rebuild_model()
 
     def with_dims(self, **dims):
         if self.dims is None:
@@ -81,7 +81,12 @@ class CompiledStanModel(CompiledModel):
         else:
             dims_new = self.dims.copy()
         dims_new.update(dims)
-        return replace(self, dims=dims_new)
+        return replace(self, dims=dims_new)._rebuild_model()
+
+    def _rebuild_model(self):
+        # The rust model captures dims and coords when it is built, so a model
+        # that already exists (`with_data` was called) has to be rebuilt.
+        return self if self.model is None else self.with_data()
 
     def with_transform_adapt(self, **kwargs):
         return replace(self, _transform_adapt_args=kwargs).with_data()
