@@ -781,16 +781,21 @@ class _BackgroundSampler:
                     "inference_library_settings": json.dumps(self._settings.as_dict()),
                 }
 
+                # An index that carries its own name would make xarray treat
+                # it as a coordinate of that other dimension, so name each
+                # one after its dimension.
+                coords = {
+                    name: pd.Index(vals).rename(name)
+                    for name, vals in (self._compiled_model.coords or {}).items()
+                }
+
                 return _arrow_to_arviz(
                     draw_batches,
                     stat_batches,
                     skip_vars=skip_vars,
                     reparameterized_names=self._compiled_model.reparameterized_names,
                     keep_unconstrained_draw=self._store_unconstrained,
-                    coords={
-                        name: pd.Index(vals)
-                        for name, vals in self._compiled_model.coords.items()
-                    },
+                    coords=coords,
                     save_warmup=self._save_warmup,
                     attrs={"sample_stats": attrs},
                 )
