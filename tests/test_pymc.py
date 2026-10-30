@@ -497,6 +497,27 @@ def test_normalizing_flow():
 
 
 @pytest.mark.pymc
+@pytest.mark.flow
+def test_normalizing_flow_rust():
+    """`test_normalizing_flow` with the triangular flow built in Rust."""
+    with pm.Model() as model:
+        pm.HalfNormal("x", shape=2)
+
+    compiled = nutpie.compile_pymc_model(
+        model, backend="jax", gradient_backend="jax"
+    ).with_transform_adapt(verbose=True, rust_flow=True)
+    trace = nutpie.sample(
+        compiled,
+        chains=1,
+        adaptation="flow",
+        window_switch_freq=128,
+        seed=1,
+        draws=500,
+    )
+    assert float(trace.sample_stats.fisher_distance.mean()) < 0.1
+
+
+@pytest.mark.pymc
 @pytest.mark.parametrize(
     ("backend", "gradient_backend"),
     [
@@ -741,3 +762,107 @@ def test_init_point_fn_unknown_key(backend, gradient_backend):
 
     with pytest.raises(KeyError, match="sigma_log__"):
         init(1, 0)
+
+
+def _hierarchical_model(n_groups=20):
+    with pm.Model() as model:
+        mu = pm.Normal("mu")
+        tau = pm.HalfNormal("tau")
+        theta = pm.Normal("theta", mu, tau, shape=n_groups)
+        pm.Normal("y", theta, 1, observed=np.zeros(n_groups))
+    return model
+
+
+def _hierarchical_expected(compiled, n_groups=20):
+    # Everything interacts with mu and tau, theta only with themselves
+    variables = compiled._unconstrained_variables()
+    hyper = [i for i, var in enumerate(variables) if var in ("mu", "tau_log__")]
+    expected = np.eye(n_groups + 2, dtype=bool)
+    expected[hyper, :] = True
+    expected[:, hyper] = True
+    return expected
+
+
+@pytest.mark.pymc
+def test_hessian_sparsity_jax():
+    compiled = nutpie.compile_pymc_model(
+        _hierarchical_model(), backend="jax", gradient_backend="jax"
+    )
+    assert compiled.hessian_sparsity is None
+    compiled = compiled.with_hessian_sparsity(seed=1)
+    np.testing.assert_array_equal(
+        compiled.hessian_sparsity.toarray(), _hierarchical_expected(compiled)
+    )
+
+    factorization = compiled.with_factorization().factorization
+    assert factorization.num_fill == 0
+    assert factorization.max_parents == 2
+    first = {factorization.variables[i] for i in factorization.order[:2]}
+    assert first == {"mu", "tau_log__"}
+
+    factorization = compiled.with_factorization(front=["theta"]).factorization
+    # Names as in the `unconstrained_parameter` coordinate of the trace
+    assert factorization.summary().index[0] == "theta_0"
+    assert (
+        factorization.unconstrained_parameters == compiled._unconstrained_parameters()
+    )
+
+    assert "hessian sparsity: 41 of 231 pairs nonzero" in repr(compiled)
+    assert compiled.with_data().hessian_sparsity is None
+
+
+@pytest.mark.pymc
+def test_hessian_sparsity_numba():
+    compiled = nutpie.compile_pymc_model(_hierarchical_model(), backend="numba")
+    with pytest.raises(NotImplementedError, match="numba"):
+        compiled.with_hessian_sparsity()
+
+    expected = _hierarchical_expected(compiled)
+    compiled = compiled.with_hessian_sparsity(expected).with_factorization()
+    assert compiled.factorization.num_fill == 0
+    assert "theta_3" in compiled.factorization.unconstrained_parameters
+    assert repr(compiled).startswith("CompiledPyMCModel (numba, n_dim=22)")
+
+
+@pytest.mark.pymc
+@pytest.mark.parametrize("backend", ["numba", "jax"])
+@pytest.mark.parametrize("storage", ["arrow", "zarr"])
+def test_unconstrained_parameter_coords(backend, storage, tmp_path):
+    with pm.Model(coords={"group": ["x", "y"]}) as model:
+        pm.Normal("a")
+        pm.HalfNormal("s")
+        pm.Normal("b", dims="group")
+    kwargs = {"gradient_backend": "jax"} if backend == "jax" else {}
+    compiled = nutpie.compile_pymc_model(model, backend=backend, **kwargs)
+    # Only in the trace, not a coord of the model
+    assert "unconstrained_parameter" not in compiled.coords
+    names = compiled._unconstrained_parameters()
+    # The order of the variables depends on the backend
+    assert sorted(names) == ["a", "b_0", "b_1", "s_log__"]
+
+    sample_kwargs = {}
+    if storage == "zarr":
+        path = tmp_path / "trace.zarr"
+        path.mkdir()
+        sample_kwargs["zarr_store"] = nutpie.zarr_store.LocalStore(str(path))
+    trace = nutpie.sample(
+        compiled,
+        chains=1,
+        tune=50,
+        draws=10,
+        store_unconstrained=True,
+        progress_bar=False,
+        seed=1,
+        **sample_kwargs,
+    )
+    coord = trace.sample_stats.coords["unconstrained_parameter"]
+    assert [str(name) for name in coord.values] == names
+    assert list(trace.posterior.coords["group"].values) == ["x", "y"]
+
+
+@pytest.mark.pymc
+def test_reserved_unconstrained_parameter():
+    with pm.Model(coords={"unconstrained_parameter": [0, 1]}) as model:
+        pm.Normal("a", dims="unconstrained_parameter")
+    with pytest.raises(ValueError, match="unconstrained_parameter"):
+        nutpie.compile_pymc_model(model)
