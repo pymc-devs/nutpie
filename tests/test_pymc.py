@@ -778,7 +778,12 @@ def test_zarr_store_sample_stats_attrs(tmp_path):
     assert set(zarr_trace.sample_stats.data_vars) == set(
         arrow_trace.sample_stats.data_vars
     )
-    assert set(zarr_trace.children) == set(arrow_trace.children)
+    arrow_groups = (
+        arrow_trace.children
+        if hasattr(arrow_trace, "children")
+        else arrow_trace.groups()
+    )
+    assert set(zarr_trace.children) == set(arrow_groups)
 
     # chain/draw carry coordinate variables, so label-based selection works
     assert "chain" in zarr_trace.posterior.coords
@@ -789,7 +794,8 @@ def test_zarr_store_sample_stats_attrs(tmp_path):
     for node in zarr_trace.subtree:
         for value in node.attrs.values():
             assert not isinstance(value, dict)
-    zarr_trace.to_netcdf(tmp_path / "roundtrip.nc")
+    if find_spec("h5netcdf") or find_spec("netCDF4"):
+        zarr_trace.to_netcdf(tmp_path / "roundtrip.nc")
 
 
 @pytest.mark.pymc

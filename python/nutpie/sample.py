@@ -221,6 +221,8 @@ def _arrow_to_arviz(
             **kwargs,
         )
     else:
+        # arviz<1 takes per-group attrs as <group>_attrs and ignores a group-keyed attrs
+        group_attrs = kwargs.pop("attrs", {})
         idata = arviz.from_dict(
             posterior=data_posterior,
             sample_stats=stats_posterior,
@@ -228,6 +230,7 @@ def _arrow_to_arviz(
             warmup_sample_stats=stats_tune,  # ty:ignore[invalid-argument-type]
             dims=dims,
             **kwargs,
+            **{f"{group}_attrs": val for group, val in group_attrs.items()},
         )
 
     if keep_unconstrained_draw and uc_data_posterior:
