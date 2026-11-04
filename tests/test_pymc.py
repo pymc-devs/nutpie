@@ -422,6 +422,25 @@ def test_pymc_model_shared(backend, gradient_backend):
 
 @pytest.mark.pymc
 @parameterize_backends
+def test_pymc_model_shared_list(backend, gradient_backend):
+    with pm.Model() as model:
+        x = pm.Data("x", np.array([1.0, 2.0, 3.0]))
+        beta = pm.Normal("beta")
+        pm.Normal("y", mu=beta * x, sigma=0.1, observed=np.array([4.0, 5.0, 6.0]))
+
+    compiled = nutpie.compile_pymc_model(
+        model,
+        backend=backend,
+        gradient_backend=gradient_backend,
+        freeze_model=False,
+    )
+    compiled2 = compiled.with_data(x=[4, 5, 6])
+    trace = nutpie.sample(compiled2, chains=1, seed=1)
+    np.testing.assert_allclose(trace.posterior.beta.mean().values, 1.0, atol=0.05)
+
+
+@pytest.mark.pymc
+@parameterize_backends
 def test_pymc_var_names(backend, gradient_backend):
     with pm.Model() as model:
         mu = pm.Data("mu", -0.1)
