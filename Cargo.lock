@@ -2410,6 +2410,7 @@ dependencies = [
 [[package]]
 name = "nuts-derive"
 version = "0.2.0"
+source = "git+https://github.com/pymc-devs/nuts-rs.git#67fe05abea520ae77531da11625297c5b1cdeed0"
 dependencies = [
  "nuts-storable",
  "proc-macro2",
@@ -2420,6 +2421,7 @@ dependencies = [
 [[package]]
 name = "nuts-rs"
 version = "0.19.1"
+source = "git+https://github.com/pymc-devs/nuts-rs.git#67fe05abea520ae77531da11625297c5b1cdeed0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -2443,6 +2445,7 @@ dependencies = [
 [[package]]
 name = "nuts-storable"
 version = "0.3.0"
+source = "git+https://github.com/pymc-devs/nuts-rs.git#67fe05abea520ae77531da11625297c5b1cdeed0"
 
 [[package]]
 name = "object_store"
@@ -4557,3 +4560,7 @@ dependencies = [
  "cc",
  "pkg-config",
 ]
+
+[[patch.unused]]
+name = "nuts-rs"
+version = "0.19.2"
