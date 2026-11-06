@@ -19,6 +19,7 @@ dependencies = [
   "pyarrow >= 12.0.0",
   "arro3-core >= 0.6.0",
   "pandas >= 2.0",
+  "scipy >= 1.11",
   "platformdirs >= 3.0.0",
   "xarray >= 2025.01.2",
   "arviz >= 0.23.0,<2.0",
@@ -36,16 +37,29 @@ Repository = "https://github.com/pymc-devs/nutpie"
 
 [project.optional-dependencies]
 stan = ["bridgestan >= 2.7.0", "stanio >= 0.5.1"]
+stanli = ["stanli", "stanio >= 0.5.1"]
 pymc = ["pymc >= 5.20.1", "numba >= 0.60.0"]
-pymc-jax = ["pymc >= 5.20.1", "jax >= 0.4.27"]
-nnflow = ["flowjax >= 17.1.0", "equinox >= 0.11.12"]
+pymc-jax = ["pymc >= 5.20.1", "jax >= 0.11"]
+# asdex detects the Hessian sparsity of jax models for the triangular flow.
+# It does not support jax 0.12 yet, see
+# https://github.com/adrhill/asdex/issues/217
+nnflow = [
+  "flowjax >= 17.1.0",
+  "equinox >= 0.11.12",
+  "optimistix >= 0.1.0",
+  "asdex >= 0.5.2",
+  "jax >= 0.11, < 0.12",
+]
 dev = [
   "bridgestan >= 2.7.0",
   "stanio >= 0.5.1",
   "pymc >= 5.20.1",
   "numba >= 0.60.0",
-  "jax >= 0.4.27",
+  "jax >= 0.11, < 0.12",
+  "asdex >= 0.5.2",
   "flowjax >= 17.0.2",
+  "matplotlib >= 3.8.0",
+  "optimistix >= 0.1.0",
   "pytest",
   "pytest-timeout",
   "pytest-arraydiff",
@@ -55,18 +69,23 @@ all = [
   "stanio >= 0.5.1",
   "pymc >= 5.20.1",
   "numba >= 0.60.0",
-  "jax >= 0.4.27",
+  "jax >= 0.11, < 0.12",
+  "asdex >= 0.5.2",
   "flowjax >= 17.1.0",
   "equinox >= 0.11.12",
+  "optimistix >= 0.1.0",
+  "matplotlib >= 3.8.0",
 ]
 docs = [
   "bridgestan >= 2.7.0",
   "stanio >= 0.5.1",
   "pymc >= 5.20.1",
   "numba >= 0.60.0",
-  "jax >= 0.4.27",
+  "jax >= 0.11, < 0.12",
+  "asdex >= 0.5.2",
   "flowjax >= 17.1.0",
   "equinox >= 0.11.12",
+  "optimistix >= 0.1.0",
   "cmdstanpy >= 1.2.0",
   "matplotlib >= 3.8.0",
   "seaborn >= 0.13.0",
@@ -92,8 +111,10 @@ features = ["pyo3/extension-module"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-m 'not slow'"
 markers = [
   "flow: tests for normalizing flows",
   "stan: tests for Stan models",
   "pymc: tests for PyMC models",
+  "slow: longer-running statistical tests (run with '-m slow')",
 ]

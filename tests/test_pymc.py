@@ -1,11 +1,13 @@
 import time
 from importlib.util import find_spec
+from pathlib import Path
 
 import pytest
 
 if find_spec("pymc") is None:
     pytest.skip("Skip pymc tests", allow_module_level=True)
 
+import arviz as az
 import numpy as np
 import pandas as pd
 import pymc as pm
@@ -468,10 +470,14 @@ def test_pymc_var_names(backend, gradient_backend):
     assert not hasattr(trace.posterior, "c")
 
 
-# TODO For some reason, the sampling results with jax are
-# not reproducible accross operating systems. Figure this
-# out and add the array_compare marker.
-# @pytest.mark.array_compare
+# The Fisher divergence to N(0, I) of the best diagonal affine map for two
+# independent HalfNormal(1), on the log scale the sampler sees: there
+# q(u) ∝ exp(u - e^{2u} / 2) with score 1 - e^{2u}, and minimizing
+# E[((u - m) / s + s (1 - e^{2u}))^2] over m, s by quadrature gives 1.1416 per
+# dimension.
+BEST_AFFINE_FISHER_HALFNORMAL_2D = 2 * 1.1416
+
+
 @pytest.mark.pymc
 @pytest.mark.flow
 def test_normalizing_flow():
@@ -480,20 +486,52 @@ def test_normalizing_flow():
 
     compiled = nutpie.compile_pymc_model(
         model, backend="jax", gradient_backend="jax"
-    ).with_transform_adapt(
-        verbose=True,
-        num_layers=2,
-    )
+    ).with_transform_adapt()
     trace = nutpie.sample(
         compiled,
         chains=1,
         adaptation="flow",
-        window_switch_freq=128,
         seed=1,
         draws=500,
     )
-    assert float(trace.sample_stats.fisher_distance.mean()) < 0.1
-    # return trace.posterior.x.isel(draw=slice(-50, None)).values.ravel()
+
+    # The flow must not bias the draws: E[x] = sqrt(2 / pi) and E[x^2] = 1,
+    # each within 4 MCSE (the true sd over the root of the ESS).
+    x = trace.posterior.x
+    for label, values, expected, sd in [
+        ("x", x, np.sqrt(2 / np.pi), np.sqrt(1 - 2 / np.pi)),
+        ("x^2", x**2, 1.0, np.sqrt(2.0)),
+    ]:
+        ess = az.ess(values.to_dataset(name="stat"), method="mean").stat
+        z = (values.mean(("chain", "draw")) - expected) / (sd / np.sqrt(ess))
+        assert (abs(z) < 4).all(), f"{label}: z-scores {z.values}"
+
+    # And it must beat every diagonal affine map by a wide margin.
+    fisher = float(trace.sample_stats.fisher_distance.mean())
+    assert fisher < 0.1 * BEST_AFFINE_FISHER_HALFNORMAL_2D
+
+
+@pytest.mark.pymc
+@pytest.mark.flow
+def test_transform_adapt_errors_are_early(monkeypatch):
+    with pm.Model() as model:
+        pm.Normal("x", shape=2)
+    compiled = nutpie.compile_pymc_model(model, backend="jax", gradient_backend="jax")
+
+    # Invalid options raise when they are set, not when the chains start
+    with pytest.raises(TypeError, match="not_an_option"):
+        compiled.with_transform_adapt(not_an_option=1)
+    with pytest.raises(ValueError, match="refit_diag"):
+        compiled.with_transform_adapt(rust_flow=False, refit_diag=True)
+
+    # A missing dependency of the sparsity detection is not hidden behind
+    # the generic detection error
+    def missing(self, **kwargs):
+        raise ImportError("asdex is missing")
+
+    monkeypatch.setattr(type(compiled), "_detect_hessian_sparsity", missing)
+    with pytest.raises(ImportError, match="asdex is missing"):
+        nutpie.sample(compiled, adaptation="flow", chains=1, tune=10, draws=10)
 
 
 @pytest.mark.pymc
@@ -542,14 +580,26 @@ def test_deterministic_sampling_numba():
 
 
 @pytest.mark.pymc
-@pytest.mark.array_compare(atol=1e-4, rtol=1e-4)
 def test_deterministic_sampling_jax():
     with pm.Model() as model:
         pm.HalfNormal("a")
 
     compiled = nutpie.compile_pymc_model(model, backend="jax", gradient_backend="jax")
-    trace = nutpie.sample(compiled, chains=2, seed=123, draws=100, tune=100)
-    return trace.posterior.a.values.ravel()
+
+    def draws():
+        trace = nutpie.sample(compiled, chains=2, seed=123, draws=100, tune=100)
+        return trace.posterior.a.values
+
+    # XLA compiles for the host CPU, so the log density differs in the last
+    # digits between machines and jax versions, and the chains drift apart.
+    # On one machine the draws must be identical.
+    first = draws()
+    np.testing.assert_array_equal(draws(), first)
+
+    # The first draws still agree with the numba backend on every machine.
+    reference = Path(__file__).parent / "reference"
+    numba = np.loadtxt(reference / "test_deterministic_sampling_numba.txt")
+    np.testing.assert_allclose(first[:, :3], numba.reshape(2, -1)[:, :3], rtol=1e-3)
 
 
 @pytest.mark.pymc
@@ -741,3 +791,108 @@ def test_init_point_fn_unknown_key(backend, gradient_backend):
 
     with pytest.raises(KeyError, match="sigma_log__"):
         init(1, 0)
+
+
+def _hierarchical_model(n_groups=20):
+    with pm.Model() as model:
+        mu = pm.Normal("mu")
+        tau = pm.HalfNormal("tau")
+        theta = pm.Normal("theta", mu, tau, shape=n_groups)
+        pm.Normal("y", theta, 1, observed=np.zeros(n_groups))
+    return model
+
+
+def _hierarchical_expected(compiled, n_groups=20):
+    # Everything interacts with mu and tau, theta only with themselves
+    variables = compiled._unconstrained_variables()
+    hyper = [i for i, var in enumerate(variables) if var in ("mu", "tau_log__")]
+    expected = np.eye(n_groups + 2, dtype=bool)
+    expected[hyper, :] = True
+    expected[:, hyper] = True
+    return expected
+
+
+@pytest.mark.pymc
+@pytest.mark.flow
+def test_hessian_sparsity_jax():
+    compiled = nutpie.compile_pymc_model(
+        _hierarchical_model(), backend="jax", gradient_backend="jax"
+    )
+    assert compiled.hessian_sparsity is None
+    compiled = compiled.with_hessian_sparsity(seed=1)
+    np.testing.assert_array_equal(
+        compiled.hessian_sparsity.toarray(), _hierarchical_expected(compiled)
+    )
+
+    factorization = compiled.with_factorization().factorization
+    assert factorization.num_fill == 0
+    assert factorization.max_parents == 2
+    first = {factorization.variables[i] for i in factorization.order[:2]}
+    assert first == {"mu", "tau_log__"}
+
+    factorization = compiled.with_factorization(front=["theta"]).factorization
+    # Names as in the `unconstrained_parameter` coordinate of the trace
+    assert factorization.summary().index[0] == "theta_0"
+    assert (
+        factorization.unconstrained_parameters == compiled._unconstrained_parameters()
+    )
+
+    assert "hessian sparsity: 41 of 231 pairs nonzero" in repr(compiled)
+    assert compiled.with_data().hessian_sparsity is None
+
+
+@pytest.mark.pymc
+def test_hessian_sparsity_numba():
+    compiled = nutpie.compile_pymc_model(_hierarchical_model(), backend="numba")
+    with pytest.raises(NotImplementedError, match="numba"):
+        compiled.with_hessian_sparsity()
+
+    expected = _hierarchical_expected(compiled)
+    compiled = compiled.with_hessian_sparsity(expected).with_factorization()
+    assert compiled.factorization.num_fill == 0
+    assert "theta_3" in compiled.factorization.unconstrained_parameters
+    assert repr(compiled).startswith("CompiledPyMCModel (numba, n_dim=22)")
+
+
+@pytest.mark.pymc
+@pytest.mark.parametrize("backend", ["numba", "jax"])
+@pytest.mark.parametrize("storage", ["arrow", "zarr"])
+def test_unconstrained_parameter_coords(backend, storage, tmp_path):
+    with pm.Model(coords={"group": ["x", "y"]}) as model:
+        pm.Normal("a")
+        pm.HalfNormal("s")
+        pm.Normal("b", dims="group")
+    kwargs = {"gradient_backend": "jax"} if backend == "jax" else {}
+    compiled = nutpie.compile_pymc_model(model, backend=backend, **kwargs)
+    # Only in the trace, not a coord of the model
+    assert "unconstrained_parameter" not in compiled.coords
+    names = compiled._unconstrained_parameters()
+    # The order of the variables depends on the backend
+    assert sorted(names) == ["a", "b_0", "b_1", "s_log__"]
+
+    sample_kwargs = {}
+    if storage == "zarr":
+        path = tmp_path / "trace.zarr"
+        path.mkdir()
+        sample_kwargs["zarr_store"] = nutpie.zarr_store.LocalStore(str(path))
+    trace = nutpie.sample(
+        compiled,
+        chains=1,
+        tune=50,
+        draws=10,
+        store_unconstrained=True,
+        progress_bar=False,
+        seed=1,
+        **sample_kwargs,
+    )
+    coord = trace.sample_stats.coords["unconstrained_parameter"]
+    assert [str(name) for name in coord.values] == names
+    assert list(trace.posterior.coords["group"].values) == ["x", "y"]
+
+
+@pytest.mark.pymc
+def test_reserved_unconstrained_parameter():
+    with pm.Model(coords={"unconstrained_parameter": [0, 1]}) as model:
+        pm.Normal("a", dims="unconstrained_parameter")
+    with pytest.raises(ValueError, match="unconstrained_parameter"):
+        nutpie.compile_pymc_model(model)
