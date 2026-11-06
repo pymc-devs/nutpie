@@ -20,7 +20,7 @@ from nutpie.triangular_flow import (
     transformer_layout,
 )
 
-pytestmark = pytest.mark.flow
+pytestmark = [pytest.mark.flow, pytest.mark.usefixtures("x64")]
 
 DIM = 7
 
@@ -98,7 +98,6 @@ def _jax_flow(seed=0, **kwargs):
 
     from nutpie.normalizing_flow import make_flow
 
-    jax.config.update("jax_enable_x64", True)
     rng = np.random.default_rng(seed)
     x, g = _draws()
     settings = {
@@ -210,7 +209,6 @@ def test_built_flow_has_the_jax_structure():
     parents, transformer, parameter count, permutation and diagonal affine."""
     from nutpie.normalizing_flow import make_flow
 
-    jax.config.update("jax_enable_x64", True)
     x, g = _draws()
     order = np.random.default_rng(3).permutation(DIM)
     settings = {

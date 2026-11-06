@@ -318,7 +318,10 @@ def test_stan_flow():
     """
     import jax
 
-    old = jax.config.update("jax_enable_x64", True)
+    # Global rather than `jax.enable_x64`, which is thread-local and so
+    # unseen by the sampler threads.
+    old = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
     try:
         # The triangular flow detects the Hessian sparsity by default
         compiled_model = nutpie.compile_stan_model(
@@ -716,6 +719,7 @@ def test_stan_cache_key_ad_hessian():
 
 
 @pytest.mark.stan
+@pytest.mark.flow
 def test_stan_repr():
     compiled_model = nutpie.compile_stan_model(code=HESSIAN_MODEL)
     assert repr(compiled_model) == (

@@ -10,6 +10,7 @@ import arviz as az
 import numpy as np
 import pymc as pm
 import pytest
+import xarray as xr
 from scipy import stats
 
 import nutpie
@@ -47,10 +48,10 @@ def _sample(model, config, *, draws, tune, seed, flow_adapt=False):
         compiled = compiled.with_hessian_sparsity(
             np.ones((compiled.n_dim, compiled.n_dim), dtype=bool)
         )
-        sampler_kwargs = {"window_switch_freq": 128}
+        # The flow uses its default tuning schedule
+        tune = None
     else:
         compiled = nutpie.compile_pymc_model(model, backend="numba")
-        sampler_kwargs = {}
     return nutpie.sample(
         compiled,
         draws=draws,
@@ -60,18 +61,15 @@ def _sample(model, config, *, draws, tune, seed, flow_adapt=False):
         seed=seed,
         save_warmup=False,
         progress_bar=False,
-        **sampler_kwargs,
         **config,
     )
 
 
-def _moment_test(posterior, values, expected, standard_deviation, *, min_ess, label):
+def _moment_test(values, expected, standard_deviation, *, min_ess, label):
     """Return an ESS-adjusted, two-sided p-value for one known-moment check."""
     values = np.asarray(values)
     assert values.ndim == 2, "expected chain-by-draw samples"
-    dataset = posterior.to_dataset().assign(
-        sampler_accuracy_statistic=(("chain", "draw"), values)
-    )
+    dataset = xr.Dataset({"sampler_accuracy_statistic": (("chain", "draw"), values)})
     ess = float(
         az.ess(
             dataset,
@@ -118,7 +116,6 @@ def _append_fast_checks(checks, trace, config_name):
     for dim in range(normal.shape[-1]):
         checks.append(
             _moment_test(
-                trace.posterior,
                 normal[:, :, dim],
                 NORMAL_MEAN,
                 NORMAL_SD,
@@ -128,7 +125,6 @@ def _append_fast_checks(checks, trace, config_name):
         )
         checks.append(
             _moment_test(
-                trace.posterior,
                 centered[:, :, dim] ** 2,
                 NORMAL_SD**2,
                 math.sqrt(2.0) * NORMAL_SD**2,
@@ -142,7 +138,6 @@ def _append_fast_checks(checks, trace, config_name):
     half_normal_sd = HALF_NORMAL_SD * math.sqrt(1.0 - 2.0 / math.pi)
     checks.append(
         _moment_test(
-            trace.posterior,
             positive,
             half_normal_mean,
             half_normal_sd,
@@ -152,7 +147,6 @@ def _append_fast_checks(checks, trace, config_name):
     )
     checks.append(
         _moment_test(
-            trace.posterior,
             positive**2,
             HALF_NORMAL_SD**2,
             math.sqrt(2.0) * HALF_NORMAL_SD**2,
@@ -182,10 +176,9 @@ def test_simple_posteriors_match_known_moments():
     _assert_no_fdr_discoveries(checks, family="quick posterior-moment")
 
 
-@pytest.mark.pymc
-@pytest.mark.slow
-def test_correlated_normal_is_unbiased_at_higher_precision():
-    """More draws test the mean, marginal variances, and covariance directly."""
+def _check_correlated_normal(flow):
+    """More draws test the mean, marginal variances, and covariance directly,
+    for the configs that do (`flow`) or do not use a normalizing flow."""
     mean = np.array([1.5, -2.0])
     covariance = np.array([[4.0, 3.0], [3.0, 9.0]])
     with pm.Model() as model:
@@ -193,6 +186,8 @@ def test_correlated_normal_is_unbiased_at_higher_precision():
 
     checks = []
     for config_index, (config_name, config, flow_adapt) in enumerate(PRECISE_CONFIGS):
+        if flow_adapt != flow:
+            continue
         trace = _sample(
             model,
             config,
@@ -207,7 +202,6 @@ def test_correlated_normal_is_unbiased_at_higher_precision():
         for dim in range(2):
             checks.append(
                 _moment_test(
-                    trace.posterior,
                     samples[:, :, dim],
                     mean[dim],
                     math.sqrt(covariance[dim, dim]),
@@ -217,7 +211,6 @@ def test_correlated_normal_is_unbiased_at_higher_precision():
             )
             checks.append(
                 _moment_test(
-                    trace.posterior,
                     centered[:, :, dim] ** 2,
                     covariance[dim, dim],
                     math.sqrt(2.0) * covariance[dim, dim],
@@ -232,7 +225,6 @@ def test_correlated_normal_is_unbiased_at_higher_precision():
         )
         checks.append(
             _moment_test(
-                trace.posterior,
                 cross_moment,
                 covariance[0, 1],
                 cross_moment_sd,
@@ -242,3 +234,16 @@ def test_correlated_normal_is_unbiased_at_higher_precision():
         )
 
     _assert_no_fdr_discoveries(checks, family="higher-precision posterior-moment")
+
+
+@pytest.mark.pymc
+@pytest.mark.slow
+def test_correlated_normal_is_unbiased_at_higher_precision():
+    _check_correlated_normal(flow=False)
+
+
+@pytest.mark.pymc
+@pytest.mark.flow
+@pytest.mark.slow
+def test_correlated_normal_is_unbiased_at_higher_precision_flow():
+    _check_correlated_normal(flow=True)

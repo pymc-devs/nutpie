@@ -113,7 +113,6 @@ def fitted_flow():
             compiled,
             chains=1,
             adaptation="flow",
-            tune=700,
             draws=200,
             store_unconstrained=True,
             store_gradient=True,

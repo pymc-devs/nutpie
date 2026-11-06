@@ -11,7 +11,7 @@ import jax.numpy as jnp
 from nutpie.normalizing_flow import _scale_last_layer, make_transformer
 from nutpie.triangular import LocationSkipMlp, SparseTriangularMap
 
-pytestmark = pytest.mark.flow
+pytestmark = [pytest.mark.flow, pytest.mark.usefixtures("x64")]
 
 
 def _banded(dim):
@@ -41,7 +41,6 @@ def test_location_skip_is_the_conditional_mean(transformer_kwargs):
     `Contract2` at zero parameters is the identity up to its `eps`, hence the
     tolerance.
     """
-    jax.config.update("jax_enable_x64", True)
     dim = 8
     transformer = (
         None if transformer_kwargs is None else make_transformer(**transformer_kwargs)
@@ -81,7 +80,6 @@ def test_scale_skip_sets_the_conditional_scale(scale_skip):
     """With the MLPs silenced, an affine transformer's scale field is the
     scale skip alone, ``raw = r . y_parents``, so ``x = y / exp(asinh(raw))``
     per variable; without the scale skip the conditioners have none."""
-    jax.config.update("jax_enable_x64", True)
     dim = 8
     flow = SparseTriangularMap(
         jax.random.key(0),
@@ -200,7 +198,6 @@ def test_native_flow_transform_matches_jax(
     from nutpie.normalizing_flow import make_flow
     from nutpie.triangular_rust import flow_transform_layout
 
-    jax.config.update("jax_enable_x64", True)
     rng = np.random.default_rng(0)
     dim = 7
     blanket = _banded(dim)
@@ -261,7 +258,6 @@ def test_native_flow_transform_diagonal_flow():
     from nutpie.normalizing_flow import make_flow
     from nutpie.triangular_rust import flow_transform_layout
 
-    jax.config.update("jax_enable_x64", True)
     rng = np.random.default_rng(0)
     x = 1.0 + rng.normal(size=(20, 3)) * np.array([0.1, 1.0, 10.0])
     g = rng.normal(size=(20, 3))
@@ -286,7 +282,6 @@ def test_tangent_sas():
     the inverse, and both log dets against autodiff."""
     from nutpie.normalizing_flow import TangentSAS
 
-    jax.config.update("jax_enable_x64", True)
     zero = TangentSAS(0.0, 0.0, 0.0, 0.0)
     x = jnp.linspace(-30.0, 30.0, 13)
     y, log_det = jax.vmap(zero.transform_and_log_det)(x)
@@ -314,7 +309,6 @@ def test_asymmetric_sas(bounds):
     derivative jumps."""
     from nutpie.normalizing_flow import AsymmetricSAS
 
-    jax.config.update("jax_enable_x64", True)
     zero = AsymmetricSAS(0.0, 0.0, 0.0, 0.0, log_gamma_bounds=bounds)
     x = jnp.linspace(-30.0, 30.0, 13)
     y, log_det = jax.vmap(zero.transform_and_log_det)(x)
@@ -371,7 +365,6 @@ def test_make_transformer_kinds(transformer, layers, n_params, location):
     start spread over ``[-2, 2]``)."""
     from paramax import unwrap
 
-    jax.config.update("jax_enable_x64", True)
     elementwise = make_transformer(transformer, layers)
     arrays = eqx.filter(elementwise, eqx.is_inexact_array)
     assert sum(a.size for a in jax.tree.leaves(arrays)) == n_params

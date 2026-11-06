@@ -122,6 +122,18 @@ def _fill(graph, order) -> sp.csr_array:
     return _pattern(np.concatenate([rows, cols]), np.concatenate([cols, rows]), n)
 
 
+def _require_matplotlib():
+    """Raise a helpful error if matplotlib, which only the plots need, is
+    not installed."""
+    try:
+        import matplotlib  # noqa: F401
+    except ImportError as err:
+        raise ImportError(
+            "Plotting requires matplotlib, which is not installed. Please "
+            "install it with something like 'pip install matplotlib'."
+        ) from err
+
+
 def _draw_cells(ax, x, y, **kwargs):
     """Draw unit squares centred at `(x, y)` in data coordinates, so that
     neighbouring cells meet without gaps at any size or resolution. Returns
@@ -380,6 +392,7 @@ class Factorization:
         -------
         The matplotlib axes.
         """
+        _require_matplotlib()
         import matplotlib.pyplot as plt
         from matplotlib.lines import Line2D
 

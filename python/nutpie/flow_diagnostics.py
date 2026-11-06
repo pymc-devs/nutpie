@@ -147,9 +147,10 @@ class FlowInfluence:
         -------
         The matplotlib axes.
         """
-        import matplotlib.pyplot as plt
+        from nutpie.sparsity import _draw_cells, _require_matplotlib, _variable_strips
 
-        from nutpie.sparsity import _draw_cells, _variable_strips
+        _require_matplotlib()
+        import matplotlib.pyplot as plt
 
         if axes is None:
             _, axes = plt.subplots(
@@ -358,6 +359,9 @@ class ConditionerCapacity:
         -------
         The two matplotlib axes.
         """
+        from nutpie.sparsity import _require_matplotlib
+
+        _require_matplotlib()
         import matplotlib.pyplot as plt
 
         if axes is None:

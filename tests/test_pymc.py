@@ -1,5 +1,6 @@
 import time
 from importlib.util import find_spec
+from pathlib import Path
 
 import pytest
 
@@ -490,14 +491,13 @@ def test_normalizing_flow():
         compiled,
         chains=1,
         adaptation="flow",
-        window_switch_freq=128,
         seed=1,
         draws=500,
     )
 
     # The flow must not bias the draws: E[x] = sqrt(2 / pi) and E[x^2] = 1,
     # each within 4 MCSE (the true sd over the root of the ESS).
-    x = trace.posterior.to_dataset().x
+    x = trace.posterior.x
     for label, values, expected, sd in [
         ("x", x, np.sqrt(2 / np.pi), np.sqrt(1 - 2 / np.pi)),
         ("x^2", x**2, 1.0, np.sqrt(2.0)),
@@ -557,14 +557,26 @@ def test_deterministic_sampling_numba():
 
 
 @pytest.mark.pymc
-@pytest.mark.array_compare(atol=1e-4, rtol=1e-4)
 def test_deterministic_sampling_jax():
     with pm.Model() as model:
         pm.HalfNormal("a")
 
     compiled = nutpie.compile_pymc_model(model, backend="jax", gradient_backend="jax")
-    trace = nutpie.sample(compiled, chains=2, seed=123, draws=100, tune=100)
-    return trace.posterior.a.values.ravel()
+
+    def draws():
+        trace = nutpie.sample(compiled, chains=2, seed=123, draws=100, tune=100)
+        return trace.posterior.a.values
+
+    # XLA compiles for the host CPU, so the log density differs in the last
+    # digits between machines and jax versions, and the chains drift apart.
+    # On one machine the draws must be identical.
+    first = draws()
+    np.testing.assert_array_equal(draws(), first)
+
+    # The first draws still agree with the numba backend on every machine.
+    reference = Path(__file__).parent / "reference"
+    numba = np.loadtxt(reference / "test_deterministic_sampling_numba.txt")
+    np.testing.assert_allclose(first[:, :3], numba.reshape(2, -1)[:, :3], rtol=1e-3)
 
 
 @pytest.mark.pymc

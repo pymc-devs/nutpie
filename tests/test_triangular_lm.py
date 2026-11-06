@@ -19,7 +19,7 @@ from nutpie.triangular_lm import (
     unpack_params,
 )
 
-pytestmark = pytest.mark.flow
+pytestmark = [pytest.mark.flow, pytest.mark.usefixtures("x64")]
 
 
 def _blanket(dim, kind, rng):
@@ -55,7 +55,6 @@ def _setup(
     n_draw=8,
     seed=0,
 ):
-    jax.config.update("jax_enable_x64", True)
     rng = np.random.default_rng(seed)
     if tangent_sas:
         kind, layers = "tangent_sas", tangent_sas
@@ -200,7 +199,6 @@ def _flow_problem(dim=7, n_draw=64, seed=0):
     from nutpie.normalizing_flow import make_flow
     from nutpie.transform_adapter import FisherLoss
 
-    jax.config.update("jax_enable_x64", True)
     rng = np.random.default_rng(seed)
     x = 0.5 + rng.normal(size=(n_draw, dim)) * np.exp(rng.normal(size=dim))
     g = -(x - 0.5) / np.exp(2 * rng.normal(size=dim)) + 0.3 * rng.normal(

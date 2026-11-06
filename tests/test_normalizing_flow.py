@@ -71,14 +71,23 @@ def test_sparse_triangular_respects_sparsity_pattern():
     bij = _triangular_map(jax.random.key(2), order, blanket, nn_width=8)
 
     x = jax.random.normal(jax.random.key(3), (dim,))
+    y, log_det = bij.transform_and_log_det(x)
 
-    jac = jax.jacfwd(lambda x: bij.transform_and_log_det(x)[0])(x)
-    jac = np.asarray(jac)
-
+    # The inverse (model -> whitened) reads the actual parent values, so its
+    # Jacobian has exactly the sparsity pattern: no other entries, and every
+    # allowed dependency is used.
     allowed = _allowed_pairs(order, blanket) | np.eye(dim, dtype=bool)
-    np.testing.assert_array_equal(jac[~allowed], 0.0)
+    inv_jac = np.asarray(jax.jacfwd(lambda y: bij.inverse_and_log_det(y)[0])(y))
+    np.testing.assert_array_equal(inv_jac != 0, allowed)
 
-    _, log_det = bij.transform_and_log_det(x)
+    # The forward map is ancestral, each variable is conditioned on the
+    # transformed values of its parents, so it depends on all its ancestors.
+    ancestors = allowed.copy()
+    for _ in range(dim):
+        ancestors |= (ancestors.astype(int) @ ancestors.astype(int)) > 0
+    jac = np.asarray(jax.jacfwd(lambda x: bij.transform_and_log_det(x)[0])(x))
+    np.testing.assert_array_equal(jac[~ancestors], 0.0)
+
     sign, logdet_full = np.linalg.slogdet(jac)
     assert sign > 0
     np.testing.assert_allclose(logdet_full, log_det, atol=1e-3)

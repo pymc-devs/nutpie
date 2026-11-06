@@ -93,6 +93,11 @@ jobs:
         with:
           name: wheels-linux-${{ matrix.target }}
           path: dist
+      # arviz < 1 needs h5py, which has no Python 3.15 wheel yet, so it is
+      # built from source against the system HDF5.
+      - name: Install HDF5
+        if: matrix.python-version == '3.15'
+        run: sudo apt-get update && sudo apt-get install -y libhdf5-dev
       - name: pytest
         shell: bash
         run: |
@@ -188,7 +193,8 @@ jobs:
           pyodide venv .venv
           source .venv/bin/activate
           pip install nutpie --no-index --no-deps --find-links dist --force-reinstall
-          pip install nutpie pytest
+          # Only the plotting tests need matplotlib
+          pip install nutpie pytest matplotlib
           python -c "import nutpie; print(nutpie.__version__)"
           python -m pytest -rs
 
@@ -313,6 +319,13 @@ jobs:
       matrix:
         suite: [stan, pymc, flow]
         python-version: ["3.12", "3.13", "3.14", "3.15"]
+        # These suites need h5py (through arviz < 1), which has no Python
+        # 3.15 wheel yet and no easy source build on Windows.
+        exclude:
+          - suite: pymc
+            python-version: "3.15"
+          - suite: flow
+            python-version: "3.15"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -360,7 +373,7 @@ jobs:
         platform:
           - runner: macos-15-intel
             target: x86_64
-          - runner: macos-14
+          - runner: macos-latest
             target: aarch64
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -407,7 +420,7 @@ jobs:
           - target: x86_64
             runner: macos-15-intel
           - target: aarch64
-            runner: macos-14
+            runner: macos-latest
         exclude:
           # numba isn't available on macOS x86_64
           - target: x86_64
@@ -429,6 +442,13 @@ jobs:
         with:
           name: wheels-macos-${{ matrix.target }}
           path: dist
+      # arviz < 1 needs h5py, which has no Python 3.15 wheel yet, so it is
+      # built from source against Homebrew's HDF5.
+      - name: Install HDF5
+        if: matrix.python-version == '3.15'
+        run: |
+          brew install hdf5
+          echo "HDF5_DIR=$(brew --prefix hdf5)" >> "$GITHUB_ENV"
       - name: pytest
         run: |
           set -e

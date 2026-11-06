@@ -5,7 +5,6 @@ import pytest
 if find_spec("jax") is None or find_spec("equinox") is None:
     pytest.skip("Skip lmopt tests", allow_module_level=True)
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -16,14 +15,7 @@ from nutpie.lmopt import (
     marquardt_floors,
 )
 
-pytestmark = pytest.mark.flow
-
-
-@pytest.fixture(autouse=True)
-def x64():
-    # Only for these tests, not for the rest of the session
-    with jax.enable_x64(True):
-        yield
+pytestmark = [pytest.mark.flow, pytest.mark.usefixtures("x64")]
 
 
 def spd_blocks(n, G, q, seed=0):

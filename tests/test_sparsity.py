@@ -1,3 +1,5 @@
+import sys
+
 import numpy as np
 import pytest
 import scipy.sparse
@@ -136,6 +138,14 @@ def test_summaries():
     assert by_variable.loc[("a", "b")].tolist() == [3, 3, 3]
     assert by_variable.loc[("a", "c")].tolist() == [2, 2, 2]
     assert ("b", "b") not in by_variable.index
+
+
+def test_plot_spy_without_matplotlib(monkeypatch):
+    # A None entry makes the import fail, as if matplotlib was not installed
+    monkeypatch.setitem(sys.modules, "matplotlib", None)
+    factorization = factorize(star(6), order="amd")
+    with pytest.raises(ImportError, match="requires matplotlib"):
+        factorization.plot_spy()
 
 
 def test_plot_spy():
