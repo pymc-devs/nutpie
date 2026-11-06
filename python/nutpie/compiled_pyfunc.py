@@ -53,12 +53,18 @@ class PyFuncModel(CompiledModel):
         return self._n_dim
 
     def with_data(self, **updates):
-        for name in updates:
+        updated = self._shared_data.copy()
+        for name, new_val in updates.items():
             if name not in self._shared_data:
                 raise ValueError(f"Unknown data variable: {name}")
+            old_val = self._shared_data[name]
+            # Convert lists and scalars to the array type and dtype of the
+            # current value, for example a jax array for the jax backend.
+            if hasattr(old_val, "__array_namespace__"):
+                xp = old_val.__array_namespace__()
+                new_val = xp.asarray(new_val, dtype=old_val.dtype)
+            updated[name] = new_val
 
-        updated = self._shared_data.copy()
-        updated.update(**updates)
         return dataclasses.replace(self, _shared_data=updated)
 
     def with_transform_adapt(self, **kwargs):
