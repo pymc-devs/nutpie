@@ -541,9 +541,11 @@ class TriangularFlowAdapter:
             )
         new_flow = fresh or restart
 
-        # A flow's first `linear_fits` fits use only the linear part of its
-        # conditioners, see `make_transform_adapter`.
-        flow_fits = 0 if new_flow else self._flow_fits
+        # The first `linear_fits` fits use only the linear part of the
+        # conditioners, see `make_transform_adapter`. They count from the
+        # start or the last restart, also if they were rejected and left
+        # no flow: else a fresh flow could repeat its linear fits forever.
+        flow_fits = 0 if restart else self._flow_fits
         linear_fit = flow_fits < self._linear_fits
         conditioners = self._linear_conditioners if linear_fit else self._conditioners
         if new_flow:
