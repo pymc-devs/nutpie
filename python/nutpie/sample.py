@@ -25,6 +25,17 @@ from nutpie.sparsity import (
 )
 
 
+def _make_transform_adapter(kwargs):
+    """The factory that creates the transform adapter of each chain.
+
+    This imports the flow dependencies and checks the options, so it raises
+    for missing packages and invalid options.
+    """
+    from nutpie.transform_adapter import make_transform_adapter
+
+    return make_transform_adapter(**kwargs)
+
+
 @dataclass(frozen=True)
 class CompiledModel:
     dims: dict[str, tuple[str, ...]] | None
@@ -54,6 +65,16 @@ class CompiledModel:
 
     def _make_model(self, *args, **kwargs):
         raise NotImplementedError()
+
+    def with_transform_adapt(self, **kwargs):
+        """Set the options of the normalizing flow adaptation.
+
+        They are used when sampling with ``adaptation="flow"``, see
+        `nutpie.transform_adapter.make_transform_adapter`. Invalid options
+        and missing flow dependencies raise here.
+        """
+        _make_transform_adapter(kwargs)
+        return dataclasses.replace(self, _transform_adapt_args=kwargs)
 
     def with_init_point_fn(self, init_point_fn):
         """Use a custom function to generate the initial point of each chain.
@@ -186,7 +207,14 @@ class CompiledModel:
         `stop_event` is set when sampling is aborted, so that a flow fit that
         is running in a chain's thread can stop early.
         """
-        return {**self._flow_structure_kwargs(settings), "stop_event": stop_event}
+        kwargs = {**self._flow_structure_kwargs(settings), "stop_event": stop_event}
+        if settings.as_dict()["adaptation"] == "flow":
+            # The chains create their adapters on their own threads, where an
+            # error would only show up as a failed initialization.
+            _make_transform_adapter(
+                {**(getattr(self, "_transform_adapt_args", None) or {}), **kwargs}
+            )
+        return kwargs
 
     def _flow_structure_kwargs(self, settings) -> dict:
         """Order and sparsity for the triangular flow, if it is used.
@@ -209,6 +237,9 @@ class CompiledModel:
                     sparsity = check_hessian_sparsity(
                         self._detect_hessian_sparsity(), self.n_dim
                     )
+                except ImportError:
+                    # A missing dependency is not a problem with the model
+                    raise
                 except Exception as err:
                     raise RuntimeError(
                         "The triangular flow needs the Hessian sparsity of the "

@@ -91,9 +91,6 @@ class CompiledStanModel(CompiledModel):
         # that already exists (`with_data` was called) has to be rebuilt.
         return self if self.model is None else self.with_data()
 
-    def with_transform_adapt(self, **kwargs):
-        return replace(self, _transform_adapt_args=kwargs)
-
     def with_init_point_fn(self, init_point_fn):
         """Use a custom function to generate the initial point of each chain.
 

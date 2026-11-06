@@ -512,6 +512,29 @@ def test_normalizing_flow():
 
 
 @pytest.mark.pymc
+@pytest.mark.flow
+def test_transform_adapt_errors_are_early(monkeypatch):
+    with pm.Model() as model:
+        pm.Normal("x", shape=2)
+    compiled = nutpie.compile_pymc_model(model, backend="jax", gradient_backend="jax")
+
+    # Invalid options raise when they are set, not when the chains start
+    with pytest.raises(TypeError, match="not_an_option"):
+        compiled.with_transform_adapt(not_an_option=1)
+    with pytest.raises(ValueError, match="refit_diag"):
+        compiled.with_transform_adapt(rust_flow=False, refit_diag=True)
+
+    # A missing dependency of the sparsity detection is not hidden behind
+    # the generic detection error
+    def missing(self, **kwargs):
+        raise ImportError("asdex is missing")
+
+    monkeypatch.setattr(type(compiled), "_detect_hessian_sparsity", missing)
+    with pytest.raises(ImportError, match="asdex is missing"):
+        nutpie.sample(compiled, adaptation="flow", chains=1, tune=10, draws=10)
+
+
+@pytest.mark.pymc
 @pytest.mark.parametrize(
     ("backend", "gradient_backend"),
     [
@@ -790,6 +813,7 @@ def _hierarchical_expected(compiled, n_groups=20):
 
 
 @pytest.mark.pymc
+@pytest.mark.flow
 def test_hessian_sparsity_jax():
     compiled = nutpie.compile_pymc_model(
         _hierarchical_model(), backend="jax", gradient_backend="jax"

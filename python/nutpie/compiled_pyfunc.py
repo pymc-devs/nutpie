@@ -2,6 +2,7 @@ import dataclasses
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
+from importlib.util import find_spec
 from typing import Any
 
 import numpy as np
@@ -70,9 +71,6 @@ class PyFuncModel(CompiledModel):
             self, _shared_data=updated, _hessian_sparsity=None, _factorization=None
         )
 
-    def with_transform_adapt(self, **kwargs):
-        return dataclasses.replace(self, _transform_adapt_args=kwargs)
-
     def with_init_point_fn(self, init_point_fn):
         """Use a custom function to generate the initial point of each chain.
 
@@ -115,6 +113,13 @@ class PyFuncModel(CompiledModel):
                 "Detecting the Hessian sparsity needs the jax log density. "
                 "Compile the model with `gradient_backend='jax'`, or pass the "
                 "pattern with `with_hessian_sparsity(array)`."
+            )
+        if find_spec("asdex") is None:
+            raise ImportError(
+                "Detecting the Hessian sparsity of a jax model requires asdex. "
+                "Please install it with something like "
+                "'pip install nutpie[nnflow]', or pass the pattern with "
+                "`with_hessian_sparsity(array)`."
             )
         import asdex
         import jax

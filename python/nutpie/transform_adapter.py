@@ -5,7 +5,8 @@ from importlib.util import find_spec
 
 if find_spec("flowjax") is None:
     raise ImportError(
-        "The 'flowjax' package is required to use normalizing flow adaptation."
+        "The 'flowjax' package is required to use normalizing flow adaptation. "
+        "Please install it with something like 'pip install nutpie[nnflow]'."
     )
 
 import traceback

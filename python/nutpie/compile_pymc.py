@@ -257,9 +257,6 @@ class CompiledPyMCModel(CompiledModel):
             self._unconstrained_names,
         )
 
-    def with_transform_adapt(self, **kwargs):
-        return dataclasses.replace(self, _transform_adapt_args=kwargs)
-
     def _detect_hessian_sparsity(self, **kwargs):
         raise NotImplementedError(
             "Detecting the Hessian sparsity is not available for the numba "

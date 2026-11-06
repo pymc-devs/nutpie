@@ -330,7 +330,7 @@ def test_stan_flow():
             num_layers=2,
             nn_width=4,
         )
-        trace = nutpie.sample(compiled_model, adaptation="flow", tune=2000, chains=1)
+        trace = nutpie.sample(compiled_model, adaptation="flow", chains=1)
         assert float(trace.sample_stats.fisher_distance.mean()) < 0.1
         trace.posterior.a  # noqa: B018
     finally:
