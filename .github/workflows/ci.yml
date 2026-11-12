@@ -49,7 +49,7 @@ jobs:
           before-script-linux: |
             dnf install -y clang-libs clang || sudo apt install llvm-dev libclang-dev clang
       - name: Upload wheels
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wheels-linux-${{ matrix.platform.target }}
           path: dist
@@ -164,7 +164,7 @@ jobs:
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
           rust-toolchain: nightly
       - name: Upload wheels
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wasm-wheels-${{ matrix.pyodide.python }}
           path: dist
@@ -287,7 +287,7 @@ jobs:
           args: --release --out dist --interpreter 3.12 3.13 3.14
           sccache: false
       - name: Upload wheels
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wheels-windows-x64
           path: dist
@@ -375,7 +375,7 @@ jobs:
           args: --release --out dist --interpreter 3.12 3.13 3.14 --zig
           sccache: false
       - name: Upload wheels
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wheels-macos-${{ matrix.platform.target }}
           path: dist
@@ -538,7 +538,7 @@ jobs:
           command: sdist
           args: --out dist
       - name: Upload sdist
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wheels-sdist
           path: dist
