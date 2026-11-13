@@ -182,6 +182,16 @@ impl LogpError for PyMcLogpError {
     }
 }
 
+/// Soft gradient clipping, `clip * asinh(g / clip)`, as the transform adapter
+/// applies it when it evaluates the logp itself.
+fn softclip(gradient: &mut [f64], clip: Option<f64>) {
+    if let Some(clip) = clip {
+        for g in gradient.iter_mut() {
+            *g = clip * (*g / clip).asinh();
+        }
+    }
+}
+
 pub struct PyMcModelRef {
     model: Arc<PyMcModel>,
     transform_adapter: Option<PyTransformAdapt>,
@@ -317,17 +327,30 @@ impl CpuLogpFunc for PyMcModelRef {
         transformed_gradient: &mut [f64],
         clip: Option<f64>,
     ) -> std::result::Result<(f64, f64), Self::LogpError> {
-        let (logp, logdet) = self
+        // The adapter has no logp function for compiled PyMC models, so evaluate
+        // the logp here, between the two halves of the transformation.
+        let part1 = self
             .transform_adapter
             .as_mut()
             .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?
-            .init_from_transformed_position(
+            .init_from_transformed_position_part1(
                 params,
                 untransformed_position,
-                untransformed_gradient,
                 transformed_position,
+            )?;
+
+        let logp = self.logp(untransformed_position, untransformed_gradient)?;
+        softclip(untransformed_gradient, clip);
+
+        let logdet = self
+            .transform_adapter
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?
+            .init_from_transformed_position_part2(
+                params,
+                part1,
+                untransformed_gradient,
                 transformed_gradient,
-                clip,
             )?;
         Ok((logp, logdet))
     }
@@ -341,17 +364,19 @@ impl CpuLogpFunc for PyMcModelRef {
         transformed_gradient: &mut [f64],
         clip: Option<f64>,
     ) -> std::result::Result<(f64, f64), Self::LogpError> {
-        let (logp, logdet) = self
+        let logp = self.logp(untransformed_position, untransformed_gradient)?;
+        softclip(untransformed_gradient, clip);
+
+        let logdet = self
             .transform_adapter
             .as_mut()
             .ok_or_else(|| PyRuntimeError::new_err("No transformation adapter specified"))?
-            .init_from_untransformed_position(
+            .inv_transform_normalize(
                 params,
                 untransformed_position,
                 untransformed_gradient,
                 transformed_position,
                 transformed_gradient,
-                clip,
             )?;
         Ok((logp, logdet))
     }
