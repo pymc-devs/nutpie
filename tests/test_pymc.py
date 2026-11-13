@@ -497,6 +497,27 @@ def test_normalizing_flow():
 
 
 @pytest.mark.pymc
+@pytest.mark.flow
+def test_normalizing_flow_numba():
+    # Regression test for https://github.com/pymc-devs/nutpie/issues/362
+    with pm.Model() as model:
+        pm.HalfNormal("x", shape=2)
+
+    compiled = nutpie.compile_pymc_model(model, backend="numba").with_transform_adapt(
+        num_layers=2,
+    )
+    trace = nutpie.sample(
+        compiled,
+        chains=1,
+        adaptation="flow",
+        window_switch_freq=128,
+        seed=1,
+        draws=500,
+    )
+    assert float(trace.sample_stats.fisher_distance.mean()) < 0.1
+
+
+@pytest.mark.pymc
 @pytest.mark.parametrize(
     ("backend", "gradient_backend"),
     [
