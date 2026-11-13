@@ -1364,8 +1364,14 @@ class DipBij(bijections.AbstractBijection):
         Q = -2 * y**3 / 27 - (a + 2) * y / 3
         # Compute the discriminant:
         delta = (Q / 2) ** 2 + (P / 3) ** 3
-        # Cardano's formula for the real solution:
-        z = jnp.cbrt(-Q / 2 + jnp.sqrt(delta)) + jnp.cbrt(-Q / 2 - jnp.sqrt(delta))
+        # Cardano's formula for the real solution, z = s1 + s2. One of the two
+        # cube root arguments, -Q/2 -+ sqrt(delta), can cancel to zero (at
+        # y = sqrt(3) when a = 0), where the gradient of cbrt is infinite. So take
+        # the cube root whose argument cannot cancel, and get the other one from
+        # s1 * s2 = -P / 3.
+        half_q = -Q / 2
+        s = jnp.cbrt(half_q + jnp.where(half_q >= 0, 1.0, -1.0) * jnp.sqrt(delta))
+        z = s - P / (3 * s)
         x = z + m
 
         # To compute the log-det for the inverse, note that it is the negative of
