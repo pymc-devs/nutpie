@@ -1371,7 +1371,9 @@ class DipBij(bijections.AbstractBijection):
         # s1 * s2 = -P / 3.
         half_q = -Q / 2
         s = jnp.cbrt(half_q + jnp.where(half_q >= 0, 1.0, -1.0) * jnp.sqrt(delta))
-        z = s - P / (3 * s)
+        # s is zero only at y = 0 when tanh(b) rounds to 1, where the root is z = 0.
+        s_is_zero = s == 0
+        z = jnp.where(s_is_zero, 0.0, s - P / (3 * jnp.where(s_is_zero, 1.0, s)))
         x = z + m
 
         # To compute the log-det for the inverse, note that it is the negative of
