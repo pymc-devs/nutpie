@@ -19,6 +19,12 @@ from paramax import NonTrainable, Parameterize, unwrap
 from paramax.wrappers import AbstractUnwrappable
 
 
+def _exp_asinh(x):
+    """``x + sqrt(1 + x**2)``, i.e. ``exp(asinh(x))``, without cancellation for x < 0."""
+    t = jnp.abs(x) + jnp.sqrt(1 + x * x)
+    return jnp.where(x >= 0, t, 1 / t)
+
+
 def _generate_sequences(k, r_vals):
     """
     Generate all binary sequences of length k with exactly r 1's.
@@ -344,8 +350,8 @@ class AsymmetricAffine(bijections.AbstractBijection):
         )
         self.shape = scale.shape
         assert self.shape == ()
-        self.scale = Parameterize(lambda x: x + jnp.sqrt(1 + x**2), jnp.zeros(()))
-        self.theta = Parameterize(lambda x: x + jnp.sqrt(1 + x**2), jnp.zeros(()))
+        self.scale = Parameterize(_exp_asinh, jnp.zeros(()))
+        self.theta = Parameterize(_exp_asinh, jnp.zeros(()))
 
     def _log_derivative_f(self, x, mu, sigma, theta):
         abs_x = jnp.abs(x)
@@ -951,8 +957,8 @@ def make_hh(key, n_dim, size, randomize_base=False):
 
 def make_elemwise_trafo(key, n_dim, *, count=1, vmap=True):
     def make_elemwise(key, loc):
-        scale = Parameterize(lambda x: x + jnp.sqrt(1 + x**2), jnp.zeros(()))
-        theta = Parameterize(lambda x: x + jnp.sqrt(1 + x**2), jnp.zeros(()))
+        scale = Parameterize(_exp_asinh, jnp.zeros(()))
+        theta = Parameterize(_exp_asinh, jnp.zeros(()))
 
         affine = AsymmetricAffine(
             loc,
@@ -1066,14 +1072,14 @@ class UnconstrainedAffine(bijections.AbstractBijection):
     def transform_and_log_det(
         self, x: ArrayLike, condition: ArrayLike | None = None
     ) -> tuple[Array, Array]:
-        scale = self.unconstrained_scale + jnp.sqrt(1 + self.unconstrained_scale**2)
+        scale = _exp_asinh(self.unconstrained_scale)
         y = self.loc + scale * x
         return y, jnp.sum(jnp.log(scale))
 
     def inverse_and_log_det(
         self, y: ArrayLike, condition: ArrayLike | None = None
     ) -> tuple[Array, Array]:
-        scale = self.unconstrained_scale + jnp.sqrt(1 + self.unconstrained_scale**2)
+        scale = _exp_asinh(self.unconstrained_scale)
         x = (y - self.loc) / scale
         return x, -jnp.sum(jnp.log(scale))
 
@@ -1256,13 +1262,13 @@ class Contract2(bijections.AbstractBijection):
         else:
             gamma = 1
         delta = jnp.exp(self.beta)
-        sigma_mod = self.sigma + jnp.sqrt(1 + self.sigma * self.sigma)
+        sigma_mod = _exp_asinh(self.sigma)
         mu = self.mu
         nu = self.nu
 
         def trafo(x):
             x = x - nu
-            z = x / 2 + jnp.sqrt(1 + x * x / 4)
+            z = _exp_asinh(x / 2)
             return (
                 sigma_mod
                 * (delta**2 * z**gamma - delta ** (-2) * z ** (-gamma))
@@ -1297,13 +1303,13 @@ class Contract2(bijections.AbstractBijection):
         else:
             gamma = 1
         delta = jnp.exp(self.beta)
-        sigma_mod = self.sigma + jnp.sqrt(1 + self.sigma * self.sigma)
+        sigma_mod = _exp_asinh(self.sigma)
         mu = self.mu
         nu = self.nu
 
         def inv_trafo(y):
             A = (gamma / sigma_mod) * (y - mu)
-            w = (A + jnp.sqrt(A * A + 4)) / (2 * delta**2)
+            w = _exp_asinh(A / 2) / delta**2
             z = w ** (1 / gamma)
             z = z - 1 / z
             return z + nu
@@ -1358,8 +1364,16 @@ class DipBij(bijections.AbstractBijection):
         Q = -2 * y**3 / 27 - (a + 2) * y / 3
         # Compute the discriminant:
         delta = (Q / 2) ** 2 + (P / 3) ** 3
-        # Cardano's formula for the real solution:
-        z = jnp.cbrt(-Q / 2 + jnp.sqrt(delta)) + jnp.cbrt(-Q / 2 - jnp.sqrt(delta))
+        # Cardano's formula for the real solution, z = s1 + s2. One of the two
+        # cube root arguments, -Q/2 -+ sqrt(delta), can cancel to zero (at
+        # y = sqrt(3) when a = 0), where the gradient of cbrt is infinite. So take
+        # the cube root whose argument cannot cancel, and get the other one from
+        # s1 * s2 = -P / 3.
+        half_q = -Q / 2
+        s = jnp.cbrt(half_q + jnp.where(half_q >= 0, 1.0, -1.0) * jnp.sqrt(delta))
+        # s is zero only at y = 0 when tanh(b) rounds to 1, where the root is z = 0.
+        s_is_zero = s == 0
+        z = jnp.where(s_is_zero, 0.0, s - P / (3 * jnp.where(s_is_zero, 1.0, s)))
         x = z + m
 
         # To compute the log-det for the inverse, note that it is the negative of
@@ -1421,7 +1435,7 @@ def make_transformer(
 
     if affine_transformer:
         affine = bijections.Affine(jnp.zeros(()), jnp.ones(()))
-        scale = Parameterize(lambda x: x + jnp.sqrt(1 + x**2), jnp.zeros(()))
+        scale = Parameterize(_exp_asinh, jnp.zeros(()))
         affine = eqx.tree_at(
             where=lambda aff: aff.scale,
             pytree=affine,
@@ -1431,8 +1445,8 @@ def make_transformer(
 
     if asymmetric_transformer:
         for loc in [0.0]:
-            scale = Parameterize(lambda x: x + jnp.sqrt(1 + x**2), jnp.zeros(()))
-            theta = Parameterize(lambda x: x + jnp.sqrt(1 + x**2), jnp.zeros(()))
+            scale = Parameterize(_exp_asinh, jnp.zeros(()))
+            theta = Parameterize(_exp_asinh, jnp.zeros(()))
 
             affine = AsymmetricAffine(
                 jnp.zeros(()) + loc,
@@ -1916,7 +1930,7 @@ def make_flow(
     key = jax.random.key(seed % (2**63), impl="threefry2x32")
 
     diag_param = Parameterize(
-        lambda x: x + jnp.sqrt(1 + x**2),
+        _exp_asinh,
         (diag**2 - 1) / (2 * diag),
     )
     diag_affine = bijections.Affine(mean, diag)
@@ -2070,11 +2084,11 @@ def extend_flow(
 
     if True:
         scale = Parameterize(
-            lambda x: x + jnp.sqrt(1 + x**2),
+            _exp_asinh,
             jnp.array(0.0),
         )
         theta = Parameterize(
-            lambda x: x + jnp.sqrt(1 + x**2),
+            _exp_asinh,
             jnp.array(0.0),
         )
 
@@ -2151,7 +2165,7 @@ def extend_flow(
 
         if False:
             scale = Parameterize(
-                lambda x: x + jnp.sqrt(1 + x**2),
+                _exp_asinh,
                 jnp.array(0.0),
             )
             affine = eqx.tree_at(
@@ -2203,7 +2217,7 @@ def extend_flow(
         new_layer = bijections.Sandwich(inner, permute)
 
     scale = Parameterize(
-        lambda x: x + jnp.sqrt(1 + x**2),
+        _exp_asinh,
         jnp.zeros(n_dim),
     )
     affine = eqx.tree_at(
@@ -2226,7 +2240,7 @@ def extend_flow(
         ),
     )
     scale = Parameterize(
-        lambda x: x + jnp.sqrt(1 + x**2),
+        _exp_asinh,
         jnp.zeros(n_dim),
     )
     affine = eqx.tree_at(
