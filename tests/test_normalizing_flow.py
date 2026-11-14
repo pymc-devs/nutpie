@@ -9,8 +9,16 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flowjax import bijections
+from jax.flatten_util import ravel_pytree
 
-from nutpie.normalizing_flow import Contract2, DipBij, _exp_asinh, make_flow
+from nutpie.normalizing_flow import (
+    Contract2,
+    DipBij,
+    Planar,
+    _exp_asinh,
+    make_flow,
+)
 
 pytestmark = pytest.mark.flow
 
@@ -175,4 +183,62 @@ def test_dipbij_inverse_gradients(b, float_dtype):
         -(dfprime_db + fsecond * expected_dx_db) / fprime,
         rtol=dtol,
         atol=dtol,
+    )
+
+
+@pytest.mark.parametrize("b", [-1.0, 0.0, 1.0])
+def test_planar_dipbij_inverse_gradients(b, float_dtype):
+    # make_flow uses DipBij inside a Planar layer, whose inverse passes the
+    # projection y @ u to DipBij's inverse. Put that projection at and next to
+    # +-sqrt(3 * (1 - a)), and check the layer's gradients with respect to y and
+    # to every trained parameter against central finite differences.
+    dtype = float_dtype
+    zero = jnp.zeros((), dtype=dtype)
+    # Contract2 with zero parameters is the identity, so DipBij sees y @ u
+    inner = bijections.Chain(
+        [Contract2(zero, zero, zero, zero, zero), _dipbij(b, dtype)]
+    )
+    layer = Planar(jax.random.key(0), inner, 3)
+    layer = eqx.tree_at(lambda p: p.u, layer, layer.u.astype(dtype))
+    params, static = eqx.partition(layer, eqx.is_inexact_array)
+    flat, unravel = ravel_pytree(params)
+
+    u = layer.u / jnp.linalg.norm(layer.u)
+    other = jnp.cross(u, jnp.asarray([1.0, 0.0, 0.0], dtype=dtype))
+    root = np.sqrt(3 * (1 - np.tanh(b)))
+
+    def loss(flat, y):
+        x, logdet = eqx.combine(unravel(flat), static).inverse_and_log_det(y)
+        return jnp.sum(jnp.sin(x)) + logdet
+
+    for d in [root, root + 1e-3, -root, 0.5]:
+        y = d * u + 0.7 * other
+        grad_params, grad_y = jax.grad(loss, argnums=(0, 1))(flat, y)
+        assert np.isfinite(grad_params).all() and np.isfinite(grad_y).all()
+        if dtype != jnp.float64:
+            continue
+        for arg, grad in [(0, grad_params), (1, grad_y)]:
+            args = [flat, y]
+            fd = []
+            for i in range(args[arg].size):
+                step = jnp.zeros_like(args[arg]).at[i].set(1e-6)
+                plus, minus = list(args), list(args)
+                plus[arg], minus[arg] = args[arg] + step, args[arg] - step
+                fd.append((loss(*plus) - loss(*minus)) / 2e-6)
+            np.testing.assert_allclose(grad, fd, rtol=1e-6, atol=1e-6)
+
+
+@pytest.mark.parametrize("b", [20.0, 50.0])
+def test_dipbij_inverse_saturated_b(b, float_dtype):
+    # For large b, tanh(b) rounds to 1, so at y = 0 both Cardano terms are zero.
+    # The inverse must still return the root x = 0 there.
+    dtype = float_dtype
+    bijection = _dipbij(b, dtype)
+    y = jnp.asarray([0.0, 1e-3, -1e-3, 0.5, -2.0], dtype=dtype)
+
+    x = jax.vmap(bijection.inverse)(y)
+
+    assert x[0] == 0
+    np.testing.assert_allclose(
+        jax.vmap(bijection.transform)(x), y, rtol=1e-4, atol=1e-6
     )
